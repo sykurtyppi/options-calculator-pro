@@ -1,0 +1,16 @@
+{
+    "version": "1.0.0",
+    "first_run": true,
+    "theme": "Dark Professional",
+    "api_keys": {
+        "alpha_vantage": "",
+        "finnhub": ""
+    },
+    "portfolio_value": 100000,
+    "max_position_risk": 0.02,
+    "cache_ttl_minutes": 30,
+    "log_level": "INFO",
+    "data_directory": "~/.options_calculator/data",
+    "cache_directory": "~/.options_calculator/cache",
+    "logs_directory": "~/.options_calculator/logs"
+}

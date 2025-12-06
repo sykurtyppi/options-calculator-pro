@@ -1,0 +1,1249 @@
+from PySide6.QtWidgets import (
+   QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+   QPushButton, QHeaderView, QMessageBox, QDialog, QFormLayout,
+   QLineEdit, QTextEdit, QComboBox, QDateEdit, QLabel, QGroupBox,
+   QSplitter, QFrame, QCheckBox, QSpinBox, QDoubleSpinBox, QFileDialog,
+   QProgressBar, QTabWidget, QGridLayout
+)
+from PySide6.QtCore import Qt, Signal, QDate, QTimer, QThread, Signal
+from PySide6.QtGui import QFont, QColor, QPalette, QIcon
+import pandas as pd
+from datetime import datetime, date
+from typing import Dict, List, Optional, Any
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TradeHistoryView(QWidget):
+   """Main trade history view widget"""
+   
+   # Signals
+   trade_selected = Signal(int)  # row index
+   trade_update_requested = Signal(int, dict)  # index, update_data
+   trade_delete_requested = Signal(int)  # index
+   export_requested = Signal(str)  # file_path
+   
+   def __init__(self, history_controller, parent=None):
+       super().__init__(parent)
+       self.history_controller = history_controller
+       self.current_data = pd.DataFrame()
+       self.filtered_data = pd.DataFrame()
+       
+       self.setup_ui()
+       self.connect_signals()
+       self.setup_styles()
+       
+       # Auto-refresh timer
+       self.refresh_timer = QTimer()
+       self.refresh_timer.timeout.connect(self.refresh_data)
+       self.refresh_timer.start(30000)  # Refresh every 30 seconds
+   
+   def setup_ui(self):
+       """Setup the user interface"""
+       layout = QVBoxLayout(self)
+       
+       # Create splitter for main content
+       splitter = QSplitter(Qt.Vertical)
+       layout.addWidget(splitter)
+       
+       # Top section - Controls and filters
+       controls_widget = self.create_controls_section()
+       splitter.addWidget(controls_widget)
+       
+       # Middle section - Trade table
+       table_widget = self.create_table_section()
+       splitter.addWidget(table_widget)
+       
+       # Bottom section - Statistics
+       stats_widget = self.create_statistics_section()
+       splitter.addWidget(stats_widget)
+       
+       # Set splitter proportions
+       splitter.setSizes([150, 400, 200])
+   
+   def create_controls_section(self) -> QWidget:
+       """Create controls and filters section"""
+       widget = QFrame()
+       widget.setFrameStyle(QFrame.StyledPanel)
+       layout = QHBoxLayout(widget)
+       
+       # Action buttons group
+       actions_group = QGroupBox("Actions")
+       actions_layout = QHBoxLayout(actions_group)
+       
+       self.refresh_btn = QPushButton("Refresh")
+       self.refresh_btn.setIcon(QIcon("icons/refresh.png"))
+       actions_layout.addWidget(self.refresh_btn)
+       
+       self.add_trade_btn = QPushButton("Add Trade")
+       self.add_trade_btn.setIcon(QIcon("icons/add.png"))
+       actions_layout.addWidget(self.add_trade_btn)
+       
+       self.update_trade_btn = QPushButton("Update Trade")
+       self.update_trade_btn.setIcon(QIcon("icons/edit.png"))
+       self.update_trade_btn.setEnabled(False)
+       actions_layout.addWidget(self.update_trade_btn)
+       
+       self.delete_trade_btn = QPushButton("Delete Trade")
+       self.delete_trade_btn.setIcon(QIcon("icons/delete.png"))
+       self.delete_trade_btn.setEnabled(False)
+       actions_layout.addWidget(self.delete_trade_btn)
+       
+       self.export_btn = QPushButton("Export")
+       self.export_btn.setIcon(QIcon("icons/export.png"))
+       actions_layout.addWidget(self.export_btn)
+       
+       layout.addWidget(actions_group)
+       
+       # Filters group
+       filters_group = QGroupBox("Filters")
+       filters_layout = QHBoxLayout(filters_group)
+       
+       # Status filter
+       filters_layout.addWidget(QLabel("Status:"))
+       self.status_filter = QComboBox()
+       self.status_filter.addItems(["All", "Pending", "Open", "Closed", "Expired", "Cancelled"])
+       filters_layout.addWidget(self.status_filter)
+       
+       # Symbol filter
+       filters_layout.addWidget(QLabel("Symbol:"))
+       self.symbol_filter = QLineEdit()
+       self.symbol_filter.setPlaceholderText("Enter symbol...")
+       filters_layout.addWidget(self.symbol_filter)
+       
+       # Date range filter
+       filters_layout.addWidget(QLabel("From:"))
+       self.date_from = QDateEdit()
+       self.date_from.setDate(QDate.currentDate().addDays(-30))
+       self.date_from.setCalendarPopup(True)
+       filters_layout.addWidget(self.date_from)
+       
+       filters_layout.addWidget(QLabel("To:"))
+       self.date_to = QDateEdit()
+       self.date_to.setDate(QDate.currentDate())
+       self.date_to.setCalendarPopup(True)
+       filters_layout.addWidget(self.date_to)
+       
+       # Apply filters button
+       self.apply_filters_btn = QPushButton("Apply Filters")
+       filters_layout.addWidget(self.apply_filters_btn)
+       
+       # Clear filters button
+       self.clear_filters_btn = QPushButton("Clear")
+       filters_layout.addWidget(self.clear_filters_btn)
+       
+       layout.addWidget(filters_group)
+       
+       # Stretch to push everything to the left
+       layout.addStretch()
+       
+       return widget
+   
+   def create_table_section(self) -> QWidget:
+       """Create trade table section"""
+       widget = QFrame()
+       widget.setFrameStyle(QFrame.StyledPanel)
+       layout = QVBoxLayout(widget)
+       
+       # Table header
+       header_layout = QHBoxLayout()
+       header_label = QLabel("Trade History")
+       header_label.setFont(QFont("Arial", 12, QFont.Bold))
+       header_layout.addWidget(header_label)
+       
+       # Row count label
+       self.row_count_label = QLabel("0 trades")
+       header_layout.addWidget(self.row_count_label)
+       header_layout.addStretch()
+       
+       layout.addLayout(header_layout)
+       
+       # Create table
+       self.trade_table = QTableWidget()
+       self.setup_table()
+       layout.addWidget(self.trade_table)
+       
+       return widget
+   
+   def setup_table(self):
+       """Setup the trade table"""
+       # Define columns
+       self.columns = [
+           "ID", "Symbol", "Type", "Status", "Entry Date", "Exit Date",
+           "Days", "Confidence", "P&L", "Win Rate", "IV Rank", "Sector", "Notes"
+       ]
+       
+       self.trade_table.setColumnCount(len(self.columns))
+       self.trade_table.setHorizontalHeaderLabels(self.columns)
+       
+       # Configure table properties
+       self.trade_table.setSelectionBehavior(QTableWidget.SelectRows)
+       self.trade_table.setSelectionMode(QTableWidget.SingleSelection)
+       self.trade_table.setAlternatingRowColors(True)
+       self.trade_table.setSortingEnabled(True)
+       
+       # Configure column widths
+       header = self.trade_table.horizontalHeader()
+       header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # ID
+       header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # Symbol
+       header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Type
+       header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Status
+       header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Entry Date
+       header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Exit Date
+       header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # Days
+       header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # Confidence
+       header.setSectionResizeMode(8, QHeaderView.ResizeToContents)  # P&L
+       header.setSectionResizeMode(9, QHeaderView.ResizeToContents)  # Win Rate
+       header.setSectionResizeMode(10, QHeaderView.ResizeToContents) # IV Rank
+       header.setSectionResizeMode(11, QHeaderView.Stretch)         # Sector
+       header.setSectionResizeMode(12, QHeaderView.Stretch)         # Notes
+   
+   def create_statistics_section(self) -> QWidget:
+       """Create statistics section"""
+       widget = QFrame()
+       widget.setFrameStyle(QFrame.StyledPanel)
+       layout = QVBoxLayout(widget)
+       
+       # Statistics header
+       stats_header = QLabel("Trade Statistics")
+       stats_header.setFont(QFont("Arial", 12, QFont.Bold))
+       layout.addWidget(stats_header)
+       
+       # Create tabs for different statistics
+       stats_tabs = QTabWidget()
+       layout.addWidget(stats_tabs)
+       
+       # Overview tab
+       overview_tab = self.create_overview_stats_tab()
+       stats_tabs.addTab(overview_tab, "Overview")
+       
+       # Performance tab
+       performance_tab = self.create_performance_stats_tab()
+       stats_tabs.addTab(performance_tab, "Performance")
+       
+       # Risk tab
+       risk_tab = self.create_risk_stats_tab()
+       stats_tabs.addTab(risk_tab, "Risk Metrics")
+       
+       return widget
+   
+   def create_overview_stats_tab(self) -> QWidget:
+       """Create overview statistics tab"""
+       widget = QWidget()
+       layout = QGridLayout(widget)
+       
+       # Create statistics labels
+       self.stats_labels = {}
+       
+       stats_items = [
+           ("Total Trades:", "total_trades", 0, 0),
+           ("Pending Trades:", "pending_trades", 0, 1),
+           ("Completed Trades:", "completed_trades", 1, 0),
+           ("Win Rate:", "win_rate", 1, 1),
+           ("Average P&L:", "avg_profit", 2, 0),
+           ("Total P&L:", "total_profit", 2, 1),
+           ("Best Trade:", "best_trade", 3, 0),
+           ("Worst Trade:", "worst_trade", 3, 1),
+       ]
+       
+       for label_text, key, row, col in stats_items:
+           # Label
+           label = QLabel(label_text)
+           label.setFont(QFont("Arial", 9, QFont.Bold))
+           layout.addWidget(label, row, col * 2, Qt.AlignRight)
+           
+           # Value
+           value_label = QLabel("0")
+           self.stats_labels[key] = value_label
+           layout.addWidget(value_label, row, col * 2 + 1, Qt.AlignLeft)
+       
+       return widget
+   
+   def create_performance_stats_tab(self) -> QWidget:
+       """Create performance statistics tab"""
+       widget = QWidget()
+       layout = QGridLayout(widget)
+       
+       performance_items = [
+           ("Profit Factor:", "profit_factor", 0, 0),
+           ("Sharpe Ratio:", "sharpe_ratio", 0, 1),
+           ("Max Drawdown:", "max_drawdown", 1, 0),
+           ("Avg Hold Days:", "avg_hold_days", 1, 1),
+           ("Consecutive Wins:", "consecutive_wins", 2, 0),
+           ("Consecutive Losses:", "consecutive_losses", 2, 1),
+       ]
+       
+       for label_text, key, row, col in performance_items:
+           # Label
+           label = QLabel(label_text)
+           label.setFont(QFont("Arial", 9, QFont.Bold))
+           layout.addWidget(label, row, col * 2, Qt.AlignRight)
+           
+           # Value
+           value_label = QLabel("0")
+           if key not in self.stats_labels:
+               self.stats_labels[key] = value_label
+           layout.addWidget(value_label, row, col * 2 + 1, Qt.AlignLeft)
+       
+       return widget
+   
+   def create_risk_stats_tab(self) -> QWidget:
+       """Create risk statistics tab"""
+       widget = QWidget()
+       layout = QVBoxLayout(widget)
+       
+       # Risk metrics will be implemented based on your specific needs
+       risk_label = QLabel("Risk metrics will be displayed here")
+       layout.addWidget(risk_label)
+       
+       return widget
+   
+   def connect_signals(self):
+       """Connect UI signals"""
+       # Button signals
+       self.refresh_btn.clicked.connect(self.refresh_data)
+       self.add_trade_btn.clicked.connect(self.show_add_trade_dialog)
+       self.update_trade_btn.clicked.connect(self.show_update_trade_dialog)
+       self.delete_trade_btn.clicked.connect(self.delete_selected_trade)
+       self.export_btn.clicked.connect(self.export_data)
+       
+       # Filter signals
+       self.apply_filters_btn.clicked.connect(self.apply_filters)
+       self.clear_filters_btn.clicked.connect(self.clear_filters)
+       self.status_filter.currentTextChanged.connect(self.apply_filters)
+       self.symbol_filter.textChanged.connect(self.apply_filters)
+       
+       # Table signals
+       self.trade_table.itemSelectionChanged.connect(self.on_selection_changed)
+       self.trade_table.itemDoubleClicked.connect(self.show_trade_details)
+       
+       # Controller signals
+       self.history_controller.history_updated.connect(self.refresh_data)
+       self.history_controller.statistics_updated.connect(self.update_statistics)
+       self.history_controller.error_occurred.connect(self.show_error)
+   
+   def setup_styles(self):
+       """Setup widget styles"""
+       self.setStyleSheet("""
+           QGroupBox {
+               font-weight: bold;
+               border: 2px solid gray;
+               border-radius: 5px;
+               margin-top: 1ex;
+               padding-top: 10px;
+           }
+           
+           QGroupBox::title {
+               subcontrol-origin: margin;
+               left: 10px;
+               padding: 0 5px 0 5px;
+           }
+           
+           QTableWidget {
+               gridline-color: #d0d0d0;
+               background-color: white;
+               alternate-background-color: #f0f0f0;
+           }
+           
+           QTableWidget::item {
+               padding: 5px;
+           }
+           
+           QTableWidget::item:selected {
+               background-color: #0078d4;
+               color: white;
+           }
+           
+           QPushButton {
+               padding: 5px 10px;
+               border: 1px solid #ccc;
+               border-radius: 3px;
+               background-color: #f0f0f0;
+           }
+           
+           QPushButton:hover {
+               background-color: #e0e0e0;
+           }
+           
+           QPushButton:pressed {
+               background-color: #d0d0d0;
+           }
+           
+           QPushButton:disabled {
+               color: #999;
+               background-color: #f5f5f5;
+           }
+       """)
+   
+   def refresh_data(self):
+       """Refresh trade data"""
+       try:
+           # Get all trades from controller
+           self.current_data = self.history_controller.get_all_trades()
+           self.apply_filters()  # This will update the table
+           
+       except Exception as e:
+           logger.error(f"Error refreshing trade data: {e}")
+           self.show_error("Refresh Error", f"Failed to refresh data: {e}")
+   
+   def apply_filters(self):
+       """Apply current filters to the data"""
+       try:
+            if hasattr(self.current_data, "empty") and self.current_data.empty:
+                self.update_table()
+                return
+            filtered = self.current_data.copy()
+           
+           # Status filter
+            status = self.status_filter.currentText()
+            if status != "All":
+                filtered = filtered[filtered["status"].str.title() == status]
+           
+            # Symbol filter
+            symbol = self.symbol_filter.text().strip().upper()
+            if symbol:
+                filtered = filtered[filtered["ticker"].str.contains(symbol, case=False, na=False)]
+           
+            # Date range filter
+            date_from = self.date_from.date().toPython()
+            date_to = self.date_to.date().toPython()
+           
+            if "date" in filtered.columns:
+                filtered["date"] = pd.to_datetime(filtered["date"]).dt.date
+                filtered = filtered[
+                    (filtered["date"] >= date_from) & 
+                    (filtered["date"] <= date_to)
+                ]
+           
+            self.filtered_data = filtered
+            self.update_table()
+           
+        except Exception as e:
+                logger.error(f"Error applying filters: {e}")
+                self.show_error("Filter Error", f"Failed to apply filters: {e}")
+   
+   def clear_filters(self):
+       """Clear all filters"""
+       self.status_filter.setCurrentText("All")
+       self.symbol_filter.clear()
+       self.date_from.setDate(QDate.currentDate().addDays(-30))
+       self.date_to.setDate(QDate.currentDate())
+       self.apply_filters()
+   
+   def update_table(self):
+       """Update the table with filtered data"""
+       try:
+           self.trade_table.setRowCount(0)
+           
+           if self.filtered_data.empty if hasattr(.empty, "empty") else len(.empty) == 0 if hasattr(.empty if hasattr(.empty, "empty") else len(.empty) == 0, "empty") else len(.empty if hasattr(.empty, "empty") else len(.empty) == 0) == 0:
+               self.row_count_label.setText("0 trades")
+               return
+           
+           # Set row count
+           row_count = len(self.filtered_data)
+           self.trade_table.setRowCount(row_count)
+           self.row_count_label.setText(f"{row_count} trades")
+           
+           # Populate table
+           for row, (index, trade) in enumerate(self.filtered_data.iterrows()):
+               self.populate_table_row(row, trade)
+           
+           # Sort by date (most recent first)
+           self.trade_table.sortItems(4, Qt.DescendingOrder)
+           
+       except Exception as e:
+           logger.error(f"Error updating table: {e}")
+   
+   def populate_table_row(self, row: int, trade: pd.Series):
+       """Populate a single table row"""
+       try:
+           # ID (hidden, store index)
+           id_item = QTableWidgetItem(str(trade.name))  # Use DataFrame index
+           self.trade_table.setItem(row, 0, id_item)
+           
+           # Symbol
+           symbol_item = QTableWidgetItem(str(trade.get("ticker", "")))
+           self.trade_table.setItem(row, 1, symbol_item)
+           
+           # Type
+           type_item = QTableWidgetItem("Calendar Spread")  # Default type
+           self.trade_table.setItem(row, 2, type_item)
+           
+           # Status
+           status = str(trade.get("status", "")).title()
+           status_item = QTableWidgetItem(status)
+           
+           # Color code status
+           if status == "Pending":
+               status_item.setBackground(QColor(255, 255, 0, 100))  # Yellow
+           elif status == "Open":
+               status_item.setBackground(QColor(0, 255, 0, 100))   # Green
+           elif status == "Closed":
+               status_item.setBackground(QColor(128, 128, 128, 100)) # Gray
+           
+           self.trade_table.setItem(row, 3, status_item)
+           
+           # Entry Date
+           entry_date = str(trade.get("date", ""))
+           entry_item = QTableWidgetItem(entry_date)
+           self.trade_table.setItem(row, 4, entry_item)
+           
+           # Exit Date (placeholder)
+           exit_item = QTableWidgetItem("")
+           self.trade_table.setItem(row, 5, exit_item)
+           
+           # Days in trade (placeholder)
+           days_item = QTableWidgetItem("")
+           self.trade_table.setItem(row, 6, days_item)
+           
+           # Confidence
+           confidence = trade.get("confidence", 0)
+           confidence_item = QTableWidgetItem(f"{confidence:.1f}%")
+           self.trade_table.setItem(row, 7, confidence_item)
+           
+           # P&L
+           pl = trade.get("pl", 0)
+           pl_item = QTableWidgetItem(f"${pl:.2f}")
+           
+           # Color code P&L
+           if pl > 0:
+               pl_item.setForeground(QColor(0, 128, 0))  # Green
+           elif pl < 0:
+               pl_item.setForeground(QColor(255, 0, 0))  # Red
+           
+           self.trade_table.setItem(row, 8, pl_item)
+           
+           # Win Rate (calculated from profitable column)
+           profitable = trade.get("profitable", False)
+           win_rate_item = QTableWidgetItem("100%" if profitable else "0%")
+           self.trade_table.setItem(row, 9, win_rate_item)
+           
+           # IV Rank
+           iv_rank = trade.get("iv30_rv30", 0)
+           iv_item = QTableWidgetItem(f"{iv_rank:.2f}")
+           self.trade_table.setItem(row, 10, iv_item)
+           
+           # Sector (placeholder)
+           sector_item = QTableWidgetItem("Technology")  # Default
+           self.trade_table.setItem(row, 11, sector_item)
+           
+           # Notes
+           notes = str(trade.get("notes", ""))
+           notes_item = QTableWidgetItem(notes)
+           self.trade_table.setItem(row, 12, notes_item)
+           
+       except Exception as e:
+           logger.error(f"Error populating table row {row}: {e}")
+   
+   def on_selection_changed(self):
+       """Handle table selection change"""
+       selected_items = self.trade_table.selectedItems()
+       has_selection = len(selected_items) > 0
+       
+       self.update_trade_btn.setEnabled(has_selection)
+       self.delete_trade_btn.setEnabled(has_selection)
+       
+       if has_selection:
+           row = self.trade_table.currentRow()
+           self.trade_selected.emit(row)
+   
+   def show_trade_details(self, item):
+       """Show detailed trade information"""
+       row = item.row()
+       if row < 0 or row >= len(self.filtered_data):
+           return
+       
+       trade = self.filtered_data.iloc[row]
+       dialog = TradeDetailsDialog(trade, self)
+       dialog.exec()
+   
+   def show_add_trade_dialog(self):
+       """Show add trade dialog"""
+       dialog = AddTradeDialog(self)
+       if dialog.exec() == QDialog.Accepted:
+           trade_data = dialog.get_trade_data()
+           # Emit signal to controller to add trade
+           # This would need to be implemented in the controller
+           pass
+   
+   def show_update_trade_dialog(self):
+       """Show update trade dialog"""
+       row = self.trade_table.currentRow()
+       if row < 0:
+           return
+       
+       trade_index = int(self.trade_table.item(row, 0).text())
+       trade = self.filtered_data.iloc[row]
+       
+       dialog = UpdateTradeDialog(trade, self)
+       if dialog.exec() == QDialog.Accepted:
+           update_data = dialog.get_update_data()
+           self.trade_update_requested.emit(trade_index, update_data)
+   
+   def delete_selected_trade(self):
+       """Delete selected trade"""
+       row = self.trade_table.currentRow()
+       if row < 0:
+           return
+       
+       trade_index = int(self.trade_table.item(row, 0).text())
+       trade_symbol = self.trade_table.item(row, 1).text()
+       
+       reply = QMessageBox.question(
+           self,
+           "Confirm Delete",
+           f"Are you sure you want to delete the trade for {trade_symbol}?",
+           QMessageBox.Yes | QMessageBox.No,
+           QMessageBox.No
+       )
+       
+       if reply == QMessageBox.Yes:
+           self.trade_delete_requested.emit(trade_index)
+   
+   def export_data(self):
+       """Export trade data"""
+       file_path, _ = QFileDialog.getSaveFileName(
+           self,
+           "Export Trade History",
+           f"trade_history_{datetime.now().strftime('%Y%m%d')}.csv",
+           "CSV Files (*.csv);;All Files (*)"
+       )
+       
+       if file_path:
+           self.export_requested.emit(file_path)
+   
+   def update_statistics(self, stats: Dict[str, Any]):
+       """Update statistics display"""
+       try:
+           for key, value in stats.items():
+               if key in self.stats_labels:
+                   label = self.stats_labels[key]
+                   
+                   if key in ["win_rate"]:
+                       label.setText(f"{value:.1f}%")
+                   elif key in ["avg_profit", "total_profit", "best_trade", "worst_trade"]:
+                       label.setText(f"${value:.2f}")
+                   elif key in ["profit_factor", "sharpe_ratio"]:
+                       label.setText(f"{value:.2f}")
+                   else:
+                       label.setText(str(value))
+                       
+       except Exception as e:
+           logger.error(f"Error updating statistics: {e}")
+   
+   def show_error(self, title: str, message: str):
+       """Show error message"""
+       QMessageBox.critical(self, title, message)
+   
+   def show_info(self, title: str, message: str):
+       """Show info message"""
+       QMessageBox.information(self, title, message)
+
+class TradeDetailsDialog(QDialog):
+   """Dialog for displaying detailed trade information"""
+   
+   def __init__(self, trade_data, parent=None):
+       super().__init__(parent)
+       self.trade_data = trade_data
+       self.setup_ui()
+   
+   def setup_ui(self):
+       """Setup dialog UI"""
+       self.setWindowTitle("Trade Details")
+       self.setModal(True)
+       self.resize(500, 400)
+       
+       layout = QVBoxLayout(self)
+       
+       # Create tabs for different sections
+       tabs = QTabWidget()
+       layout.addWidget(tabs)
+       
+       # Basic info tab
+       basic_tab = self.create_basic_info_tab()
+       tabs.addTab(basic_tab, "Basic Info")
+       
+       # Analysis tab
+       analysis_tab = self.create_analysis_tab()
+       tabs.addTab(analysis_tab, "Analysis")
+       
+       # Performance tab
+       performance_tab = self.create_performance_tab()
+       tabs.addTab(performance_tab, "Performance")
+       
+       # Close button
+       close_btn = QPushButton("Close")
+       close_btn.clicked.connect(self.accept)
+       layout.addWidget(close_btn)
+   
+   def create_basic_info_tab(self) -> QWidget:
+       """Create basic info tab"""
+       widget = QWidget()
+       layout = QFormLayout(widget)
+       
+       # Add fields
+       layout.addRow("Symbol:", QLabel(str(self.trade_data.get("ticker", ""))))
+       layout.addRow("Status:", QLabel(str(self.trade_data.get("status", "")).title()))
+       layout.addRow("Date:", QLabel(str(self.trade_data.get("date", ""))))
+       layout.addRow("P&L:", QLabel(f"${self.trade_data.get('pl', 0):.2f}"))
+       layout.addRow("Confidence:", QLabel(f"{self.trade_data.get('confidence', 0):.1f}%"))
+       
+       return widget
+   
+   def create_analysis_tab(self) -> QWidget:
+       """Create analysis tab"""
+       widget = QWidget()
+       layout = QFormLayout(widget)
+       
+       # Add analysis fields
+       layout.addRow("IV/RV Ratio:", QLabel(f"{self.trade_data.get('iv30_rv30', 0):.2f}"))
+       layout.addRow("Term Structure:", QLabel(f"{self.trade_data.get('ts_slope_0_45', 0):.6f}"))
+       layout.addRow("Days to Earnings:", QLabel(str(self.trade_data.get('days_to_earnings', 0))))
+       layout.addRow("VIX:", QLabel(f"{self.trade_data.get('vix', 0):.2f}"))
+       
+       return widget
+   
+   def create_performance_tab(self) -> QWidget:
+       """Create performance tab"""
+       widget = QWidget()
+       layout = QFormLayout(widget)
+       
+       # Add performance fields
+       profitable = self.trade_data.get('profitable', False)
+       layout.addRow("Profitable:", QLabel("Yes" if profitable else "No"))
+       layout.addRow("Notes:", QLabel(str(self.trade_data.get('notes', ""))))
+       
+       return widget
+
+class UpdateTradeDialog(QDialog):
+   """Dialog for updating trade information"""
+   
+   def __init__(self, trade_data, parent=None):
+       super().__init__(parent)
+       self.trade_data = trade_data
+       self.setup_ui()
+   
+   def setup_ui(self):
+       """Setup dialog UI"""
+       self.setWindowTitle("Update Trade")
+       self.setModal(True)
+       self.resize(400, 300)
+       
+       layout = QFormLayout(self)
+       
+       # Status
+       self.status_combo = QComboBox()
+       self.status_combo.addItems(["pending", "open", "closed", "expired", "cancelled"])
+       current_status = str(self.trade_data.get("status", "")).lower()
+       if current_status in ["pending", "open", "closed", "expired", "cancelled"]:
+           self.status_combo.setCurrentText(current_status)
+       layout.addRow("Status:", self.status_combo)
+       
+       # P&L
+       self.pl_input = QDoubleSpinBox()
+       self.pl_input.setRange(-99999.99, 99999.99)
+       self.pl_input.setValue(self.trade_data.get("pl", 0))
+       self.pl_input.setPrefix("$")
+       layout.addRow("P&L:", self.pl_input)
+       
+       # Notes
+       self.notes_input = QTextEdit()
+       self.notes_input.setPlainText(str(self.trade_data.get("notes", "")))
+       self.notes_input.setMaximumHeight(100)
+       layout.addRow("Notes:", self.notes_input)
+       
+       # Buttons
+       button_layout = QHBoxLayout()
+       
+       update_btn = QPushButton("Update")
+       update_btn.clicked.connect(self.accept)
+       button_layout.addWidget(update_btn)
+       
+       cancel_btn = QPushButton("Cancel")
+       cancel_btn.clicked.connect(self.reject)
+       button_layout.addWidget(cancel_btn)
+       
+       layout.addRow(button_layout)
+   
+   def get_update_data(self) -> Dict[str, Any]:
+       """Get updated trade data"""
+       return {
+           "status": self.status_combo.currentText(),
+           "pl": self.pl_input.value(),
+           "notes": self.notes_input.toPlainText(),
+           "profitable": self.pl_input.value() > 0
+       }
+
+class AddTradeDialog(QDialog):
+   """Dialog for adding new trade"""
+   
+   def __init__(self, parent=None):
+       super().__init__(parent)
+       self.setup_ui()
+   
+   def setup_ui(self):
+       """Setup dialog UI"""
+       self.setWindowTitle("Add New Trade")
+       self.setModal(True)
+       self.resize(400, 350)
+       
+       layout = QFormLayout(self)
+       
+       # Symbol
+       self.symbol_input = QLineEdit()
+       self.symbol_input.setPlaceholderText("e.g., AAPL")
+       layout.addRow("Symbol:", self.symbol_input)
+       
+       # Trade Type
+       self.type_combo = QComboBox()
+       self.type_combo.addItems([
+           "Calendar Spread", "Iron Condor", "Straddle", "Strangle",
+           "Butterfly", "Covered Call", "Cash Secured Put"
+       ])
+       layout.addRow("Trade Type:", self.type_combo)
+       
+       # Status
+       self.status_combo = QComboBox()
+       self.status_combo.addItems(["pending", "open", "closed"])
+       layout.addRow("Status:", self.status_combo)
+       
+       # Entry Date
+       self.entry_date = QDateEdit()
+       self.entry_date.setDate(QDate.currentDate())
+       self.entry_date.setCalendarPopup(True)
+       layout.addRow("Entry Date:", self.entry_date)
+       
+       # Confidence
+       self.confidence_input = QDoubleSpinBox()
+       self.confidence_input.setRange(0, 100)
+       self.confidence_input.setValue(50)
+       self.confidence_input.setSuffix("%")
+       layout.addRow("Confidence:", self.confidence_input)
+       
+       # P&L
+       self.pl_input = QDoubleSpinBox()
+       self.pl_input.setRange(-99999.99, 99999.99)
+       self.pl_input.setValue(0)
+       self.pl_input.setPrefix("$")
+       layout.addRow("P&L:", self.pl_input)
+       
+       # IV/RV Ratio
+       self.iv_rv_input = QDoubleSpinBox()
+       self.iv_rv_input.setRange(0, 10)
+       self.iv_rv_input.setValue(1.0)
+       self.iv_rv_input.setDecimals(2)
+       layout.addRow("IV/RV Ratio:", self.iv_rv_input)
+       
+       # Days to Earnings
+       self.days_earnings_input = QSpinBox()
+       self.days_earnings_input.setRange(0, 365)
+       self.days_earnings_input.setValue(7)
+       layout.addRow("Days to Earnings:", self.days_earnings_input)
+       
+       # VIX
+       self.vix_input = QDoubleSpinBox()
+       self.vix_input.setRange(0, 100)
+       self.vix_input.setValue(20)
+       self.vix_input.setDecimals(2)
+       layout.addRow("VIX:", self.vix_input)
+       
+       # Notes
+       self.notes_input = QTextEdit()
+       self.notes_input.setMaximumHeight(80)
+       self.notes_input.setPlaceholderText("Optional notes...")
+       layout.addRow("Notes:", self.notes_input)
+       
+       # Buttons
+       button_layout = QHBoxLayout()
+       
+       add_btn = QPushButton("Add Trade")
+       add_btn.clicked.connect(self.validate_and_accept)
+       button_layout.addWidget(add_btn)
+       
+       cancel_btn = QPushButton("Cancel")
+       cancel_btn.clicked.connect(self.reject)
+       button_layout.addWidget(cancel_btn)
+       
+       layout.addRow(button_layout)
+   
+   def validate_and_accept(self):
+       """Validate input and accept if valid"""
+       if not self.symbol_input.text().strip():
+           QMessageBox.warning(self, "Validation Error", "Please enter a symbol.")
+           return
+       
+       self.accept()
+   
+   def get_trade_data(self) -> Dict[str, Any]:
+       """Get trade data from form"""
+       return {
+           "ticker": self.symbol_input.text().strip().upper(),
+           "trade_type": self.type_combo.currentText().lower().replace(" ", "_"),
+           "status": self.status_combo.currentText(),
+           "date": self.entry_date.date().toPython().isoformat(),
+           "confidence": self.confidence_input.value(),
+           "pl": self.pl_input.value(),
+           "profitable": self.pl_input.value() > 0,
+           "iv30_rv30": self.iv_rv_input.value(),
+           "days_to_earnings": self.days_earnings_input.value(),
+           "vix": self.vix_input.value(),
+           "notes": self.notes_input.toPlainText(),
+           "ts_slope_0_45": 0.0,  # Default values
+           "avg_volume_normalized": 0.5,
+           "delta_weighted_gamma": 0.01
+       }
+
+class TradeHistoryExportDialog(QDialog):
+   """Dialog for configuring export options"""
+   
+   def __init__(self, parent=None):
+       super().__init__(parent)
+       self.setup_ui()
+   
+   def setup_ui(self):
+       """Setup dialog UI"""
+       self.setWindowTitle("Export Trade History")
+       self.setModal(True)
+       self.resize(350, 250)
+       
+       layout = QVBoxLayout(self)
+       
+       # Export options group
+       options_group = QGroupBox("Export Options")
+       options_layout = QFormLayout(options_group)
+       
+       # Include pending trades
+       self.include_pending_cb = QCheckBox()
+       self.include_pending_cb.setChecked(True)
+       options_layout.addRow("Include Pending Trades:", self.include_pending_cb)
+       
+       # Date range
+       self.date_range_cb = QCheckBox()
+       self.date_range_cb.toggled.connect(self.toggle_date_range)
+       options_layout.addRow("Filter by Date Range:", self.date_range_cb)
+       
+       # Date inputs (initially disabled)
+       self.start_date = QDateEdit()
+       self.start_date.setDate(QDate.currentDate().addDays(-30))
+       self.start_date.setCalendarPopup(True)
+       self.start_date.setEnabled(False)
+       options_layout.addRow("Start Date:", self.start_date)
+       
+       self.end_date = QDateEdit()
+       self.end_date.setDate(QDate.currentDate())
+       self.end_date.setCalendarPopup(True)
+       self.end_date.setEnabled(False)
+       options_layout.addRow("End Date:", self.end_date)
+       
+       # Export format
+       self.format_combo = QComboBox()
+       self.format_combo.addItems(["CSV", "Excel", "JSON"])
+       options_layout.addRow("Format:", self.format_combo)
+       
+       layout.addWidget(options_group)
+       
+       # Buttons
+       button_layout = QHBoxLayout()
+       
+       export_btn = QPushButton("Export")
+       export_btn.clicked.connect(self.accept)
+       button_layout.addWidget(export_btn)
+       
+       cancel_btn = QPushButton("Cancel")
+       cancel_btn.clicked.connect(self.reject)
+       button_layout.addWidget(cancel_btn)
+       
+       layout.addLayout(button_layout)
+   
+   def toggle_date_range(self, checked: bool):
+       """Toggle date range inputs"""
+       self.start_date.setEnabled(checked)
+       self.end_date.setEnabled(checked)
+   
+   def get_export_options(self) -> Dict[str, Any]:
+       """Get export configuration"""
+       options = {
+           "include_pending": self.include_pending_cb.isChecked(),
+           "format": self.format_combo.currentText().lower(),
+           "use_date_range": self.date_range_cb.isChecked()
+       }
+       
+       if options["use_date_range"]:
+           options["start_date"] = self.start_date.date().toPython()
+           options["end_date"] = self.end_date.date().toPython()
+       
+       return options
+
+class TradeHistoryImportDialog(QDialog):
+   """Dialog for importing trade history"""
+   
+   def __init__(self, parent=None):
+       super().__init__(parent)
+       self.file_path = ""
+       self.setup_ui()
+   
+   def setup_ui(self):
+       """Setup dialog UI"""
+       self.setWindowTitle("Import Trade History")
+       self.setModal(True)
+       self.resize(400, 200)
+       
+       layout = QVBoxLayout(self)
+       
+       # File selection
+       file_group = QGroupBox("Select File")
+       file_layout = QHBoxLayout(file_group)
+       
+       self.file_path_label = QLabel("No file selected")
+       file_layout.addWidget(self.file_path_label)
+       
+       browse_btn = QPushButton("Browse...")
+       browse_btn.clicked.connect(self.browse_file)
+       file_layout.addWidget(browse_btn)
+       
+       layout.addWidget(file_group)
+       
+       # Import options
+       options_group = QGroupBox("Import Options")
+       options_layout = QFormLayout(options_group)
+       
+       # Merge with existing
+       self.merge_cb = QCheckBox()
+       self.merge_cb.setChecked(True)
+       options_layout.addRow("Merge with Existing Data:", self.merge_cb)
+       
+       # Skip duplicates
+       self.skip_duplicates_cb = QCheckBox()
+       self.skip_duplicates_cb.setChecked(True)
+       options_layout.addRow("Skip Duplicates:", self.skip_duplicates_cb)
+       
+       layout.addWidget(options_group)
+       
+       # Progress bar (hidden initially)
+       self.progress_bar = QProgressBar()
+       self.progress_bar.setVisible(False)
+       layout.addWidget(self.progress_bar)
+       
+       # Buttons
+       button_layout = QHBoxLayout()
+       
+       self.import_btn = QPushButton("Import")
+       self.import_btn.clicked.connect(self.start_import)
+       self.import_btn.setEnabled(False)
+       button_layout.addWidget(self.import_btn)
+       
+       cancel_btn = QPushButton("Cancel")
+       cancel_btn.clicked.connect(self.reject)
+       button_layout.addWidget(cancel_btn)
+       
+       layout.addLayout(button_layout)
+   
+   def browse_file(self):
+       """Browse for import file"""
+       file_path, _ = QFileDialog.getOpenFileName(
+           self,
+           "Select Trade History File",
+           "",
+           "CSV Files (*.csv);;Excel Files (*.xlsx);;JSON Files (*.json);;All Files (*)"
+       )
+       
+       if file_path:
+           self.file_path = file_path
+           self.file_path_label.setText(file_path)
+           self.import_btn.setEnabled(True)
+   
+   def start_import(self):
+       """Start import process"""
+       if not self.file_path:
+           return
+       
+       self.progress_bar.setVisible(True)
+       self.progress_bar.setRange(0, 0)  # Indeterminate progress
+       
+       # Here you would typically start a background thread for import
+       # For now, just accept the dialog
+       self.accept()
+   
+   def get_import_options(self) -> Dict[str, Any]:
+       """Get import configuration"""
+       return {
+           "file_path": self.file_path,
+           "merge": self.merge_cb.isChecked(),
+           "skip_duplicates": self.skip_duplicates_cb.isChecked()
+       }
+
+class TradePerformanceChart(QWidget):
+   """Widget for displaying trade performance charts"""
+   
+   def __init__(self, parent=None):
+       super().__init__(parent)
+       self.setup_ui()
+   
+   def setup_ui(self):
+       """Setup chart UI"""
+       layout = QVBoxLayout(self)
+       
+       # Chart controls
+       controls_layout = QHBoxLayout()
+       
+       # Chart type selector
+       self.chart_type_combo = QComboBox()
+       self.chart_type_combo.addItems([
+           "Cumulative P&L", "Monthly Returns", "Win Rate by Month",
+           "Trade Duration", "P&L Distribution"
+       ])
+       self.chart_type_combo.currentTextChanged.connect(self.update_chart)
+       controls_layout.addWidget(QLabel("Chart Type:"))
+       controls_layout.addWidget(self.chart_type_combo)
+       
+       controls_layout.addStretch()
+       layout.addLayout(controls_layout)
+       
+       # Chart area (placeholder - would use matplotlib or plotly)
+       self.chart_label = QLabel("Chart will be displayed here")
+       self.chart_label.setAlignment(Qt.AlignCenter)
+       self.chart_label.setMinimumHeight(300)
+       self.chart_label.setStyleSheet("border: 1px solid gray; background-color: white;")
+       layout.addWidget(self.chart_label)
+   
+   def update_chart(self):
+       """Update chart based on selection"""
+       chart_type = self.chart_type_combo.currentText()
+       self.chart_label.setText(f"{chart_type} chart would be displayed here")
+   
+   def set_data(self, trade_data: pd.DataFrame):
+       """Set trade data for charts"""
+       # This would process the data and update charts
+       pass
+
+# Additional utility classes
+
+class TradeFilterWidget(QWidget):
+   """Reusable trade filter widget"""
+   
+   filters_changed = Signal()
+   
+   def __init__(self, parent=None):
+       super().__init__(parent)
+       self.setup_ui()
+   
+   def setup_ui(self):
+       """Setup filter UI"""
+       layout = QGridLayout(self)
+       
+       # Symbol filter
+       layout.addWidget(QLabel("Symbol:"), 0, 0)
+       self.symbol_filter = QLineEdit()
+       self.symbol_filter.textChanged.connect(self.filters_changed)
+       layout.addWidget(self.symbol_filter, 0, 1)
+       
+       # Status filter
+       layout.addWidget(QLabel("Status:"), 0, 2)
+       self.status_filter = QComboBox()
+       self.status_filter.addItems(["All", "Pending", "Open", "Closed"])
+       self.status_filter.currentTextChanged.connect(self.filters_changed)
+       layout.addWidget(self.status_filter, 0, 3)
+       
+       # Profitable filter
+       layout.addWidget(QLabel("Profitable:"), 1, 0)
+       self.profitable_filter = QComboBox()
+       self.profitable_filter.addItems(["All", "Yes", "No"])
+       self.profitable_filter.currentTextChanged.connect(self.filters_changed)
+       layout.addWidget(self.profitable_filter, 1, 1)
+       
+       # Date range
+       layout.addWidget(QLabel("From:"), 1, 2)
+       self.date_from = QDateEdit()
+       self.date_from.setDate(QDate.currentDate().addDays(-30))
+       self.date_from.dateChanged.connect(self.filters_changed)
+       layout.addWidget(self.date_from, 1, 3)
+       
+       layout.addWidget(QLabel("To:"), 2, 0)
+       self.date_to = QDateEdit()
+       self.date_to.setDate(QDate.currentDate())
+       self.date_to.dateChanged.connect(self.filters_changed)
+       layout.addWidget(self.date_to, 2, 1)
+       
+       # Clear button
+       clear_btn = QPushButton("Clear Filters")
+       clear_btn.clicked.connect(self.clear_filters)
+       layout.addWidget(clear_btn, 2, 2)
+   
+   def clear_filters(self):
+       """Clear all filters"""
+       self.symbol_filter.clear()
+       self.status_filter.setCurrentText("All")
+       self.profitable_filter.setCurrentText("All")
+       self.date_from.setDate(QDate.currentDate().addDays(-30))
+       self.date_to.setDate(QDate.currentDate())
+       self.filters_changed.emit()
+   
+   def get_filters(self) -> Dict[str, Any]:
+       """Get current filter values"""
+       return {
+           "symbol": self.symbol_filter.text().strip(),
+           "status": self.status_filter.currentText(),
+           "profitable": self.profitable_filter.currentText(),
+           "date_from": self.date_from.date().toPython(),
+           "date_to": self.date_to.date().toPython()
+       }
+
+class TradeStatsWidget(QWidget):
+   """Reusable trade statistics widget"""
+   
+   def __init__(self, parent=None):
+       super().__init__(parent)
+       self.setup_ui()
+   
+   def setup_ui(self):
+       """Setup statistics UI"""
+       layout = QGridLayout(self)
+       
+       # Create stat labels
+       self.stat_labels = {}
+       
+       stats = [
+           ("Total Trades", "total_trades", 0, 0),
+           ("Win Rate", "win_rate", 0, 1),
+           ("Total P&L", "total_pnl", 0, 2),
+           ("Best Trade", "best_trade", 1, 0),
+           ("Worst Trade", "worst_trade", 1, 1),
+           ("Avg P&L", "avg_pnl", 1, 2),
+       ]
+       
+       for label_text, key, row, col in stats:
+           # Create label
+           label = QLabel(label_text + ":")
+           label.setFont(QFont("Arial", 9, QFont.Bold))
+           layout.addWidget(label, row * 2, col)
+           
+           # Create value label
+           value_label = QLabel("--")
+           value_label.setAlignment(Qt.AlignCenter)
+           self.stat_labels[key] = value_label
+           layout.addWidget(value_label, row * 2 + 1, col)
+   
+   def update_stats(self, stats: Dict[str, Any]):
+       """Update statistics display"""
+       for key, value in stats.items():
+           if key in self.stat_labels:
+               label = self.stat_labels[key]
+               
+               if key == "win_rate":
+                   label.setText(f"{value:.1f}%")
+               elif key in ["total_pnl", "best_trade", "worst_trade", "avg_pnl"]:
+                   label.setText(f"${value:.2f}")
+                   
+                   # Color code P&L values
+                   if value > 0:
+                       label.setStyleSheet("color: green; font-weight: bold;")
+                   elif value < 0:
+                       label.setStyleSheet("color: red; font-weight: bold;")
+                   else:
+                       label.setStyleSheet("color: black;")
+               else:
+                   label.setText(str(value))
+class HistoryView:
+    """Temporary placeholder for HistoryView"""
+    def __init__(self):
+        pass
