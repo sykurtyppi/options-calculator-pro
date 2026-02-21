@@ -1,6 +1,8 @@
 """
-Simple Options Calculator - Clean GUI that actually works
-Shows real market data and basic options analysis
+Options Calculator launcher.
+
+Default launch path is the institutional dashboard (core.app/MainWindow).
+The legacy simple calculator remains as a fallback UI.
 """
 
 import sys
@@ -440,9 +442,17 @@ def main():
 
     # Set application style
     app.setStyle('Fusion')
+    app.setApplicationName("Options Calculator Pro")
 
-    window = SimpleOptionsCalculator()
-    window.show()
+    window = None
+    try:
+        # Preferred UI: institutional multi-tab dashboard.
+        from core.app import OptionsCalculatorApp
+        window = OptionsCalculatorApp()
+    except Exception:
+        logging.exception("Institutional UI launch failed, falling back to SimpleOptionsCalculator")
+        window = SimpleOptionsCalculator()
+        window.show()
 
     sys.exit(app.exec())
 

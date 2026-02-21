@@ -30,11 +30,11 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox, QDoubleSpinBox,
     QFrame, QCompleter, QTabWidget, QSplitter,
-    QScrollArea, QSizePolicy, QShortcut, QComboBox,
+    QScrollArea, QSizePolicy, QComboBox,
     QTableWidget, QTableWidgetItem, QTextEdit, QFileDialog, QApplication
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QStringListModel
-from PySide6.QtGui import QFont, QKeySequence, QBrush, QColor
+from PySide6.QtGui import QFont, QKeySequence, QBrush, QColor, QShortcut
 
 from utils.config_manager import ConfigManager
 
