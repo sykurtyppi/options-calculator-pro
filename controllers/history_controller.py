@@ -54,5 +54,3 @@ class HistoryController(QObject):
         """Save a trade"""
         self.add_trade(trade_data)
         self.trade_saved.emit(trade_data)
-    def get_all_trades(self): return self.get_history()
-    def save_trade(self, trade_data): self.add_trade(trade_data); self.trade_saved.emit(trade_data)

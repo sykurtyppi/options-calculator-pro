@@ -12,6 +12,7 @@ import asyncio
 from .base_worker import BaseWorker
 from services.market_data import MarketDataService
 from services.options_service import OptionsService
+from utils.config_manager import ConfigManager
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +27,9 @@ class DataFetchWorker(BaseWorker):
         self.fetch_options = fetch_options or {}
         
         # Services
+        self.config_manager = ConfigManager()
         self.market_data = MarketDataService()
-        self.options_service = OptionsService()
+        self.options_service = OptionsService(self.config_manager, self.market_data)
         
         # Results
         self.fetch_results = {}
@@ -133,7 +135,7 @@ class DataFetchWorker(BaseWorker):
         period = self.fetch_options.get('historical_period', '1y')
         interval = self.fetch_options.get('historical_interval', '1d')
         
-        hist_data = self.market_data.get_historical_data(symbol, period=period)
+        hist_data = self.market_data.get_historical_data(symbol, period=period, interval=interval)
         
         if not hist_data.empty:
             return {
@@ -162,9 +164,11 @@ class DataFetchWorker(BaseWorker):
                 
                 chain = self.options_service.get_option_chain(symbol, expiry, timeout=30)
                 if chain:
+                    calls = [self._serialize_option_contract(c) for c in getattr(chain, 'calls', [])]
+                    puts = [self._serialize_option_contract(p) for p in getattr(chain, 'puts', [])]
                     chains[expiry] = {
-                        'calls': chain.calls.to_dict('records') if hasattr(chain, 'calls') else [],
-                        'puts': chain.puts.to_dict('records') if hasattr(chain, 'puts') else []
+                        'calls': calls,
+                        'puts': puts
                     }
             
             return {
@@ -237,6 +241,31 @@ class DataFetchWorker(BaseWorker):
         except Exception as e:
             logger.error(f"Error fetching fundamental data for {symbol}: {e}")
             return None
+
+    @staticmethod
+    def _serialize_option_contract(contract: Any) -> Dict[str, Any]:
+        """Serialize option contract dataclass/object to a plain dictionary."""
+        try:
+            option_type = getattr(contract, 'option_type', None)
+            option_type_value = getattr(option_type, 'value', str(option_type)) if option_type is not None else None
+            return {
+                'symbol': getattr(contract, 'symbol', ''),
+                'strike': float(getattr(contract, 'strike', 0.0) or 0.0),
+                'expiration': getattr(contract, 'expiration', ''),
+                'option_type': option_type_value,
+                'bid': float(getattr(contract, 'bid', 0.0) or 0.0),
+                'ask': float(getattr(contract, 'ask', 0.0) or 0.0),
+                'last': float(getattr(contract, 'last', 0.0) or 0.0),
+                'volume': int(getattr(contract, 'volume', 0) or 0),
+                'open_interest': int(getattr(contract, 'open_interest', 0) or 0),
+                'implied_volatility': float(getattr(contract, 'implied_volatility', 0.0) or 0.0),
+                'delta': getattr(contract, 'delta', None),
+                'gamma': getattr(contract, 'gamma', None),
+                'theta': getattr(contract, 'theta', None),
+                'vega': getattr(contract, 'vega', None),
+            }
+        except Exception:
+            return {}
 
 
 class CacheUpdateWorker(BaseWorker):

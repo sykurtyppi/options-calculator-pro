@@ -21,8 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 import backoff
 from contextlib import asynccontextmanager
 
-from ..models.option_data import OptionContract, OptionChain, OptionType
-from ..utils.logger import get_logger
+from models.option_data import OptionContract, OptionChain, OptionType
+from utils.logger import get_logger
 
 class DataProvider(Enum):
     """Supported market data providers"""

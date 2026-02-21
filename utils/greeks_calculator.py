@@ -502,7 +502,11 @@ class GreeksCalculator:
             # Risk metrics
             option_price = self._estimate_option_price(params)
             lambda_ = delta * S / option_price if option_price != 0 else 0
-            epsilon = -S * math.exp(-q*T) * Nd1 if params.option_type == OptionType.CALL else S * math.exp(-q*T) * norm.cdf(-d1)
+            epsilon = (
+                -S * math.exp(-q*T) * Nd1 / 100
+                if params.option_type == OptionType.CALL
+                else S * math.exp(-q*T) * norm.cdf(-d1) / 100
+            )
             
             # Dollar Greeks
             dollar_delta = delta * S

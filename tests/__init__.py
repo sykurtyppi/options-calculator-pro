@@ -5,13 +5,18 @@ Comprehensive testing infrastructure for all application components
 
 import sys
 import os
-import pytest
 import logging
 from pathlib import Path
 
+try:
+    import pytest  # noqa: F401
+except ImportError:  # pragma: no cover - pytest is optional for unittest runs
+    pytest = None
+
 # Add the project root to the Python path
 project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 # Configure test logging
 logging.basicConfig(

@@ -175,11 +175,8 @@ class GreeksCalculator:
         n_d1 = norm.pdf(d1)  # PDF at d1
         n_d2 = norm.pdf(d2)  # PDF at d2
         
-        # Option type multiplier
-        phi = 1 if option_type == OptionType.CALL else -1
-        
         # First-order Greeks
-        delta = phi * exp(-q * T) * N_d1 if option_type == OptionType.CALL else phi * exp(-q * T) * (N_d1 - 1)
+        delta = exp(-q * T) * N_d1 if option_type == OptionType.CALL else exp(-q * T) * (N_d1 - 1)
         
         gamma = exp(-q * T) * n_d1 / (S * sigma * sqrt(T))
         
@@ -288,7 +285,7 @@ class GreeksCalculator:
         # Theta (first derivative w.r.t. time)
         if T > dt:
             P_theta = self._black_scholes_price(S, K, T - dt, r, sigma, option_type, q)
-            theta = (P_theta - P0) / dt
+            theta = (P_theta - P0) / dt / 365.25
         else:
             theta = 0.0
         
