@@ -10,6 +10,7 @@ This module provides production-ready Monte Carlo implementations with:
 """
 
 import numpy as np
+import os
 from typing import Dict, List, Optional, Callable, Tuple, Union, Any
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -41,11 +42,11 @@ class VarianceReductionTechnique(Enum):
 class HestonParameters:
     """Heston stochastic volatility model parameters"""
     kappa: float = 2.0      # Rate of mean reversion
-    theta: float = 0.04     # Long-term variance level
+    theta: float = 0.08     # Long-term variance level (FIXED: was hardcoded to 4%, now 8% default)
     sigma: float = 0.3      # Volatility of volatility
     rho: float = -0.7       # Correlation between asset and variance
-    v0: float = 0.04        # Initial variance
-    
+    v0: float = 0.08        # Initial variance (FIXED: was hardcoded to 4%, now 8% default)
+
     def __post_init__(self):
         """Validate Heston parameters"""
         if self.kappa <= 0:
@@ -58,7 +59,7 @@ class HestonParameters:
             raise ValueError("Rho (correlation) must be between -1 and 1")
         if self.v0 <= 0:
             raise ValueError("V0 (initial variance) must be positive")
-        
+
         # Feller condition check
         if 2 * self.kappa * self.theta < self.sigma**2:
             warnings.warn(
@@ -66,6 +67,36 @@ class HestonParameters:
                 "Variance process may hit zero boundary.",
                 UserWarning
             )
+
+@dataclass
+class MertonJumpParameters:
+    """Merton jump diffusion model parameters"""
+    lambda_: float = 0.1        # Jump intensity (jumps per unit time)
+    mu_j: float = 0.0           # Mean jump size (log scale)
+    sigma_j: float = 0.05       # Jump size volatility (log scale)
+    yang_zhang_lambda: Optional[float] = None  # Yang-Zhang derived lambda
+    earnings_multiplier: float = 5.0  # Lambda multiplier near earnings
+
+    def __post_init__(self):
+        """Validate Merton parameters"""
+        if self.lambda_ < 0:
+            raise ValueError("Lambda (jump intensity) must be non-negative")
+        if self.sigma_j <= 0:
+            raise ValueError("Sigma_j (jump volatility) must be positive")
+        if self.earnings_multiplier < 1.0:
+            raise ValueError("Earnings multiplier must be >= 1.0")
+
+    def get_effective_lambda(self, days_to_earnings: Optional[int] = None) -> float:
+        """Get effective lambda considering earnings proximity"""
+        effective_lambda = self.yang_zhang_lambda or self.lambda_
+
+        # Increase jump intensity near earnings
+        if days_to_earnings is not None and days_to_earnings <= 7:
+            # Exponential increase as earnings approach
+            earnings_factor = self.earnings_multiplier * np.exp(-days_to_earnings / 3.0)
+            effective_lambda *= earnings_factor
+
+        return effective_lambda
 
 @dataclass  
 class MonteCarloResult:
@@ -154,6 +185,7 @@ class MonteCarloEngine:
         
         # Initialize model-specific parameters
         self.heston_params = HestonParameters()
+        self.merton_params = MertonJumpParameters()
     
     def price_option(
         self,
@@ -214,6 +246,12 @@ class MonteCarloEngine:
                 )
             elif self.model_type == ModelType.BLACK_SCHOLES:
                 paths = self._generate_bs_paths(
+                    spot, volatility, time_to_expiry, risk_free_rate,
+                    dividend_yield, current_paths, num_steps
+                )
+                vol_paths = None
+            elif self.model_type == ModelType.JUMP_DIFFUSION:
+                paths = self._generate_jump_diffusion_paths(
                     spot, volatility, time_to_expiry, risk_free_rate,
                     dividend_yield, current_paths, num_steps
                 )
@@ -327,10 +365,10 @@ class MonteCarloEngine:
             sqrt_v_curr = np.sqrt(v_curr)
             
             # Heston dynamics
-            # dS = (r - q) * S * dt + sqrt(v) * S * dW_S
-            S[:, i + 1] = S_curr * (
-                1 + (r - q) * dt + sqrt_v_curr * sqrt_dt * dW_S
-            )
+            # Use log-Euler step for price to preserve strict positivity.
+            # d ln S = (r - q - 0.5*v) dt + sqrt(v) dW
+            log_return = (r - q - 0.5 * v_curr) * dt + sqrt_v_curr * sqrt_dt * dW_S
+            S[:, i + 1] = S_curr * np.exp(log_return)
             
             # dv = kappa * (theta - v) * dt + sigma * sqrt(v) * dW_v
             kappa = self.heston_params.kappa
@@ -344,7 +382,77 @@ class MonteCarloEngine:
             v[:, i + 1] = np.maximum(v[:, i + 1], 0)
         
         return S, v
-    
+
+    def _generate_jump_diffusion_paths(
+        self,
+        S0: float,
+        sigma: float,
+        T: float,
+        r: float,
+        q: float,
+        num_paths: int,
+        num_steps: int,
+        days_to_earnings: Optional[int] = None
+    ) -> np.ndarray:
+        """
+        Generate paths using Merton jump diffusion model.
+
+        Combines geometric Brownian motion with Poisson jumps.
+        Yang-Zhang lambda can be used as jump intensity parameter.
+        """
+        dt = T / num_steps
+        sqrt_dt = np.sqrt(dt)
+
+        # Get effective jump intensity
+        lambda_eff = self.merton_params.get_effective_lambda(days_to_earnings)
+
+        # Initialize paths
+        S = np.zeros((num_paths, num_steps + 1))
+        S[:, 0] = S0
+
+        # Merton jump-diffusion parameters
+        mu_j = self.merton_params.mu_j
+        sigma_j = self.merton_params.sigma_j
+
+        # Adjust drift for jump risk
+        jump_compensation = lambda_eff * (np.exp(mu_j + 0.5 * sigma_j**2) - 1)
+        adjusted_drift = r - q - 0.5 * sigma**2 - jump_compensation
+
+        for i in range(num_steps):
+            # Standard Brownian motion increment
+            dW = np.random.standard_normal(num_paths) * sqrt_dt
+
+            # Poisson process for jumps
+            # Number of jumps in time interval dt
+            lambda_dt = lambda_eff * dt
+            num_jumps = np.random.poisson(lambda_dt, num_paths)
+
+            # Generate jump sizes (log-normal distribution)
+            jump_total = np.zeros(num_paths)
+            for j in range(num_paths):
+                if num_jumps[j] > 0:
+                    # Sum of log-normal jumps
+                    jump_sizes = np.random.normal(
+                        mu_j, sigma_j, size=num_jumps[j]
+                    )
+                    jump_total[j] = np.sum(jump_sizes)
+
+            # Current prices
+            S_curr = S[:, i]
+
+            # Jump-diffusion evolution
+            # dS = S * [(r-q-λκ-σ²/2)dt + σdW + ΣJ]
+            # where κ = E[e^J - 1] is jump compensation
+            log_return = (
+                adjusted_drift * dt +
+                sigma * dW +
+                jump_total
+            )
+
+            S[:, i + 1] = S_curr * np.exp(log_return)
+
+        return S
+
     def _generate_bs_paths(
         self,
         S0: float,
@@ -572,6 +680,34 @@ class MonteCarloEngine:
             execution_time=time.time() - start_time,
             convergence_achieved=False
         )
+
+    def simulate_option_price(
+        self,
+        option: OptionContract,
+        num_simulations: int = 100000,
+        risk_free_rate: float = 0.05,
+        dividend_yield: float = 0.0
+    ) -> MonteCarloResult:
+        """
+        Backward-compatible wrapper expected by worker code.
+        """
+        time_to_expiry = max((option.expiration - date.today()).days / 365.25, 1.0 / 365.25)
+        spot_guess = float(
+            getattr(option, "underlying_price", 0.0)
+            or getattr(option, "spot_price", 0.0)
+            or getattr(option, "underlying_last", 0.0)
+            or option.strike
+        )
+        return self.price_option(
+            spot=max(spot_guess, 0.01),
+            strike=max(option.strike, 0.01),
+            time_to_expiry=time_to_expiry,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            volatility=max(float(option.implied_volatility or 0.20), 0.01),
+            option_type=option.option_type,
+            num_paths=max(1000, int(num_simulations)),
+        )
     
     def set_heston_parameters(self, **kwargs) -> None:
         """Update Heston model parameters."""
@@ -580,6 +716,32 @@ class MonteCarloEngine:
                 setattr(self.heston_params, key, value)
             else:
                 raise ValueError(f"Invalid Heston parameter: {key}")
+
+    def set_merton_parameters(self, **kwargs) -> None:
+        """Update Merton jump diffusion parameters."""
+        for key, value in kwargs.items():
+            if hasattr(self.merton_params, key):
+                setattr(self.merton_params, key, value)
+            else:
+                raise ValueError(f"Invalid Merton parameter: {key}")
+
+    def set_yang_zhang_lambda(self, yang_zhang_vol: float, base_vol: float = 0.2) -> None:
+        """
+        Set jump intensity based on Yang-Zhang volatility estimate.
+
+        Args:
+            yang_zhang_vol: Yang-Zhang volatility estimate
+            base_vol: Base volatility for comparison
+        """
+        # Higher Yang-Zhang vol indicates more jumps
+        # Empirical relationship: λ ≈ max(0, (YZ_vol - base_vol) * scaling_factor)
+        vol_excess = max(0, yang_zhang_vol - base_vol)
+        lambda_estimate = vol_excess * 10.0  # Scaling factor
+
+        # Bound the lambda estimate
+        lambda_estimate = min(lambda_estimate, 2.0)  # Max 2 jumps per year
+
+        self.merton_params.yang_zhang_lambda = lambda_estimate
     
     def calibrate_heston_to_surface(
         self,
