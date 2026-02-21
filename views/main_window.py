@@ -32,134 +32,47 @@ from PySide6.QtWidgets import (
     QFrame, QCompleter, QTabWidget, QSplitter,
     QScrollArea, QSizePolicy, QComboBox,
     QListWidget, QListWidgetItem,
+    QHeaderView,
     QTableWidget, QTableWidgetItem, QTextEdit, QFileDialog, QApplication
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QStringListModel
 from PySide6.QtGui import QFont, QKeySequence, QBrush, QColor, QShortcut
 
 from utils.config_manager import ConfigManager
+from views.design_system import (
+    app_font,
+    app_theme_stylesheet,
+    button_style as ds_button_style,
+    mono_text_style as ds_mono_text_style,
+    panel_style as ds_panel_style,
+    status_strip_style as ds_status_strip_style,
+    summary_strip_style as ds_summary_strip_style,
+    table_style as ds_table_style,
+)
 
 
 def _panel_style() -> str:
-    return """
-        QFrame {
-            background-color: #1a1a1a;
-            border: 1px solid #2d2d2d;
-            border-radius: 8px;
-        }
-    """
+    return ds_panel_style()
 
 
 def _status_strip_style(level: str = "info") -> str:
-    palette = {
-        "info": ("#111827", "#1f2937", "#93c5fd"),
-        "success": ("#052e16", "#14532d", "#86efac"),
-        "warn": ("#422006", "#78350f", "#fcd34d"),
-        "error": ("#3f0b13", "#7f1d1d", "#fca5a5"),
-    }
-    bg, border, fg = palette.get(level, palette["info"])
-    return f"""
-        QLabel {{
-            background-color: {bg};
-            border: 1px solid {border};
-            border-radius: 6px;
-            color: {fg};
-            padding: 8px 12px;
-            font-weight: bold;
-        }}
-    """
+    return ds_status_strip_style(level)
 
 
 def _summary_strip_style() -> str:
-    return """
-        QLabel {
-            color: #94a3b8;
-            background-color: #0f172a;
-            border: 1px solid #1e293b;
-            border-radius: 6px;
-            padding: 7px 10px;
-        }
-    """
+    return ds_summary_strip_style()
 
 
 def _table_style() -> str:
-    return """
-        QTableWidget {
-            background-color: #1a1a1a;
-            border: 1px solid #2d2d2d;
-            gridline-color: #2d2d2d;
-            color: #ffffff;
-        }
-        QTableWidget::item {
-            padding: 8px;
-            border-bottom: 1px solid #2d2d2d;
-        }
-        QTableWidget::item:selected {
-            background-color: #0ea5e9;
-        }
-        QHeaderView::section {
-            background-color: #2d2d2d;
-            color: #ffffff;
-            padding: 8px;
-            border: none;
-            font-weight: bold;
-        }
-    """
+    return ds_table_style()
 
 
 def _mono_text_style() -> str:
-    return """
-        QTextEdit {
-            background-color: #111111;
-            border: 1px solid #2d2d2d;
-            color: #cbd5e1;
-            font-family: 'Consolas', monospace;
-            font-size: 11px;
-            padding: 8px;
-        }
-    """
+    return ds_mono_text_style()
 
 
 def _button_style(kind: str = "secondary") -> str:
-    styles = {
-        "primary": """
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #0ea5e9, stop:1 #0284c7);
-                border: none;
-                border-radius: 6px;
-                color: white;
-                font-weight: bold;
-                padding: 8px 16px;
-            }
-            QPushButton:hover { background: #0284c7; }
-            QPushButton:disabled { background-color: #334155; color: #94a3b8; }
-        """,
-        "secondary": """
-            QPushButton {
-                background-color: #1f2937;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                color: #cbd5e1;
-                font-weight: bold;
-                padding: 8px 14px;
-            }
-            QPushButton:hover { background-color: #334155; }
-            QPushButton:disabled { color: #64748b; border-color: #1f2937; }
-        """,
-        "tertiary": """
-            QPushButton {
-                background-color: #111827;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                color: #cbd5e1;
-                font-weight: bold;
-                padding: 8px 14px;
-            }
-            QPushButton:hover { background-color: #1f2937; }
-        """,
-    }
-    return styles.get(kind, styles["secondary"])
+    return ds_button_style(kind)
 
 
 class MarketOverviewWidget(QFrame):
@@ -506,9 +419,15 @@ class QuickAnalysisWidget(QFrame):
 
 
 class DashboardView(QScrollArea):
-    """Streamlined dashboard with 2-column grid and top 3 highlights only"""
+    """Dashboard centered around a single daily action plan."""
 
     analysis_requested = Signal(str)
+    ACTION_PLAN_CANDIDATES = [
+        ("NVDA", "0.73", "79.5%", "Front IV rich"),
+        ("AAPL", "0.67", "74.0%", "Stable liquidity"),
+        ("MSFT", "0.64", "72.1%", "Cleaner spread profile"),
+        ("AMD", "0.66", "71.3%", "Near-term premium"),
+    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -518,185 +437,189 @@ class DashboardView(QScrollArea):
         self.setup_ui()
 
     def setup_ui(self):
-        """Setup streamlined dashboard with less crowded design"""
-        # Main content widget
+        """Build a simplified dashboard around one primary action card."""
         content_widget = QWidget()
         self.setWidget(content_widget)
 
         main_layout = QVBoxLayout(content_widget)
-        main_layout.setSpacing(20)
-        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(12, 12, 12, 12)
 
-        # Market Overview + Quick Analysis (tighter spacing)
+        # Top row: market context + quick analysis entry.
         top_section = QHBoxLayout()
-        top_section.setSpacing(15)
+        top_section.setSpacing(12)
 
         self.market_overview = MarketOverviewWidget()
         self.quick_analysis = QuickAnalysisWidget()
-        self.quick_analysis.symbol_entered.connect(self.analysis_requested)
+        self.quick_analysis.symbol_entered.connect(self._handle_symbol_entry)
 
         top_section.addWidget(self.market_overview, 1)
         top_section.addWidget(self.quick_analysis, 1)
         main_layout.addLayout(top_section)
 
-        # Top 3 Highlights only - with View More button
-        highlights_frame = QFrame()
-        highlights_frame.setStyleSheet("""
-            QFrame {
-                background-color: #262626;
-                border: 1px solid #2d2d2d;
-                border-radius: 8px;
-                padding: 10px;
-            }
-        """)
-        highlights_layout = QVBoxLayout(highlights_frame)
-        highlights_layout.setSpacing(15)
-        highlights_layout.setContentsMargins(20, 15, 20, 15)
+        # Primary workspace: single action plan card.
+        action_frame = QFrame()
+        action_frame.setStyleSheet(_panel_style())
+        action_layout = QVBoxLayout(action_frame)
+        action_layout.setSpacing(10)
+        action_layout.setContentsMargins(16, 14, 16, 14)
 
-        # Title row with View More button
         title_row = QHBoxLayout()
-        highlights_title = QLabel("Market Highlights")
-        highlights_title.setFont(QFont("Segoe UI", 16, QFont.Bold))
-        highlights_title.setStyleSheet("color: #0ea5e9;")
-
-        view_more_btn = QPushButton("View More")
-        view_more_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0ea5e9;
-                color: #ffffff;
-                border: none;
-                padding: 6px 15px;
-                border-radius: 4px;
-                font-size: 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #0284c7;
-            }
-        """)
-        view_more_btn.setFixedHeight(28)
-
-        title_row.addWidget(highlights_title)
+        title = QLabel("Today's Action Plan")
+        title.setFont(app_font(16, bold=True))
+        title.setStyleSheet("color: #e0f2fe;")
+        title_row.addWidget(title)
         title_row.addStretch()
-        title_row.addWidget(view_more_btn)
-        highlights_layout.addLayout(title_row)
+        date_label = QLabel(datetime.now().strftime("%a %Y-%m-%d"))
+        date_label.setFont(app_font(10))
+        date_label.setStyleSheet("color: #64748b;")
+        title_row.addWidget(date_label)
+        action_layout.addLayout(title_row)
 
-        # 2-column grid for top 3 highlights only
-        grid_layout = QGridLayout()
-        grid_layout.setSpacing(15)
+        self.plan_status_label = QLabel(
+            "Step 1: Validate regime and event timing. Then shortlist and execute only top-confidence setups."
+        )
+        self.plan_status_label.setStyleSheet(_status_strip_style("info"))
+        action_layout.addWidget(self.plan_status_label)
 
-        # Show only top 3 highlights with clean cards
-        highlight_data = [
-            ("High IV Plays", ["NVDA: 45% IV", "TSLA: 38% IV"], "#10b981"),
-            ("Calendar Ideas", ["SPY Feb/Mar", "QQQ Jan/Feb"], "#0ea5e9"),
-            ("Risk Status", ["VIX: 18.4", "Market: Low"], "#f59e0b")
-        ]
+        self.plan_context_label = QLabel(
+            "Workflow: 1) Regime check  2) Candidate shortlisting  3) Symbol-level execution."
+        )
+        self.plan_context_label.setStyleSheet(_summary_strip_style())
+        action_layout.addWidget(self.plan_context_label)
 
-        for i, (title, items, color) in enumerate(highlight_data):
-            card = self._create_highlight_card(title, items, color)
-            row = i // 2
-            col = i % 2
-            grid_layout.addWidget(card, row, col)
+        steps_grid = QGridLayout()
+        steps_grid.setHorizontalSpacing(10)
+        steps_grid.setVerticalSpacing(8)
+        steps_grid.addWidget(self._create_step_card("1", "Regime Check", "Confirm term structure and IV/RV context."), 0, 0)
+        steps_grid.addWidget(self._create_step_card("2", "Build Shortlist", "Use scanner confidence + liquidity filters."), 0, 1)
+        steps_grid.addWidget(self._create_step_card("3", "Execute Setup", "Run analysis only on strongest candidates."), 0, 2)
+        action_layout.addLayout(steps_grid)
 
-        highlights_layout.addLayout(grid_layout)
-        main_layout.addWidget(highlights_frame)
+        self.plan_table = QTableWidget(0, 4)
+        self.plan_table.setHorizontalHeaderLabels(["Symbol", "Setup", "Confidence", "Why"])
+        self.plan_table.verticalHeader().setVisible(False)
+        self.plan_table.setAlternatingRowColors(True)
+        self.plan_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.plan_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.plan_table.setStyleSheet(_table_style())
+        self.plan_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.plan_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.plan_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.plan_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.plan_table.itemSelectionChanged.connect(self._on_plan_selection_changed)
+        action_layout.addWidget(self.plan_table)
+        self._populate_plan_candidates()
 
-        # Add stretch to push content to top
+        actions_row = QHBoxLayout()
+        self.analyze_selected_btn = QPushButton("Analyze Selected Candidate")
+        self.analyze_selected_btn.setStyleSheet(_button_style("primary"))
+        self.analyze_selected_btn.clicked.connect(self._analyze_selected_candidate)
+        actions_row.addWidget(self.analyze_selected_btn)
+
+        self.refresh_plan_btn = QPushButton("Refresh Plan Context")
+        self.refresh_plan_btn.setStyleSheet(_button_style("secondary"))
+        self.refresh_plan_btn.clicked.connect(self._refresh_plan_context)
+        actions_row.addWidget(self.refresh_plan_btn)
+        actions_row.addStretch()
+        action_layout.addLayout(actions_row)
+
+        main_layout.addWidget(action_frame)
         main_layout.addStretch(1)
 
-    def _create_highlight_card(self, title, items, color):
-        """Create a subtle highlight card with consistent styling"""
+    def _create_step_card(self, step_number: str, title: str, subtitle: str) -> QFrame:
+        """Create compact action-step card."""
         card = QFrame()
-        card.setStyleSheet(f"""
-            QFrame {{
-                background-color: #1a1a1a;
-                border: 1px solid #2d2d2d;
-                border-radius: 6px;
-                padding: 12px;
-            }}
-        """)
-
-        layout = QVBoxLayout(card)
-        layout.setSpacing(8)
-        layout.setContentsMargins(12, 10, 12, 10)
-
-        # Title with single accent color
-        title_label = QLabel(title)
-        title_label.setFont(QFont("Segoe UI", 13, QFont.Bold))
-        title_label.setStyleSheet("color: #0ea5e9;")
-        layout.addWidget(title_label)
-
-        # Items with muted text
-        for item in items:
-            item_label = QLabel(f"• {item}")
-            item_label.setFont(QFont("Segoe UI", 11))
-            item_label.setStyleSheet("color: #94a3b8; padding-left: 8px;")
-            layout.addWidget(item_label)
-
-        return card
-
-    def _create_card(self, title):
-        """Create a clean card container with title"""
-        card = QFrame()
-        card.setStyleSheet("""
+        card.setStyleSheet(
+            """
             QFrame {
-                background-color: #1a1a1a;
-                border: 1px solid #2d2d2d;
+                background-color: #0b1220;
+                border: 1px solid #1f2937;
                 border-radius: 8px;
             }
-        """)
+            """
+        )
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
 
-        # Add title if provided
-        if title:
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(0, 0, 0, 0)
-            card_layout.setSpacing(0)
+        badge = QLabel(f"Step {step_number}")
+        badge.setFont(app_font(9, bold=True))
+        badge.setStyleSheet("color: #0ea5e9;")
+        layout.addWidget(badge)
 
-            title_label = QLabel(title)
-            title_label.setFont(QFont("Segoe UI", 14, QFont.Bold))
-            title_label.setStyleSheet("""
-                QLabel {
-                    color: #0ea5e9;
-                    padding: 12px 16px 8px 16px;
-                    border-bottom: 1px solid #2d2d2d;
-                }
-            """)
-            card_layout.addWidget(title_label)
+        title_label = QLabel(title)
+        title_label.setFont(app_font(11, bold=True))
+        title_label.setStyleSheet("color: #e2e8f0;")
+        layout.addWidget(title_label)
 
-            # Content area will be added by caller
-            content_widget = QWidget()
-            card_layout.addWidget(content_widget)
-            return content_widget
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setWordWrap(True)
+        subtitle_label.setFont(app_font(10))
+        subtitle_label.setStyleSheet("color: #94a3b8;")
+        layout.addWidget(subtitle_label)
 
         return card
 
-    def _add_clean_highlight(self, layout, row, col, title, items):
-        """Add clean highlight section with consistent styling"""
-        container = QFrame()
-        container.setStyleSheet("""
-            QFrame {
-                background-color: #0a0a0a;
-                border: 1px solid #2d2d2d;
-                border-radius: 6px;
-            }
-        """)
+    def _populate_plan_candidates(self):
+        """Load candidate rows for the daily action plan."""
+        self.plan_table.setRowCount(len(self.ACTION_PLAN_CANDIDATES))
+        for row_idx, row in enumerate(self.ACTION_PLAN_CANDIDATES):
+            for col_idx, value in enumerate(row):
+                item = QTableWidgetItem(value)
+                if col_idx == 0:
+                    item.setFont(app_font(10, bold=True, mono=True))
+                if col_idx == 2:
+                    item.setForeground(QBrush(QColor("#10b981")))
+                self.plan_table.setItem(row_idx, col_idx, item)
+        if self.plan_table.rowCount() > 0:
+            self.plan_table.selectRow(0)
+            self._on_plan_selection_changed()
 
-        container_layout = QVBoxLayout(container)
-        container_layout.setSpacing(8)
-        container_layout.setContentsMargins(12, 12, 12, 12)
+    def _refresh_plan_context(self):
+        """Refresh summary context text."""
+        now = datetime.now().strftime("%H:%M:%S")
+        self.plan_status_label.setText(
+            f"Plan refreshed at {now} | prioritize top confidence setups with clean execution windows."
+        )
 
-        title_label = QLabel(title)
-        title_label.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        title_label.setStyleSheet("color: #0ea5e9;")
-        container_layout.addWidget(title_label)
+    def _on_plan_selection_changed(self):
+        """Update context strip when candidate row changes."""
+        row_idx = self.plan_table.currentRow()
+        if row_idx < 0:
+            return
+        symbol_item = self.plan_table.item(row_idx, 0)
+        reason_item = self.plan_table.item(row_idx, 3)
+        if symbol_item is None:
+            return
+        symbol = symbol_item.text()
+        reason = reason_item.text() if reason_item is not None else ""
+        self.plan_context_label.setText(
+            f"Selected {symbol} | {reason} | Click 'Analyze Selected Candidate' to continue."
+        )
 
-        for item in items:
-            item_label = QLabel(f"• {item}")
-            item_label.setFont(QFont("Segoe UI", 11))
-            item_label.setStyleSheet("color: #94a3b8; padding-left: 8px;")
-            container_layout.addWidget(item_label)
+    def _analyze_selected_candidate(self):
+        """Trigger analysis for currently selected candidate."""
+        row_idx = self.plan_table.currentRow()
+        if row_idx < 0:
+            self.plan_status_label.setText("No candidate selected.")
+            return
+        symbol_item = self.plan_table.item(row_idx, 0)
+        if symbol_item is None:
+            return
+        symbol = symbol_item.text().strip().upper()
+        self.quick_analysis.symbol_input.setText(symbol)
+        self._handle_symbol_entry(symbol)
 
-        layout.addWidget(container, row, col)
+    def _handle_symbol_entry(self, symbol: str):
+        """Handle quick-analysis symbol submission."""
+        clean_symbol = symbol.strip().upper()
+        if not clean_symbol:
+            return
+        self.plan_status_label.setText(
+            f"Running action plan for {clean_symbol} | switching to execution analysis."
+        )
+        self.analysis_requested.emit(clean_symbol)
 
 
 # Import the new professional Calendar Spreads view
@@ -1990,12 +1913,12 @@ class MainWindow(QWidget):
         brand_block = QVBoxLayout()
         brand_block.setSpacing(2)
         app_title = QLabel("Options Calculator Pro")
-        app_title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        app_title.setFont(app_font(16, bold=True))
         app_title.setStyleSheet("color: #f8fafc;")
         brand_block.addWidget(app_title)
 
         app_subtitle = QLabel("Earnings Volatility Workspace")
-        app_subtitle.setFont(QFont("Segoe UI", 10))
+        app_subtitle.setFont(app_font(10))
         app_subtitle.setStyleSheet("color: #94a3b8;")
         brand_block.addWidget(app_subtitle)
         header_layout.addLayout(brand_block)
@@ -2003,6 +1926,7 @@ class MainWindow(QWidget):
         header_layout.addStretch()
 
         quick_label = QLabel("Quick Analyze")
+        quick_label.setFont(app_font(10, bold=True))
         quick_label.setStyleSheet("color: #94a3b8; font-weight: bold;")
         header_layout.addWidget(quick_label)
 
@@ -2043,7 +1967,7 @@ class MainWindow(QWidget):
         nav_layout.setSpacing(10)
 
         nav_title = QLabel("Workspace")
-        nav_title.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        nav_title.setFont(app_font(11, bold=True))
         nav_title.setStyleSheet("color: #cbd5e1;")
         nav_layout.addWidget(nav_title)
 
@@ -2078,7 +2002,7 @@ class MainWindow(QWidget):
         content_layout.setSpacing(8)
 
         self.workspace_title_label = QLabel("Dashboard")
-        self.workspace_title_label.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        self.workspace_title_label.setFont(app_font(14, bold=True))
         self.workspace_title_label.setStyleSheet("color: #f8fafc;")
         content_layout.addWidget(self.workspace_title_label)
 
@@ -2140,30 +2064,30 @@ class MainWindow(QWidget):
         layout.setContentsMargins(12, 5, 12, 5)
 
         self.status_label = QLabel("Ready | Select a tab to begin")
-        self.status_label.setFont(QFont("Consolas", 9))
+        self.status_label.setFont(app_font(9, mono=True))
         self.status_label.setStyleSheet("color: #94a3b8;")
         layout.addWidget(self.status_label)
 
         self.tab_context_label = QLabel("Tab: Dashboard")
-        self.tab_context_label.setFont(QFont("Consolas", 9))
+        self.tab_context_label.setFont(app_font(9, mono=True))
         self.tab_context_label.setStyleSheet("color: #64748b;")
         layout.addWidget(self.tab_context_label)
 
         self.shortcuts_hint_label = QLabel("Shortcuts: Ctrl+1..5 switch | Ctrl+L focus | Ctrl+Enter analyze")
-        self.shortcuts_hint_label.setFont(QFont("Consolas", 9))
+        self.shortcuts_hint_label.setFont(app_font(9, mono=True))
         self.shortcuts_hint_label.setStyleSheet("color: #64748b;")
         layout.addWidget(self.shortcuts_hint_label)
 
         layout.addStretch()
 
         self.last_action_label = QLabel("Last action: --")
-        self.last_action_label.setFont(QFont("Consolas", 9))
+        self.last_action_label.setFont(app_font(9, mono=True))
         self.last_action_label.setStyleSheet("color: #64748b;")
         layout.addWidget(self.last_action_label)
 
         # Connection indicator
         self.connection_indicator = QLabel("● Connected")
-        self.connection_indicator.setFont(QFont("Consolas", 9))
+        self.connection_indicator.setFont(app_font(9, mono=True))
         self.connection_indicator.setStyleSheet("color: #10b981;")
         layout.addWidget(self.connection_indicator)
 
@@ -2236,82 +2160,10 @@ class MainWindow(QWidget):
             self.last_action_label.setText(f"Last action: {timestamp} | {message}")
 
     def _apply_theme(self):
-        """Apply clean global dark theme."""
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #030712;
-                color: #e2e8f0;
-                font-family: 'Segoe UI', 'Helvetica', sans-serif;
-                font-size: 12px;
-            }
-
-            QScrollArea {
-                border: none;
-                background-color: transparent;
-            }
-
-            QScrollBar:vertical {
-                background-color: #111827;
-                width: 12px;
-                border-radius: 6px;
-                margin: 2px;
-            }
-
-            QScrollBar::handle:vertical {
-                background-color: #334155;
-                border-radius: 5px;
-                min-height: 20px;
-                margin: 1px;
-            }
-
-            QScrollBar::handle:vertical:hover {
-                background-color: #475569;
-            }
-
-            QScrollBar:horizontal {
-                background-color: #111827;
-                height: 12px;
-                border-radius: 6px;
-                margin: 2px;
-            }
-
-            QScrollBar::handle:horizontal {
-                background-color: #334155;
-                border-radius: 5px;
-                min-width: 20px;
-                margin: 1px;
-            }
-
-            QScrollBar::handle:horizontal:hover {
-                background-color: #475569;
-            }
-
-            QLabel {
-                color: #e2e8f0;
-            }
-
-            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-                background-color: #111827;
-                border: 1px solid #334155;
-                border-radius: 4px;
-                color: #e2e8f0;
-                padding: 6px 8px;
-                font-size: 11px;
-            }
-
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
-                border-color: #0ea5e9;
-            }
-
-            QToolTip {
-                background-color: #111827;
-                color: #e2e8f0;
-                border: 1px solid #334155;
-                border-radius: 4px;
-                padding: 6px;
-                font-size: 11px;
-            }
-
+        """Apply the shared theme plus navigation-specific styles."""
+        self.setStyleSheet(
+            app_theme_stylesheet()
+            + """
             QListWidget {
                 background-color: #0b1220;
                 border: 1px solid #1e293b;
@@ -2340,7 +2192,8 @@ class MainWindow(QWidget):
                 background-color: #111827;
                 border: 1px solid #334155;
             }
-        """)
+            """
+        )
 
     def _create_fallback_calendar_view(self):
         """Create a fallback calendar spreads view with proper structure"""
@@ -2434,6 +2287,10 @@ class MainWindow(QWidget):
 
             # Update quick analysis summary
             self.dashboard_view.quick_analysis.update_analysis_summary(f"Analyzing {symbol}...")
+            if hasattr(self.dashboard_view, "plan_status_label"):
+                self.dashboard_view.plan_status_label.setText(
+                    f"Executing plan for {symbol} | analysis requested and routing to Analysis Brief."
+                )
 
         except Exception as e:
             self.logger.error(f"Error handling analysis request: {e}")

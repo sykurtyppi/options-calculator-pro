@@ -28,6 +28,16 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QStringListModel, Slot, QTimer
 from PySide6.QtGui import QFont, QBrush, QColor
 
+from views.design_system import (
+    app_font,
+    app_theme_stylesheet,
+    button_style as ds_button_style,
+    input_style as ds_input_style,
+    panel_style as ds_panel_style,
+    status_strip_style as ds_status_strip_style,
+    table_style as ds_table_style,
+)
+
 
 class CalendarSpreadsView(QWidget):
     """
@@ -103,7 +113,7 @@ class CalendarSpreadsView(QWidget):
 
         # Title
         title_label = QLabel("Trade Setup")
-        title_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        title_label.setFont(app_font(16, bold=True))
         title_label.setStyleSheet("color: #0ea5e9; margin-bottom: 10px;")
         left_layout.addWidget(title_label)
 
@@ -115,13 +125,29 @@ class CalendarSpreadsView(QWidget):
         strategy_frame = self._create_input_section("Strategy Parameters", self._create_strategy_inputs())
         left_layout.addWidget(strategy_frame)
 
-        # Position sizing section
-        position_frame = self._create_input_section("Position Sizing", self._create_position_inputs())
-        left_layout.addWidget(position_frame)
+        # Advanced controls (hidden until needed)
+        self.advanced_toggle_btn = QPushButton("Show Advanced Controls")
+        self.advanced_toggle_btn.setCheckable(True)
+        self.advanced_toggle_btn.setChecked(False)
+        self.advanced_toggle_btn.setFixedHeight(30)
+        self.advanced_toggle_btn.setStyleSheet(self._get_tertiary_button_style())
+        self.advanced_toggle_btn.setToolTip("Reveal position sizing and debit override controls.")
+        self.advanced_toggle_btn.toggled.connect(self._toggle_advanced_controls)
+        left_layout.addWidget(self.advanced_toggle_btn)
 
-        # Debit override section
-        debit_frame = self._create_input_section("Debit Override", self._create_debit_inputs())
-        left_layout.addWidget(debit_frame)
+        self.advanced_controls_frame = QFrame()
+        self.advanced_controls_frame.setStyleSheet(ds_panel_style())
+        advanced_layout = QVBoxLayout(self.advanced_controls_frame)
+        advanced_layout.setSpacing(10)
+        advanced_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.position_frame = self._create_input_section("Position Sizing", self._create_position_inputs())
+        self.debit_frame = self._create_input_section("Debit Override", self._create_debit_inputs())
+        advanced_layout.addWidget(self.position_frame)
+        advanced_layout.addWidget(self.debit_frame)
+
+        self.advanced_controls_frame.setVisible(False)
+        left_layout.addWidget(self.advanced_controls_frame)
 
         # Action buttons
         buttons_layout = QVBoxLayout()
@@ -163,6 +189,21 @@ class CalendarSpreadsView(QWidget):
         self.left_scroll.setWidget(left_content)
         self.splitter.addWidget(self.left_scroll)
         self._on_strategy_input_changed(announce_feedback=False)
+
+    def _toggle_advanced_controls(self, visible: bool):
+        """Show or hide advanced controls to reduce form density."""
+        self.advanced_controls_frame.setVisible(visible)
+        self.advanced_toggle_btn.setText(
+            "Hide Advanced Controls" if visible else "Show Advanced Controls"
+        )
+        if visible:
+            self.left_hint_label.setText(
+                "Advanced controls are visible. Use them only if you need manual sizing/debit overrides."
+            )
+        else:
+            self.left_hint_label.setText(
+                "Enter a valid symbol (e.g., AAPL) to enable actions."
+            )
 
     def _setup_right_panel(self):
         """Setup right panel with Results Summary + QTabWidget"""
@@ -217,14 +258,7 @@ class CalendarSpreadsView(QWidget):
     def _create_input_section(self, title, content_widget):
         """Create a consistent input section with title and content"""
         frame = QFrame()
-        frame.setStyleSheet("""
-            QFrame {
-                background-color: #1a1a1a;
-                border: 1px solid #2d2d2d;
-                border-radius: 6px;
-                padding: 10px;
-            }
-        """)
+        frame.setStyleSheet(ds_panel_style())
 
         layout = QVBoxLayout(frame)
         layout.setSpacing(10)
@@ -232,7 +266,7 @@ class CalendarSpreadsView(QWidget):
 
         # Section title
         title_label = QLabel(title)
-        title_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        title_label.setFont(app_font(12, bold=True))
         title_label.setStyleSheet("color: #0ea5e9; margin-bottom: 5px;")
         layout.addWidget(title_label)
 
@@ -508,12 +542,9 @@ class CalendarSpreadsView(QWidget):
 
     def _apply_consistent_styling(self):
         """Apply consistent styling with single accent color"""
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #1a1a1a;
-                color: #ffffff;
-                font-family: 'Segoe UI', sans-serif;
-            }
+        self.setStyleSheet(
+            app_theme_stylesheet()
+            + """
             QTabWidget::pane {
                 border: 1px solid #2d2d2d;
                 background-color: #1a1a1a;
@@ -533,113 +564,28 @@ class CalendarSpreadsView(QWidget):
             QTabBar::tab:hover {
                 background-color: #374151;
             }
-        """)
+            """
+        )
 
     def _get_primary_button_style(self):
         """Get primary button style with accent color"""
-        return """
-            QPushButton {
-                background-color: #0ea5e9;
-                color: #ffffff;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: #0284c7;
-            }
-            QPushButton:pressed {
-                background-color: #0369a1;
-            }
-            QPushButton:disabled {
-                background-color: #334155;
-                color: #94a3b8;
-            }
-        """
+        return ds_button_style("primary")
 
     def _get_secondary_button_style(self):
         """Get secondary button style"""
-        return """
-            QPushButton {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #2d2d2d;
-                padding: 6px 12px;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #374151;
-            }
-            QPushButton:disabled {
-                color: #64748b;
-                border-color: #1f2937;
-            }
-        """
+        return ds_button_style("secondary")
 
     def _get_tertiary_button_style(self):
         """Get tertiary button style for non-primary actions."""
-        return """
-            QPushButton {
-                background-color: #111827;
-                color: #cbd5e1;
-                border: 1px solid #334155;
-                padding: 4px 10px;
-                border-radius: 4px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1f2937;
-            }
-            QPushButton:pressed {
-                background-color: #0f172a;
-            }
-        """
+        return ds_button_style("tertiary")
 
     def _get_input_style(self, error: bool = False):
         """Get consistent input field style"""
-        border_color = "#ef4444" if error else "#2d2d2d"
-        return """
-            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-                background-color: #0a0a0a;
-                border: 1px solid %s;
-                border-radius: 4px;
-                padding: 6px 8px;
-                color: #ffffff;
-                font-size: 12px;
-            }
-            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-                border-color: #0ea5e9;
-            }
-        """ % border_color
+        return ds_input_style(error=error)
 
     def _get_table_style(self):
         """Get consistent table style"""
-        return """
-            QTableWidget {
-                background-color: #1a1a1a;
-                border: 1px solid #2d2d2d;
-                gridline-color: #2d2d2d;
-                color: #ffffff;
-            }
-            QTableWidget::item {
-                padding: 8px;
-                border-bottom: 1px solid #2d2d2d;
-            }
-            QTableWidget::item:selected {
-                background-color: #0ea5e9;
-            }
-            QHeaderView::section {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                padding: 8px;
-                border: none;
-                font-weight: bold;
-            }
-        """
+        return ds_table_style()
 
     def _calculate_spread(self):
         """Handle calculate spread button click"""
@@ -824,48 +770,16 @@ class CalendarSpreadsView(QWidget):
 
     def _set_feedback(self, message: str, level: str = "info"):
         """Update right-panel workflow feedback strip."""
-        style_map = {
-            "info": ("#111827", "#1f2937", "#93c5fd"),
-            "success": ("#072a1f", "#14532d", "#86efac"),
-            "warn": ("#2a1a05", "#78350f", "#fcd34d"),
-            "error": ("#2a0d12", "#7f1d1d", "#fca5a5"),
-        }
-        bg, border, text = style_map.get(level, style_map["info"])
         self.feedback_strip.setText(message)
-        self.feedback_strip.setStyleSheet(f"""
-            QLabel {{
-                background-color: {bg};
-                border: 1px solid {border};
-                border-bottom: none;
-                color: {text};
-                padding: 6px 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }}
-        """)
+        style = ds_status_strip_style(level)
+        self.feedback_strip.setStyleSheet(style.replace("border-radius: 6px;", "border-radius: 0px;"))
 
     def _set_context(self, message: str, level: str = "neutral"):
         """Update secondary context strip with compact workflow details."""
-        style_map = {
-            "neutral": ("#0b1220", "#94a3b8"),
-            "info": ("#0f172a", "#93c5fd"),
-            "success": ("#052e16", "#86efac"),
-            "warn": ("#422006", "#fcd34d"),
-            "error": ("#3f0b13", "#fca5a5"),
-        }
-        bg, text = style_map.get(level, style_map["neutral"])
         self.context_strip.setText(message)
-        self.context_strip.setStyleSheet(f"""
-            QLabel {{
-                background-color: {bg};
-                border-left: 1px solid #1f2937;
-                border-right: 1px solid #1f2937;
-                color: {text};
-                padding: 4px 12px;
-                font-size: 10px;
-                font-weight: bold;
-            }}
-        """)
+        style_level = "neutral" if level == "neutral" else level
+        style = ds_status_strip_style(style_level)
+        self.context_strip.setStyleSheet(style.replace("border-radius: 6px;", "border-radius: 0px;"))
 
     def _start_analysis_feedback(self, symbol: str):
         """Start animated feedback while analysis is running."""
@@ -974,6 +888,8 @@ class CalendarSpreadsView(QWidget):
         """Reset setup controls and clear stale output placeholders."""
         self._stop_analysis_feedback()
         self._analysis_feedback_symbol = ""
+        if hasattr(self, "advanced_toggle_btn") and self.advanced_toggle_btn.isChecked():
+            self.advanced_toggle_btn.setChecked(False)
         self.symbol_input.clear()
         self.near_exp_combo.setCurrentIndex(0)
         self.far_exp_combo.setCurrentIndex(0)
