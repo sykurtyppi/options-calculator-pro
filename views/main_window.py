@@ -82,29 +82,25 @@ class MarketOverviewWidget(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(84)
+        self.setFixedHeight(76)
         self.setStyleSheet("""
             QFrame {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #1a1a1a, stop:1 #2d2d2d);
-                border: 1px solid #404040;
+                background-color: #111827;
+                border: 1px solid #1f2937;
                 border-radius: 8px;
-                margin: 2px;
             }
             QLabel {
-                color: #ffffff;
-                font-family: 'Segoe UI', sans-serif;
+                color: #e2e8f0;
             }
         """)
 
         layout = QHBoxLayout(self)
-        layout.setSpacing(20)
-        layout.setContentsMargins(16, 8, 16, 8)
+        layout.setSpacing(16)
+        layout.setContentsMargins(14, 8, 14, 8)
 
         # Market indicators
         self._add_market_indicator(layout, "S&P 500", "4,850.23", "+0.45%", "#10b981")
         self._add_market_indicator(layout, "VIX", "18.42", "-2.1%", "#10b981")
-        self._add_market_indicator(layout, "NASDAQ", "15,234.67", "+0.82%", "#10b981")
 
         layout.addStretch()
 
@@ -114,23 +110,23 @@ class MarketOverviewWidget(QFrame):
         status_block.setContentsMargins(0, 0, 0, 0)
 
         self.status_label = QLabel("● MARKET CLOSED")
-        self.status_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.status_label.setFont(app_font(10, bold=True))
         self.status_label.setStyleSheet("color: #ef4444;")
         status_block.addWidget(self.status_label)
 
         self.session_label = QLabel("Weekend")
-        self.session_label.setFont(QFont("Segoe UI", 8))
+        self.session_label.setFont(app_font(9))
         self.session_label.setStyleSheet("color: #94a3b8;")
         status_block.addWidget(self.session_label)
 
-        self.playbook_label = QLabel("Weekend mode: research and backtest workflows")
-        self.playbook_label.setFont(QFont("Segoe UI", 8))
+        self.playbook_label = QLabel("Research mode")
+        self.playbook_label.setFont(app_font(8))
         self.playbook_label.setStyleSheet("color: #64748b;")
         status_block.addWidget(self.playbook_label)
         layout.addLayout(status_block)
 
         self.time_label = QLabel("--:-- ET")
-        self.time_label.setFont(QFont("Consolas", 9))
+        self.time_label.setFont(app_font(9, mono=True))
         self.time_label.setStyleSheet("color: #94a3b8;")
         layout.addWidget(self.time_label)
 
@@ -146,7 +142,7 @@ class MarketOverviewWidget(QFrame):
         container.setSpacing(0)
 
         name_label = QLabel(name)
-        name_label.setFont(QFont("Segoe UI", 8))
+        name_label.setFont(app_font(8))
         name_label.setStyleSheet("color: #94a3b8;")
         container.addWidget(name_label)
 
@@ -154,11 +150,11 @@ class MarketOverviewWidget(QFrame):
         row_layout.setSpacing(8)
 
         value_label = QLabel(value)
-        value_label.setFont(QFont("Consolas", 10, QFont.Bold))
+        value_label.setFont(app_font(10, bold=True, mono=True))
         row_layout.addWidget(value_label)
 
         change_label = QLabel(change)
-        change_label.setFont(QFont("Consolas", 9))
+        change_label.setFont(app_font(9, mono=True))
         change_label.setStyleSheet(f"color: {color};")
         row_layout.addWidget(change_label)
 
@@ -204,12 +200,12 @@ class MarketOverviewWidget(QFrame):
     def _resolve_session_playbook(self, phase: str) -> str:
         """Provide concise workflow guidance by market session."""
         playbook = {
-            "weekend": "Weekend mode: tune thresholds, run backtests, review edge notes",
-            "pre_market": "Prep mode: queue symbols and validate term structure",
-            "open": "Live mode: prioritize execution quality and risk controls",
-            "after_hours": "Post-close mode: review outcomes and update assumptions",
+            "weekend": "Research mode",
+            "pre_market": "Prep mode",
+            "open": "Live mode",
+            "after_hours": "Review mode",
         }
-        return playbook.get(phase, "Workflow mode: monitor setup quality and risk")
+        return playbook.get(phase, "Workflow mode")
 
 
 class QuickAnalysisWidget(QFrame):
@@ -445,16 +441,15 @@ class DashboardView(QScrollArea):
         main_layout.setSpacing(12)
         main_layout.setContentsMargins(12, 12, 12, 12)
 
-        # Top row: market context + quick analysis entry.
+        # Top row: market context + clear session focus.
         top_section = QHBoxLayout()
         top_section.setSpacing(12)
 
         self.market_overview = MarketOverviewWidget()
-        self.quick_analysis = QuickAnalysisWidget()
-        self.quick_analysis.symbol_entered.connect(self._handle_symbol_entry)
+        self.focus_card = self._create_focus_card()
 
-        top_section.addWidget(self.market_overview, 1)
-        top_section.addWidget(self.quick_analysis, 1)
+        top_section.addWidget(self.market_overview, 2)
+        top_section.addWidget(self.focus_card, 1)
         main_layout.addLayout(top_section)
 
         # Primary workspace: single action plan card.
@@ -561,6 +556,31 @@ class DashboardView(QScrollArea):
 
         return card
 
+    def _create_focus_card(self) -> QFrame:
+        """Create a minimal focus card to reduce top-row clutter."""
+        card = QFrame()
+        card.setStyleSheet(_panel_style())
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        title = QLabel("Session Focus")
+        title.setFont(app_font(11, bold=True))
+        title.setStyleSheet("color: #e2e8f0;")
+        layout.addWidget(title)
+
+        self.focus_primary_label = QLabel("Run only high-confidence setups into earnings windows.")
+        self.focus_primary_label.setWordWrap(True)
+        self.focus_primary_label.setStyleSheet("color: #cbd5e1;")
+        layout.addWidget(self.focus_primary_label)
+
+        self.focus_secondary_label = QLabel("Shortcut: use top-bar symbol input, then analyze.")
+        self.focus_secondary_label.setWordWrap(True)
+        self.focus_secondary_label.setStyleSheet("color: #64748b; font-size: 10px;")
+        layout.addWidget(self.focus_secondary_label)
+        layout.addStretch()
+        return card
+
     def _populate_plan_candidates(self):
         """Load candidate rows for the daily action plan."""
         self.plan_table.setRowCount(len(self.ACTION_PLAN_CANDIDATES))
@@ -608,7 +628,6 @@ class DashboardView(QScrollArea):
         if symbol_item is None:
             return
         symbol = symbol_item.text().strip().upper()
-        self.quick_analysis.symbol_input.setText(symbol)
         self._handle_symbol_entry(symbol)
 
     def _handle_symbol_entry(self, symbol: str):
@@ -619,6 +638,8 @@ class DashboardView(QScrollArea):
         self.plan_status_label.setText(
             f"Running action plan for {clean_symbol} | switching to execution analysis."
         )
+        self.focus_primary_label.setText(f"Current focus: {clean_symbol} setup execution.")
+        self.focus_secondary_label.setText("Analysis request dispatched. Review Analysis Brief next.")
         self.analysis_requested.emit(clean_symbol)
 
 
@@ -1954,7 +1975,7 @@ class MainWindow(QWidget):
         body_layout.setSpacing(10)
 
         nav_frame = QFrame()
-        nav_frame.setFixedWidth(250)
+        nav_frame.setFixedWidth(220)
         nav_frame.setStyleSheet("""
             QFrame {
                 background-color: #0f172a;
@@ -2068,16 +2089,6 @@ class MainWindow(QWidget):
         self.status_label.setStyleSheet("color: #94a3b8;")
         layout.addWidget(self.status_label)
 
-        self.tab_context_label = QLabel("Tab: Dashboard")
-        self.tab_context_label.setFont(app_font(9, mono=True))
-        self.tab_context_label.setStyleSheet("color: #64748b;")
-        layout.addWidget(self.tab_context_label)
-
-        self.shortcuts_hint_label = QLabel("Shortcuts: Ctrl+1..5 switch | Ctrl+L focus | Ctrl+Enter analyze")
-        self.shortcuts_hint_label.setFont(app_font(9, mono=True))
-        self.shortcuts_hint_label.setStyleSheet("color: #64748b;")
-        layout.addWidget(self.shortcuts_hint_label)
-
         layout.addStretch()
 
         self.last_action_label = QLabel("Last action: --")
@@ -2130,11 +2141,10 @@ class MainWindow(QWidget):
             self._update_status("Input error | Enter a valid symbol (e.g., AAPL).")
             return
         self.global_symbol_input.setText(symbol)
-        if hasattr(self.dashboard_view, "quick_analysis"):
-            self.dashboard_view.quick_analysis.symbol_input.setText(symbol)
-        if hasattr(self.analysis_view, "symbol_input"):
-            self.analysis_view.symbol_input.setText(symbol)
-        self._handle_analysis_request(symbol)
+        if hasattr(self.dashboard_view, "_handle_symbol_entry"):
+            self.dashboard_view._handle_symbol_entry(symbol)
+        else:
+            self._handle_analysis_request(symbol)
 
     def _on_tab_changed(self, index: int):
         """Update status context when navigation tabs change."""
@@ -2149,7 +2159,8 @@ class MainWindow(QWidget):
         self.workspace_subtitle_label.setText(
             self._workspace_descriptions.get(tab_name, "Workspace ready.")
         )
-        self.tab_context_label.setText(f"Tab: {tab_name}")
+        if hasattr(self, "tab_context_label"):
+            self.tab_context_label.setText(f"Tab: {tab_name}")
         self._update_status(f"{tab_name} ready", track_action=False)
 
     def _update_status(self, message: str, track_action: bool = True):
@@ -2271,6 +2282,8 @@ class MainWindow(QWidget):
     def _handle_analysis_request(self, symbol):
         """Handle analysis request from dashboard"""
         try:
+            if hasattr(self, "analysis_view") and hasattr(self.analysis_view, "symbol_input"):
+                self.analysis_view.symbol_input.setText(symbol)
             self._update_status(f"Analyzing {symbol}...")
 
             # Switch to analysis tab
@@ -2285,8 +2298,15 @@ class MainWindow(QWidget):
 
             self.analysis_requested.emit(symbol, params)
 
-            # Update quick analysis summary
-            self.dashboard_view.quick_analysis.update_analysis_summary(f"Analyzing {symbol}...")
+            # Update dashboard focus text
+            if hasattr(self.dashboard_view, "focus_primary_label"):
+                self.dashboard_view.focus_primary_label.setText(
+                    f"Current focus: {symbol} setup execution."
+                )
+            if hasattr(self.dashboard_view, "focus_secondary_label"):
+                self.dashboard_view.focus_secondary_label.setText(
+                    "Analysis request dispatched. Review Analysis Brief next."
+                )
             if hasattr(self.dashboard_view, "plan_status_label"):
                 self.dashboard_view.plan_status_label.setText(
                     f"Executing plan for {symbol} | analysis requested and routing to Analysis Brief."
@@ -2392,7 +2412,12 @@ class MainWindow(QWidget):
             analysis_type = "Calendar Spread" if is_calendar_analysis else "Standard"
             summary = f"{symbol}: {analysis_type} analysis complete"
             if hasattr(self, 'dashboard_view'):
-                self.dashboard_view.quick_analysis.update_analysis_summary(summary)
+                if hasattr(self.dashboard_view, "focus_primary_label"):
+                    self.dashboard_view.focus_primary_label.setText(summary)
+                if hasattr(self.dashboard_view, "focus_secondary_label"):
+                    self.dashboard_view.focus_secondary_label.setText(
+                        "Result updated. Continue with risk review or next candidate."
+                    )
 
             # Update status
             self._update_status(f"Analysis completed for {symbol}")
@@ -2403,7 +2428,7 @@ class MainWindow(QWidget):
 
     def get_current_symbol(self) -> str:
         """Get currently entered symbol"""
-        return self.dashboard_view.quick_analysis.symbol_input.text().strip().upper()
+        return self.global_symbol_input.text().strip().upper()
 
     def get_analysis_parameters(self) -> dict:
         """Get current analysis parameters"""

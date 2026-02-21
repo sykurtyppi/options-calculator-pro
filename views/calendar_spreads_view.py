@@ -122,8 +122,9 @@ class CalendarSpreadsView(QWidget):
         left_layout.addWidget(symbol_frame)
 
         # Strategy parameters section
-        strategy_frame = self._create_input_section("Strategy Parameters", self._create_strategy_inputs())
-        left_layout.addWidget(strategy_frame)
+        self.strategy_frame = self._create_input_section("Strategy Parameters", self._create_strategy_inputs())
+        left_layout.addWidget(self.strategy_frame)
+        self.strategy_frame.setEnabled(False)
 
         # Advanced controls (hidden until needed)
         self.advanced_toggle_btn = QPushButton("Show Advanced Controls")
@@ -215,34 +216,19 @@ class CalendarSpreadsView(QWidget):
         self.feedback_strip = QLabel("Ready | Enter a symbol to start calendar spread analysis.")
         self.feedback_strip.setFixedHeight(32)
         self.feedback_strip.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        self.feedback_strip.setStyleSheet("""
-            QLabel {
-                background-color: #111827;
-                border: 1px solid #1f2937;
-                border-bottom: none;
-                color: #93c5fd;
-                padding: 6px 12px;
-                font-size: 11px;
-                font-weight: bold;
-            }
-        """)
+        self.feedback_strip.setStyleSheet(
+            ds_status_strip_style("info").replace("border-radius: 6px;", "border-radius: 0px;")
+        )
         right_layout.addWidget(self.feedback_strip)
 
         self.context_strip = QLabel("No analysis yet | Configure setup and run analysis to populate live metrics.")
         self.context_strip.setFixedHeight(26)
         self.context_strip.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        self.context_strip.setStyleSheet("""
-            QLabel {
-                background-color: #0b1220;
-                border-left: 1px solid #1f2937;
-                border-right: 1px solid #1f2937;
-                color: #94a3b8;
-                padding: 4px 12px;
-                font-size: 10px;
-                font-weight: bold;
-            }
-        """)
+        self.context_strip.setStyleSheet(
+            ds_status_strip_style("neutral").replace("border-radius: 6px;", "border-radius: 0px;")
+        )
         right_layout.addWidget(self.context_strip)
+        self.context_strip.setVisible(False)
 
         # Results Summary strip (KPI tiles)
         self.results_summary = self._create_results_summary()
@@ -675,9 +661,10 @@ class CalendarSpreadsView(QWidget):
         self._active_symbol = raw_symbol
         if not raw_symbol:
             self._stop_analysis_feedback()
+            self.strategy_frame.setEnabled(False)
             self.calculate_btn.setEnabled(False)
             self.analyze_btn.setEnabled(False)
-            self.left_hint_label.setText("Enter a valid symbol (e.g., AAPL) to enable actions.")
+            self.left_hint_label.setText("Step 1: Enter a symbol to unlock setup controls.")
             self.symbol_validation_label.setText("Format: 1-8 chars, letters/numbers (. and - allowed)")
             self.symbol_validation_label.setStyleSheet("color: #64748b; font-size: 10px;")
             self._set_feedback("Ready | Enter a symbol to start calendar spread analysis.", level="info")
@@ -686,21 +673,22 @@ class CalendarSpreadsView(QWidget):
             return
 
         is_valid = self._is_valid_symbol(raw_symbol)
+        self.strategy_frame.setEnabled(is_valid)
         self._on_strategy_input_changed(announce_feedback=False)
 
         if is_valid:
             self.symbol_validation_label.setText(f"Symbol looks valid: {raw_symbol}")
             self.symbol_validation_label.setStyleSheet("color: #10b981; font-size: 10px;")
             if self.calculate_btn.isEnabled():
-                self.left_hint_label.setText("Actions enabled. Use Calculate for setup or Run Live Analysis for full model output.")
+                self.left_hint_label.setText("Setup ready. Calculate first, then run live analysis if needed.")
                 self._set_feedback(f"Ready | {raw_symbol} loaded. Choose an action.", level="success")
             else:
-                self.left_hint_label.setText("Symbol valid. Next step: adjust expirations to a valid calendar spacing.")
+                self.left_hint_label.setText("Step 2: Adjust expirations until term spacing is valid.")
                 self._set_feedback("Setup warning | Expiration spacing needs adjustment.", level="warn")
             self.symbol_input.setStyleSheet(self._get_input_style())
         else:
             self._stop_analysis_feedback()
-            self.left_hint_label.setText("Symbol format is invalid. Example valid values: AAPL, BRK.B, BTC-USD")
+            self.left_hint_label.setText("Symbol format is invalid. Example: AAPL")
             self.symbol_validation_label.setText("Invalid symbol format")
             self.symbol_validation_label.setStyleSheet("color: #ef4444; font-size: 10px;")
             self._set_feedback("Input error | Invalid symbol format.", level="error")
@@ -724,11 +712,11 @@ class CalendarSpreadsView(QWidget):
         self.analyze_btn.setEnabled(ready)
 
         if symbol_valid and not term_valid:
-            self.left_hint_label.setText("Adjust expirations: far leg must be later than near leg by at least 7 days.")
+            self.left_hint_label.setText("Step 2: Far expiration must be at least 7 days after near expiration.")
             if announce_feedback:
                 self._set_feedback("Setup warning | Fix expiration spacing before running.", level="warn")
         elif symbol_valid and term_valid:
-            self.left_hint_label.setText("Actions enabled. Use Calculate for setup or Run Live Analysis for full model output.")
+            self.left_hint_label.setText("Step 3: Run Calculate Spread to preview risk/reward.")
             if announce_feedback:
                 self._set_feedback(f"Ready | {symbol} setup validated.", level="success")
 
@@ -776,6 +764,10 @@ class CalendarSpreadsView(QWidget):
 
     def _set_context(self, message: str, level: str = "neutral"):
         """Update secondary context strip with compact workflow details."""
+        show_context = level not in {"neutral"} and bool(message.strip())
+        self.context_strip.setVisible(show_context)
+        if not show_context:
+            return
         self.context_strip.setText(message)
         style_level = "neutral" if level == "neutral" else level
         style = ds_status_strip_style(style_level)
