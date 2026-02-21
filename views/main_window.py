@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QSpinBox, QDoubleSpinBox,
     QFrame, QCompleter, QTabWidget, QSplitter,
     QScrollArea, QSizePolicy, QComboBox,
+    QListWidget, QListWidgetItem,
     QTableWidget, QTableWidgetItem, QTextEdit, QFileDialog, QApplication
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QStringListModel
@@ -1956,129 +1957,187 @@ class MainWindow(QWidget):
         self.logger.info("Modern Options Calculator Main Window initialized")
 
     def _setup_ui(self):
-        """Setup the professional interface"""
-        # CRITICAL: Remove ALL maximum width restrictions for full screen
-        self.setMinimumWidth(900)
-        self.setMinimumHeight(600)
-
-        # NEVER set maximum width - allow full expansion
-        # self.setMaximumWidth() is FORBIDDEN
-
-        # Enable full window expansion
+        """Setup a cleaner workspace-oriented interface."""
+        self.setMinimumWidth(1100)
+        self.setMinimumHeight(700)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(8)
+        self._workspace_descriptions = {
+            "Dashboard": "Session overview, market posture, and quick-entry actions.",
+            "Calendar Lab": "Build and validate calendar spreads with live setup feedback.",
+            "Scanner": "Filter earnings candidates by edge, confidence, and liquidity.",
+            "Analysis Brief": "Generate and export structured institutional research notes.",
+            "History": "Review backtests, sessions, and execution outcomes.",
+        }
 
-        # Header with app title
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setSpacing(10)
+
+        # Header: concise branding + global quick action.
         header_frame = QFrame()
-        header_frame.setFixedHeight(50)
         header_frame.setStyleSheet("""
             QFrame {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0ea5e9, stop:1 #0284c7);
-                border-radius: 8px;
-                margin: 2px;
+                background-color: #111827;
+                border: 1px solid #1f2937;
+                border-radius: 10px;
             }
         """)
-
         header_layout = QHBoxLayout(header_frame)
-        header_layout.setContentsMargins(20, 8, 20, 8)
+        header_layout.setContentsMargins(16, 12, 16, 12)
+        header_layout.setSpacing(12)
 
+        brand_block = QVBoxLayout()
+        brand_block.setSpacing(2)
         app_title = QLabel("Options Calculator Pro")
-        app_title.setFont(QFont("Segoe UI", 18, QFont.Bold))
-        app_title.setStyleSheet("color: #ffffff;")
-        header_layout.addWidget(app_title)
+        app_title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        app_title.setStyleSheet("color: #f8fafc;")
+        brand_block.addWidget(app_title)
+
+        app_subtitle = QLabel("Earnings Volatility Workspace")
+        app_subtitle.setFont(QFont("Segoe UI", 10))
+        app_subtitle.setStyleSheet("color: #94a3b8;")
+        brand_block.addWidget(app_subtitle)
+        header_layout.addLayout(brand_block)
 
         header_layout.addStretch()
 
-        version_label = QLabel("v12.0.0")
-        version_label.setFont(QFont("Segoe UI", 10))
-        version_label.setStyleSheet("color: #e0f2fe;")
+        quick_label = QLabel("Quick Analyze")
+        quick_label.setStyleSheet("color: #94a3b8; font-weight: bold;")
+        header_layout.addWidget(quick_label)
+
+        self.global_symbol_input = QLineEdit()
+        self.global_symbol_input.setPlaceholderText("Symbol")
+        self.global_symbol_input.setMaxLength(8)
+        self.global_symbol_input.setFixedWidth(120)
+        self.global_symbol_input.returnPressed.connect(self._run_global_analysis)
+        header_layout.addWidget(self.global_symbol_input)
+
+        self.global_analyze_btn = QPushButton("Run")
+        self.global_analyze_btn.setFixedWidth(76)
+        self.global_analyze_btn.setStyleSheet(_button_style("primary"))
+        self.global_analyze_btn.clicked.connect(self._run_global_analysis)
+        header_layout.addWidget(self.global_analyze_btn)
+
+        version_label = QLabel("v13.0")
+        version_label.setStyleSheet("color: #64748b;")
         header_layout.addWidget(version_label)
 
         main_layout.addWidget(header_frame)
 
-        # Navigation tabs
+        # Main body: left navigation + right workspace.
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(10)
+
+        nav_frame = QFrame()
+        nav_frame.setFixedWidth(250)
+        nav_frame.setStyleSheet("""
+            QFrame {
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 10px;
+            }
+        """)
+        nav_layout = QVBoxLayout(nav_frame)
+        nav_layout.setContentsMargins(12, 12, 12, 12)
+        nav_layout.setSpacing(10)
+
+        nav_title = QLabel("Workspace")
+        nav_title.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        nav_title.setStyleSheet("color: #cbd5e1;")
+        nav_layout.addWidget(nav_title)
+
+        self.nav_list = QListWidget()
+        self.nav_list.setSpacing(6)
+        self.nav_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        for label in ["Dashboard", "Calendar Lab", "Scanner", "Analysis Brief", "History"]:
+            item = QListWidgetItem(label)
+            item.setToolTip(self._workspace_descriptions.get(label, ""))
+            self.nav_list.addItem(item)
+        self.nav_list.currentRowChanged.connect(self._switch_to_tab)
+        nav_layout.addWidget(self.nav_list, 1)
+
+        nav_hint = QLabel("Use Ctrl+1..5 to switch sections.\nCtrl+L focuses quick symbol.")
+        nav_hint.setWordWrap(True)
+        nav_hint.setStyleSheet("color: #64748b; font-size: 10px;")
+        nav_layout.addWidget(nav_hint)
+
+        body_layout.addWidget(nav_frame)
+
+        content_frame = QFrame()
+        content_frame.setStyleSheet("""
+            QFrame {
+                background-color: #020617;
+                border: 1px solid #1e293b;
+                border-radius: 10px;
+            }
+        """)
+        content_layout = QVBoxLayout(content_frame)
+        content_layout.setContentsMargins(12, 10, 12, 12)
+        content_layout.setSpacing(8)
+
+        self.workspace_title_label = QLabel("Dashboard")
+        self.workspace_title_label.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        self.workspace_title_label.setStyleSheet("color: #f8fafc;")
+        content_layout.addWidget(self.workspace_title_label)
+
+        self.workspace_subtitle_label = QLabel(self._workspace_descriptions["Dashboard"])
+        self.workspace_subtitle_label.setStyleSheet("color: #94a3b8; margin-top: -4px;")
+        content_layout.addWidget(self.workspace_subtitle_label)
+
         self.tab_widget = QTabWidget()
+        self.tab_widget.setDocumentMode(True)
+        self.tab_widget.tabBar().hide()
         self.tab_widget.setStyleSheet("""
             QTabWidget::pane {
-                border: 1px solid #2d2d2d;
-                background-color: #0a0a0a;
-                border-radius: 8px;
-            }
-            QTabBar::tab {
-                background-color: #1a1a1a;
-                color: #94a3b8;
-                padding: 12px 20px;
-                margin: 2px;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                font-weight: bold;
-                min-width: 100px;
-            }
-            QTabBar::tab:selected {
-                background-color: #0ea5e9;
-                color: #ffffff;
-            }
-            QTabBar::tab:hover:!selected {
-                background-color: #2d2d2d;
-                color: #ffffff;
+                border: none;
+                background-color: #020617;
             }
         """)
 
-        # Create views with safe instantiation
         self.dashboard_view = DashboardView()
         self.dashboard_view.analysis_requested.connect(self._handle_analysis_request)
-
-        # Create Calendar Spreads view safely
         if CalendarSpreadsView:
             self.calendar_view = CalendarSpreadsView()
         else:
             self.calendar_view = self._create_fallback_calendar_view()
-
         self.scanner_view = ScannerView()
         self.analysis_view = AnalysisView()
         self.history_view = HistoryView()
 
-        # Add tabs
         self.tab_widget.addTab(self.dashboard_view, "Dashboard")
-        self.tab_widget.addTab(self.calendar_view, "Calendar Spreads")
+        self.tab_widget.addTab(self.calendar_view, "Calendar Lab")
         self.tab_widget.addTab(self.scanner_view, "Scanner")
-        self.tab_widget.addTab(self.analysis_view, "Analysis")
+        self.tab_widget.addTab(self.analysis_view, "Analysis Brief")
         self.tab_widget.addTab(self.history_view, "History")
-        self.tab_widget.setTabToolTip(0, "Market context and quick symbol analysis")
-        self.tab_widget.setTabToolTip(1, "Calendar spread setup, candidates, and Greeks")
-        self.tab_widget.setTabToolTip(2, "Scan symbols by volatility and liquidity filters")
-        self.tab_widget.setTabToolTip(3, "Detailed per-symbol diagnostics and model outputs")
-        self.tab_widget.setTabToolTip(4, "Historical reports, backtests, and trade review")
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
-        # Enable tab widget to expand and fill available space
         self.tab_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        main_layout.addWidget(self.tab_widget, 1)  # Stretch factor 1
+        content_layout.addWidget(self.tab_widget, 1)
+        body_layout.addWidget(content_frame, 1)
 
-        # Status bar
+        main_layout.addLayout(body_layout, 1)
+
         self._setup_status_bar(main_layout)
         self._setup_shortcuts()
-        self._on_tab_changed(self.tab_widget.currentIndex())
+        self.nav_list.setCurrentRow(0)
+        self._on_tab_changed(0)
 
     def _setup_status_bar(self, parent_layout):
-        """Setup status bar"""
+        """Setup status bar."""
         status_frame = QFrame()
-        status_frame.setFixedHeight(30)
+        status_frame.setFixedHeight(34)
         status_frame.setStyleSheet("""
             QFrame {
-                background-color: #1a1a1a;
-                border: 1px solid #2d2d2d;
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
                 border-radius: 6px;
-                margin: 2px;
             }
         """)
 
         layout = QHBoxLayout(status_frame)
-        layout.setContentsMargins(12, 4, 12, 4)
+        layout.setContentsMargins(12, 5, 12, 5)
 
         self.status_label = QLabel("Ready | Select a tab to begin")
         self.status_label.setFont(QFont("Consolas", 9))
@@ -2090,7 +2149,7 @@ class MainWindow(QWidget):
         self.tab_context_label.setStyleSheet("color: #64748b;")
         layout.addWidget(self.tab_context_label)
 
-        self.shortcuts_hint_label = QLabel("Shortcuts: Ctrl+1-5 tabs | Ctrl+L symbol | Ctrl+Enter analyze")
+        self.shortcuts_hint_label = QLabel("Shortcuts: Ctrl+1..5 switch | Ctrl+L focus | Ctrl+Enter analyze")
         self.shortcuts_hint_label.setFont(QFont("Consolas", 9))
         self.shortcuts_hint_label.setStyleSheet("color: #64748b;")
         layout.addWidget(self.shortcuts_hint_label)
@@ -2114,9 +2173,9 @@ class MainWindow(QWidget):
         """Configure keyboard shortcuts for faster workflow navigation."""
         self._shortcuts = []
 
-        self._register_shortcut("Ctrl+L", self.dashboard_view.quick_analysis.focus_symbol_input)
-        self._register_shortcut("Ctrl+Return", self.dashboard_view.quick_analysis.trigger_analysis)
-        self._register_shortcut("Ctrl+Enter", self.dashboard_view.quick_analysis.trigger_analysis)
+        self._register_shortcut("Ctrl+L", self._focus_global_symbol)
+        self._register_shortcut("Ctrl+Return", self._run_global_analysis)
+        self._register_shortcut("Ctrl+Enter", self._run_global_analysis)
 
         for idx in range(min(5, self.tab_widget.count())):
             self._register_shortcut(
@@ -2135,11 +2194,37 @@ class MainWindow(QWidget):
         if 0 <= index < self.tab_widget.count():
             self.tab_widget.setCurrentIndex(index)
 
+    def _focus_global_symbol(self):
+        """Focus global symbol input and select text."""
+        self.global_symbol_input.setFocus()
+        self.global_symbol_input.selectAll()
+
+    def _run_global_analysis(self):
+        """Run quick analysis from top header input."""
+        symbol = self.global_symbol_input.text().strip().upper()
+        if not symbol or not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,7}", symbol):
+            self._update_status("Input error | Enter a valid symbol (e.g., AAPL).")
+            return
+        self.global_symbol_input.setText(symbol)
+        if hasattr(self.dashboard_view, "quick_analysis"):
+            self.dashboard_view.quick_analysis.symbol_input.setText(symbol)
+        if hasattr(self.analysis_view, "symbol_input"):
+            self.analysis_view.symbol_input.setText(symbol)
+        self._handle_analysis_request(symbol)
+
     def _on_tab_changed(self, index: int):
         """Update status context when navigation tabs change."""
         if index < 0 or index >= self.tab_widget.count():
             return
         tab_name = self.tab_widget.tabText(index)
+        if hasattr(self, "nav_list") and self.nav_list.currentRow() != index:
+            self.nav_list.blockSignals(True)
+            self.nav_list.setCurrentRow(index)
+            self.nav_list.blockSignals(False)
+        self.workspace_title_label.setText(tab_name)
+        self.workspace_subtitle_label.setText(
+            self._workspace_descriptions.get(tab_name, "Workspace ready.")
+        )
         self.tab_context_label.setText(f"Tab: {tab_name}")
         self._update_status(f"{tab_name} ready", track_action=False)
 
@@ -2151,11 +2236,11 @@ class MainWindow(QWidget):
             self.last_action_label.setText(f"Last action: {timestamp} | {message}")
 
     def _apply_theme(self):
-        """Apply modern dark theme"""
+        """Apply clean global dark theme."""
         self.setStyleSheet("""
             QWidget {
-                background-color: #0a0a0a;
-                color: #ffffff;
+                background-color: #030712;
+                color: #e2e8f0;
                 font-family: 'Segoe UI', 'Helvetica', sans-serif;
                 font-size: 12px;
             }
@@ -2166,50 +2251,50 @@ class MainWindow(QWidget):
             }
 
             QScrollBar:vertical {
-                background-color: #1a1a1a;
+                background-color: #111827;
                 width: 12px;
                 border-radius: 6px;
                 margin: 2px;
             }
 
             QScrollBar::handle:vertical {
-                background-color: #404040;
+                background-color: #334155;
                 border-radius: 5px;
                 min-height: 20px;
                 margin: 1px;
             }
 
             QScrollBar::handle:vertical:hover {
-                background-color: #505050;
+                background-color: #475569;
             }
 
             QScrollBar:horizontal {
-                background-color: #1a1a1a;
+                background-color: #111827;
                 height: 12px;
                 border-radius: 6px;
                 margin: 2px;
             }
 
             QScrollBar::handle:horizontal {
-                background-color: #404040;
+                background-color: #334155;
                 border-radius: 5px;
                 min-width: 20px;
                 margin: 1px;
             }
 
             QScrollBar::handle:horizontal:hover {
-                background-color: #505050;
+                background-color: #475569;
             }
 
             QLabel {
-                color: #ffffff;
+                color: #e2e8f0;
             }
 
             QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-                background-color: #1a1a1a;
-                border: 1px solid #404040;
+                background-color: #111827;
+                border: 1px solid #334155;
                 border-radius: 4px;
-                color: #ffffff;
+                color: #e2e8f0;
                 padding: 6px 8px;
                 font-size: 11px;
             }
@@ -2219,12 +2304,41 @@ class MainWindow(QWidget):
             }
 
             QToolTip {
-                background-color: #1a1a1a;
-                color: #ffffff;
-                border: 1px solid #404040;
+                background-color: #111827;
+                color: #e2e8f0;
+                border: 1px solid #334155;
                 border-radius: 4px;
                 padding: 6px;
                 font-size: 11px;
+            }
+
+            QListWidget {
+                background-color: #0b1220;
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+                padding: 4px;
+                outline: none;
+            }
+
+            QListWidget::item {
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                color: #cbd5e1;
+                padding: 10px 10px;
+                margin: 2px 0;
+                font-weight: bold;
+            }
+
+            QListWidget::item:selected {
+                background-color: #0b3b5a;
+                border: 1px solid #0ea5e9;
+                color: #e0f2fe;
+            }
+
+            QListWidget::item:hover:!selected {
+                background-color: #111827;
+                border: 1px solid #334155;
             }
         """)
 
