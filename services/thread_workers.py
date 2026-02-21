@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
 
-from models.option_data import OptionData
+from models.option_data import OptionContract
 from models.analysis_result import AnalysisResult
 from utils.error_handler import ErrorHandler, handle_exceptions, ErrorSeverity
 
@@ -132,7 +132,7 @@ class BackgroundWorker(ABC):
             self._worker_thread.join(timeout=timeout)
         
         # Shutdown executor
-        self._executor.shutdown(wait=True, timeout=timeout)
+        self._executor.shutdown(wait=True)
         
         self.logger.info(f"Worker '{self.name}' stopped")
     
@@ -585,17 +585,63 @@ class MonteCarloWorker(BackgroundWorker):
     
     def run_simulation(
         self,
-        option: OptionData,
+        option: OptionContract,
         num_simulations: int = 10000,
         callback: Optional[Callable] = None
     ) -> str:
         """Submit Monte Carlo simulation task"""
-        from services.container import get_container
-        from models.monte_carlo import MonteCarloEngine
+        from utils.monte_carlo import MonteCarloEngine
+        from services.market_data import MarketDataService
+        import pandas as pd
+        import numpy as np
+        from datetime import date
         
         def simulate():
             engine = MonteCarloEngine()
-            return engine.simulate_option_price(option, num_simulations)
+            market_data = MarketDataService()
+            symbol = str(getattr(option, "symbol", "UNKNOWN"))
+
+            spot_guess = float(
+                getattr(option, "underlying_price", 0.0)
+                or getattr(option, "spot_price", 0.0)
+                or getattr(option, "underlying_last", 0.0)
+                or getattr(option, "strike", 0.0)
+                or 100.0
+            )
+            spot_guess = max(0.01, spot_guess)
+
+            historical_data = market_data.get_historical_data(symbol, period="6mo", interval="1d")
+            if historical_data is None or historical_data.empty:
+                # Synthetic flat history fallback to keep worker deterministic/stable.
+                closes = np.full(120, spot_guess, dtype=float)
+                historical_data = pd.DataFrame({"Close": closes})
+
+            implied_vol = float(getattr(option, "implied_volatility", 0.25) or 0.25)
+            implied_vol = max(0.01, min(3.0, implied_vol))
+            rv_proxy = max(0.01, min(3.0, implied_vol * 0.85))
+
+            dte = 30
+            expiration = getattr(option, "expiration", None)
+            if expiration is not None:
+                try:
+                    if hasattr(expiration, "date"):
+                        expiration = expiration.date()
+                    dte = max(1, int((expiration - date.today()).days))
+                except Exception:
+                    dte = 30
+
+            return engine.run_simulation(
+                symbol=symbol,
+                current_price=spot_guess,
+                historical_data=historical_data,
+                volatility_metrics={
+                    "iv30": implied_vol,
+                    "rv30": rv_proxy,
+                },
+                simulations=max(1000, int(num_simulations)),
+                days_to_expiration=dte,
+                use_jump_diffusion=True,
+            )
         
         return self.submit_task(
             simulate,

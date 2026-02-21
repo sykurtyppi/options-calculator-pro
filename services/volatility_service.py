@@ -165,6 +165,27 @@ class VolatilityService:
         }
         
         self.logger.info("VolatilityService initialized")
+
+    @staticmethod
+    def _period_from_days(days: int) -> str:
+        """Convert lookback days to a valid yfinance period string."""
+        if days <= 5:
+            return "5d"
+        if days <= 30:
+            return "1mo"
+        if days <= 90:
+            return "3mo"
+        if days <= 180:
+            return "6mo"
+        if days <= 365:
+            return "1y"
+        if days <= 730:
+            return "2y"
+        if days <= 1825:
+            return "5y"
+        if days <= 3650:
+            return "10y"
+        return "max"
     
     def calculate_realized_volatility(self, symbol: str, window: int = 30, 
                                     model: VolatilityModel = VolatilityModel.YANG_ZHANG,
@@ -188,17 +209,17 @@ class VolatilityService:
             if cached_data is not None:
                 return cached_data if not return_last_only else cached_data.iloc[-1]
             
-            # Get historical price data
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=window + 60)  # Extra buffer
-            
-            price_data = self.market_data.get_historical_data(
-                symbol, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
-            )
+            # Get historical price data with buffer to stabilize rolling windows
+            period = self._period_from_days(window + 60)
+            price_data = self.market_data.get_historical_data(symbol, period=period, interval="1d")
             
             if price_data.empty or len(price_data) < self.min_data_points:
                 self.logger.warning(f"Insufficient data for {symbol} volatility calculation")
-                return self.default_volatility
+                if return_last_only:
+                    return self.default_volatility
+                else:
+                    # Return Series with default values to maintain type consistency
+                    return pd.Series([self.default_volatility], name='volatility')
             
             # Calculate volatility based on model
             if model == VolatilityModel.YANG_ZHANG:
@@ -219,7 +240,11 @@ class VolatilityService:
             
         except Exception as e:
             self.logger.error(f"Error calculating realized volatility for {symbol}: {e}")
-            return self.default_volatility
+            if return_last_only:
+                return self.default_volatility
+            else:
+                # Return Series with default values to maintain type consistency
+                return pd.Series([self.default_volatility], name='volatility')
     
     def calculate_volatility_metrics(self, symbol: str) -> VolatilityMetrics:
         """
@@ -536,7 +561,7 @@ class VolatilityService:
             # Replace zeros and NaNs
             for col in required_columns:
                 data.loc[data[col] <= 0, col] = np.nan
-                data[col] = data[col].fillna(method='ffill').fillna(method='bfill')
+                data[col] = data[col].ffill().bfill()
                 
                 # If still NaN, use median
                 if data[col].isna().any():
@@ -545,29 +570,27 @@ class VolatilityService:
                         median_val = 1.0
                     data[col] = data[col].fillna(median_val)
             
-            # Yang-Zhang calculation
+            # Yang-Zhang calculation:
+            # overnight returns: O_t / C_{t-1}
+            # open-to-close returns: C_t / O_t
+            # Rogers-Satchell intraday estimator
             log_ho = np.log(data["High"] / data["Open"])
             log_lo = np.log(data["Low"] / data["Open"])
             log_co = np.log(data["Close"] / data["Open"])
             log_oc = np.log(data["Open"] / data["Close"].shift(1))
-            log_cc = np.log(data["Close"] / data["Close"].shift(1))
             
             rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
             
-            # Rolling calculations
-            close_vol = log_cc.rolling(window=window).apply(
-                lambda x: np.sum(x**2) * window / (window - 1), raw=True
-            )
-            open_vol = log_oc.rolling(window=window).apply(
-                lambda x: np.sum(x**2) * window / (window - 1), raw=True
-            )
-            window_rs = rs.rolling(window=window).apply(
-                lambda x: np.sum(x) * window / (window - 1), raw=True
-            )
+            # Rolling sample variances (ddof=1) with drift removal.
+            open_vol = log_oc.rolling(window=window, min_periods=window).var(ddof=1)
+            close_vol = log_co.rolling(window=window, min_periods=window).var(ddof=1)
+            window_rs = rs.rolling(window=window, min_periods=window).mean()
             
             # Yang-Zhang formula
             k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
-            result = np.sqrt(open_vol + k * close_vol + (1 - k) * window_rs) * np.sqrt(self.trading_periods)
+            yz_variance = open_vol + k * close_vol + (1 - k) * window_rs
+            yz_variance = yz_variance.clip(lower=0.0)
+            result = np.sqrt(yz_variance) * np.sqrt(self.trading_periods)
             
             # Clean and bound results
             result = result.fillna(self.default_volatility)
@@ -677,7 +700,11 @@ class VolatilityService:
         try:
             # Get longer history for ranking
             vol_series = self.calculate_realized_volatility(symbol, 30, return_last_only=False)
-            
+
+            # Handle case where insufficient data returns scalar instead of Series
+            if isinstance(vol_series, (int, float)):
+                return 0.5, 50.0
+
             if len(vol_series) < 30:
                 return 0.5, 50.0
             
@@ -786,12 +813,8 @@ class VolatilityService:
         """Calculate volatility clustering coefficient"""
         try:
             # Get returns data
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=120)
-            
-            price_data = self.market_data.get_historical_data(
-                symbol, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
-            )
+            period = self._period_from_days(120)
+            price_data = self.market_data.get_historical_data(symbol, period=period, interval="1d")
             
             if price_data.empty or len(price_data) < 50:
                 return 0.5
@@ -821,26 +844,46 @@ class VolatilityService:
             if len(days) < 2 or len(ivs) < 2:
                 return 0.0
             
-            # Find closest points to start and end days
-            days_array = np.array(days)
-            ivs_array = np.array(ivs)
-            
-            start_idx = np.argmin(np.abs(days_array - start_day))
-            end_idx = np.argmin(np.abs(days_array - end_day))
-            
-            if start_idx == end_idx:
+            if end_day <= start_day:
                 return 0.0
-            
-            start_days = days[start_idx]
-            end_days = days[end_idx]
-            start_iv = ivs[start_idx]
-            end_iv = ivs[end_idx]
-            
-            if end_days != start_days:
-                slope = (end_iv - start_iv) / (end_days - start_days)
-                return slope
-            else:
+
+            days_array = np.asarray(days, dtype=float)
+            ivs_array = np.asarray(ivs, dtype=float)
+            valid_mask = np.isfinite(days_array) & np.isfinite(ivs_array)
+            if valid_mask.sum() < 2:
                 return 0.0
+
+            days_valid = days_array[valid_mask]
+            ivs_valid = ivs_array[valid_mask]
+
+            # Sort and average duplicate tenors.
+            sort_idx = np.argsort(days_valid)
+            days_sorted = days_valid[sort_idx]
+            ivs_sorted = ivs_valid[sort_idx]
+            unique_days, inverse = np.unique(days_sorted, return_inverse=True)
+            if len(unique_days) < 2:
+                return 0.0
+            unique_ivs = np.array([
+                float(np.mean(ivs_sorted[inverse == i])) for i in range(len(unique_days))
+            ], dtype=float)
+
+            def _interp_or_extrapolate(target_day: float) -> float:
+                if target_day <= unique_days[0]:
+                    x0, x1 = unique_days[0], unique_days[1]
+                    y0, y1 = unique_ivs[0], unique_ivs[1]
+                elif target_day >= unique_days[-1]:
+                    x0, x1 = unique_days[-2], unique_days[-1]
+                    y0, y1 = unique_ivs[-2], unique_ivs[-1]
+                else:
+                    return float(np.interp(target_day, unique_days, unique_ivs))
+                if x1 == x0:
+                    return float(y0)
+                return float(y0 + (y1 - y0) * ((target_day - x0) / (x1 - x0)))
+
+            start_iv = _interp_or_extrapolate(float(start_day))
+            end_iv = _interp_or_extrapolate(float(end_day))
+            slope = (end_iv - start_iv) / float(end_day - start_day)
+            return float(slope)
                 
         except Exception as e:
             self.logger.warning(f"Error calculating term structure slope: {e}")
@@ -1294,12 +1337,8 @@ class VolatilityService:
             max_vol_drawdown = drawdowns.min()
             
             # Volatility Sharpe ratio (return per unit of volatility risk)
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=90)
-            
-            price_data = self.market_data.get_historical_data(
-                symbol, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
-            )
+            period = self._period_from_days(90)
+            price_data = self.market_data.get_historical_data(symbol, period=period, interval="1d")
             
             vol_sharpe = 0.0
             if not price_data.empty:
@@ -1322,7 +1361,69 @@ class VolatilityService:
         except Exception as e:
             self.logger.error(f"Error calculating volatility risk metrics: {e}")
             return {"error": str(e)}
-    
+
+    def calculate_iv_rank(self, symbol: str, current_iv: float, period_days: int = 252) -> float:
+        """
+        Calculate implied volatility rank - current IV vs historical IV range over period
+        Returns rank from 0-1 where 1 = highest IV in period
+        """
+        try:
+            # Get historical IV data (approximated from RV for now)
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=period_days)
+
+            # Get historical volatility series as proxy for IV
+            vol_series = self.calculate_realized_volatility(symbol, 30, return_last_only=False)
+
+            if len(vol_series) < 30:
+                # Fallback calculation if insufficient data
+                return 0.5  # Neutral rank
+
+            # Calculate rank: (current - min) / (max - min)
+            hist_vols = vol_series.dropna()
+            if len(hist_vols) < 10:
+                return 0.5
+
+            vol_min = hist_vols.min()
+            vol_max = hist_vols.max()
+
+            if vol_max <= vol_min:
+                return 0.5
+
+            iv_rank = (current_iv - vol_min) / (vol_max - vol_min)
+            return max(0.0, min(1.0, iv_rank))  # Clamp to 0-1 range
+
+        except Exception as e:
+            self.logger.warning(f"Error calculating IV rank for {symbol}: {e}")
+            return 0.5  # Default neutral rank
+
+    def calculate_iv_percentile(self, symbol: str, current_iv: float, period_days: int = 252) -> float:
+        """
+        Calculate implied volatility percentile - what % of time IV was below current level
+        Returns percentile from 0-100 where 100 = highest IV in period
+        """
+        try:
+            # Get historical IV data (approximated from RV for now)
+            vol_series = self.calculate_realized_volatility(symbol, 30, return_last_only=False)
+
+            if len(vol_series) < 30:
+                return 50.0  # Neutral percentile
+
+            hist_vols = vol_series.dropna()
+            if len(hist_vols) < 10:
+                return 50.0
+
+            # Calculate what percentage of historical values are below current IV
+            below_current = (hist_vols < current_iv).sum()
+            total_count = len(hist_vols)
+
+            percentile = (below_current / total_count) * 100.0
+            return max(0.0, min(100.0, percentile))
+
+        except Exception as e:
+            self.logger.warning(f"Error calculating IV percentile for {symbol}: {e}")
+            return 50.0  # Default neutral percentile
+
     def export_volatility_report(self, symbol: str, output_file: str) -> bool:
         """Export comprehensive volatility analysis report"""
         try:

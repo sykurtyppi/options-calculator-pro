@@ -7,9 +7,10 @@ import logging
 import asyncio
 import aiohttp
 import time
+import random
 from typing import Optional, Dict, List, Any, Tuple
 from datetime import datetime, timedelta, date
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import pandas as pd
 import yfinance as yf
@@ -31,6 +32,43 @@ class DataProvider(Enum):
     ALPHA_VANTAGE = "alpha_vantage"
     FINNHUB = "finnhub"
     POLYGON = "polygon"
+
+class RetryStrategy(Enum):
+    """Retry strategies for rate limits"""
+    EXPONENTIAL_BACKOFF = "exponential_backoff"
+    LINEAR_BACKOFF = "linear_backoff"
+    FIBONACCI_BACKOFF = "fibonacci_backoff"
+
+@dataclass
+class RetryConfig:
+    """Configuration for retry logic"""
+    max_retries: int = 3
+    base_delay: float = 1.0  # Base delay in seconds
+    max_delay: float = 300.0  # Maximum delay (5 minutes)
+    exponential_base: float = 2.0
+    jitter_factor: float = 0.1  # Add randomness to prevent thundering herd
+    strategy: RetryStrategy = RetryStrategy.EXPONENTIAL_BACKOFF
+
+@dataclass
+class CircuitBreakerState:
+    """Circuit breaker state for provider failure management"""
+    failure_count: int = 0
+    last_failure_time: float = 0.0
+    is_open: bool = False
+    half_open_time: Optional[float] = None
+    failure_threshold: int = 5  # Open after 5 consecutive failures
+    recovery_timeout: float = 300.0  # 5 minutes before trying half-open
+    success_threshold: int = 3  # Successes needed to close from half-open
+
+@dataclass
+class ProviderHealth:
+    """Provider health tracking"""
+    success_count: int = 0
+    failure_count: int = 0
+    last_success_time: float = 0.0
+    last_failure_time: float = 0.0
+    average_response_time: float = 0.0
+    circuit_breaker: CircuitBreakerState = field(default_factory=CircuitBreakerState)
 
 
 @dataclass
@@ -241,34 +279,69 @@ class DataProviderManager:
         self.logger = logging.getLogger(f"{__name__}.ProviderManager")
         self.config_manager = config_manager
         
-        # Provider configurations
+        # Provider configurations with enhanced rate limiting
         self.providers = {
             DataProvider.YAHOO_FINANCE: {
                 'enabled': True,
                 'priority': 1,
-                'rate_limit': 2000,  # requests per day
-                'timeout': 10
+                'rate_limit': 200,  # Conservative limit - requests per hour
+                'rate_window': 3600,  # 1 hour window
+                'timeout': 8,
+                'retry_delay': 5,  # seconds
+                'max_retries': 3
             },
             DataProvider.ALPHA_VANTAGE: {
-                'enabled': bool(config_manager.get("api.alpha_vantage_key")),
+                'enabled': bool(config_manager.get("api_keys", {}).get("alpha_vantage", "")),
                 'priority': 2,
-                'rate_limit': 500,
+                'rate_limit': 500,  # requests per day
+                'rate_window': 86400,  # 24 hours
                 'timeout': 15,
-                'api_key': config_manager.get("api.alpha_vantage_key", "")
+                'retry_delay': 12,
+                'max_retries': 2,
+                'api_key': config_manager.get("api_keys", {}).get("alpha_vantage", "")
             },
             DataProvider.FINNHUB: {
-                'enabled': bool(config_manager.get("api.finnhub_key")),
+                'enabled': bool(config_manager.get("api_keys", {}).get("finnhub", "")),
                 'priority': 3,
-                'rate_limit': 60,
+                'rate_limit': 60,  # requests per minute
+                'rate_window': 60,  # 1 minute
                 'timeout': 10,
-                'api_key': config_manager.get("api.finnhub_key", "")
+                'retry_delay': 15,
+                'max_retries': 2,
+                'api_key': config_manager.get("api_keys", {}).get("finnhub", "")
             }
         }
         
         # Rate limiting tracking
-        self.rate_limits = {provider: {'count': 0, 'reset_time': time.time()} 
+        self.rate_limits = {provider: {'count': 0, 'reset_time': time.time()}
                            for provider in self.providers}
-        
+
+        # Provider health tracking
+        self.provider_health = {provider: ProviderHealth()
+                               for provider in self.providers}
+
+        # Retry configuration per provider
+        self.retry_configs = {
+            DataProvider.YAHOO_FINANCE: RetryConfig(
+                max_retries=5,
+                base_delay=2.0,
+                max_delay=120.0,  # 2 minutes max
+                exponential_base=1.5
+            ),
+            DataProvider.ALPHA_VANTAGE: RetryConfig(
+                max_retries=3,
+                base_delay=5.0,
+                max_delay=300.0,  # 5 minutes max
+                exponential_base=2.0
+            ),
+            DataProvider.FINNHUB: RetryConfig(
+                max_retries=3,
+                base_delay=3.0,
+                max_delay=180.0,  # 3 minutes max
+                exponential_base=1.8
+            )
+        }
+
         self.session = None
     
     async def get_session(self):
@@ -287,90 +360,341 @@ class DataProviderManager:
     def get_available_providers(self, data_type: str = 'price') -> List[DataProvider]:
         """Get list of available providers for data type, sorted by priority"""
         available = []
-        
+
         for provider, config in self.providers.items():
-            if config['enabled'] and not self._is_rate_limited(provider):
+            if (config['enabled'] and
+                not self._is_rate_limited(provider) and
+                not self._is_circuit_breaker_open(provider)):
                 available.append(provider)
-        
-        # Sort by priority
+
+        # Sort by priority (lower number = higher priority)
         available.sort(key=lambda p: self.providers[p]['priority'])
         return available
-    
+
+    def get_provider_health_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Get health summary for all providers"""
+        summary = {}
+
+        for provider, health in self.provider_health.items():
+            rate_info = self.rate_limits[provider]
+            provider_config = self.providers[provider]
+
+            summary[provider.value] = {
+                'enabled': provider_config['enabled'],
+                'success_count': health.success_count,
+                'failure_count': health.failure_count,
+                'success_rate': (health.success_count / max(health.success_count + health.failure_count, 1)) * 100,
+                'average_response_time': health.average_response_time,
+                'circuit_breaker_open': health.circuit_breaker.is_open,
+                'rate_limit_usage': f"{rate_info['count']}/{provider_config['rate_limit']}",
+                'last_success': health.last_success_time,
+                'last_failure': health.last_failure_time
+            }
+
+        return summary
+
+    async def fetch_price_with_fallback(self, symbol: str) -> Optional[PriceData]:
+        """
+        Fetch price using intelligent provider fallback.
+        Tries providers in order of priority, respecting rate limits and circuit breakers.
+        """
+        available_providers = self.get_available_providers('price')
+
+        if not available_providers:
+            self.logger.warning(f"No available providers for {symbol}")
+            return None
+
+        for provider in available_providers:
+            try:
+                self.logger.debug(f"Trying {provider.value} for {symbol}")
+
+                if provider == DataProvider.YAHOO_FINANCE:
+                    result = await self.fetch_price_yahoo(symbol)
+                elif provider == DataProvider.ALPHA_VANTAGE:
+                    result = await self.fetch_price_alpha_vantage(symbol)
+                elif provider == DataProvider.FINNHUB:
+                    result = await self.fetch_price_finnhub(symbol)
+                else:
+                    continue
+
+                if result:
+                    self.logger.info(f"Successfully fetched {symbol} from {provider.value}")
+                    return result
+
+            except Exception as e:
+                self.logger.warning(f"Provider {provider.value} failed for {symbol}: {e}")
+                continue
+
+        self.logger.error(f"All providers failed for {symbol}")
+        return None
+
+    async def test_provider_connectivity(self, provider: DataProvider) -> bool:
+        """Test connectivity to a specific provider"""
+        test_symbol = "AAPL"  # Use AAPL as test symbol
+
+        try:
+            if provider == DataProvider.YAHOO_FINANCE:
+                result = await self.fetch_price_yahoo(test_symbol)
+            elif provider == DataProvider.ALPHA_VANTAGE:
+                result = await self.fetch_price_alpha_vantage(test_symbol)
+            elif provider == DataProvider.FINNHUB:
+                result = await self.fetch_price_finnhub(test_symbol)
+            else:
+                return False
+
+            return result is not None
+
+        except Exception as e:
+            self.logger.warning(f"Connectivity test failed for {provider.value}: {e}")
+            return False
+
+    def reset_circuit_breaker(self, provider: DataProvider):
+        """Manually reset a circuit breaker (admin function)"""
+        health = self.provider_health[provider]
+        health.circuit_breaker.is_open = False
+        health.circuit_breaker.failure_count = 0
+        health.circuit_breaker.half_open_time = None
+        self.logger.info(f"Circuit breaker manually reset for {provider.value}")
+
     def _is_rate_limited(self, provider: DataProvider) -> bool:
         """Check if provider is rate limited"""
         rate_info = self.rate_limits[provider]
+        provider_config = self.providers[provider]
         current_time = time.time()
-        
-        # Reset counter if needed (daily reset)
-        if current_time - rate_info['reset_time'] > 86400:
+
+        # Reset counter if window has passed
+        rate_window = provider_config.get('rate_window', 86400)  # default to daily
+        if current_time - rate_info['reset_time'] > rate_window:
             rate_info['count'] = 0
             rate_info['reset_time'] = current_time
-        
+
         # Check if over limit
-        return rate_info['count'] >= self.providers[provider]['rate_limit']
+        is_limited = rate_info['count'] >= provider_config['rate_limit']
+
+        if is_limited:
+            self.logger.warning(f"Provider {provider.value} is rate limited. "
+                              f"Count: {rate_info['count']}/{provider_config['rate_limit']}")
+
+        return is_limited
     
     def _increment_rate_limit(self, provider: DataProvider):
         """Increment rate limit counter"""
         self.rate_limits[provider]['count'] += 1
+
+    def _is_circuit_breaker_open(self, provider: DataProvider) -> bool:
+        """Check if circuit breaker is open for a provider"""
+        health = self.provider_health[provider]
+        circuit_breaker = health.circuit_breaker
+        current_time = time.time()
+
+        if circuit_breaker.is_open:
+            # Check if we should try half-open
+            if (current_time - circuit_breaker.last_failure_time) > circuit_breaker.recovery_timeout:
+                circuit_breaker.is_open = False
+                circuit_breaker.half_open_time = current_time
+                self.logger.info(f"Circuit breaker for {provider.value} moving to half-open state")
+                return False
+            return True
+
+        return False
+
+    def _record_success(self, provider: DataProvider, response_time: float):
+        """Record successful API call"""
+        health = self.provider_health[provider]
+        circuit_breaker = health.circuit_breaker
+
+        health.success_count += 1
+        health.last_success_time = time.time()
+
+        # Update average response time
+        if health.average_response_time == 0:
+            health.average_response_time = response_time
+        else:
+            # Exponential moving average
+            health.average_response_time = (health.average_response_time * 0.9) + (response_time * 0.1)
+
+        # Circuit breaker state management
+        if circuit_breaker.half_open_time is not None:
+            # In half-open state, count successes
+            circuit_breaker.success_threshold -= 1
+            if circuit_breaker.success_threshold <= 0:
+                # Close the circuit breaker
+                circuit_breaker.is_open = False
+                circuit_breaker.half_open_time = None
+                circuit_breaker.failure_count = 0
+                circuit_breaker.success_threshold = 3  # Reset
+                self.logger.info(f"Circuit breaker for {provider.value} closed after successful recovery")
+
+    def _record_failure(self, provider: DataProvider, error: Exception):
+        """Record failed API call and manage circuit breaker"""
+        health = self.provider_health[provider]
+        circuit_breaker = health.circuit_breaker
+
+        health.failure_count += 1
+        health.last_failure_time = time.time()
+        circuit_breaker.failure_count += 1
+        circuit_breaker.last_failure_time = time.time()
+
+        # Check if we should open the circuit breaker
+        if circuit_breaker.failure_count >= circuit_breaker.failure_threshold:
+            circuit_breaker.is_open = True
+            circuit_breaker.half_open_time = None
+            self.logger.warning(
+                f"Circuit breaker opened for {provider.value} after {circuit_breaker.failure_count} failures. "
+                f"Last error: {error}"
+            )
+
+    def _calculate_backoff_delay(self, provider: DataProvider, attempt: int) -> float:
+        """Calculate backoff delay with jitter"""
+        retry_config = self.retry_configs.get(provider, RetryConfig())
+
+        if retry_config.strategy == RetryStrategy.EXPONENTIAL_BACKOFF:
+            delay = retry_config.base_delay * (retry_config.exponential_base ** attempt)
+        elif retry_config.strategy == RetryStrategy.LINEAR_BACKOFF:
+            delay = retry_config.base_delay * (attempt + 1)
+        else:  # Fibonacci
+            fib = [1, 1]
+            for i in range(2, attempt + 3):
+                fib.append(fib[i-1] + fib[i-2])
+            delay = retry_config.base_delay * fib[min(attempt + 2, len(fib) - 1)]
+
+        # Apply jitter to prevent thundering herd
+        jitter = delay * retry_config.jitter_factor * (random.random() - 0.5)
+        delay = delay + jitter
+
+        # Ensure delay doesn't exceed maximum
+        delay = min(delay, retry_config.max_delay)
+
+        return delay
+
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        """Detect if error is due to rate limiting"""
+        error_messages = [
+            "rate limit", "too many requests", "quota exceeded",
+            "429", "throttled", "api limit", "request limit",
+            "rate exceeded", "usage limit"
+        ]
+
+        error_str = str(error).lower()
+        return any(msg in error_str for msg in error_messages)
     
     async def fetch_price_yahoo(self, symbol: str) -> Optional[PriceData]:
-        """Fetch price from Yahoo Finance"""
-        try:
-            # Use yfinance in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            
-            def get_yahoo_price():
-                ticker = yf.Ticker(symbol)
-                
-                # Try to get real-time price
-                try:
-                    hist = ticker.history(period="1d", interval="1m")
-                    if not hist.empty:
-                        price = float(hist['Close'].iloc[-1])
-                        volume = int(hist['Volume'].iloc[-1]) if 'Volume' in hist.columns else None
-                        timestamp = hist.index[-1].to_pydatetime()
-                        
-                        return PriceData(
-                            symbol=symbol,
-                            price=price,
-                            timestamp=timestamp,
-                            volume=volume,
-                            provider="yahoo"
-                        )
-                except Exception:
-                    pass
-                
-                # Fallback to info
-                info = ticker.info
-                price_fields = ["regularMarketPrice", "currentPrice", "price"]
-                
-                for field in price_fields:
-                    if field in info and info[field] and float(info[field]) > 0:
-                        return PriceData(
-                            symbol=symbol,
-                            price=float(info[field]),
-                            timestamp=datetime.now(),
-                            volume=info.get("regularMarketVolume"),
-                            change=info.get("regularMarketChange"),
-                            change_percent=info.get("regularMarketChangePercent"),
-                            provider="yahoo"
-                        )
-                
-                return None
-            
-            # Execute in thread pool
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(get_yahoo_price)
-                result = await loop.run_in_executor(None, future.result)
-                
-                if result:
-                    self._increment_rate_limit(DataProvider.YAHOO_FINANCE)
-                
-                return result
-                
-        except Exception as e:
-            self.logger.error(f"Error fetching Yahoo price for {symbol}: {e}")
+        """Fetch price from Yahoo Finance with intelligent retry logic"""
+        provider = DataProvider.YAHOO_FINANCE
+
+        # Check circuit breaker
+        if self._is_circuit_breaker_open(provider):
+            self.logger.warning(f"Circuit breaker open for {provider.value}, skipping request")
             return None
+
+        retry_config = self.retry_configs[provider]
+
+        for attempt in range(retry_config.max_retries + 1):
+            try:
+                start_time = time.time()
+
+                # Use yfinance in thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+
+                def get_yahoo_price():
+                    ticker = yf.Ticker(symbol)
+
+                    # Try to get real-time price
+                    try:
+                        hist = ticker.history(period="1d", interval="1m")
+                        if not hist.empty:
+                            price = float(hist['Close'].iloc[-1])
+                            volume = int(hist['Volume'].iloc[-1]) if 'Volume' in hist.columns else None
+                            timestamp = hist.index[-1].to_pydatetime()
+
+                            return PriceData(
+                                symbol=symbol,
+                                price=price,
+                                timestamp=timestamp,
+                                volume=volume,
+                                provider="yahoo"
+                            )
+                    except Exception as e:
+                        # Check if it's a rate limit error
+                        if self._is_rate_limit_error(e):
+                            raise e  # Re-raise to trigger retry logic
+                        pass
+
+                    # Fallback to info
+                    info = ticker.info
+                    price_fields = ["regularMarketPrice", "currentPrice", "price"]
+
+                    for field in price_fields:
+                        if field in info and info[field] and float(info[field]) > 0:
+                            return PriceData(
+                                symbol=symbol,
+                                price=float(info[field]),
+                                timestamp=datetime.now(),
+                                volume=info.get("regularMarketVolume"),
+                                change=info.get("regularMarketChange"),
+                                change_percent=info.get("regularMarketChangePercent"),
+                                provider="yahoo"
+                            )
+
+                    return None
+
+                # Execute in thread pool
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = loop.run_in_executor(executor, get_yahoo_price)
+                    result = await asyncio.wait_for(
+                        future,
+                        timeout=self.providers[DataProvider.YAHOO_FINANCE]['timeout']
+                    )
+
+                    if result:
+                        # Record success
+                        response_time = time.time() - start_time
+                        self._record_success(provider, response_time)
+                        self._increment_rate_limit(provider)
+
+                        self.logger.info(f"Successfully fetched {symbol} from Yahoo Finance "
+                                       f"(attempt {attempt + 1}, {response_time:.2f}s)")
+                        return result
+
+                    # No data returned but no exception - try next attempt
+                    if attempt < retry_config.max_retries:
+                        delay = self._calculate_backoff_delay(provider, attempt)
+                        self.logger.info(f"No data for {symbol} from Yahoo Finance, "
+                                       f"retrying in {delay:.1f}s (attempt {attempt + 1})")
+                        await asyncio.sleep(delay)
+                        continue
+
+                    return None
+
+            except Exception as e:
+                # Record failure
+                self._record_failure(provider, e)
+
+                # Check if this is a rate limit error
+                is_rate_limit = self._is_rate_limit_error(e)
+
+                if is_rate_limit:
+                    self.logger.warning(f"Rate limit hit for Yahoo Finance on {symbol} "
+                                      f"(attempt {attempt + 1}): {e}")
+                else:
+                    self.logger.error(f"Error fetching {symbol} from Yahoo Finance "
+                                    f"(attempt {attempt + 1}): {e}")
+
+                # If this is the last attempt, give up
+                if attempt >= retry_config.max_retries:
+                    self.logger.error(f"All retry attempts exhausted for {symbol} from Yahoo Finance")
+                    return None
+
+                # Calculate backoff delay (longer for rate limits)
+                delay = self._calculate_backoff_delay(provider, attempt)
+                if is_rate_limit:
+                    delay *= 2  # Double delay for rate limit errors
+
+                self.logger.info(f"Retrying {symbol} from Yahoo Finance in {delay:.1f}s "
+                               f"(attempt {attempt + 1}/{retry_config.max_retries})")
+                await asyncio.sleep(delay)
+
+        return None
     
     async def fetch_price_alpha_vantage(self, symbol: str) -> Optional[PriceData]:
         """Fetch price from Alpha Vantage"""
@@ -454,11 +778,9 @@ class DataProviderManager:
 
 
 
-    def get_current_price(self, symbol: str) -> float:
-        """Get current price for a symbol using yfinance"""
+    async def get_current_price_async(self, symbol: str) -> Optional[float]:
+        """Get current price using intelligent provider fallback"""
         try:
-            import yfinance as yf
-            
             # Handle special symbols
             if symbol == "VIX":
                 symbol = "^VIX"
@@ -466,24 +788,152 @@ class DataProviderManager:
                 symbol = "^GSPC"
             elif symbol == "NDX":
                 symbol = "^NDX"
-            
+
+            # Try with intelligent fallback
+            price_data = await self.fetch_price_with_fallback(symbol)
+            if price_data:
+                return price_data.price
+
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Error fetching price for {symbol}: {e}")
+            return None
+
+    def get_current_price(self, symbol: str) -> float:
+        """Get current price for a symbol (synchronous wrapper)"""
+        try:
+            # Check cache first
+            cache_key = f"price_{symbol}"
+            cached_price = self.cache.get(cache_key, 'price')
+            if cached_price is not None:
+                return float(cached_price)
+
+            # Handle special symbols
+            if symbol == "VIX":
+                symbol = "^VIX"
+            elif symbol == "SPX":
+                symbol = "^GSPC"
+            elif symbol == "NDX":
+                symbol = "^NDX"
+
+            # For synchronous calls, fallback to direct Yahoo Finance
+            # (This maintains backwards compatibility)
+            import yfinance as yf
+
             ticker = yf.Ticker(symbol)
             data = ticker.history(period="1d")
-            
+
             if not data.empty:
                 price = float(data["Close"].iloc[-1])
-                if hasattr(self, "logger"):
-                    self.logger.info(f"Fetched {symbol}: ${price:.2f}")
+                # Cache the result
+                self.cache.set(cache_key, price, 'price')
+                self.logger.info(f"Fetched {symbol}: ${price:.2f}")
                 return price
             else:
-                if hasattr(self, "logger"):
-                    self.logger.warning(f"No data for {symbol}")
+                self.logger.warning(f"No data for {symbol}")
                 return 0.0
-                
+
         except Exception as e:
-            if hasattr(self, "logger"):
-                self.logger.error(f"Error fetching {symbol}: {e}")
+            self.logger.error(f"Error fetching {symbol}: {e}")
             return 0.0
+
+    def get_historical_data(self, symbol: str, period: str = "1y",
+                          interval: str = "1d") -> pd.DataFrame:
+        """
+        Get historical data for symbol
+
+        Args:
+            symbol: Stock symbol
+            period: Data period (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)
+            interval: Data interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)
+
+        Returns:
+            DataFrame with OHLCV data
+        """
+        try:
+            # 🔧 PARAMETER SAFETY FIX: Validate symbol is string, not DataFrame
+            if not isinstance(symbol, str):
+                self.logger.error(f"🔧 SYMBOL TYPE ERROR FIX: Expected str, got {type(symbol).__name__}: {symbol}")
+                return pd.DataFrame()
+
+            symbol = symbol.upper().strip()
+
+            # Check cache first
+            cache_key = f"historical_{symbol}_{period}_{interval}"
+            cached_data = self.cache.get(cache_key, 'historical')
+
+            if cached_data and isinstance(cached_data, dict):
+                try:
+                    # Fixed cache reconstruction: Handle string-based datetime index from cache
+                    df = pd.DataFrame(cached_data['data'])
+
+                    # Check if this uses the new string index format
+                    if cached_data.get('data_format') == 'string_index':
+                        # Index is already properly formatted strings, convert to datetime
+                        df.index = pd.to_datetime(df.index)
+                    else:
+                        # Legacy format - try to convert
+                        try:
+                            df.index = pd.to_datetime(df.index)
+                        except Exception as legacy_error:
+                            self.logger.warning(f"Legacy cache format conversion failed: {legacy_error}")
+                            return pd.DataFrame()  # Force fresh fetch
+
+                    if not df.empty and len(df) > 10:  # Reasonable amount of data
+                        return df
+                except Exception as cache_error:
+                    self.logger.warning(f"Error reconstructing cached historical data: {cache_error}")
+                    # Clear corrupted cache entry
+                    self.cache.delete(cache_key, 'historical')
+
+            # Fetch fresh data using yfinance
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            hist_data = ticker.history(period=period, interval=interval)
+
+            if not hist_data.empty:
+                # Fix critical cache issue: Convert Timestamp index to string keys for cache compatibility
+                # hist_data.to_dict('index') creates Timestamp keys which cache system rejects
+                try:
+                    # Convert index to ISO strings before creating dict
+                    hist_data_copy = hist_data.copy()
+                    hist_data_copy.index = hist_data_copy.index.strftime('%Y-%m-%d %H:%M:%S')
+
+                    # Cache the result with string-keyed data
+                    cache_data = {
+                        'data': hist_data_copy.to_dict('index'),
+                        'period': period,
+                        'interval': interval,
+                        'symbol': symbol,
+                        'start_date': hist_data.index[0].isoformat(),
+                        'end_date': hist_data.index[-1].isoformat(),
+                        'data_format': 'string_index'  # Mark for proper reconstruction
+                    }
+                except Exception as e:
+                    self.logger.warning(f"Error preparing cache data for {symbol}: {e}")
+                    # Fallback: cache without historical data dict
+                    cache_data = {
+                        'symbol': symbol,
+                        'period': period,
+                        'interval': interval,
+                        'start_date': hist_data.index[0].isoformat(),
+                        'end_date': hist_data.index[-1].isoformat(),
+                        'row_count': len(hist_data),
+                        'data_format': 'fallback'
+                    }
+
+                self.cache.set(cache_key, cache_data, 'historical')
+
+                self.logger.debug(f"Retrieved {len(hist_data)} data points for {symbol}")
+                return hist_data
+            else:
+                self.logger.warning(f"No historical data available for {symbol}")
+                return pd.DataFrame()
+
+        except Exception as e:
+            self.logger.error(f"Error getting historical data for {symbol}: {e}")
+            return pd.DataFrame()
 
 class MarketDataService(QObject):
     """
@@ -524,7 +974,25 @@ class MarketDataService(QObject):
         self.connection_timer.start(60000)  # 1 minute
         
         self.logger.info("MarketDataService initialized")
-    
+
+    def get_provider_health(self) -> Dict[str, Dict[str, Any]]:
+        """Get health status of all data providers"""
+        return self.provider_manager.get_provider_health_summary()
+
+    async def get_price_with_retry(self, symbol: str) -> Optional[float]:
+        """Get price using intelligent retry and fallback logic"""
+        price_data = await self.provider_manager.fetch_price_with_fallback(symbol)
+        return price_data.price if price_data else None
+
+    def reset_provider_circuit_breaker(self, provider_name: str):
+        """Reset circuit breaker for a provider"""
+        try:
+            provider = DataProvider(provider_name.lower())
+            self.provider_manager.reset_circuit_breaker(provider)
+            self.logger.info(f"Reset circuit breaker for {provider_name}")
+        except ValueError:
+            self.logger.error(f"Unknown provider: {provider_name}")
+
     def start(self):
         """Start the market data service"""
         if self.is_running:
@@ -574,6 +1042,11 @@ class MarketDataService(QObject):
             Next earnings date or None if unavailable
         """
         try:
+            # 🔧 PARAMETER SAFETY FIX: Validate symbol is string, not DataFrame
+            if not isinstance(symbol, str):
+                self.logger.error(f"🔧 SYMBOL TYPE ERROR FIX: Expected str, got {type(symbol).__name__}: {symbol}")
+                return None
+
             symbol = symbol.upper().strip()
             
             # Check cache first
@@ -641,6 +1114,10 @@ class MarketDataService(QObject):
         except Exception as e:
             self.logger.error(f"Error getting earnings date for {symbol}: {e}")
             return None
+
+    def get_next_earnings_date(self, symbol: str) -> Optional[date]:
+        """Backward-compatible alias for get_next_earnings."""
+        return self.get_next_earnings(symbol)
     
     def get_multiple_prices(self, symbols: List[str]) -> Dict[str, Optional[float]]:
         """
@@ -792,15 +1269,18 @@ class MarketDataService(QObject):
                     break
                 
                 # Process update request
-                symbol, force_refresh = update_request
-                self.get_current_price(symbol, force_refresh)
+                if isinstance(update_request, tuple) and len(update_request) == 2:
+                    symbol, force_refresh = update_request
+                else:
+                    symbol, force_refresh = update_request, False
+                self.get_current_price(symbol, force_refresh=bool(force_refresh))
                 
             except queue.Empty:
                 continue
             except Exception as e:
                 self.logger.error(f"Error in update worker: {e}")
-    
-        # TEMP FIX: def _test_connection(self):
+
+    def _test_connection(self):
         """Test connection to data providers"""
         try:
             # Test with a common symbol
@@ -844,16 +1324,15 @@ class MarketDataService(QObject):
         """Clear all cached data"""
         try:
             # Clear memory cache
-            with self.cache.cache_lock:
-                self.cache.memory_cache.clear()
-            
+            self.cache.memory_cache.clear()
+
             # Clear database cache
             with sqlite3.connect(self.cache.db_path) as conn:
                 conn.execute("DELETE FROM market_cache")
                 conn.commit()
-            
+
             self.logger.info("Market data cache cleared")
-            
+
         except Exception as e:
             self.logger.error(f"Error clearing cache: {e}")
     def get_market_overview(self):
@@ -879,99 +1358,183 @@ class MarketDataService(QObject):
                 'updated': False
             }
     
+
     def get_vix(self):
-        """Get current VIX (volatility index)"""
+        """Get current VIX (volatility index) with caching"""
         try:
+            # Check cache first
+            cache_key = "price_^VIX"
+            cached_price = self.cache.get(cache_key, 'price')
+            if cached_price is not None:
+                return float(cached_price)
+
             import yfinance as yf
             ticker = yf.Ticker("^VIX")
             data = ticker.history(period="1d")
             if not data.empty:
-                return round(float(data['Close'].iloc[-1]), 2)
-        except:
-            pass
+                price = round(float(data['Close'].iloc[-1]), 2)
+                # Cache the result
+                self.cache.set(cache_key, price, 'price')
+                return price
+        except Exception as e:
+            self.logger.warning(f"Error fetching VIX: {e}")
         return 23.45  # Default fallback
-    
+
     def get_spx(self):
-        """Get current S&P 500 price"""
+        """Get current S&P 500 price with caching"""
         try:
+            # Check cache first
+            cache_key = "price_^GSPC"
+            cached_price = self.cache.get(cache_key, 'price')
+            if cached_price is not None:
+                return float(cached_price)
+
             import yfinance as yf
             ticker = yf.Ticker("^GSPC")
             data = ticker.history(period="1d")
             if not data.empty:
-                return round(float(data['Close'].iloc[-1]), 2)
-        except:
-            pass
+                price = round(float(data['Close'].iloc[-1]), 2)
+                # Cache the result
+                self.cache.set(cache_key, price, 'price')
+                return price
+        except Exception as e:
+            self.logger.warning(f"Error fetching SPX: {e}")
         return 4850.00  # More realistic default
-    
+
     def get_nasdaq(self):
-        """Get current NASDAQ price"""
+        """Get current NASDAQ price with caching"""
         try:
+            # Check cache first
+            cache_key = "price_^IXIC"
+            cached_price = self.cache.get(cache_key, 'price')
+            if cached_price is not None:
+                return float(cached_price)
+
             import yfinance as yf
             ticker = yf.Ticker("^IXIC")
             data = ticker.history(period="1d")
             if not data.empty:
-                return round(float(data['Close'].iloc[-1]), 2)
-        except:
-            pass
-        return 15200.00  # More realistic default
-    
-    def get_vix(self):
-        """Get current VIX (volatility index)"""
-        try:
-            import yfinance as yf
-            ticker = yf.Ticker("^VIX")
-            data = ticker.history(period="1d")
-            if not data.empty:
-                return round(float(data['Close'].iloc[-1]), 2)
-        except:
-            pass
-        return 23.45  # Default fallback
-    
-    def get_spx(self):
-        """Get current S&P 500 price"""
-        try:
-            import yfinance as yf
-            ticker = yf.Ticker("^GSPC")
-            data = ticker.history(period="1d")
-            if not data.empty:
-                return round(float(data['Close'].iloc[-1]), 2)
-        except:
-            pass
-        return 4850.00  # More realistic default
-    
-    def get_nasdaq(self):
-        """Get current NASDAQ price"""
-        try:
-            import yfinance as yf
-            ticker = yf.Ticker("^IXIC")
-            data = ticker.history(period="1d")
-            if not data.empty:
-                return round(float(data['Close'].iloc[-1]), 2)
-        except:
-            pass
+                price = round(float(data['Close'].iloc[-1]), 2)
+                # Cache the result
+                self.cache.set(cache_key, price, 'price')
+                return price
+        except Exception as e:
+            self.logger.warning(f"Error fetching NASDAQ: {e}")
         return 15200.00  # More realistic default
 
-    def get_current_price(self, symbol: str) -> float:
-        """Get current price for a symbol using yfinance"""
+    def get_current_price(self, symbol: str, force_refresh: bool = False) -> float:
+        """Get current price for a symbol with caching"""
         try:
-            import yfinance as yf
-            
-            # Map symbols
+            # Check cache first
+            cache_key = f"price_{symbol}"
+            if not force_refresh:
+                cached_price = self.cache.get(cache_key, 'price')
+                if cached_price is not None:
+                    return float(cached_price)
+
+            # Handle special symbols
             if symbol == "VIX":
                 symbol = "^VIX"
             elif symbol == "SPX":
                 symbol = "^GSPC"
             elif symbol == "NDX":
                 symbol = "^NDX"
-                
+
+            # Fetch fresh data
+            import yfinance as yf
             ticker = yf.Ticker(symbol)
             data = ticker.history(period="1d")
-            
+
             if not data.empty:
                 price = float(data["Close"].iloc[-1])
+                # Cache the result for 1 minute
+                self.cache.set(cache_key, price, 'price')
+                self.logger.info(f"Fetched {symbol}: ${price:.2f}")
                 return price
-            return 0.0
-            
+            else:
+                self.logger.warning(f"No data available for {symbol}")
+                return 0.0
+
         except Exception as e:
-            print(f"Error fetching {symbol}: {e}")
+            self.logger.error(f"Error fetching {symbol}: {e}")
             return 0.0
+
+    def get_historical_data(self, symbol: str, period: str = "1y",
+                          interval: str = "1d") -> pd.DataFrame:
+        """Get historical data for symbol with caching"""
+        try:
+            # Check cache first
+            cache_key = f"historical_{symbol}_{period}_{interval}"
+            cached_data = self.cache.get(cache_key, 'historical')
+
+            if cached_data and isinstance(cached_data, dict):
+                try:
+                    # Fixed cache reconstruction: Handle string-based datetime index from cache
+                    df = pd.DataFrame(cached_data['data'])
+
+                    # Check if this uses the new string index format
+                    if cached_data.get('data_format') == 'string_index':
+                        # Index is already properly formatted strings, convert to datetime
+                        df.index = pd.to_datetime(df.index)
+                    else:
+                        # Legacy format - try to convert
+                        try:
+                            df.index = pd.to_datetime(df.index)
+                        except Exception as legacy_error:
+                            self.logger.warning(f"Legacy cache format conversion failed: {legacy_error}")
+                            return pd.DataFrame()  # Force fresh fetch
+
+                    if not df.empty and len(df) > 10:  # Reasonable amount of data
+                        return df
+                except Exception as cache_error:
+                    self.logger.warning(f"Error reconstructing cached historical data: {cache_error}")
+                    # Clear corrupted cache entry
+                    self.cache.delete(cache_key, 'historical')
+
+            # Fetch fresh data
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            hist_data = ticker.history(period=period, interval=interval)
+
+            if not hist_data.empty:
+                # Fix critical cache issue: Convert Timestamp index to string keys for cache compatibility
+                # hist_data.to_dict('index') creates Timestamp keys which cache system rejects
+                try:
+                    # Convert index to ISO strings before creating dict
+                    hist_data_copy = hist_data.copy()
+                    hist_data_copy.index = hist_data_copy.index.strftime('%Y-%m-%d %H:%M:%S')
+
+                    # Cache the result with string-keyed data
+                    cache_data = {
+                        'data': hist_data_copy.to_dict('index'),
+                        'period': period,
+                        'interval': interval,
+                        'symbol': symbol,
+                        'start_date': hist_data.index[0].isoformat(),
+                        'end_date': hist_data.index[-1].isoformat(),
+                        'data_format': 'string_index'  # Mark for proper reconstruction
+                    }
+                except Exception as e:
+                    self.logger.warning(f"Error preparing cache data for {symbol}: {e}")
+                    # Fallback: cache without historical data dict
+                    cache_data = {
+                        'symbol': symbol,
+                        'period': period,
+                        'interval': interval,
+                        'start_date': hist_data.index[0].isoformat(),
+                        'end_date': hist_data.index[-1].isoformat(),
+                        'row_count': len(hist_data),
+                        'data_format': 'fallback'
+                    }
+
+                self.cache.set(cache_key, cache_data, 'historical')
+
+                self.logger.debug(f"Retrieved {len(hist_data)} data points for {symbol}")
+                return hist_data
+            else:
+                self.logger.warning(f"No historical data available for {symbol}")
+                return pd.DataFrame()
+
+        except Exception as e:
+            self.logger.error(f"Error getting historical data for {symbol}: {e}")
+            return pd.DataFrame()

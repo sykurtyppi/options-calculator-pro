@@ -311,36 +311,56 @@ class MLService:
                 self.logger.error(traceback.format_exc())
                 return False
     
-    def predict_trade_outcome(self, raw_data: Dict[str, Any]) -> PredictionResult:
+    def predict_trade_outcome(self, raw_data: Union[Dict[str, Any], 'TradeFeatures']) -> PredictionResult:
         """
         Predict outcome of a trade using the trained model
-        
+
         Args:
-            raw_data: Raw trade data dictionary
-            
+            raw_data: Raw trade data dictionary or TradeFeatures object
+
         Returns:
             PredictionResult with probability and analysis
         """
         try:
+            # Handle both TradeFeatures objects and raw data dictionaries
+            if isinstance(raw_data, TradeFeatures):
+                features = raw_data
+            else:
+                # Prepare features from raw data dictionary
+                features = self.prepare_features(raw_data)
+
             # Check if model is available
             if self.model is None:
-                self.logger.warning("No trained model available, returning default prediction")
-                return self._get_default_prediction()
-            
-            # Prepare features
-            features = self.prepare_features(raw_data)
+                self.logger.warning("No trained model available, using rules-based prediction")
+                return self._get_default_prediction(features)
+
+            # Create feature array for model
             feature_array = features.to_array().reshape(1, -1)
             
-            # Scale features
-            if self.feature_scaler:
-                feature_array = self.feature_scaler.transform(feature_array)
-            
-            # Select features
-            if self.feature_selector:
-                feature_array = self.feature_selector.transform(feature_array)
-            
-            # Make prediction
-            probability = self.model.predict_proba(feature_array)[0, 1]  # Probability of success
+            # Handle different model structures
+            if isinstance(self.model, dict):
+                # Institutional model structure with separate return/direction models
+                if self.model.get('scaler'):
+                    feature_array = self.model['scaler'].transform(feature_array)
+
+                # Use return model for probability prediction
+                if 'return_model' in self.model:
+                    probability = self.model['return_model'].predict_proba(feature_array)[0, 1]
+                else:
+                    self.logger.warning("Return model not found in institutional model structure")
+                    return self._get_default_prediction(features)
+            else:
+                # Legacy single model structure
+                # Scale features
+                if self.feature_scaler:
+                    feature_array = self.feature_scaler.transform(feature_array)
+
+                # Select features
+                if self.feature_selector:
+                    feature_array = self.feature_selector.transform(feature_array)
+
+                # Make prediction
+                probability = self.model.predict_proba(feature_array)[0, 1]  # Probability of success
             
             # Determine confidence level
             confidence = self._determine_confidence(probability)
@@ -371,7 +391,11 @@ class MLService:
             
         except Exception as e:
             self.logger.error(f"Error predicting trade outcome: {e}")
-            return self._get_default_prediction()
+            # Try to use prepared features if available, otherwise fall back to None
+            try:
+                return self._get_default_prediction(features if 'features' in locals() else None)
+            except:
+                return self._get_default_prediction()
     
     def get_model_performance(self) -> Optional[ModelMetrics]:
         """Get current model performance metrics"""
@@ -684,6 +708,28 @@ class MLService:
     
     def _load_model(self) -> bool:
         try:
+            # Try institutional models first
+            institutional_models_dir = os.path.expanduser("~/.options_calculator_pro/models")
+            return_model_path = os.path.join(institutional_models_dir, "calendar_spread_return_model.pkl")
+            direction_model_path = os.path.join(institutional_models_dir, "calendar_spread_direction_model.pkl")
+            scaler_path = os.path.join(institutional_models_dir, "feature_scaler.pkl")
+
+            if os.path.exists(return_model_path) and os.path.exists(direction_model_path):
+                try:
+                    import joblib
+                    self.model = {
+                        'return_model': joblib.load(return_model_path),
+                        'direction_model': joblib.load(direction_model_path),
+                        'scaler': joblib.load(scaler_path) if os.path.exists(scaler_path) else None
+                    }
+                    self.logger.info("🏛️ Institutional ML models loaded successfully")
+                    self.logger.info(f"   Return model: {return_model_path}")
+                    self.logger.info(f"   Direction model: {direction_model_path}")
+                    return True
+                except Exception as e:
+                    self.logger.warning(f"Failed to load institutional models: {e}")
+
+            # Fall back to standard model
             if not os.path.exists(self.model_file):
                 self.logger.info("No saved model found")
                 return False
@@ -804,17 +850,112 @@ class MLService:
         else:
             return "STRONG SELL"
     
-    def _get_default_prediction(self) -> PredictionResult:
-        """Get default prediction when model is unavailable"""
-        return PredictionResult(
-            probability=0.5,
-            confidence=PredictionConfidence.MODERATE,
-            contributing_factors={},
-            risk_score=0.5,
-            recommendation="HOLD",
-            model_version="DEFAULT",
-            prediction_timestamp=datetime.now()
-        )
+    def _get_default_prediction(self, features: Optional['TradeFeatures'] = None) -> PredictionResult:
+        """Get enhanced rules-based prediction when model is unavailable"""
+
+        if features is None:
+            # Basic default when no features available
+            return PredictionResult(
+                probability=0.5,
+                confidence=PredictionConfidence.LOW,
+                contributing_factors={"status": "no_features"},
+                risk_score=0.5,
+                recommendation="HOLD",
+                model_version="RULES_BASED_DEFAULT",
+                prediction_timestamp=datetime.now()
+            )
+
+        # Rules-based scoring using technical analysis
+        try:
+            score = 0.5  # Base 50%
+            factors = {}
+            confidence_score = 0.0
+
+            # IV Rank analysis (30% weight)
+            if hasattr(features, 'iv_rank') and features.iv_rank > 0.7:  # High IV favorable for selling
+                score += 0.15
+                factors["high_iv_rank"] = 0.15
+                confidence_score += 0.3
+            elif hasattr(features, 'iv_rank') and features.iv_rank < 0.3:  # Low IV less favorable
+                score -= 0.1
+                factors["low_iv_rank"] = -0.1
+                confidence_score += 0.2
+
+            # IV vs RV analysis (25% weight)
+            if hasattr(features, 'iv30_rv30'):
+                iv_rv_ratio = features.iv30_rv30
+                if iv_rv_ratio > 1.2:  # IV significantly higher than RV
+                    score += 0.12
+                    factors["iv_premium"] = 0.12
+                    confidence_score += 0.25
+                elif iv_rv_ratio < 0.8:  # RV higher than IV (risky)
+                    score -= 0.15
+                    factors["rv_premium"] = -0.15
+                    confidence_score += 0.25
+
+            # RSI analysis
+            if hasattr(features, 'rsi'):
+                if features.rsi < 30:  # Oversold
+                    score += 0.08
+                    factors["oversold_rsi"] = 0.08
+                elif features.rsi > 70:  # Overbought
+                    score -= 0.05
+                    factors["overbought_rsi"] = -0.05
+                confidence_score += 0.15
+
+            # Volume analysis
+            if hasattr(features, 'volume_ratio') and features.volume_ratio > 1.5:  # High volume
+                score += 0.08
+                factors["high_volume"] = 0.08
+                confidence_score += 0.1
+
+            # Ensure probability stays in valid range
+            probability = max(0.1, min(0.9, score))
+
+            # Calculate confidence based on how many factors contributed
+            if confidence_score > 0.6:
+                confidence = PredictionConfidence.HIGH
+            elif confidence_score > 0.3:
+                confidence = PredictionConfidence.MODERATE
+            else:
+                confidence = PredictionConfidence.LOW
+
+            # Generate recommendation
+            if probability > 0.65:
+                recommendation = "BUY"
+                risk_score = 0.3
+            elif probability > 0.55:
+                recommendation = "MODERATE_BUY"
+                risk_score = 0.4
+            elif probability > 0.45:
+                recommendation = "HOLD"
+                risk_score = 0.5
+            else:
+                recommendation = "AVOID"
+                risk_score = 0.6
+
+            return PredictionResult(
+                probability=probability,
+                confidence=confidence,
+                contributing_factors=factors,
+                risk_score=risk_score,
+                recommendation=recommendation,
+                model_version="RULES_BASED_v1.0",
+                prediction_timestamp=datetime.now()
+            )
+
+        except Exception as e:
+            self.logger.warning(f"Error in rules-based prediction: {e}")
+            # Fallback to basic default
+            return PredictionResult(
+                probability=0.5,
+                confidence=PredictionConfidence.LOW,
+                contributing_factors={"error": str(e)},
+                risk_score=0.5,
+                recommendation="HOLD",
+                model_version="RULES_BASED_FALLBACK",
+                prediction_timestamp=datetime.now()
+            )
     
     def _get_default_features(self) -> TradeFeatures:
         """Get default features when preparation fails"""

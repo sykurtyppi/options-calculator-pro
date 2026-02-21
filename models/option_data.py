@@ -176,7 +176,7 @@ class CalendarSpread:
     def estimate_pnl(self, new_underlying_price: float, iv_change: float = 0.0, days_passed: int = 0) -> float:
         """Estimate P&L for given scenario"""
         net_greeks = self.calculate_net_greeks()
-        price_change = new_underlying_price - self.short_option.symbol
+        price_change = new_underlying_price - self.strike
         delta_pnl = net_greeks['delta'] * price_change * self.contracts * 100
         theta_pnl = net_greeks['theta'] * days_passed * self.contracts * 100
         vega_pnl = net_greeks['vega'] * iv_change * self.contracts * 100

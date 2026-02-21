@@ -558,5 +558,157 @@ def create_calendar_spread_trade(symbol: str, strike: float, short_expiration: d
        entry_date=date.today(),
        legs=[short_leg, long_leg]
    )
-   
+
    return trade
+
+@dataclass
+class TradePlan:
+    """Trade plan with analysis and risk management"""
+    id: str
+    symbol: str
+    trade_type: TradeType
+    direction: TradeDirection
+
+    # Analysis inputs
+    underlying_price: float
+    implied_volatility: float
+    historical_volatility: float
+    iv_rank: float
+    days_to_earnings: int
+    vix_level: float
+
+    # Strategy parameters
+    target_strike: float
+    target_expiration: date
+    max_risk: float
+    profit_target: float
+    stop_loss_percentage: float
+
+    # Analysis scores
+    technical_score: float = 0.0
+    fundamental_score: float = 0.0
+    volatility_score: float = 0.0
+    overall_confidence: float = 0.0
+
+    # Risk metrics
+    probability_of_profit: float = 0.0
+    expected_return: float = 0.0
+    risk_reward_ratio: float = 0.0
+    kelly_fraction: float = 0.0
+
+    # Metadata
+    analysis_date: datetime = field(default_factory=datetime.now)
+    notes: str = ""
+    approved: bool = False
+
+    @property
+    def is_high_confidence(self) -> bool:
+        """Check if this is a high confidence trade"""
+        return self.overall_confidence >= 0.7
+
+    @property
+    def is_favorable_risk_reward(self) -> bool:
+        """Check if risk/reward is favorable"""
+        return self.risk_reward_ratio >= 2.0
+
+    @property
+    def recommended_position_size(self) -> float:
+        """Calculate recommended position size based on Kelly criterion"""
+        return min(0.25, max(0.01, self.kelly_fraction))  # Cap at 25%, minimum 1%
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            "id": self.id,
+            "symbol": self.symbol,
+            "trade_type": self.trade_type.value,
+            "direction": self.direction.value,
+            "underlying_price": self.underlying_price,
+            "implied_volatility": self.implied_volatility,
+            "historical_volatility": self.historical_volatility,
+            "iv_rank": self.iv_rank,
+            "days_to_earnings": self.days_to_earnings,
+            "vix_level": self.vix_level,
+            "target_strike": self.target_strike,
+            "target_expiration": self.target_expiration.isoformat(),
+            "max_risk": self.max_risk,
+            "profit_target": self.profit_target,
+            "stop_loss_percentage": self.stop_loss_percentage,
+            "technical_score": self.technical_score,
+            "fundamental_score": self.fundamental_score,
+            "volatility_score": self.volatility_score,
+            "overall_confidence": self.overall_confidence,
+            "probability_of_profit": self.probability_of_profit,
+            "expected_return": self.expected_return,
+            "risk_reward_ratio": self.risk_reward_ratio,
+            "kelly_fraction": self.kelly_fraction,
+            "analysis_date": self.analysis_date.isoformat(),
+            "notes": self.notes,
+            "approved": self.approved
+        }
+
+@dataclass
+class TradeExecution:
+    """Trade execution record"""
+    id: str
+    plan_id: str
+    trade_id: str
+
+    # Execution details
+    execution_date: datetime
+    execution_price: float
+    executed_quantity: int
+    commission: float
+    slippage: float
+
+    # Market conditions at execution
+    market_price: float
+    bid_ask_spread: float
+    volume: int
+    implied_volatility_at_execution: float
+
+    # Execution quality metrics
+    price_improvement: float = 0.0  # How much better than expected
+    time_to_fill: float = 0.0  # Seconds to fill
+    partial_fills: int = 0
+    execution_quality_score: float = 0.0
+
+    # Notes
+    execution_venue: str = ""
+    notes: str = ""
+
+    @property
+    def total_cost(self) -> float:
+        """Total cost including commission and slippage"""
+        return (self.execution_price * self.executed_quantity * 100) + self.commission + self.slippage
+
+    @property
+    def effective_price(self) -> float:
+        """Effective price per contract including all costs"""
+        return self.total_cost / (self.executed_quantity * 100)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return {
+            "id": self.id,
+            "plan_id": self.plan_id,
+            "trade_id": self.trade_id,
+            "execution_date": self.execution_date.isoformat(),
+            "execution_price": self.execution_price,
+            "executed_quantity": self.executed_quantity,
+            "commission": self.commission,
+            "slippage": self.slippage,
+            "market_price": self.market_price,
+            "bid_ask_spread": self.bid_ask_spread,
+            "volume": self.volume,
+            "implied_volatility_at_execution": self.implied_volatility_at_execution,
+            "price_improvement": self.price_improvement,
+            "time_to_fill": self.time_to_fill,
+            "partial_fills": self.partial_fills,
+            "execution_quality_score": self.execution_quality_score,
+            "execution_venue": self.execution_venue,
+            "notes": self.notes
+        }
+
+# Alias for backwards compatibility
+TradeData = Trade

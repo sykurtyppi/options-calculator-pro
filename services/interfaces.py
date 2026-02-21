@@ -11,9 +11,9 @@ from datetime import date
 from decimal import Decimal
 import pandas as pd
 
-from models.option_data import OptionData
+from models.option_data import OptionContract, OptionChain, CalendarSpread
 from models.analysis_result import AnalysisResult
-from models.trade_data import TradeData
+from models.trade_data import TradePlan, TradeExecution, Trade
 from models.greeks import GreeksResult
 
 
@@ -65,7 +65,7 @@ class IVolatilityService(ABC):
     @abstractmethod
     def calculate_implied_volatility(
         self,
-        option: OptionData,
+        option: OptionContract,
         market_price: float
     ) -> Optional[float]:
         """Calculate implied volatility from market price"""
@@ -95,7 +95,7 @@ class IOptionsService(ABC):
     @abstractmethod
     def calculate_option_price(
         self,
-        option: OptionData,
+        option: OptionContract,
         spot_price: float,
         volatility: float,
         risk_free_rate: float = 0.05
@@ -106,7 +106,7 @@ class IOptionsService(ABC):
     @abstractmethod
     def calculate_greeks(
         self,
-        option: OptionData,
+        option: OptionContract,
         spot_price: float,
         volatility: float,
         risk_free_rate: float = 0.05
@@ -128,7 +128,7 @@ class IOptionsService(ABC):
     @abstractmethod
     def calculate_profit_loss(
         self,
-        trades: List[TradeData],
+        trades: List[Trade],
         spot_prices: List[float]
     ) -> Dict[str, Any]:
         """Calculate P&L for trade portfolio"""

@@ -27,9 +27,9 @@ class ConfigManager:
         if system == "Windows":
             config_dir = Path(os.environ.get("APPDATA", "")) / "Options Calculator Pro"
         elif system == "Darwin":  # macOS
-            config_dir = Path.home() / "Library" / "Application Support" / "Options Calculator Pro"
+            config_dir = Path.home() / ".options_calculator_pro"
         else:  # Linux and others
-            config_dir = Path.home() / ".options_calculator"
+            config_dir = Path.home() / ".options_calculator_pro"
         
         return config_dir
     
@@ -235,4 +235,3 @@ class ConfigManager:
             self.save_config()
         except Exception as e:
             self.logger.error(f"Error saving config: {e}")
-    def save(self): self.save_config()

@@ -168,11 +168,14 @@ class ServiceContainer:
             if registration.factory:
                 dependencies = self._resolve_dependencies(registration.dependencies)
                 return registration.factory(**dependencies)
-            
-            # Resolve constructor dependencies
-            constructor_args = self._resolve_constructor_dependencies(
-                registration.implementation
-            )
+
+            # Use explicit dependencies if provided, otherwise resolve from constructor
+            if registration.dependencies:
+                constructor_args = self._resolve_dependencies(registration.dependencies)
+            else:
+                constructor_args = self._resolve_constructor_dependencies(
+                    registration.implementation
+                )
             
             # Create instance
             instance = registration.implementation(**constructor_args)
@@ -289,13 +292,14 @@ def create_default_container() -> ServiceContainer:
     from services.options_service import OptionsService
     from services.ml_service import MLService
     from services.async_api import AsyncMarketDataClient
+    from services.cache_adapter import CacheServiceAdapter
     from utils.config_manager import ConfigManager
     from utils.ttl_cache import MultiTTLCache
-    
+
     container = ServiceContainer()
-    
-    # Cache service (MultiTTLCache as ICacheService)
-    container.register_instance(ICacheService, MultiTTLCache())
+
+    # Cache service (using professional adapter)
+    container.register_instance(ICacheService, CacheServiceAdapter())
     
     # Config service
     container.register(
@@ -308,19 +312,17 @@ def create_default_container() -> ServiceContainer:
     container.register(
         IMarketDataService,
         MarketDataService,
-        dependencies={
-            'config_manager': IConfigService,
-            'cache': ICacheService
-        }
+        lifecycle=ServiceLifecycle.SINGLETON
+        # No dependencies - MarketDataService.__init__(parent=None) takes no injected dependencies
     )
     
-    # Volatility service  
+    # Volatility service
     container.register(
         IVolatilityService,
         VolatilityService,
         dependencies={
-            'market_data': IMarketDataService,
-            'cache': ICacheService
+            'config_manager': IConfigService,
+            'market_data_service': IMarketDataService
         }
     )
     
