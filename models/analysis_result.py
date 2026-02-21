@@ -64,6 +64,7 @@ class RiskMetrics:
     expected_value: float
     debit_paid: float
     contracts: int
+    transaction_cost_per_contract: float = 0.0
     
     @property
     def is_profitable_setup(self) -> bool:
@@ -98,7 +99,7 @@ class VolatilityMetrics:
     @property
     def is_contango(self) -> bool:
         """Check if term structure is in contango"""
-        return self.term_structure_slope < -0.002
+        return self.term_structure_slope > 0.002
 
 
 @dataclass
@@ -214,6 +215,26 @@ class AnalysisResult:
     sector: str = "Unknown"
     market_cap: Optional[float] = None
     beta: Optional[float] = None
+    analysis_type: str = "comprehensive"
+    source: str = "analysis_controller"
+
+    @staticmethod
+    def _component_value(component: Any, key: str, default: Any = None) -> Any:
+        """Read field from either dataclass-like object or dictionary."""
+        if isinstance(component, dict):
+            return component.get(key, default)
+        return getattr(component, key, default)
+
+    @staticmethod
+    def _probability_pct(value: Any) -> float:
+        """Normalize probability values to 0-100 percent for display."""
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if numeric <= 1.0:
+            numeric *= 100.0
+        return max(0.0, min(100.0, numeric))
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization"""
@@ -225,47 +246,56 @@ class AnalysisResult:
             'analysis_duration': self.analysis_duration,
             'sector': self.sector,
             'days_to_earnings': self.days_to_earnings,
+            'analysis_type': self.analysis_type,
+            'source': self.source,
             
             # Confidence
-            'confidence_score': self.confidence_score.overall_score,
-            'recommendation': self.confidence_score.recommendation,
-            'risk_level': self.confidence_score.risk_level,
+            'confidence_score': self._component_value(self.confidence_score, 'overall_score', 0.0),
+            'recommendation': self._component_value(self.confidence_score, 'recommendation', 'UNKNOWN'),
+            'risk_level': self._component_value(self.confidence_score, 'risk_level', 'UNKNOWN'),
             
             # Volatility
-            'iv30': self.volatility_metrics.iv30,
-            'rv30': self.volatility_metrics.rv30,
-            'iv_rv_ratio': self.volatility_metrics.iv_rv_ratio,
-            'iv_rank': self.volatility_metrics.iv_rank,
-            'iv_percentile': self.volatility_metrics.iv_percentile,
-            'vix_level': self.volatility_metrics.vix_level,
+            'iv30': self._component_value(self.volatility_metrics, 'iv30', self._component_value(self.volatility_metrics, 'implied_vol_30d', 0.0)),
+            'rv30': self._component_value(self.volatility_metrics, 'rv30', self._component_value(self.volatility_metrics, 'realized_vol_30d', 0.0)),
+            'iv_rv_ratio': self._component_value(self.volatility_metrics, 'iv_rv_ratio', 1.0),
+            'iv_rank': self._component_value(self.volatility_metrics, 'iv_rank', self._component_value(self.volatility_metrics, 'vol_rank', 0.5)),
+            'iv_percentile': self._component_value(self.volatility_metrics, 'iv_percentile', self._component_value(self.volatility_metrics, 'vol_percentile', 50.0)),
+            'vix_level': self._component_value(self.volatility_metrics, 'vix_level', 20.0),
             
             # Options
-            'strike': self.options_data.strike,
-            'debit': self.options_data.debit,
-            'short_premium': self.options_data.short_premium,
-            'long_premium': self.options_data.long_premium,
+            'strike': self._component_value(self.options_data, 'strike', 0.0),
+            'debit': self._component_value(self.options_data, 'debit', 0.0),
+            'short_premium': self._component_value(self.options_data, 'short_premium', 0.0),
+            'long_premium': self._component_value(self.options_data, 'long_premium', 0.0),
             
             # Greeks
-            'net_delta': self.greeks.net_delta,
-            'net_gamma': self.greeks.net_gamma,
-            'net_theta': self.greeks.net_theta,
-            'net_vega': self.greeks.net_vega,
+            'net_delta': self._component_value(self.greeks, 'net_delta', 0.0),
+            'net_gamma': self._component_value(self.greeks, 'net_gamma', 0.0),
+            'net_theta': self._component_value(self.greeks, 'net_theta', 0.0),
+            'net_vega': self._component_value(self.greeks, 'net_vega', 0.0),
             
             # Monte Carlo
-            'prob_exceed_1x': self.monte_carlo_result.prob_exceed_1x,
-            'expected_return': self.monte_carlo_result.expected_return,
+            'prob_exceed_1x': self._component_value(self.monte_carlo_result, 'prob_exceed_1x', 0.0),
+            'expected_return': self._component_value(self.monte_carlo_result, 'expected_return', 0.0),
             
             # Risk
-            'max_loss': self.risk_metrics.max_loss_total,
-            'max_profit': self.risk_metrics.max_profit_total,
-            'probability_of_profit': self.risk_metrics.probability_of_profit,
-            'expected_value': self.risk_metrics.expected_value,
+            'max_loss': self._component_value(self.risk_metrics, 'max_loss_total', 0.0),
+            'max_profit': self._component_value(self.risk_metrics, 'max_profit_total', 0.0),
+            'probability_of_profit': self._component_value(self.risk_metrics, 'probability_of_profit', 0.0),
+            'expected_value': self._component_value(self.risk_metrics, 'expected_value', 0.0),
+            'transaction_cost_per_contract': self._component_value(
+                self.risk_metrics, 'transaction_cost_per_contract', 0.0
+            ),
         }
         
         # Add ML prediction if available
         if self.ml_prediction:
-            result['ml_success_probability'] = self.ml_prediction.success_probability
-            result['ml_confidence'] = self.ml_prediction.model_accuracy
+            if isinstance(self.ml_prediction, dict):
+                result['ml_success_probability'] = self.ml_prediction.get('probability', 0.0)
+                result['ml_confidence'] = self.ml_prediction.get('confidence', 'unknown')
+            else:
+                result['ml_success_probability'] = self._component_value(self.ml_prediction, 'success_probability', 0.0)
+                result['ml_confidence'] = self._component_value(self.ml_prediction, 'model_accuracy', 0.0)
         
         # Add earnings date if available
         if self.earnings_date:
@@ -283,41 +313,52 @@ class AnalysisResult:
     @property
     def is_tradeable(self) -> bool:
         """Check if the setup is tradeable"""
+        confidence = float(self._component_value(self.confidence_score, 'overall_score', 0.0))
+        liquid_flag = self._component_value(self.options_data, 'is_liquid', None)
+        if liquid_flag is None:
+            avg_volume = float(self._component_value(self.options_data, 'average_volume', 0.0))
+            open_interest = float(self._component_value(self.options_data, 'open_interest', 0.0))
+            liquid_flag = avg_volume > 100 and open_interest > 100
+        profitable = self._component_value(self.risk_metrics, 'is_profitable_setup', None)
+        if profitable is None:
+            profitable = float(self._component_value(self.risk_metrics, 'expected_value', 0.0)) > 0.0
         return (
-            self.confidence_score.overall_score >= 50 and
-            self.options_data.is_liquid and
-            self.risk_metrics.is_profitable_setup
+            confidence >= 50 and
+            bool(liquid_flag) and
+            bool(profitable)
         )
     
     @property
     def trade_summary(self) -> str:
         """Get a concise trade summary"""
+        prob_pct = self._probability_pct(self._component_value(self.risk_metrics, 'probability_of_profit', 0.0))
         return (
             f"{self.symbol} Calendar Spread: "
-            f"{self.confidence_score.overall_score:.1f}% confidence, "
-            f"${self.risk_metrics.max_loss_total:.0f} max risk, "
-            f"{self.risk_metrics.probability_of_profit:.1f}% prob profit"
+            f"{float(self._component_value(self.confidence_score, 'overall_score', 0.0)):.1f}% confidence, "
+            f"${float(self._component_value(self.risk_metrics, 'max_loss_total', 0.0)):.0f} max risk, "
+            f"{prob_pct:.1f}% prob profit"
         )
-    
+
     def get_display_data(self) -> Dict[str, str]:
         """Get formatted data for UI display"""
+        prob_pct = self._probability_pct(self._component_value(self.risk_metrics, 'probability_of_profit', 0.0))
         return {
             'Symbol': self.symbol,
             'Price': f"${self.current_price:.2f}",
-            'Confidence': f"{self.confidence_score.overall_score:.1f}%",
-            'Recommendation': self.confidence_score.recommendation,
-            'Risk Level': self.confidence_score.risk_level,
-            'IV Rank': f"{self.volatility_metrics.iv_rank:.2f}",
-            'IV/RV Ratio': f"{self.volatility_metrics.iv_rv_ratio:.2f}",
+            'Confidence': f"{float(self._component_value(self.confidence_score, 'overall_score', 0.0)):.1f}%",
+            'Recommendation': str(self._component_value(self.confidence_score, 'recommendation', 'UNKNOWN')),
+            'Risk Level': str(self._component_value(self.confidence_score, 'risk_level', 'UNKNOWN')),
+            'IV Rank': f"{float(self._component_value(self.volatility_metrics, 'iv_rank', self._component_value(self.volatility_metrics, 'vol_rank', 0.0))):.2f}",
+            'IV/RV Ratio': f"{float(self._component_value(self.volatility_metrics, 'iv_rv_ratio', 1.0)):.2f}",
             'Days to Earnings': f"{self.days_to_earnings} days",
-            'Strike': f"${self.options_data.strike:.2f}",
-            'Debit': f"${self.options_data.debit:.2f}",
-            'Max Loss': f"${self.risk_metrics.max_loss_total:.0f}",
-            'Max Profit': f"${self.risk_metrics.max_profit_total:.0f}",
-            'Prob Profit': f"{self.risk_metrics.probability_of_profit:.1f}%",
-            'Expected Value': f"${self.risk_metrics.expected_value:.0f}",
-            'Net Theta': f"${self.greeks.net_theta:.2f}/day",
-            'Monte Carlo 1x': f"{self.monte_carlo_result.prob_exceed_1x:.1f}%",
+            'Strike': f"${float(self._component_value(self.options_data, 'strike', 0.0)):.2f}",
+            'Debit': f"${float(self._component_value(self.options_data, 'debit', 0.0)):.2f}",
+            'Max Loss': f"${float(self._component_value(self.risk_metrics, 'max_loss_total', 0.0)):.0f}",
+            'Max Profit': f"${float(self._component_value(self.risk_metrics, 'max_profit_total', 0.0)):.0f}",
+            'Prob Profit': f"{prob_pct:.1f}%",
+            'Expected Value': f"${float(self._component_value(self.risk_metrics, 'expected_value', 0.0)):.0f}",
+            'Net Theta': f"${float(self._component_value(self.greeks, 'net_theta', 0.0)):.2f}/day",
+            'Monte Carlo 1x': f"{float(self._component_value(self.monte_carlo_result, 'prob_exceed_1x', 0.0)):.1f}%",
             'Analysis Time': f"{self.analysis_duration:.1f}s"
         }
 
