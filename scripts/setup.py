@@ -20,7 +20,7 @@ class OptionsCalculatorSetup:
         self.system = platform.system()
         self.python_version = sys.version_info
         self.project_root = Path(__file__).parent.parent
-        self.venv_path = self.project_root / "venv"
+        self.venv_path = self.project_root / ".venv"
         self.config_dir = self.get_config_directory()
         
     def get_config_directory(self) -> Path:
