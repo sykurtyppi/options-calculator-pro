@@ -8,11 +8,26 @@ import logging
 import logging.handlers
 import sys
 import os
+import threading
 from pathlib import Path
 from datetime import datetime
 import functools
 from typing import Optional, Dict, Any
 import json
+
+
+_LOGGER_SETUP_LOCK = threading.Lock()
+
+
+def _reset_logger_handlers(logger: logging.Logger):
+    """Remove and close existing handlers in a lock to avoid racey reconfiguration."""
+    with _LOGGER_SETUP_LOCK:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                continue
 
 
 class ColoredFormatter(logging.Formatter):
@@ -164,8 +179,8 @@ def setup_logger(
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper()))
     
-    # Clear existing handlers to avoid duplicates
-    logger.handlers.clear()
+    # Reset existing handlers to avoid duplicates and stale file handles.
+    _reset_logger_handlers(logger)
     
     # Setup log directory
     if log_dir is None:
@@ -415,7 +430,7 @@ class LogAnalyzer:
                                 duration = float(duration_part)
                                 durations.append(duration)
                                 operations += 1
-                        except:
+                        except Exception:
                             continue
                     
                     elif "Failed" in line or "Error" in line:
@@ -449,15 +464,18 @@ def init_logging(debug: bool = False, json_logs: bool = False) -> logging.Logger
     )
 
 
+def get_logger(name=None):
+    """Get a logger instance - compatibility function"""
+    return setup_logger(name or __name__)
+
+
 # Export main functions
 __all__ = [
     'setup_logger',
+    'get_logger',
     'get_trading_logger',
     'log_function_call',
     'log_performance',
     'LogAnalyzer',
-    'init_logging'
+    'init_logging',
 ]
-def get_logger(name=None):
-    """Get a logger instance - compatibility function"""
-    return setup_logger(name or __name__)
