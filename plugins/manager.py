@@ -1,1 +1,0 @@
-# Plugin manager logic

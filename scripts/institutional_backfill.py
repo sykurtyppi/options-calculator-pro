@@ -208,11 +208,15 @@ class InstitutionalDataCollector:
                           max_backtest_symbols: int = 10,
                           entry_days_before_earnings: int = 7,
                           exit_days_after_earnings: int = 1,
+                          target_entry_dte: int = 6,
+                          entry_dte_band: int = 6,
+                          min_daily_share_volume: int = 1_000_000,
+                          max_abs_momentum_5d: float = 0.11,
                           use_crush_confidence_gate: bool = True,
                           allow_global_crush_profile: bool = True,
                           min_crush_confidence: float = 0.45,
                           min_crush_magnitude: float = 0.08,
-                          min_crush_edge: float = 0.05,
+                          min_crush_edge: float = 0.02,
                           require_true_earnings: bool = False,
                           allow_proxy_earnings: bool = True,
                           start_date: Optional[str] = None,
@@ -227,6 +231,10 @@ class InstitutionalDataCollector:
         max_backtest_symbols = max(1, int(max_backtest_symbols))
         entry_days_before_earnings = max(1, int(entry_days_before_earnings))
         exit_days_after_earnings = max(0, int(exit_days_after_earnings))
+        target_entry_dte = max(1, int(target_entry_dte))
+        entry_dte_band = max(1, int(entry_dte_band))
+        min_daily_share_volume = max(0, int(min_daily_share_volume))
+        max_abs_momentum_5d = max(0.01, float(max_abs_momentum_5d))
         min_crush_confidence = max(0.0, min(1.0, float(min_crush_confidence)))
         min_crush_magnitude = max(0.0, min(1.0, float(min_crush_magnitude)))
         min_crush_edge = max(0.0, min(1.0, float(min_crush_edge)))
@@ -245,6 +253,10 @@ class InstitutionalDataCollector:
             'earnings_event_mode': True,
             'entry_days_before_earnings': entry_days_before_earnings,
             'exit_days_after_earnings': exit_days_after_earnings,
+            'target_entry_dte': target_entry_dte,
+            'entry_dte_band': entry_dte_band,
+            'min_daily_share_volume': min_daily_share_volume,
+            'max_abs_momentum_5d': max_abs_momentum_5d,
             'use_crush_confidence_gate': bool(use_crush_confidence_gate),
             'allow_global_crush_profile': bool(allow_global_crush_profile),
             'min_crush_confidence': min_crush_confidence,
@@ -616,11 +628,35 @@ class InstitutionalDataCollector:
             min_trades=min_trades,
             use_composite_signal=use_composite_signal,
         )
+        recommendation_reason = str(recommendation.get('reason', 'unknown'))
+        available_trade_count = int(recommendation.get('available_trade_count', 0) or 0)
+        max_trade_count = int(recommendation.get('max_trade_count_for_thresholds', 0) or 0)
+        suggested_min_trades = recommendation.get('suggested_min_trades')
+        if suggested_min_trades is not None:
+            try:
+                suggested_min_trades = int(suggested_min_trades)
+            except (TypeError, ValueError):
+                suggested_min_trades = None
+
         candidates_df = pd.DataFrame(recommendation.get('candidate_thresholds', []))
 
         if deciles_df.empty:
             self.logger.warning("⚠️ No decile rows available for threshold tuning")
             return None
+
+        if (
+            not recommendation.get('recommended')
+            and recommendation_reason == 'insufficient_trade_count_for_thresholds'
+        ):
+            suggestion_text = (
+                f" Consider --tuning-min-trades {suggested_min_trades}."
+                if suggested_min_trades is not None else ""
+            )
+            self.logger.warning(
+                "⚠️ Threshold tuning produced no candidates: "
+                f"min_trades={min_trades}, available_trades={available_trade_count}, "
+                f"max_trades_at_any_threshold={max_trade_count}.{suggestion_text}"
+            )
 
         output_path = Path(output_dir)
         if not output_path.is_absolute():
@@ -659,6 +695,16 @@ class InstitutionalDataCollector:
             else:
                 f.write("## Recommended Threshold\n\n")
                 f.write(f"- No recommendation (`reason={recommendation.get('reason', 'unknown')}`)\n\n")
+                if recommendation_reason == 'insufficient_trade_count_for_thresholds':
+                    f.write("### Candidate Availability\n\n")
+                    f.write(f"- Available trades in scope: `{available_trade_count}`\n")
+                    f.write(f"- Max trades at any threshold: `{max_trade_count}`\n")
+                    if suggested_min_trades is not None:
+                        f.write(
+                            f"- Suggested min trades for this sample: `{suggested_min_trades}` "
+                            "(use `--tuning-min-trades`)\n"
+                        )
+                    f.write("\n")
 
             f.write("## Decile Performance\n\n")
             f.write("```text\n")
@@ -697,6 +743,10 @@ class InstitutionalDataCollector:
             'candidate_rows': int(len(candidates_df)),
             'recommended': bool(recommendation.get('recommended', False)),
             'best_threshold': recommendation.get('best_threshold'),
+            'reason': recommendation_reason,
+            'available_trade_count': available_trade_count,
+            'max_trade_count_for_thresholds': max_trade_count,
+            'suggested_min_trades': suggested_min_trades,
             'session_id': resolved_session,
         }
 
@@ -706,6 +756,10 @@ class InstitutionalDataCollector:
                           trades_per_day_grid: List[int],
                           entry_days_grid: List[int],
                           exit_days_grid: List[int],
+                          target_entry_dte: int = 6,
+                          entry_dte_band: int = 6,
+                          min_daily_share_volume: int = 1_000_000,
+                          max_abs_momentum_5d: float = 0.11,
                           position_contracts: int = 1,
                           lookback_days: int = 365,
                           max_backtest_symbols: int = 10,
@@ -713,7 +767,7 @@ class InstitutionalDataCollector:
                           allow_global_crush_profile: bool = True,
                           min_crush_confidence: float = 0.45,
                           min_crush_magnitude: float = 0.08,
-                          min_crush_edge: float = 0.05,
+                          min_crush_edge: float = 0.02,
                           require_true_earnings: bool = False,
                           allow_proxy_earnings: bool = True,
                           output_dir: str = "exports/reports",
@@ -730,6 +784,10 @@ class InstitutionalDataCollector:
         position_contracts = max(1, int(position_contracts))
         lookback_days = max(120, int(lookback_days))
         max_backtest_symbols = max(1, int(max_backtest_symbols))
+        target_entry_dte = max(1, int(target_entry_dte))
+        entry_dte_band = max(1, int(entry_dte_band))
+        min_daily_share_volume = max(0, int(min_daily_share_volume))
+        max_abs_momentum_5d = max(0.01, float(max_abs_momentum_5d))
         top_n = max(1, int(top_n))
         min_crush_confidence = max(0.0, min(1.0, float(min_crush_confidence)))
         min_crush_magnitude = max(0.0, min(1.0, float(min_crush_magnitude)))
@@ -743,6 +801,10 @@ class InstitutionalDataCollector:
             'iv_rv_min': 0.95,
             'iv_rv_max': 2.30,
             'earnings_event_mode': True,
+            'target_entry_dte': target_entry_dte,
+            'entry_dte_band': entry_dte_band,
+            'min_daily_share_volume': min_daily_share_volume,
+            'max_abs_momentum_5d': max_abs_momentum_5d,
             'use_crush_confidence_gate': bool(use_crush_confidence_gate),
             'allow_global_crush_profile': bool(allow_global_crush_profile),
             'min_crush_confidence': min_crush_confidence,
@@ -858,6 +920,10 @@ class InstitutionalDataCollector:
                          trades_per_day_grid: List[int],
                          entry_days_grid: List[int],
                          exit_days_grid: List[int],
+                         target_entry_dte: int = 6,
+                         entry_dte_band: int = 6,
+                         min_daily_share_volume: int = 1_000_000,
+                         max_abs_momentum_5d: float = 0.11,
                          train_days: int = 252,
                          test_days: int = 63,
                          step_days: int = 63,
@@ -869,9 +935,12 @@ class InstitutionalDataCollector:
                          allow_global_crush_profile: bool = True,
                          min_crush_confidence: float = 0.45,
                          min_crush_magnitude: float = 0.08,
-                         min_crush_edge: float = 0.05,
+                         min_crush_edge: float = 0.02,
                          require_true_earnings: bool = False,
                          allow_proxy_earnings: bool = True,
+                         min_splits: int = 8,
+                         min_total_test_trades: int = 80,
+                         min_trades_per_split: float = 5.0,
                          output_dir: str = "exports/reports",
                          start_date: Optional[str] = None,
                          end_date: Optional[str] = None) -> Optional[dict]:
@@ -889,9 +958,16 @@ class InstitutionalDataCollector:
         position_contracts = max(1, int(position_contracts))
         lookback_days = max(120, int(lookback_days))
         max_backtest_symbols = max(1, int(max_backtest_symbols))
+        target_entry_dte = max(1, int(target_entry_dte))
+        entry_dte_band = max(1, int(entry_dte_band))
+        min_daily_share_volume = max(0, int(min_daily_share_volume))
+        max_abs_momentum_5d = max(0.01, float(max_abs_momentum_5d))
         min_crush_confidence = max(0.0, min(1.0, float(min_crush_confidence)))
         min_crush_magnitude = max(0.0, min(1.0, float(min_crush_magnitude)))
         min_crush_edge = max(0.0, min(1.0, float(min_crush_edge)))
+        min_splits = max(1, int(min_splits))
+        min_total_test_trades = max(1, int(min_total_test_trades))
+        min_trades_per_split = max(1.0, float(min_trades_per_split))
 
         base_params = {
             'strategy_type': 'calendar_spread',
@@ -901,6 +977,10 @@ class InstitutionalDataCollector:
             'iv_rv_min': 0.95,
             'iv_rv_max': 2.30,
             'earnings_event_mode': True,
+            'target_entry_dte': target_entry_dte,
+            'entry_dte_band': entry_dte_band,
+            'min_daily_share_volume': min_daily_share_volume,
+            'max_abs_momentum_5d': max_abs_momentum_5d,
             'use_crush_confidence_gate': bool(use_crush_confidence_gate),
             'allow_global_crush_profile': bool(allow_global_crush_profile),
             'min_crush_confidence': min_crush_confidence,
@@ -945,6 +1025,8 @@ class InstitutionalDataCollector:
         csv_path = output_path / f"earnings_oos_validation_{timestamp}.csv"
         md_path = output_path / f"earnings_oos_validation_{timestamp}.md"
         json_path = output_path / f"earnings_oos_validation_{timestamp}_best_params.json"
+        report_card_md_path = output_path / f"earnings_oos_report_card_{timestamp}.md"
+        report_card_json_path = output_path / f"earnings_oos_report_card_{timestamp}.json"
 
         oos_df.to_csv(csv_path, index=False)
 
@@ -974,6 +1056,13 @@ class InstitutionalDataCollector:
             best_group = oos_df.iloc[0]
             best_params = {}
 
+        report_card = self.db.build_oos_report_card(
+            oos_df=oos_df,
+            min_splits=min_splits,
+            min_total_test_trades=min_total_test_trades,
+            min_trades_per_split=min_trades_per_split,
+        )
+
         with md_path.open("w", encoding="utf-8") as f:
             f.write("# Earnings Rolling OOS Validation\n\n")
             f.write(f"- Generated: {datetime.now().isoformat(timespec='seconds')}\n")
@@ -989,6 +1078,54 @@ class InstitutionalDataCollector:
             if 'test_mean_crush_confidence' in oos_df.columns:
                 f.write(f"- Mean test crush confidence: {oos_df['test_mean_crush_confidence'].mean():.2f}\n")
             f.write("\n")
+            f.write("## OOS Robustness Report Card\n\n")
+            if report_card.get('ready'):
+                verdict = report_card.get('verdict', {})
+                sample = report_card.get('sample', {})
+                metrics = report_card.get('metrics', {})
+                alpha = metrics.get('alpha', {}) or {}
+                sharpe = metrics.get('sharpe', {}) or {}
+                pnl = metrics.get('pnl', {}) or {}
+                win_rate = metrics.get('win_rate', {}) or {}
+                f.write(f"- Grade: `{verdict.get('grade', 'n/a')}`\n")
+                f.write(f"- Overall pass: `{verdict.get('overall_pass', False)}`\n")
+                f.write(f"- Message: {verdict.get('message', 'n/a')}\n")
+                f.write(f"- Splits: `{sample.get('splits', 0)}`\n")
+                f.write(f"- Total test trades: `{sample.get('total_test_trades', 0)}`\n")
+                f.write(f"- Avg trades/split: `{float(sample.get('avg_trades_per_split', 0.0)):.2f}`\n")
+                if alpha.get('mean') is not None:
+                    f.write(
+                        f"- Alpha mean (95% CI): `{float(alpha['mean']):.4f}` "
+                        f"[`{float(alpha.get('low', alpha['mean'])):.4f}`, `{float(alpha.get('high', alpha['mean'])):.4f}`]\n"
+                    )
+                if sharpe.get('mean') is not None:
+                    f.write(
+                        f"- Sharpe mean (95% CI): `{float(sharpe['mean']):.4f}` "
+                        f"[`{float(sharpe.get('low', sharpe['mean'])):.4f}`, `{float(sharpe.get('high', sharpe['mean'])):.4f}`]\n"
+                    )
+                if pnl.get('mean') is not None:
+                    f.write(
+                        f"- PnL mean (95% CI): `${float(pnl['mean']):.2f}` "
+                        f"[`${float(pnl.get('low', pnl['mean'])):.2f}`, `${float(pnl.get('high', pnl['mean'])):.2f}`]\n"
+                    )
+                if win_rate.get('mean') is not None:
+                    f.write(
+                        f"- Win rate (Wilson 95% CI): `{float(win_rate['mean']):.2%}` "
+                        f"[`{float(win_rate.get('low', win_rate['mean'])):.2%}`, `{float(win_rate.get('high', win_rate['mean'])):.2%}`]\n"
+                    )
+                f.write("\n")
+                f.write("### Gates\n\n")
+                for gate_name, gate in (report_card.get('gates') or {}).items():
+                    f.write(
+                        f"- `{gate_name}`: {'PASS' if gate.get('passed') else 'FAIL'} "
+                        f"(actual={gate.get('actual')}, required={gate.get('required')})\n"
+                    )
+                f.write("\n")
+            else:
+                f.write(
+                    f"- Report card unavailable (`reason={report_card.get('reason', 'unknown')}`)\n\n"
+                )
+
             f.write("## Best Stable Parameters (Grouped by OOS mean alpha)\n\n")
             if best_params:
                 for key, value in best_params.items():
@@ -1021,9 +1158,77 @@ class InstitutionalDataCollector:
                 'source_csv': str(csv_path),
             }, f, indent=2, default=str)
 
+        with report_card_json_path.open("w", encoding="utf-8") as f:
+            json.dump({
+                'generated_at': datetime.now().isoformat(timespec='seconds'),
+                'thresholds': {
+                    'min_splits': min_splits,
+                    'min_total_test_trades': min_total_test_trades,
+                    'min_trades_per_split': min_trades_per_split,
+                },
+                'report_card': report_card,
+                'source_oos_csv': str(csv_path),
+            }, f, indent=2, default=str)
+
+        with report_card_md_path.open("w", encoding="utf-8") as f:
+            f.write("# Earnings OOS Robustness Report Card\n\n")
+            f.write(f"- Generated: {datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"- Source OOS CSV: `{csv_path}`\n")
+            f.write(f"- Min splits: `{min_splits}`\n")
+            f.write(f"- Min total test trades: `{min_total_test_trades}`\n")
+            f.write(f"- Min trades per split: `{min_trades_per_split:.2f}`\n\n")
+            if report_card.get('ready'):
+                verdict = report_card.get('verdict', {}) or {}
+                sample = report_card.get('sample', {}) or {}
+                metrics = report_card.get('metrics', {}) or {}
+                alpha = metrics.get('alpha', {}) or {}
+                sharpe = metrics.get('sharpe', {}) or {}
+                pnl = metrics.get('pnl', {}) or {}
+                win_rate = metrics.get('win_rate', {}) or {}
+                f.write(f"## Verdict\n\n")
+                f.write(f"- Grade: `{verdict.get('grade', 'n/a')}`\n")
+                f.write(f"- Overall pass: `{verdict.get('overall_pass', False)}`\n")
+                f.write(f"- Message: {verdict.get('message', 'n/a')}\n\n")
+                f.write("## Sample\n\n")
+                f.write(f"- Splits: `{sample.get('splits', 0)}`\n")
+                f.write(f"- Total test trades: `{sample.get('total_test_trades', 0)}`\n")
+                f.write(f"- Avg trades per split: `{float(sample.get('avg_trades_per_split', 0.0)):.2f}`\n\n")
+                f.write("## Confidence Intervals\n\n")
+                if alpha.get('mean') is not None:
+                    f.write(
+                        f"- Alpha: `{float(alpha['mean']):.4f}` "
+                        f"[`{float(alpha.get('low', alpha['mean'])):.4f}`, `{float(alpha.get('high', alpha['mean'])):.4f}`]\n"
+                    )
+                if sharpe.get('mean') is not None:
+                    f.write(
+                        f"- Sharpe: `{float(sharpe['mean']):.4f}` "
+                        f"[`{float(sharpe.get('low', sharpe['mean'])):.4f}`, `{float(sharpe.get('high', sharpe['mean'])):.4f}`]\n"
+                    )
+                if pnl.get('mean') is not None:
+                    f.write(
+                        f"- PnL: `${float(pnl['mean']):.2f}` "
+                        f"[`${float(pnl.get('low', pnl['mean'])):.2f}`, `${float(pnl.get('high', pnl['mean'])):.2f}`]\n"
+                    )
+                if win_rate.get('mean') is not None:
+                    f.write(
+                        f"- Win rate: `{float(win_rate['mean']):.2%}` "
+                        f"[`{float(win_rate.get('low', win_rate['mean'])):.2%}`, `{float(win_rate.get('high', win_rate['mean'])):.2%}`]\n"
+                    )
+                f.write("\n## Gates\n\n")
+                for gate_name, gate in (report_card.get('gates') or {}).items():
+                    f.write(
+                        f"- `{gate_name}`: {'PASS' if gate.get('passed') else 'FAIL'} "
+                        f"(actual={gate.get('actual')}, required={gate.get('required')})\n"
+                    )
+            else:
+                f.write(
+                    f"Report card unavailable (`reason={report_card.get('reason', 'unknown')}`).\n"
+                )
+
         self.logger.info(f"✅ OOS CSV saved: {csv_path}")
         self.logger.info(f"✅ OOS summary saved: {md_path}")
         self.logger.info(f"✅ OOS best params saved: {json_path}")
+        self.logger.info(f"✅ OOS report card saved: {report_card_json_path}")
         best_split = oos_df.sort_values(
             by=['test_alpha_score', 'test_sharpe_ratio', 'test_total_pnl'],
             ascending=[False, False, False]
@@ -1032,8 +1237,11 @@ class InstitutionalDataCollector:
             'csv_path': str(csv_path),
             'markdown_path': str(md_path),
             'json_path': str(json_path),
+            'report_card_markdown_path': str(report_card_md_path),
+            'report_card_json_path': str(report_card_json_path),
             'splits': int(len(oos_df)),
             'best_params': best_params,
+            'report_card': report_card,
             'best_test_session_id': str(best_split['test_session_id']),
         }
 
@@ -1176,6 +1384,34 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--target-entry-dte',
+        type=int,
+        default=6,
+        help='Preferred days-to-earnings for entry scoring sweet-spot (default: 6)'
+    )
+
+    parser.add_argument(
+        '--entry-dte-band',
+        type=int,
+        default=6,
+        help='Width of timing sweet-spot around target entry DTE (default: 6)'
+    )
+
+    parser.add_argument(
+        '--min-daily-share-volume',
+        type=int,
+        default=1000000,
+        help='Minimum underlying daily share volume filter (default: 1,000,000)'
+    )
+
+    parser.add_argument(
+        '--max-abs-momentum-5d',
+        type=float,
+        default=0.11,
+        help='Max absolute 5-day momentum allowed for entry filtering (default: 0.11)'
+    )
+
+    parser.add_argument(
         '--require-true-earnings',
         action='store_true',
         help='Require API-sourced earnings dates (skip proxy fallback)'
@@ -1216,8 +1452,8 @@ def parse_arguments():
     parser.add_argument(
         '--min-crush-edge',
         type=float,
-        default=0.05,
-        help='Minimum crush edge score required per trade (default: 0.05)'
+        default=0.02,
+        help='Minimum crush edge score required per trade (default: 0.02)'
     )
 
     parser.add_argument(
@@ -1370,6 +1606,27 @@ def parse_arguments():
         type=str,
         default='exports/reports',
         help='Directory for OOS CSV/summary outputs'
+    )
+
+    parser.add_argument(
+        '--oos-min-splits',
+        type=int,
+        default=8,
+        help='Minimum OOS splits required for report-card pass gate (default: 8)'
+    )
+
+    parser.add_argument(
+        '--oos-min-total-test-trades',
+        type=int,
+        default=80,
+        help='Minimum total test trades required for report-card pass gate (default: 80)'
+    )
+
+    parser.add_argument(
+        '--oos-min-trades-per-split',
+        type=float,
+        default=5.0,
+        help='Minimum average test trades per split for report-card pass gate (default: 5.0)'
     )
 
     parser.add_argument(
@@ -1568,6 +1825,10 @@ async def main():
                     trades_per_day_grid=_parse_csv_ints(args.sweep_max_trades_per_day),
                     entry_days_grid=_parse_csv_ints(args.sweep_entry_days_before),
                     exit_days_grid=_parse_csv_ints(args.sweep_exit_days_after),
+                    target_entry_dte=args.target_entry_dte,
+                    entry_dte_band=args.entry_dte_band,
+                    min_daily_share_volume=args.min_daily_share_volume,
+                    max_abs_momentum_5d=args.max_abs_momentum_5d,
                     train_days=args.oos_train_days,
                     test_days=args.oos_test_days,
                     step_days=args.oos_step_days,
@@ -1582,12 +1843,22 @@ async def main():
                     min_crush_edge=args.min_crush_edge,
                     require_true_earnings=args.require_true_earnings,
                     allow_proxy_earnings=allow_proxy_earnings,
+                    min_splits=args.oos_min_splits,
+                    min_total_test_trades=args.oos_min_total_test_trades,
+                    min_trades_per_split=args.oos_min_trades_per_split,
                     output_dir=args.oos_output_dir,
                     start_date=args.backtest_start_date,
                     end_date=args.backtest_end_date,
                 )
                 if oos_result:
-                    logger.info(f"✅ OOS validation completed: {oos_result['splits']} splits")
+                    card = oos_result.get('report_card', {})
+                    verdict = card.get('verdict', {}) if isinstance(card, dict) else {}
+                    logger.info(
+                        "✅ OOS validation completed: "
+                        f"{oos_result['splits']} splits, "
+                        f"grade={verdict.get('grade', 'n/a')}, "
+                        f"pass={verdict.get('overall_pass', False)}"
+                    )
                     latest_session_id = str(oos_result.get('best_test_session_id') or latest_session_id or "")
             elif args.parameter_sweep:
                 sweep_result = collector.run_parameter_sweep(
@@ -1597,6 +1868,10 @@ async def main():
                     trades_per_day_grid=_parse_csv_ints(args.sweep_max_trades_per_day),
                     entry_days_grid=_parse_csv_ints(args.sweep_entry_days_before),
                     exit_days_grid=_parse_csv_ints(args.sweep_exit_days_after),
+                    target_entry_dte=args.target_entry_dte,
+                    entry_dte_band=args.entry_dte_band,
+                    min_daily_share_volume=args.min_daily_share_volume,
+                    max_abs_momentum_5d=args.max_abs_momentum_5d,
                     position_contracts=args.position_contracts,
                     lookback_days=args.lookback_days,
                     max_backtest_symbols=args.max_backtest_symbols,
@@ -1631,6 +1906,10 @@ async def main():
                     max_backtest_symbols=args.max_backtest_symbols,
                     entry_days_before_earnings=args.entry_days_before_earnings,
                     exit_days_after_earnings=args.exit_days_after_earnings,
+                    target_entry_dte=args.target_entry_dte,
+                    entry_dte_band=args.entry_dte_band,
+                    min_daily_share_volume=args.min_daily_share_volume,
+                    max_abs_momentum_5d=args.max_abs_momentum_5d,
                     use_crush_confidence_gate=use_crush_confidence_gate,
                     allow_global_crush_profile=allow_global_crush_profile,
                     min_crush_confidence=args.min_crush_confidence,
@@ -1677,11 +1956,24 @@ async def main():
                     output_dir=args.tuning_output_dir,
                 )
                 if tuning_result:
-                    logger.info(
-                        "✅ Threshold tuning completed: "
-                        f"{tuning_result['candidate_rows']} candidates, "
-                        f"best_threshold={tuning_result.get('best_threshold')}"
-                    )
+                    if tuning_result.get('recommended'):
+                        logger.info(
+                            "✅ Threshold tuning completed: "
+                            f"{tuning_result['candidate_rows']} candidates, "
+                            f"best_threshold={tuning_result.get('best_threshold')}"
+                        )
+                    else:
+                        reason = tuning_result.get('reason', 'unknown')
+                        suggestion = tuning_result.get('suggested_min_trades')
+                        suffix = (
+                            f", suggested_min_trades={suggestion}"
+                            if suggestion is not None else ""
+                        )
+                        logger.warning(
+                            "⚠️ Threshold tuning completed without recommendation: "
+                            f"reason={reason}, candidate_rows={tuning_result['candidate_rows']}"
+                            f"{suffix}"
+                        )
                 else:
                     logger.warning("⚠️ Threshold tuning did not produce results")
             return
@@ -1739,6 +2031,10 @@ async def main():
                     trades_per_day_grid=_parse_csv_ints(args.sweep_max_trades_per_day),
                     entry_days_grid=_parse_csv_ints(args.sweep_entry_days_before),
                     exit_days_grid=_parse_csv_ints(args.sweep_exit_days_after),
+                    target_entry_dte=args.target_entry_dte,
+                    entry_dte_band=args.entry_dte_band,
+                    min_daily_share_volume=args.min_daily_share_volume,
+                    max_abs_momentum_5d=args.max_abs_momentum_5d,
                     train_days=args.oos_train_days,
                     test_days=args.oos_test_days,
                     step_days=args.oos_step_days,
@@ -1753,12 +2049,20 @@ async def main():
                     min_crush_edge=args.min_crush_edge,
                     require_true_earnings=args.require_true_earnings,
                     allow_proxy_earnings=allow_proxy_earnings,
+                    min_splits=args.oos_min_splits,
+                    min_total_test_trades=args.oos_min_total_test_trades,
+                    min_trades_per_split=args.oos_min_trades_per_split,
                     output_dir=args.oos_output_dir,
                     start_date=args.backtest_start_date,
                     end_date=args.backtest_end_date,
                 )
                 if oos_result:
-                    logger.info("✅ OOS validation finished and reports were generated")
+                    card = oos_result.get('report_card', {})
+                    verdict = card.get('verdict', {}) if isinstance(card, dict) else {}
+                    logger.info(
+                        "✅ OOS validation finished and reports were generated "
+                        f"(grade={verdict.get('grade', 'n/a')}, pass={verdict.get('overall_pass', False)})"
+                    )
                     latest_session_id = str(oos_result.get('best_test_session_id') or latest_session_id or "")
                 else:
                     logger.warning("⚠️ OOS validation did not produce results")
@@ -1771,6 +2075,10 @@ async def main():
                     trades_per_day_grid=_parse_csv_ints(args.sweep_max_trades_per_day),
                     entry_days_grid=_parse_csv_ints(args.sweep_entry_days_before),
                     exit_days_grid=_parse_csv_ints(args.sweep_exit_days_after),
+                    target_entry_dte=args.target_entry_dte,
+                    entry_dte_band=args.entry_dte_band,
+                    min_daily_share_volume=args.min_daily_share_volume,
+                    max_abs_momentum_5d=args.max_abs_momentum_5d,
                     position_contracts=args.position_contracts,
                     lookback_days=args.lookback_days,
                     max_backtest_symbols=args.max_backtest_symbols,
@@ -1803,6 +2111,10 @@ async def main():
                     max_backtest_symbols=args.max_backtest_symbols,
                     entry_days_before_earnings=args.entry_days_before_earnings,
                     exit_days_after_earnings=args.exit_days_after_earnings,
+                    target_entry_dte=args.target_entry_dte,
+                    entry_dte_band=args.entry_dte_band,
+                    min_daily_share_volume=args.min_daily_share_volume,
+                    max_abs_momentum_5d=args.max_abs_momentum_5d,
                     use_crush_confidence_gate=use_crush_confidence_gate,
                     allow_global_crush_profile=allow_global_crush_profile,
                     min_crush_confidence=args.min_crush_confidence,
@@ -1815,8 +2127,22 @@ async def main():
                 )
 
                 if session_id:
-                    logger.info("✅ System is ready for institutional trading!")
                     latest_session_id = str(session_id)
+                    results_df = collector.db.get_backtest_results(session_id)
+                    total_trades = 0
+                    if not results_df.empty and 'total_trades' in results_df.columns:
+                        try:
+                            total_trades = int(results_df.iloc[0]['total_trades'])
+                        except (TypeError, ValueError):
+                            total_trades = 0
+
+                    if total_trades > 0:
+                        logger.info("✅ System is ready for institutional trading!")
+                    else:
+                        logger.warning(
+                            "⚠️ Backtest completed but produced 0 trades; "
+                            "do not treat this run as production-ready."
+                        )
                 else:
                     logger.warning("⚠️ Backtest validation failed")
 

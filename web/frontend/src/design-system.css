@@ -1,0 +1,44 @@
+:root {
+  --font-sans: 'IBM Plex Sans', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  --radius-sm: 10px;
+  --radius-md: 12px;
+  --radius-lg: 14px;
+  --ring: 0 0 0 2px rgba(61, 210, 162, 0.3);
+
+  --bg: #07131d;
+  --panel: #0c1e2d;
+  --panel-2: #10293b;
+  --text: #e6f0f8;
+  --muted: #8ea4b7;
+  --line: #27445c;
+  --accent: #3dd2a2;
+  --accent-2: #39a0ff;
+  --danger: #f05d5e;
+}
+
+button {
+  transition: transform 120ms ease, filter 120ms ease, box-shadow 120ms ease;
+}
+
+button:hover:not(:disabled) {
+  filter: brightness(1.04);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}

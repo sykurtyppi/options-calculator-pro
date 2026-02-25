@@ -1,7 +1,7 @@
 """
-Utilities package for Options Calculator Pro
+Utilities package for Options Calculator Pro (web edition).
 """
 
-from .config_manager import ConfigManager
+from .logger import setup_logger
 
-__all__ = ['ConfigManager']
+__all__ = ["setup_logger"]

@@ -784,13 +784,15 @@ class InstitutionalMLDatabase:
                         INSERT OR REPLACE INTO ml_features
                         (symbol, date, underlying_price, price_momentum_5d, price_momentum_20d,
                          volume_ratio_10d, iv_rank, iv_percentile, iv30_rv30_ratio,
+                         vol_term_structure_slope,
                          rsi_14, bb_position, vix_level, forward_return_1d, forward_return_5d,
                          forward_return_21d, forward_volatility_21d)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         symbol, date.strftime('%Y-%m-%d'), row['Close'],
                         price_momentum_5d, price_momentum_20d, volume_ratio,
                         float(iv_rank.iloc[i]), float(iv_percentile.iloc[i]), float(iv30_rv30_ratio.iloc[i]),
+                        float(slope_ratio.iloc[i]),
                         row.get('RSI_14', 50.0), row.get('BB_Position', 0.5), float(vix_proxy.iloc[i]),
                         forward_return_1d, forward_return_5d, forward_return_21d,
                         None if pd.isna(forward_vol_21d.iloc[i]) else float(forward_vol_21d.iloc[i])
@@ -916,7 +918,17 @@ class InstitutionalMLDatabase:
         allow_global_crush_profile = bool(strategy_params.get('allow_global_crush_profile', True))
         min_crush_confidence = float(np.clip(float(strategy_params.get('min_crush_confidence', 0.45)), 0.0, 1.0))
         min_crush_magnitude = float(np.clip(float(strategy_params.get('min_crush_magnitude', 0.08)), 0.0, 1.0))
-        min_crush_edge = float(np.clip(float(strategy_params.get('min_crush_edge', 0.05)), 0.0, 1.0))
+        min_crush_edge = float(np.clip(float(strategy_params.get('min_crush_edge', 0.02)), 0.0, 1.0))
+        target_entry_dte = max(1, int(strategy_params.get('target_entry_dte', 6)))
+        entry_dte_band = max(1, int(strategy_params.get('entry_dte_band', 6)))
+        min_daily_share_volume = max(
+            0.0,
+            self._safe_numeric(strategy_params.get('min_daily_share_volume', 1_000_000), 1_000_000.0),
+        )
+        max_abs_momentum_5d = max(
+            0.01,
+            self._safe_numeric(strategy_params.get('max_abs_momentum_5d', 0.11), 0.11),
+        )
         execution_profile = str(strategy_params.get('execution_profile', 'institutional')).strip().lower() or 'institutional'
         execution_cost_model = ExecutionCostModel(execution_profile)
 
@@ -964,10 +976,16 @@ class InstitutionalMLDatabase:
                     event_date = pd.Timestamp(trade_date).to_pydatetime()
                     days_to_earnings = 0
 
-                iv_rv_ratio = float(getattr(row, 'iv30_rv30_ratio', np.nan))
+                iv_rv_ratio = self._safe_numeric(getattr(row, 'iv30_rv30_ratio', np.nan), np.nan)
                 if not np.isfinite(iv_rv_ratio):
                     continue
                 if iv_rv_ratio < iv_rv_min or iv_rv_ratio > iv_rv_max:
+                    continue
+                momentum_5d = abs(self._safe_numeric(getattr(row, 'price_momentum_5d', 0.0), 0.0))
+                if momentum_5d > max_abs_momentum_5d:
+                    continue
+                daily_share_volume = self._safe_numeric(getattr(row, 'volume', np.nan), np.nan)
+                if np.isfinite(daily_share_volume) and daily_share_volume < min_daily_share_volume:
                     continue
 
                 symbol = str(getattr(row, 'symbol', 'UNKNOWN'))
@@ -986,10 +1004,21 @@ class InstitutionalMLDatabase:
                     if crush_context['edge_score'] < min_crush_edge:
                         continue
 
-                setup_score = self._score_setup_quality(row)
+                setup_score = self._score_setup_quality(
+                    row=row,
+                    days_to_earnings=days_to_earnings,
+                    target_entry_dte=target_entry_dte,
+                    entry_dte_band=entry_dte_band,
+                )
                 if setup_score < min_signal_score:
                     continue
-                rank_score = float(np.clip(setup_score + 0.25 * crush_context['edge_score'], 0.0, 1.35))
+                rank_score = self._rank_candidate_for_alpha(
+                    setup_score=setup_score,
+                    crush_context=crush_context,
+                    days_to_earnings=days_to_earnings,
+                    target_entry_dte=target_entry_dte,
+                    entry_dte_band=entry_dte_band,
+                )
                 scored_rows.append((rank_score, setup_score, row, row_hold_days, event_date, days_to_earnings, crush_context))
 
             if not scored_rows:
@@ -1035,8 +1064,11 @@ class InstitutionalMLDatabase:
                 f.price_momentum_20d,
                 f.volume_ratio_10d,
                 f.iv30_rv30_ratio,
+                f.vol_term_structure_slope,
                 f.rsi_14,
                 f.bb_position,
+                f.put_call_ratio,
+                f.options_volume_ratio,
                 f.vix_level,
                 f.forward_return_1d,
                 f.forward_return_5d,
@@ -1916,31 +1948,124 @@ class InstitutionalMLDatabase:
             'max_relative_day': max_relative_day,
         }
 
-    def _score_setup_quality(self, row: Any) -> float:
-        """Map feature state into a normalized [0, 1] pre-earnings setup quality score."""
-        iv_rv_ratio = float(getattr(row, 'iv30_rv30_ratio', 1.0) or 1.0)
-        momentum_5d = abs(float(getattr(row, 'price_momentum_5d', 0.0) or 0.0))
-        rsi_14 = float(getattr(row, 'rsi_14', 50.0) or 50.0)
-        bb_position = float(getattr(row, 'bb_position', 0.5) or 0.5)
-        volume_ratio = float(getattr(row, 'volume_ratio_10d', 1.0) or 1.0)
-        vix_level = float(getattr(row, 'vix_level', 20.0) or 20.0)
+    @staticmethod
+    def _score_entry_timing(days_to_earnings: Optional[int], target_entry_dte: int,
+                            entry_dte_band: int) -> float:
+        """Prefer setups close to the pre-event timing sweet-spot."""
+        if days_to_earnings is None or days_to_earnings <= 0:
+            return 0.50
+        band = float(max(1, entry_dte_band))
+        z = (float(days_to_earnings) - float(max(1, target_entry_dte))) / band
+        return float(np.clip(np.exp(-0.5 * z * z), 0.0, 1.0))
 
-        iv_component = np.clip((iv_rv_ratio - 0.90) / 0.90, 0.0, 1.0)
+    @staticmethod
+    def _safe_numeric(value: Any, default: float = 0.0) -> float:
+        """Convert optional/messy inputs to float with fallback."""
+        try:
+            if value is None:
+                return float(default)
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not np.isfinite(numeric):
+            return float(default)
+        return numeric
+
+    @staticmethod
+    def _score_iv_rv_quality(iv_rv_ratio: float) -> float:
+        """
+        Reward elevated IV/RV while avoiding a purely monotonic chase of extremes.
+        A bell-shaped core plus a premium-presence gate is more robust out-of-sample.
+        """
+        target = 1.28
+        width = 0.38
+        z = (float(iv_rv_ratio) - target) / width
+        bell_component = float(np.exp(-0.5 * z * z))
+        premium_gate = float(np.clip((float(iv_rv_ratio) - 0.92) / 0.40, 0.0, 1.0))
+        return float(np.clip(0.60 * bell_component + 0.40 * premium_gate, 0.0, 1.0))
+
+    @staticmethod
+    def _score_term_structure_quality(term_slope: float) -> float:
+        """
+        Prefer moderate front-end richness in the event window, not extreme dislocations.
+        """
+        if not np.isfinite(term_slope):
+            return 0.50
+        target = 0.10
+        width = 0.22
+        z = (float(term_slope) - target) / width
+        return float(np.clip(np.exp(-0.5 * z * z), 0.0, 1.0))
+
+    def _score_setup_quality(self, row: Any, days_to_earnings: Optional[int] = None,
+                             target_entry_dte: int = 6, entry_dte_band: int = 6) -> float:
+        """Map feature state into a normalized [0, 1] pre-earnings setup quality score."""
+        iv_rv_ratio = self._safe_numeric(getattr(row, 'iv30_rv30_ratio', 1.0), 1.0)
+        momentum_5d = abs(self._safe_numeric(getattr(row, 'price_momentum_5d', 0.0), 0.0))
+        rsi_14 = self._safe_numeric(getattr(row, 'rsi_14', 50.0), 50.0)
+        bb_position = self._safe_numeric(getattr(row, 'bb_position', 0.5), 0.5)
+        volume_ratio = self._safe_numeric(getattr(row, 'volume_ratio_10d', 1.0), 1.0)
+        vix_level = self._safe_numeric(getattr(row, 'vix_level', 20.0), 20.0)
+        term_slope = self._safe_numeric(getattr(row, 'vol_term_structure_slope', np.nan), np.nan)
+        daily_share_volume = self._safe_numeric(getattr(row, 'volume', np.nan), np.nan)
+
+        iv_component = self._score_iv_rv_quality(iv_rv_ratio)
+        timing_component = self._score_entry_timing(days_to_earnings, target_entry_dte, entry_dte_band)
         stability_component = 1.0 - np.clip(momentum_5d / 0.06, 0.0, 1.0)
         rsi_component = 1.0 - np.clip(abs(rsi_14 - 50.0) / 35.0, 0.0, 1.0)
         bb_component = 1.0 - np.clip(abs(bb_position - 0.5) / 0.5, 0.0, 1.0)
-        flow_component = np.clip((volume_ratio - 0.8) / 1.2, 0.0, 1.0)
+        flow_component = np.clip((volume_ratio - 0.85) / 1.15, 0.0, 1.0)
         regime_component = 1.0 - np.clip(abs(vix_level - 22.0) / 18.0, 0.0, 1.0)
+        term_component = self._score_term_structure_quality(term_slope)
+
+        if np.isfinite(daily_share_volume):
+            liquidity_component = np.clip(
+                (np.log1p(max(1.0, daily_share_volume)) - np.log1p(250_000.0))
+                / (np.log1p(25_000_000.0) - np.log1p(250_000.0)),
+                0.0,
+                1.0,
+            )
+        else:
+            liquidity_component = 0.45
+
+        # Very crowded prints can reverse quickly and carry wider execution drag.
+        crowding_penalty = np.clip(max(volume_ratio - 2.6, 0.0) / 2.4, 0.0, 1.0)
 
         score = (
-            0.30 * iv_component
-            + 0.22 * stability_component
-            + 0.14 * rsi_component
-            + 0.12 * bb_component
+            0.24 * iv_component
+            + 0.18 * timing_component
+            + 0.16 * stability_component
+            + 0.10 * rsi_component
+            + 0.08 * bb_component
             + 0.12 * flow_component
-            + 0.10 * regime_component
+            + 0.06 * regime_component
+            + 0.06 * term_component
+            + 0.10 * liquidity_component
+            - 0.16 * crowding_penalty
         )
         return float(np.clip(score, 0.0, 1.0))
+
+    def _rank_candidate_for_alpha(self, setup_score: float, crush_context: Dict[str, Any],
+                                  days_to_earnings: Optional[int], target_entry_dte: int,
+                                  entry_dte_band: int) -> float:
+        """Blend setup quality with crush profile quality into final candidate rank."""
+        confidence = float(np.clip(float(crush_context.get('confidence', 0.0)), 0.0, 1.0))
+        signal_strength = float(np.clip(float(crush_context.get('signal_strength', 0.0)), 0.0, 1.0))
+        magnitude_component = float(np.clip(float(crush_context.get('magnitude', 0.0)) / 0.30, 0.0, 1.0))
+        edge_component = float(np.clip(float(crush_context.get('edge_score', 0.0)) / 0.10, 0.0, 1.0))
+        timing_component = self._score_entry_timing(days_to_earnings, target_entry_dte, entry_dte_band)
+
+        crush_quality = (
+            0.34 * confidence
+            + 0.26 * signal_strength
+            + 0.24 * magnitude_component
+            + 0.16 * edge_component
+        )
+        rank_score = (
+            0.62 * float(setup_score)
+            + 0.30 * crush_quality
+            + 0.08 * timing_component
+        )
+        return float(np.clip(rank_score, 0.0, 1.35))
 
     def _resolve_forward_return(self, row: Any, hold_days: int) -> Optional[float]:
         """Project a hold-period return from available forward-return labels."""
@@ -2917,6 +3042,9 @@ class InstitutionalMLDatabase:
                 'session_id': session_id,
                 'min_confidence': float(min_confidence),
                 'min_trades': min_trades,
+                'available_trade_count': 0,
+                'max_trade_count_for_thresholds': 0,
+                'suggested_min_trades': None,
                 'candidate_count': 0,
                 'best_threshold': None,
                 'best_metrics': None,
@@ -2925,6 +3053,7 @@ class InstitutionalMLDatabase:
             }
 
         diagnostics = diagnostics.copy()
+        available_trade_count = int(len(diagnostics))
         base_score = diagnostics['setup_score'].clip(lower=0.0, upper=1.0)
         edge_score = np.clip(diagnostics['crush_edge_score'] / 0.12, 0.0, 1.0)
         if use_composite_signal:
@@ -2947,6 +3076,9 @@ class InstitutionalMLDatabase:
                 'signal_name': signal_name,
                 'min_confidence': float(min_confidence),
                 'min_trades': min_trades,
+                'available_trade_count': available_trade_count,
+                'max_trade_count_for_thresholds': 0,
+                'suggested_min_trades': None,
                 'candidate_count': 0,
                 'best_threshold': None,
                 'best_metrics': None,
@@ -2960,9 +3092,11 @@ class InstitutionalMLDatabase:
             if np.isfinite(v)
         })
         candidate_rows: List[Dict[str, Any]] = []
+        max_trade_count_for_thresholds = 0
         for threshold in thresholds:
             subset = diagnostics[diagnostics['signal_score'] >= float(threshold)].copy()
             trade_count = int(len(subset))
+            max_trade_count_for_thresholds = max(max_trade_count_for_thresholds, trade_count)
             if trade_count < min_trades:
                 continue
 
@@ -3030,6 +3164,11 @@ class InstitutionalMLDatabase:
             })
 
         if not candidate_rows:
+            suggested_min_trades = None
+            if max_trade_count_for_thresholds >= 5:
+                suggested_min_trades = int(
+                    max(5, round(0.67 * float(max_trade_count_for_thresholds)))
+                )
             return {
                 'recommended': False,
                 'reason': 'insufficient_trade_count_for_thresholds',
@@ -3037,6 +3176,9 @@ class InstitutionalMLDatabase:
                 'signal_name': signal_name,
                 'min_confidence': float(min_confidence),
                 'min_trades': min_trades,
+                'available_trade_count': available_trade_count,
+                'max_trade_count_for_thresholds': int(max_trade_count_for_thresholds),
+                'suggested_min_trades': suggested_min_trades,
                 'candidate_count': 0,
                 'best_threshold': None,
                 'best_metrics': None,
@@ -3057,6 +3199,9 @@ class InstitutionalMLDatabase:
             'signal_name': signal_name,
             'min_confidence': float(np.clip(float(min_confidence), 0.0, 1.0)),
             'min_trades': min_trades,
+            'available_trade_count': available_trade_count,
+            'max_trade_count_for_thresholds': int(max_trade_count_for_thresholds),
+            'suggested_min_trades': None,
             'candidate_count': int(len(candidates_df)),
             'best_threshold': float(best['threshold']),
             'best_metrics': self._normalize_json_value(best.to_dict()),
@@ -3072,8 +3217,15 @@ class InstitutionalMLDatabase:
                            crush_directional_accuracy: float = 0.0) -> float:
         """Compute composite alpha score used for sweep/OOS ranking."""
         sharpe_component = float(np.clip(float(sharpe) / 2.0, -1.0, 2.0))
-        pnl_drawdown_component = float(float(total_pnl) / max(abs(float(max_drawdown)), 1.0))
-        consistency_component = float(float(mean_net_return) / max(float(return_std), 1e-6)) if float(return_std) > 0 else 0.0
+        pnl_drawdown_raw = float(float(total_pnl) / max(abs(float(max_drawdown)), 1.0))
+        pnl_drawdown_component = float(
+            np.clip(np.sign(pnl_drawdown_raw) * np.log1p(abs(pnl_drawdown_raw)), -2.5, 2.5)
+        )
+        consistency_raw = (
+            float(float(mean_net_return) / max(float(return_std), 1e-6))
+            if float(return_std) > 0 else 0.0
+        )
+        consistency_component = float(np.clip(consistency_raw, -2.0, 2.0))
         crush_conf_component = float(np.clip(crush_confidence, 0.0, 1.0))
         crush_edge_component = float(np.clip(crush_edge / 0.12, 0.0, 1.0))
         crush_coverage_component = float(np.clip(crush_coverage, 0.0, 1.0))
@@ -3442,6 +3594,208 @@ class InstitutionalMLDatabase:
         except Exception as e:
             self.logger.error(f"❌ OOS validation failed: {e}")
             return pd.DataFrame()
+
+    @staticmethod
+    def _normal_mean_confidence_interval(values: pd.Series, z_score: float = 1.96) -> Dict[str, Optional[float]]:
+        """Compute normal-approximation CI for the sample mean."""
+        series = pd.to_numeric(values, errors='coerce').dropna()
+        n = int(len(series))
+        if n == 0:
+            return {'mean': None, 'low': None, 'high': None, 'n': 0}
+        mean_val = float(series.mean())
+        if n < 2:
+            return {'mean': mean_val, 'low': mean_val, 'high': mean_val, 'n': 1}
+
+        std = float(series.std(ddof=1))
+        if not np.isfinite(std):
+            return {'mean': mean_val, 'low': mean_val, 'high': mean_val, 'n': n}
+
+        half_width = float(z_score * std / np.sqrt(max(n, 1)))
+        return {
+            'mean': mean_val,
+            'low': float(mean_val - half_width),
+            'high': float(mean_val + half_width),
+            'n': n,
+        }
+
+    @staticmethod
+    def _wilson_confidence_interval(successes: int, trials: int, z_score: float = 1.96) -> Tuple[Optional[float], Optional[float]]:
+        """Wilson score interval for binomial proportion."""
+        n = int(max(0, trials))
+        if n <= 0:
+            return None, None
+        s = float(np.clip(successes, 0, n))
+        p_hat = s / n
+        z2 = float(z_score ** 2)
+        denom = 1.0 + z2 / n
+        center = (p_hat + z2 / (2.0 * n)) / denom
+        spread = (
+            z_score
+            * np.sqrt((p_hat * (1.0 - p_hat) / n) + (z2 / (4.0 * n * n)))
+            / denom
+        )
+        return float(max(0.0, center - spread)), float(min(1.0, center + spread))
+
+    def build_oos_report_card(self, oos_df: pd.DataFrame, min_splits: int = 8,
+                              min_total_test_trades: int = 80,
+                              min_trades_per_split: float = 5.0) -> Dict[str, Any]:
+        """
+        Build institutional report card for walk-forward OOS robustness.
+        Includes sample-size gates and confidence intervals.
+        """
+        min_splits = max(1, int(min_splits))
+        min_total_test_trades = max(1, int(min_total_test_trades))
+        min_trades_per_split = max(1.0, float(min_trades_per_split))
+
+        if oos_df is None or oos_df.empty:
+            return {
+                'ready': False,
+                'reason': 'no_oos_rows',
+                'sample': {
+                    'splits': 0,
+                    'total_test_trades': 0,
+                    'avg_trades_per_split': 0.0,
+                },
+                'gates': {},
+                'metrics': {},
+                'verdict': {
+                    'overall_pass': False,
+                    'grade': 'F',
+                    'message': 'No OOS rows available.',
+                },
+            }
+
+        required_cols = [
+            'test_alpha_score',
+            'test_sharpe_ratio',
+            'test_total_pnl',
+            'test_total_trades',
+            'test_win_rate',
+        ]
+        missing = [col for col in required_cols if col not in oos_df.columns]
+        if missing:
+            return {
+                'ready': False,
+                'reason': 'missing_columns',
+                'missing_columns': missing,
+                'sample': {
+                    'splits': int(len(oos_df)),
+                    'total_test_trades': 0,
+                    'avg_trades_per_split': 0.0,
+                },
+                'gates': {},
+                'metrics': {},
+                'verdict': {
+                    'overall_pass': False,
+                    'grade': 'F',
+                    'message': f"Missing required OOS columns: {', '.join(missing)}.",
+                },
+            }
+
+        df = oos_df.copy()
+        trades = pd.to_numeric(df['test_total_trades'], errors='coerce').fillna(0.0).clip(lower=0.0)
+        split_count = int(len(df))
+        total_test_trades = int(np.round(float(trades.sum())))
+        avg_trades_per_split = float(trades.mean()) if split_count > 0 else 0.0
+
+        alpha_ci = self._normal_mean_confidence_interval(df['test_alpha_score'])
+        sharpe_ci = self._normal_mean_confidence_interval(df['test_sharpe_ratio'])
+        pnl_ci = self._normal_mean_confidence_interval(df['test_total_pnl'])
+
+        win_rate = pd.to_numeric(df['test_win_rate'], errors='coerce').fillna(0.0).clip(lower=0.0, upper=1.0)
+        expected_wins = int(np.round(float((win_rate * trades).sum())))
+        win_rate_mean = (
+            float(np.clip(expected_wins / total_test_trades, 0.0, 1.0))
+            if total_test_trades > 0 else 0.0
+        )
+        win_rate_ci_low, win_rate_ci_high = self._wilson_confidence_interval(expected_wins, total_test_trades)
+
+        positive_alpha_rate = float((pd.to_numeric(df['test_alpha_score'], errors='coerce').fillna(0.0) > 0.0).mean())
+        positive_pnl_rate = float((pd.to_numeric(df['test_total_pnl'], errors='coerce').fillna(0.0) > 0.0).mean())
+
+        gates = {
+            'min_splits': {
+                'required': min_splits,
+                'actual': split_count,
+                'passed': bool(split_count >= min_splits),
+            },
+            'min_total_test_trades': {
+                'required': min_total_test_trades,
+                'actual': total_test_trades,
+                'passed': bool(total_test_trades >= min_total_test_trades),
+            },
+            'min_trades_per_split': {
+                'required': float(min_trades_per_split),
+                'actual': float(avg_trades_per_split),
+                'passed': bool(avg_trades_per_split >= min_trades_per_split),
+            },
+            'alpha_ci_positive': {
+                'required': '> 0',
+                'actual': alpha_ci.get('low'),
+                'passed': bool(alpha_ci.get('low') is not None and float(alpha_ci['low']) > 0.0),
+            },
+            'sharpe_ci_positive': {
+                'required': '> 0',
+                'actual': sharpe_ci.get('low'),
+                'passed': bool(sharpe_ci.get('low') is not None and float(sharpe_ci['low']) > 0.0),
+            },
+            'pnl_ci_positive': {
+                'required': '> 0',
+                'actual': pnl_ci.get('low'),
+                'passed': bool(pnl_ci.get('low') is not None and float(pnl_ci['low']) > 0.0),
+            },
+        }
+
+        overall_pass = all(bool(gate.get('passed')) for gate in gates.values())
+        high_confidence_pass = (
+            overall_pass
+            and split_count >= 12
+            and total_test_trades >= 150
+            and positive_alpha_rate >= 0.60
+            and positive_pnl_rate >= 0.60
+        )
+        if high_confidence_pass:
+            grade = 'A'
+            message = "Institutional robustness gate passed with high sample quality."
+        elif overall_pass:
+            grade = 'B'
+            message = "Robustness gate passed; monitor live drift and execution quality."
+        elif gates['min_splits']['passed'] and gates['min_total_test_trades']['passed']:
+            grade = 'C'
+            message = "Coverage is acceptable, but confidence intervals still cross zero."
+        else:
+            grade = 'D'
+            message = "Insufficient OOS evidence. Expand samples before trusting the edge."
+
+        return {
+            'ready': True,
+            'reason': 'ok',
+            'sample': {
+                'splits': split_count,
+                'total_test_trades': total_test_trades,
+                'avg_trades_per_split': avg_trades_per_split,
+                'estimated_wins': expected_wins,
+            },
+            'metrics': {
+                'alpha': alpha_ci,
+                'sharpe': sharpe_ci,
+                'pnl': pnl_ci,
+                'win_rate': {
+                    'mean': win_rate_mean,
+                    'low': win_rate_ci_low,
+                    'high': win_rate_ci_high,
+                    'n': total_test_trades,
+                },
+                'positive_alpha_split_rate': positive_alpha_rate,
+                'positive_pnl_split_rate': positive_pnl_rate,
+            },
+            'gates': gates,
+            'verdict': {
+                'overall_pass': bool(overall_pass),
+                'grade': grade,
+                'message': message,
+            },
+        }
 
     async def train_ml_model_on_historical_spreads(self) -> dict:
         """

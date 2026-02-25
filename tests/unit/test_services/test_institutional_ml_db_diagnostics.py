@@ -204,6 +204,33 @@ class TestInstitutionalDiagnostics(unittest.TestCase):
             self.assertGreaterEqual(threshold, 0.0)
             self.assertLessEqual(threshold, 1.0)
 
+    def test_threshold_recommendation_reports_trade_count_constraints(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = f"{tmp_dir}/inst_tune_constraints.db"
+            db = InstitutionalMLDatabase(db_path=db_path)
+            self._seed_backtest_data(db)
+
+            recommendation = db.recommend_signal_threshold_from_deciles(
+                session_id="session_diag_1",
+                min_confidence=0.30,
+                min_trades=200,
+                use_composite_signal=True,
+            )
+            self.assertFalse(recommendation.get("recommended", False))
+            self.assertEqual(
+                recommendation.get("reason"),
+                "insufficient_trade_count_for_thresholds",
+            )
+            self.assertGreater(recommendation.get("available_trade_count", 0), 0)
+            self.assertGreater(recommendation.get("max_trade_count_for_thresholds", 0), 0)
+            suggested = recommendation.get("suggested_min_trades")
+            self.assertIsNotNone(suggested)
+            self.assertGreaterEqual(int(suggested), 5)
+            self.assertLessEqual(
+                int(suggested),
+                int(recommendation.get("max_trade_count_for_thresholds", 0)),
+            )
+
     def test_proxy_schedule_generation_requires_sufficient_history(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_proxy.db")
@@ -372,6 +399,70 @@ class TestInstitutionalDiagnostics(unittest.TestCase):
             self.assertEqual(status["capture_days"], 5)
             self.assertEqual(status["min_relative_day"], -4)
             self.assertEqual(status["max_relative_day"], 1)
+
+    def test_oos_report_card_passes_with_confident_sample(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_oos_pass.db")
+            oos_df = pd.DataFrame(
+                {
+                    "split_index": list(range(12)),
+                    "test_alpha_score": np.linspace(0.09, 0.16, 12),
+                    "test_sharpe_ratio": np.linspace(1.10, 2.00, 12),
+                    "test_total_pnl": np.linspace(60.0, 220.0, 12),
+                    "test_total_trades": [14, 15, 16, 14, 13, 17, 15, 16, 14, 15, 13, 16],
+                    "test_win_rate": np.linspace(0.62, 0.81, 12),
+                }
+            )
+
+            report = db.build_oos_report_card(
+                oos_df=oos_df,
+                min_splits=8,
+                min_total_test_trades=80,
+                min_trades_per_split=5.0,
+            )
+
+            self.assertTrue(report.get("ready"))
+            self.assertTrue(report.get("verdict", {}).get("overall_pass"))
+            self.assertIn(report.get("verdict", {}).get("grade"), {"A", "B"})
+            self.assertTrue(report["gates"]["min_splits"]["passed"])
+            self.assertTrue(report["gates"]["min_total_test_trades"]["passed"])
+            self.assertTrue(report["gates"]["min_trades_per_split"]["passed"])
+            self.assertTrue(report["gates"]["alpha_ci_positive"]["passed"])
+            self.assertTrue(report["gates"]["sharpe_ci_positive"]["passed"])
+            self.assertTrue(report["gates"]["pnl_ci_positive"]["passed"])
+            self.assertGreater(report["metrics"]["alpha"]["low"], 0.0)
+            self.assertGreater(report["metrics"]["sharpe"]["low"], 0.0)
+            self.assertGreater(report["metrics"]["pnl"]["low"], 0.0)
+            self.assertGreaterEqual(report["metrics"]["win_rate"]["mean"], 0.0)
+            self.assertLessEqual(report["metrics"]["win_rate"]["mean"], 1.0)
+
+    def test_oos_report_card_fails_when_sample_is_thin(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_oos_fail.db")
+            oos_df = pd.DataFrame(
+                {
+                    "split_index": [0, 1, 2],
+                    "test_alpha_score": [0.02, -0.01, 0.01],
+                    "test_sharpe_ratio": [0.20, -0.30, 0.10],
+                    "test_total_pnl": [8.0, -12.0, 4.0],
+                    "test_total_trades": [3, 4, 2],
+                    "test_win_rate": [0.50, 0.25, 0.50],
+                }
+            )
+
+            report = db.build_oos_report_card(
+                oos_df=oos_df,
+                min_splits=8,
+                min_total_test_trades=80,
+                min_trades_per_split=5.0,
+            )
+
+            self.assertTrue(report.get("ready"))
+            self.assertFalse(report.get("verdict", {}).get("overall_pass"))
+            self.assertFalse(report["gates"]["min_splits"]["passed"])
+            self.assertFalse(report["gates"]["min_total_test_trades"]["passed"])
+            self.assertFalse(report["gates"]["min_trades_per_split"]["passed"])
+            self.assertIn(report.get("verdict", {}).get("grade"), {"C", "D"})
 
 
 if __name__ == "__main__":
