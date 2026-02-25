@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +19,13 @@ class EdgeAnalyzeResponse(BaseModel):
 
 
 class OOSReportRequest(BaseModel):
+    oos_stability_profile: Literal[
+        "stability_auto",
+        "evidence_balanced",
+        "variance_control",
+        "alpha_focus",
+    ] = "stability_auto"
+
     lookback_days: int = 1095
     max_backtest_symbols: int = 50
     backtest_start_date: Optional[str] = "2023-01-01"

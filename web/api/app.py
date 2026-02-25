@@ -48,6 +48,143 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_OOS_STABILITY_PROFILES: Dict[str, Dict[str, Any]] = {
+    "evidence_balanced": {
+        "execution_profiles": ["institutional"],
+        "hold_days_grid": [7],
+        "trades_per_day_grid": [4],
+        "entry_days_grid": [7],
+        "exit_days_grid": [1],
+        "defaults": {
+            "min_signal_score": 0.50,
+            "min_crush_confidence": 0.30,
+            "min_crush_magnitude": 0.06,
+            "min_crush_edge": 0.02,
+            "target_entry_dte": 6,
+            "entry_dte_band": 6,
+            "min_daily_share_volume": 1_000_000,
+            "max_abs_momentum_5d": 0.11,
+            "lookback_days": 1095,
+            "max_backtest_symbols": 50,
+        },
+    },
+    "variance_control": {
+        "execution_profiles": ["institutional_tight", "institutional"],
+        "hold_days_grid": [1, 3],
+        "trades_per_day_grid": [1, 2],
+        "entry_days_grid": [3, 5],
+        "exit_days_grid": [1],
+        "defaults": {
+            "min_signal_score": 0.55,
+            "min_crush_confidence": 0.40,
+            "min_crush_magnitude": 0.07,
+            "min_crush_edge": 0.03,
+            "target_entry_dte": 6,
+            "entry_dte_band": 4,
+            "min_daily_share_volume": 2_500_000,
+            "max_abs_momentum_5d": 0.08,
+            "lookback_days": 1095,
+            "max_backtest_symbols": 50,
+        },
+    },
+    "alpha_focus": {
+        "execution_profiles": ["institutional_tight"],
+        "hold_days_grid": [1],
+        "trades_per_day_grid": [1],
+        "entry_days_grid": [2, 3],
+        "exit_days_grid": [1],
+        "defaults": {
+            "min_signal_score": 0.60,
+            "min_crush_confidence": 0.45,
+            "min_crush_magnitude": 0.08,
+            "min_crush_edge": 0.035,
+            "target_entry_dte": 6,
+            "entry_dte_band": 3,
+            "min_daily_share_volume": 5_000_000,
+            "max_abs_momentum_5d": 0.07,
+            "lookback_days": 1095,
+            "max_backtest_symbols": 50,
+        },
+    },
+}
+
+_OOS_AUTO_PROFILE_ORDER: Tuple[str, ...] = (
+    "evidence_balanced",
+    "variance_control",
+    "alpha_focus",
+)
+
+
+def _resolve_stability_profile(profile: Optional[str]) -> str:
+    normalized = (profile or "stability_auto").strip().lower()
+    if normalized == "stability_auto":
+        return normalized
+    if normalized in _OOS_STABILITY_PROFILES:
+        return normalized
+    return "stability_auto"
+
+
+def _build_profiled_run_kwargs(
+    request: OOSReportRequest,
+    profile_name: str,
+    train_days: int,
+    test_days: int,
+    step_days: int,
+    use_profile_defaults: bool,
+) -> Dict[str, Any]:
+    profile = _OOS_STABILITY_PROFILES[profile_name]
+    defaults = profile["defaults"]
+
+    if use_profile_defaults:
+        min_signal_score = float(defaults["min_signal_score"])
+        min_crush_confidence = float(defaults["min_crush_confidence"])
+        min_crush_magnitude = float(defaults["min_crush_magnitude"])
+        min_crush_edge = float(defaults["min_crush_edge"])
+        target_entry_dte = int(defaults["target_entry_dte"])
+        entry_dte_band = int(defaults["entry_dte_band"])
+        min_daily_share_volume = int(defaults["min_daily_share_volume"])
+        max_abs_momentum_5d = float(defaults["max_abs_momentum_5d"])
+    else:
+        min_signal_score = max(float(request.min_signal_score), float(defaults["min_signal_score"]))
+        min_crush_confidence = max(float(request.min_crush_confidence), float(defaults["min_crush_confidence"]))
+        min_crush_magnitude = max(float(request.min_crush_magnitude), float(defaults["min_crush_magnitude"]))
+        min_crush_edge = max(float(request.min_crush_edge), float(defaults["min_crush_edge"]))
+        target_entry_dte = int(request.target_entry_dte)
+        entry_dte_band = min(int(request.entry_dte_band), int(defaults["entry_dte_band"]))
+        min_daily_share_volume = max(int(request.min_daily_share_volume), int(defaults["min_daily_share_volume"]))
+        max_abs_momentum_5d = min(float(request.max_abs_momentum_5d), float(defaults["max_abs_momentum_5d"]))
+
+    return {
+        "execution_profiles": list(profile["execution_profiles"]),
+        "hold_days_grid": list(profile["hold_days_grid"]),
+        "signal_threshold_grid": [min_signal_score],
+        "trades_per_day_grid": list(profile["trades_per_day_grid"]),
+        "entry_days_grid": list(profile["entry_days_grid"]),
+        "exit_days_grid": list(profile["exit_days_grid"]),
+        "target_entry_dte": target_entry_dte,
+        "entry_dte_band": max(1, entry_dte_band),
+        "min_daily_share_volume": min_daily_share_volume,
+        "max_abs_momentum_5d": max_abs_momentum_5d,
+        "train_days": train_days,
+        "test_days": test_days,
+        "step_days": step_days,
+        "top_n_train": request.oos_top_n_train,
+        "lookback_days": max(int(request.lookback_days), int(defaults["lookback_days"])),
+        "max_backtest_symbols": max(int(request.max_backtest_symbols), int(defaults["max_backtest_symbols"])),
+        "use_crush_confidence_gate": True,
+        "allow_global_crush_profile": True,
+        "min_crush_confidence": min_crush_confidence,
+        "min_crush_magnitude": min_crush_magnitude,
+        "min_crush_edge": min_crush_edge,
+        "allow_proxy_earnings": True,
+        "min_splits": request.oos_min_splits,
+        "min_total_test_trades": request.oos_min_total_test_trades,
+        "min_trades_per_split": request.oos_min_trades_per_split,
+        "output_dir": "exports/reports",
+        "start_date": request.backtest_start_date,
+        "end_date": request.backtest_end_date,
+    }
+
 
 def _json_safe(value: Any) -> Any:
     """Convert numpy/pandas/path-like objects to JSON-serializable primitives."""
@@ -93,18 +230,40 @@ def _oos_report_card_from_result(result: Optional[Dict[str, Any]]) -> Dict[str, 
     return report_card if isinstance(report_card, dict) else {}
 
 
-def _oos_result_score(result: Optional[Dict[str, Any]]) -> Tuple[int, int, int, float]:
+def _oos_result_score(result: Optional[Dict[str, Any]]) -> Tuple[int, int, float, float, float, int, int]:
     report_card = _oos_report_card_from_result(result)
     verdict = report_card.get("verdict", {}) if isinstance(report_card, dict) else {}
     sample = report_card.get("sample", {}) if isinstance(report_card, dict) else {}
     metrics = report_card.get("metrics", {}) if isinstance(report_card, dict) else {}
     alpha = metrics.get("alpha", {}) if isinstance(metrics, dict) else {}
+    sharpe = metrics.get("sharpe", {}) if isinstance(metrics, dict) else {}
+    pnl = metrics.get("pnl", {}) if isinstance(metrics, dict) else {}
 
     overall_pass = 1 if bool(verdict.get("overall_pass")) else 0
+    alpha_low = float(alpha.get("low", -999.0) or -999.0)
+    sharpe_low = float(sharpe.get("low", -999.0) or -999.0)
+    pnl_low = float(pnl.get("low", -999.0) or -999.0)
+    ci_positive_count = int(alpha_low > 0.0) + int(sharpe_low > 0.0) + int(pnl_low > 0.0)
     total_trades = int(sample.get("total_test_trades", 0) or 0)
     splits = int(sample.get("splits", 0) or 0)
-    alpha_low = float(alpha.get("low", -999.0) or -999.0)
-    return overall_pass, total_trades, splits, alpha_low
+    return overall_pass, ci_positive_count, alpha_low, sharpe_low, pnl_low, total_trades, splits
+
+
+def _oos_profile_summary(profile_name: str, result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    report_card = _oos_report_card_from_result(result)
+    verdict = report_card.get("verdict", {}) if isinstance(report_card, dict) else {}
+    sample = report_card.get("sample", {}) if isinstance(report_card, dict) else {}
+    metrics = report_card.get("metrics", {}) if isinstance(report_card, dict) else {}
+    return {
+        "profile": profile_name,
+        "grade": verdict.get("grade"),
+        "overall_pass": verdict.get("overall_pass"),
+        "total_test_trades": sample.get("total_test_trades"),
+        "avg_trades_per_split": sample.get("avg_trades_per_split"),
+        "alpha_low": (metrics.get("alpha", {}) if isinstance(metrics, dict) else {}).get("low"),
+        "sharpe_low": (metrics.get("sharpe", {}) if isinstance(metrics, dict) else {}).get("low"),
+        "pnl_low": (metrics.get("pnl", {}) if isinstance(metrics, dict) else {}).get("low"),
+    }
 
 
 def _oos_sample_insufficient(result: Optional[Dict[str, Any]]) -> bool:
@@ -187,39 +346,58 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
             pass
         if adjustment_note:
             notes.append(adjustment_note)
+        stability_profile_requested = _resolve_stability_profile(request.oos_stability_profile)
+        stability_profile_used: str = stability_profile_requested
+        profile_summaries: List[Dict[str, Any]] = []
 
-        run_kwargs: Dict[str, Any] = {
-            "execution_profiles": ["institutional"],
-            "hold_days_grid": [7],
-            "signal_threshold_grid": [request.min_signal_score],
-            "trades_per_day_grid": [4],
-            "entry_days_grid": [7],
-            "exit_days_grid": [1],
-            "target_entry_dte": request.target_entry_dte,
-            "entry_dte_band": request.entry_dte_band,
-            "min_daily_share_volume": request.min_daily_share_volume,
-            "max_abs_momentum_5d": request.max_abs_momentum_5d,
-            "train_days": train_days,
-            "test_days": test_days,
-            "step_days": step_days,
-            "top_n_train": request.oos_top_n_train,
-            "lookback_days": request.lookback_days,
-            "max_backtest_symbols": request.max_backtest_symbols,
-            "use_crush_confidence_gate": True,
-            "allow_global_crush_profile": True,
-            "min_crush_confidence": request.min_crush_confidence,
-            "min_crush_magnitude": request.min_crush_magnitude,
-            "min_crush_edge": request.min_crush_edge,
-            "allow_proxy_earnings": True,
-            "min_splits": request.oos_min_splits,
-            "min_total_test_trades": request.oos_min_total_test_trades,
-            "min_trades_per_split": request.oos_min_trades_per_split,
-            "output_dir": "exports/reports",
-            "start_date": request.backtest_start_date,
-            "end_date": request.backtest_end_date,
-        }
+        run_kwargs: Dict[str, Any]
+        result: Optional[Dict[str, Any]]
+        if stability_profile_requested == "stability_auto":
+            auto_candidates: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+            for profile_name in _OOS_AUTO_PROFILE_ORDER:
+                candidate_kwargs = _build_profiled_run_kwargs(
+                    request=request,
+                    profile_name=profile_name,
+                    train_days=train_days,
+                    test_days=test_days,
+                    step_days=step_days,
+                    use_profile_defaults=True,
+                )
+                candidate_result = collector.run_oos_validation(**candidate_kwargs)
+                if candidate_result:
+                    auto_candidates.append((profile_name, candidate_result, candidate_kwargs))
+                    profile_summaries.append(_oos_profile_summary(profile_name, candidate_result))
+                else:
+                    notes.append(f"Auto profile `{profile_name}` produced no OOS rows.")
 
-        result = collector.run_oos_validation(**run_kwargs)
+            if auto_candidates:
+                stability_profile_used, result, run_kwargs = max(
+                    auto_candidates,
+                    key=lambda row: _oos_result_score(row[1]),
+                )
+                notes.append(f"Stability auto selected `{stability_profile_used}` profile.")
+            else:
+                stability_profile_used = "evidence_balanced"
+                run_kwargs = _build_profiled_run_kwargs(
+                    request=request,
+                    profile_name=stability_profile_used,
+                    train_days=train_days,
+                    test_days=test_days,
+                    step_days=step_days,
+                    use_profile_defaults=True,
+                )
+                result = None
+        else:
+            run_kwargs = _build_profiled_run_kwargs(
+                request=request,
+                profile_name=stability_profile_requested,
+                train_days=train_days,
+                test_days=test_days,
+                step_days=step_days,
+                use_profile_defaults=False,
+            )
+            result = collector.run_oos_validation(**run_kwargs)
+            profile_summaries.append(_oos_profile_summary(stability_profile_requested, result))
 
         # Evidence-first fallback: if sample coverage is weak, rerun once with
         # larger universe and denser rolling windows to increase OOS evidence.
@@ -245,6 +423,11 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
                     test_days = int(adaptive_kwargs["test_days"])
                     step_days = int(adaptive_kwargs["step_days"])
                     adaptive_used = True
+                    stability_profile_used = (
+                        f"{stability_profile_used}+adaptive"
+                        if not stability_profile_used.endswith("+adaptive")
+                        else stability_profile_used
+                    )
                     notes.append(
                         "Adaptive OOS retry applied (evidence-first): "
                         f"symbols={adaptive_kwargs['max_backtest_symbols']}, "
@@ -271,6 +454,9 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
                         "lookback_days": int(run_kwargs["lookback_days"]),
                         "max_backtest_symbols": int(run_kwargs["max_backtest_symbols"]),
                     },
+                    "stability_profile_requested": stability_profile_requested,
+                    "stability_profile_used": stability_profile_used,
+                    "stability_profiles_evaluated": profile_summaries,
                     "adaptive_retry_used": adaptive_used,
                     "notes": notes,
                 }),
@@ -299,6 +485,9 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
                 "lookback_days": int(adaptive_kwargs["lookback_days"] if adaptive_used else run_kwargs["lookback_days"]),
                 "max_backtest_symbols": int(adaptive_kwargs["max_backtest_symbols"] if adaptive_used else run_kwargs["max_backtest_symbols"]),
             },
+            "stability_profile_requested": stability_profile_requested,
+            "stability_profile_used": stability_profile_used,
+            "stability_profiles_evaluated": profile_summaries,
             "adaptive_retry_used": adaptive_used,
             "notes": notes,
         }

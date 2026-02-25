@@ -4,6 +4,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 const OOS_TIMEOUT_MS = 180000
 
 const DEFAULT_OOS_PARAMS = {
+  oos_stability_profile: 'stability_auto',
   lookback_days: '1095',
   max_backtest_symbols: '50',
   backtest_start_date: '2023-01-01',
@@ -23,6 +24,56 @@ const DEFAULT_OOS_PARAMS = {
   oos_min_splits: '8',
   oos_min_total_test_trades: '80',
   oos_min_trades_per_split: '5.0'
+}
+
+const OOS_PROFILE_PRESETS = {
+  stability_auto: {
+    min_signal_score: '0.50',
+    min_crush_confidence: '0.30',
+    min_crush_magnitude: '0.06',
+    min_crush_edge: '0.02',
+    min_daily_share_volume: '1000000',
+    max_abs_momentum_5d: '0.11',
+    target_entry_dte: '6',
+    entry_dte_band: '6'
+  },
+  evidence_balanced: {
+    min_signal_score: '0.50',
+    min_crush_confidence: '0.30',
+    min_crush_magnitude: '0.06',
+    min_crush_edge: '0.02',
+    min_daily_share_volume: '1000000',
+    max_abs_momentum_5d: '0.11',
+    target_entry_dte: '6',
+    entry_dte_band: '6'
+  },
+  variance_control: {
+    min_signal_score: '0.55',
+    min_crush_confidence: '0.40',
+    min_crush_magnitude: '0.07',
+    min_crush_edge: '0.03',
+    min_daily_share_volume: '2500000',
+    max_abs_momentum_5d: '0.08',
+    target_entry_dte: '6',
+    entry_dte_band: '4'
+  },
+  alpha_focus: {
+    min_signal_score: '0.60',
+    min_crush_confidence: '0.45',
+    min_crush_magnitude: '0.08',
+    min_crush_edge: '0.035',
+    min_daily_share_volume: '5000000',
+    max_abs_momentum_5d: '0.07',
+    target_entry_dte: '6',
+    entry_dte_band: '3'
+  }
+}
+
+const OOS_PROFILE_LABELS = {
+  stability_auto: 'Stability Auto',
+  evidence_balanced: 'Evidence Balanced',
+  variance_control: 'Variance Control',
+  alpha_focus: 'Alpha Focus'
 }
 
 function Metric({ label, value, accent = false, tone = 'default' }) {
@@ -156,10 +207,20 @@ function App() {
     setOosParams((prev) => ({ ...prev, [key]: value }))
   }
 
+  function applyOosPreset(profileName) {
+    const preset = OOS_PROFILE_PRESETS[profileName] || {}
+    setOosParams((prev) => ({
+      ...prev,
+      ...preset,
+      oos_stability_profile: profileName
+    }))
+  }
+
   function buildOosPayload() {
     return {
-      lookback_days: parseIntOr(oosParams.lookback_days, 730),
-      max_backtest_symbols: parseIntOr(oosParams.max_backtest_symbols, 20),
+      oos_stability_profile: oosParams.oos_stability_profile || 'stability_auto',
+      lookback_days: parseIntOr(oosParams.lookback_days, 1095),
+      max_backtest_symbols: parseIntOr(oosParams.max_backtest_symbols, 50),
       backtest_start_date: oosParams.backtest_start_date || null,
       backtest_end_date: oosParams.backtest_end_date || null,
       min_signal_score: parseFloatOr(oosParams.min_signal_score, 0.5),
@@ -170,9 +231,9 @@ function App() {
       entry_dte_band: parseIntOr(oosParams.entry_dte_band, 6),
       min_daily_share_volume: parseIntOr(oosParams.min_daily_share_volume, 1000000),
       max_abs_momentum_5d: parseFloatOr(oosParams.max_abs_momentum_5d, 0.11),
-      oos_train_days: parseIntOr(oosParams.oos_train_days, 252),
-      oos_test_days: parseIntOr(oosParams.oos_test_days, 63),
-      oos_step_days: parseIntOr(oosParams.oos_step_days, 63),
+      oos_train_days: parseIntOr(oosParams.oos_train_days, 189),
+      oos_test_days: parseIntOr(oosParams.oos_test_days, 42),
+      oos_step_days: parseIntOr(oosParams.oos_step_days, 42),
       oos_top_n_train: parseIntOr(oosParams.oos_top_n_train, 1),
       oos_min_splits: parseIntOr(oosParams.oos_min_splits, 8),
       oos_min_total_test_trades: parseIntOr(oosParams.oos_min_total_test_trades, 80),
@@ -380,6 +441,19 @@ function App() {
         <section className="oos-block">
           <div className="oos-controls">
             <label className="oos-field">
+              <span>Stability Profile</span>
+              <select
+                value={oosParams.oos_stability_profile}
+                onChange={(e) => applyOosPreset(e.target.value)}
+              >
+                {Object.entries(OOS_PROFILE_LABELS).map(([key, label]) => (
+                  <option key={key} value={key}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="oos-field">
               <span>Backtest Start</span>
               <input type="date" value={oosParams.backtest_start_date} onChange={(e) => updateOosParam('backtest_start_date', e.target.value)} />
             </label>
@@ -482,6 +556,9 @@ function App() {
           {oosError && <div className="error-banner">{oosError}</div>}
           {oosResult && (
             <>
+              <div className="oos-message">
+                Stability profile used: <strong>{oosResult.summary?.stability_profile_used || oosParams.oos_stability_profile}</strong>
+              </div>
               {oosResult.summary?.message && <div className="oos-message">{oosResult.summary.message}</div>}
               {Array.isArray(oosResult.summary?.notes) && oosResult.summary.notes.length > 0 && (
                 <div className="oos-message">

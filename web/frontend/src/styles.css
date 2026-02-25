@@ -283,7 +283,8 @@ button:disabled {
   letter-spacing: 0.05em;
 }
 
-.oos-field input {
+.oos-field input,
+.oos-field select {
   height: 36px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--line);
