@@ -19,8 +19,8 @@ class EdgeAnalyzeResponse(BaseModel):
 
 
 class OOSReportRequest(BaseModel):
-    lookback_days: int = 730
-    max_backtest_symbols: int = 20
+    lookback_days: int = 1095
+    max_backtest_symbols: int = 50
     backtest_start_date: Optional[str] = "2023-01-01"
     backtest_end_date: Optional[str] = None
     min_signal_score: float = 0.50
@@ -32,9 +32,9 @@ class OOSReportRequest(BaseModel):
     min_daily_share_volume: int = 1_000_000
     max_abs_momentum_5d: float = 0.11
 
-    oos_train_days: int = 252
-    oos_test_days: int = 63
-    oos_step_days: int = 63
+    oos_train_days: int = 189
+    oos_test_days: int = 42
+    oos_step_days: int = 42
     oos_top_n_train: int = 1
 
     oos_min_splits: int = 8

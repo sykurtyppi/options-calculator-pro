@@ -1,0 +1,14 @@
+# Reproducibility constraints (validated locally on 2026-02-25).
+# Install with:
+#   pip install -r web/api/requirements-web.txt -c web/api/constraints-web.txt
+
+fastapi==0.133.0
+uvicorn==0.41.0
+pydantic==2.12.5
+yfinance==1.2.0
+pandas==3.0.1
+numpy==2.4.2
+lxml==6.0.2
+psutil==5.9.8
+pytest==9.0.2
+httpx==0.28.1

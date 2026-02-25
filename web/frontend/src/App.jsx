@@ -4,8 +4,8 @@ const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 const OOS_TIMEOUT_MS = 180000
 
 const DEFAULT_OOS_PARAMS = {
-  lookback_days: '730',
-  max_backtest_symbols: '20',
+  lookback_days: '1095',
+  max_backtest_symbols: '50',
   backtest_start_date: '2023-01-01',
   backtest_end_date: '',
   min_signal_score: '0.50',
@@ -16,9 +16,9 @@ const DEFAULT_OOS_PARAMS = {
   entry_dte_band: '6',
   min_daily_share_volume: '1000000',
   max_abs_momentum_5d: '0.11',
-  oos_train_days: '252',
-  oos_test_days: '63',
-  oos_step_days: '63',
+  oos_train_days: '189',
+  oos_test_days: '42',
+  oos_step_days: '42',
   oos_top_n_train: '1',
   oos_min_splits: '8',
   oos_min_total_test_trades: '80',
@@ -483,6 +483,13 @@ function App() {
           {oosResult && (
             <>
               {oosResult.summary?.message && <div className="oos-message">{oosResult.summary.message}</div>}
+              {Array.isArray(oosResult.summary?.notes) && oosResult.summary.notes.length > 0 && (
+                <div className="oos-message">
+                  {oosResult.summary.notes.map((note, idx) => (
+                    <div key={idx}>{note}</div>
+                  ))}
+                </div>
+              )}
               <div className="oos-grid">
                 <Metric label="Grade" value={oosResult.summary?.grade || '--'} accent />
                 <Metric label="Pass" value={fmtBool(oosResult.summary?.overall_pass)} />

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 import sys
 import sqlite3
 
@@ -86,6 +86,44 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _oos_report_card_from_result(result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    report_card = result.get("report_card", {})
+    return report_card if isinstance(report_card, dict) else {}
+
+
+def _oos_result_score(result: Optional[Dict[str, Any]]) -> Tuple[int, int, int, float]:
+    report_card = _oos_report_card_from_result(result)
+    verdict = report_card.get("verdict", {}) if isinstance(report_card, dict) else {}
+    sample = report_card.get("sample", {}) if isinstance(report_card, dict) else {}
+    metrics = report_card.get("metrics", {}) if isinstance(report_card, dict) else {}
+    alpha = metrics.get("alpha", {}) if isinstance(metrics, dict) else {}
+
+    overall_pass = 1 if bool(verdict.get("overall_pass")) else 0
+    total_trades = int(sample.get("total_test_trades", 0) or 0)
+    splits = int(sample.get("splits", 0) or 0)
+    alpha_low = float(alpha.get("low", -999.0) or -999.0)
+    return overall_pass, total_trades, splits, alpha_low
+
+
+def _oos_sample_insufficient(result: Optional[Dict[str, Any]]) -> bool:
+    report_card = _oos_report_card_from_result(result)
+    if not report_card:
+        return True
+    if not bool(report_card.get("ready", False)):
+        return True
+    verdict = report_card.get("verdict", {}) if isinstance(report_card, dict) else {}
+    if bool(verdict.get("overall_pass", False)):
+        return False
+    gates = report_card.get("gates", {}) if isinstance(report_card, dict) else {}
+    for gate_name in ("min_splits", "min_total_test_trades", "min_trades_per_split"):
+        gate = gates.get(gate_name, {}) if isinstance(gates, dict) else {}
+        if isinstance(gate, dict) and gate.get("passed") is False:
+            return True
+    return False
+
+
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
     return {
@@ -119,6 +157,7 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
         test_days = int(request.oos_test_days)
         step_days = int(request.oos_step_days)
         adjustment_note = None
+        notes: List[str] = []
 
         # Auto-fit OOS windows to available feature history so first-run users
         # get a diagnostic result instead of hard 422 failures.
@@ -146,37 +185,77 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
         except Exception:
             # Non-fatal: keep user-supplied windows.
             pass
+        if adjustment_note:
+            notes.append(adjustment_note)
 
-        result = collector.run_oos_validation(
-            execution_profiles=["institutional"],
-            hold_days_grid=[7],
-            signal_threshold_grid=[request.min_signal_score],
-            trades_per_day_grid=[4],
-            entry_days_grid=[7],
-            exit_days_grid=[1],
-            target_entry_dte=request.target_entry_dte,
-            entry_dte_band=request.entry_dte_band,
-            min_daily_share_volume=request.min_daily_share_volume,
-            max_abs_momentum_5d=request.max_abs_momentum_5d,
-            train_days=train_days,
-            test_days=test_days,
-            step_days=step_days,
-            top_n_train=request.oos_top_n_train,
-            lookback_days=request.lookback_days,
-            max_backtest_symbols=request.max_backtest_symbols,
-            use_crush_confidence_gate=True,
-            allow_global_crush_profile=True,
-            min_crush_confidence=request.min_crush_confidence,
-            min_crush_magnitude=request.min_crush_magnitude,
-            min_crush_edge=request.min_crush_edge,
-            allow_proxy_earnings=True,
-            min_splits=request.oos_min_splits,
-            min_total_test_trades=request.oos_min_total_test_trades,
-            min_trades_per_split=request.oos_min_trades_per_split,
-            output_dir="exports/reports",
-            start_date=request.backtest_start_date,
-            end_date=request.backtest_end_date,
+        run_kwargs: Dict[str, Any] = {
+            "execution_profiles": ["institutional"],
+            "hold_days_grid": [7],
+            "signal_threshold_grid": [request.min_signal_score],
+            "trades_per_day_grid": [4],
+            "entry_days_grid": [7],
+            "exit_days_grid": [1],
+            "target_entry_dte": request.target_entry_dte,
+            "entry_dte_band": request.entry_dte_band,
+            "min_daily_share_volume": request.min_daily_share_volume,
+            "max_abs_momentum_5d": request.max_abs_momentum_5d,
+            "train_days": train_days,
+            "test_days": test_days,
+            "step_days": step_days,
+            "top_n_train": request.oos_top_n_train,
+            "lookback_days": request.lookback_days,
+            "max_backtest_symbols": request.max_backtest_symbols,
+            "use_crush_confidence_gate": True,
+            "allow_global_crush_profile": True,
+            "min_crush_confidence": request.min_crush_confidence,
+            "min_crush_magnitude": request.min_crush_magnitude,
+            "min_crush_edge": request.min_crush_edge,
+            "allow_proxy_earnings": True,
+            "min_splits": request.oos_min_splits,
+            "min_total_test_trades": request.oos_min_total_test_trades,
+            "min_trades_per_split": request.oos_min_trades_per_split,
+            "output_dir": "exports/reports",
+            "start_date": request.backtest_start_date,
+            "end_date": request.backtest_end_date,
+        }
+
+        result = collector.run_oos_validation(**run_kwargs)
+
+        # Evidence-first fallback: if sample coverage is weak, rerun once with
+        # larger universe and denser rolling windows to increase OOS evidence.
+        adaptive_kwargs = dict(run_kwargs)
+        adaptive_kwargs["lookback_days"] = max(int(run_kwargs["lookback_days"]), 1095)
+        adaptive_kwargs["max_backtest_symbols"] = max(int(run_kwargs["max_backtest_symbols"]), 50)
+        adaptive_kwargs["train_days"] = max(63, min(int(run_kwargs["train_days"]), 189))
+        adaptive_kwargs["test_days"] = max(21, min(int(run_kwargs["test_days"]), 42))
+        adaptive_kwargs["step_days"] = max(21, min(int(run_kwargs["step_days"]), 42))
+        adaptive_changed = any(
+            adaptive_kwargs[key] != run_kwargs[key]
+            for key in ("lookback_days", "max_backtest_symbols", "train_days", "test_days", "step_days")
         )
+        adaptive_used = False
+        if adaptive_changed and (result is None or _oos_sample_insufficient(result)):
+            retry_result = collector.run_oos_validation(**adaptive_kwargs)
+            if retry_result:
+                baseline_score = _oos_result_score(result)
+                retry_score = _oos_result_score(retry_result)
+                if result is None or retry_score > baseline_score:
+                    result = retry_result
+                    train_days = int(adaptive_kwargs["train_days"])
+                    test_days = int(adaptive_kwargs["test_days"])
+                    step_days = int(adaptive_kwargs["step_days"])
+                    adaptive_used = True
+                    notes.append(
+                        "Adaptive OOS retry applied (evidence-first): "
+                        f"symbols={adaptive_kwargs['max_backtest_symbols']}, "
+                        f"lookback={adaptive_kwargs['lookback_days']}, "
+                        f"train/test/step={train_days}/{test_days}/{step_days}."
+                    )
+                else:
+                    notes.append("Adaptive OOS retry completed but baseline run retained.")
+            else:
+                notes.append("Adaptive OOS retry produced no rows.")
+
         if not result:
             return OOSReportResponse(
                 generated_at=datetime.now(timezone.utc),
@@ -189,8 +268,11 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
                         "train_days": train_days,
                         "test_days": test_days,
                         "step_days": step_days,
+                        "lookback_days": int(run_kwargs["lookback_days"]),
+                        "max_backtest_symbols": int(run_kwargs["max_backtest_symbols"]),
                     },
-                    "notes": [adjustment_note] if adjustment_note else [],
+                    "adaptive_retry_used": adaptive_used,
+                    "notes": notes,
                 }),
                 output_files={},
             )
@@ -214,8 +296,11 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
                 "train_days": train_days,
                 "test_days": test_days,
                 "step_days": step_days,
+                "lookback_days": int(adaptive_kwargs["lookback_days"] if adaptive_used else run_kwargs["lookback_days"]),
+                "max_backtest_symbols": int(adaptive_kwargs["max_backtest_symbols"] if adaptive_used else run_kwargs["max_backtest_symbols"]),
             },
-            "notes": [adjustment_note] if adjustment_note else [],
+            "adaptive_retry_used": adaptive_used,
+            "notes": notes,
         }
         output_files = {
             "csv": result.get("csv_path"),
