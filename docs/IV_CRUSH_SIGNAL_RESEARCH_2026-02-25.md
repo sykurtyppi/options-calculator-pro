@@ -20,7 +20,7 @@
 - Smile concavity can indicate richer event-risk pricing, but also higher jump risk that must be charged in risk terms.
 
 ## Changes implemented in code
-- Enforced short-leg/event alignment hard gates in `/Users/tristanalejandro/Downloads/options_calculator_pro/web/api/edge_engine.py`:
+- Enforced short-leg/event alignment hard gates in `web/api/edge_engine.py`:
   - earnings must be strictly before short-leg expiry
   - minimum short-leg DTE
   - missing near-term quote/implied move -> hard no-trade

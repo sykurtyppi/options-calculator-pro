@@ -10,14 +10,14 @@ Web-first IV crush and earnings calendar spread research platform.
 Legacy desktop UI (PySide/Tk) and scanner stack were removed from this repository.
 
 ## Project Layout
-- `/Users/tristanalejandro/Downloads/options_calculator_pro/web/api` FastAPI backend
-- `/Users/tristanalejandro/Downloads/options_calculator_pro/web/frontend` React + Vite frontend
-- `/Users/tristanalejandro/Downloads/options_calculator_pro/scripts/institutional_backfill.py` data/backtest pipeline entrypoint
-- `/Users/tristanalejandro/Downloads/options_calculator_pro/services/institutional_ml_db.py` institutional analytics engine
+- `web/api`: FastAPI backend
+- `web/frontend`: React + Vite frontend
+- `scripts/institutional_backfill.py`: data/backtest pipeline entrypoint
+- `services/institutional_ml_db.py`: institutional analytics engine
 
 ## Run Backend
 ```bash
-cd /Users/tristanalejandro/Downloads/options_calculator_pro
+cd /path/to/options_calculator_pro
 [ -d .venv ] || python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -27,7 +27,7 @@ python -m uvicorn web.api.app:app --reload --host 0.0.0.0 --port 8000
 
 ## Run Frontend
 ```bash
-cd /Users/tristanalejandro/Downloads/options_calculator_pro/web/frontend
+cd /path/to/options_calculator_pro/web/frontend
 npm install
 npm run dev
 ```

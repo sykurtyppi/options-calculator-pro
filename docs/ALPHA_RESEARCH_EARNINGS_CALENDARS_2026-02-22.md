@@ -23,10 +23,10 @@ Improve pre-earnings calendar spread signal quality for institutional-style IV-c
 
 ## Implemented in Code
 - Added timing-aware and non-monotonic IV/RV setup scoring:
-  - `/Users/tristanalejandro/Downloads/options_calculator_pro/services/institutional_ml_db.py`
+  - `services/institutional_ml_db.py`
   - methods: `_score_entry_timing`, `_score_iv_rv_quality`, `_score_term_structure_quality`, `_score_setup_quality`
 - Added alpha-rank combiner for candidate selection:
-  - `/Users/tristanalejandro/Downloads/options_calculator_pro/services/institutional_ml_db.py`
+  - `services/institutional_ml_db.py`
   - method: `_rank_candidate_for_alpha`
 - Added execution-reality prefilters in walk-forward candidate loop:
   - min underlying share volume (`min_daily_share_volume`)
@@ -34,7 +34,7 @@ Improve pre-earnings calendar spread signal quality for institutional-style IV-c
 - Added term-structure proxy persistence in feature pipeline:
   - `ml_features.vol_term_structure_slope` now populated during feature generation
 - Added CLI/config knobs for these controls:
-  - `/Users/tristanalejandro/Downloads/options_calculator_pro/scripts/institutional_backfill.py`
+  - `scripts/institutional_backfill.py`
   - flags: `--target-entry-dte`, `--entry-dte-band`, `--min-daily-share-volume`, `--max-abs-momentum-5d`
 
 ## New Defaults Added
@@ -45,7 +45,7 @@ Improve pre-earnings calendar spread signal quality for institutional-style IV-c
 
 ## Recommended Validation Run
 ```bash
-python3 /Users/tristanalejandro/Downloads/options_calculator_pro/scripts/institutional_backfill.py \
+python3 scripts/institutional_backfill.py \
   --backtest-only --threshold-tuning --regime-diagnostics \
   --hold-days 7 \
   --entry-days-before-earnings 7 \

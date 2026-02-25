@@ -1,6 +1,6 @@
-# Web Migration Skeleton
+# Web Platform
 
-This folder contains the first web migration slice:
+This folder contains the production web surface:
 
 - `web/api`: FastAPI backend
 - `web/frontend`: React (Vite) frontend
@@ -10,8 +10,12 @@ This folder contains the first web migration slice:
 Run from repo root:
 
 ```bash
-pip install fastapi uvicorn pydantic yfinance pandas numpy
-uvicorn web.api.app:app --reload --host 0.0.0.0 --port 8000
+cd /path/to/options_calculator_pro
+[ -d .venv ] || python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r web/api/requirements-web.txt
+python -m uvicorn web.api.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Available endpoints:
@@ -39,4 +43,4 @@ VITE_API_BASE=http://127.0.0.1:8000 npm run dev
 
 - Workflow is intentionally single-ticker and scanner-free.
 - OOS endpoint writes artifacts under `exports/reports` using existing project backtesting logic.
-- This is a skeleton foundation; next iteration should add auth, persistence, and structured async job handling.
+- For free data feeds, strict no-trade gating is expected on sparse or low-confidence setups.
