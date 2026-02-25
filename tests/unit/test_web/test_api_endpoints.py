@@ -127,6 +127,41 @@ class _ProfileCaptureStubCollector:
         }
 
 
+class _SampleBottleneckStubCollector:
+    def __init__(self):
+        self.db = type("StubDB", (), {"db_path": str(Path(tempfile.gettempdir()) / "stub_oos_bottleneck.sqlite")})()
+
+    def run_oos_validation(self, **_kwargs):
+        return {
+            "splits": np.int64(6),
+            "best_params": {},
+            "report_card": {
+                "ready": True,
+                "verdict": {"grade": "D", "overall_pass": False},
+                "sample": {"splits": np.int64(6), "total_test_trades": np.int64(32), "avg_trades_per_split": np.float64(5.33)},
+                "metrics": {
+                    "alpha": {"mean": np.float64(0.14), "low": np.float64(0.03)},
+                    "sharpe": {"mean": np.float64(0.66), "low": np.float64(0.11)},
+                    "win_rate": {"mean": np.float64(0.58), "low": np.float64(0.49)},
+                    "pnl": {"mean": np.float64(42.0), "low": np.float64(8.0)},
+                },
+                "gates": {
+                    "alpha_ci_positive": {"passed": True},
+                    "sharpe_ci_positive": {"passed": True},
+                    "pnl_ci_positive": {"passed": True},
+                    "min_splits": {"required": 8, "actual": 6, "passed": False},
+                    "min_total_test_trades": {"required": 80, "actual": 32, "passed": False},
+                    "min_trades_per_split": {"required": 5.0, "actual": 5.33, "passed": True},
+                },
+            },
+            "csv_path": Path("exports/reports/oos_bottleneck.csv"),
+            "markdown_path": Path("exports/reports/oos_bottleneck.md"),
+            "json_path": Path("exports/reports/oos_bottleneck.json"),
+            "report_card_markdown_path": Path("exports/reports/oos_bottleneck_report_card.md"),
+            "report_card_json_path": Path("exports/reports/oos_bottleneck_report_card.json"),
+        }
+
+
 @unittest.skipIf(TestClient is None, "httpx/TestClient dependency not available")
 class TestApiEndpoints(unittest.TestCase):
     def setUp(self):
@@ -214,17 +249,65 @@ class TestApiEndpoints(unittest.TestCase):
         kwargs = _ProfileCaptureStubCollector.last_kwargs
         self.assertIsNotNone(kwargs)
         self.assertEqual(kwargs["execution_profiles"], ["institutional_tight", "institutional"])
-        self.assertEqual(kwargs["trades_per_day_grid"], [1, 2])
-        self.assertEqual(kwargs["entry_days_grid"], [3, 5])
-        self.assertEqual(kwargs["signal_threshold_grid"], [0.55])
-        self.assertAlmostEqual(kwargs["min_crush_confidence"], 0.40, places=6)
-        self.assertAlmostEqual(kwargs["min_crush_magnitude"], 0.07, places=6)
-        self.assertAlmostEqual(kwargs["min_crush_edge"], 0.03, places=6)
+        self.assertEqual(kwargs["trades_per_day_grid"], [2])
+        self.assertEqual(kwargs["entry_days_grid"], [5, 7])
+        self.assertEqual(kwargs["signal_threshold_grid"], [0.65])
+        self.assertAlmostEqual(kwargs["min_crush_confidence"], 0.50, places=6)
+        self.assertAlmostEqual(kwargs["min_crush_magnitude"], 0.09, places=6)
+        self.assertAlmostEqual(kwargs["min_crush_edge"], 0.025, places=6)
         self.assertEqual(kwargs["entry_dte_band"], 4)
-        self.assertEqual(kwargs["min_daily_share_volume"], 2_500_000)
-        self.assertAlmostEqual(kwargs["max_abs_momentum_5d"], 0.08, places=6)
+        self.assertEqual(kwargs["min_daily_share_volume"], 10_000_000)
+        self.assertAlmostEqual(kwargs["max_abs_momentum_5d"], 0.09, places=6)
         self.assertEqual(payload["summary"]["stability_profile_requested"], "variance_control")
         self.assertEqual(payload["summary"]["stability_profile_used"], "variance_control")
+
+    def test_oos_sample_expansion_profile_broadens_search_space(self):
+        _ProfileCaptureStubCollector.last_kwargs = None
+        with patch.object(app_module, "InstitutionalDataCollector", _ProfileCaptureStubCollector):
+            response = self.client.post(
+                "/api/oos/report-card",
+                json={
+                    "oos_stability_profile": "sample_expansion",
+                    "min_signal_score": 0.30,
+                    "min_crush_confidence": 0.10,
+                    "min_crush_magnitude": 0.01,
+                    "min_crush_edge": 0.001,
+                    "entry_dte_band": 9,
+                    "min_daily_share_volume": 100_000,
+                    "max_abs_momentum_5d": 0.20,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        kwargs = _ProfileCaptureStubCollector.last_kwargs
+        self.assertIsNotNone(kwargs)
+        self.assertEqual(kwargs["execution_profiles"], ["institutional"])
+        self.assertEqual(kwargs["hold_days_grid"], [1, 3])
+        self.assertEqual(kwargs["trades_per_day_grid"], [2, 3])
+        self.assertEqual(kwargs["entry_days_grid"], [3, 5, 7])
+        self.assertEqual(kwargs["signal_threshold_grid"], [0.45])
+        self.assertAlmostEqual(kwargs["min_crush_confidence"], 0.25, places=6)
+        self.assertAlmostEqual(kwargs["min_crush_magnitude"], 0.05, places=6)
+        self.assertAlmostEqual(kwargs["min_crush_edge"], 0.015, places=6)
+        self.assertEqual(kwargs["entry_dte_band"], 6)
+        self.assertEqual(kwargs["min_daily_share_volume"], 1_000_000)
+        self.assertAlmostEqual(kwargs["max_abs_momentum_5d"], 0.11, places=6)
+        self.assertEqual(payload["summary"]["stability_profile_requested"], "sample_expansion")
+        self.assertEqual(payload["summary"]["stability_profile_used"], "sample_expansion")
+
+    def test_oos_report_card_flags_sample_bottleneck_note(self):
+        with patch.object(app_module, "InstitutionalDataCollector", _SampleBottleneckStubCollector):
+            response = self.client.post(
+                "/api/oos/report-card",
+                json={"oos_stability_profile": "evidence_balanced"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        notes = payload["summary"].get("notes", [])
+        self.assertTrue(any("sample size is insufficient" in note.lower() for note in notes))
+        self.assertTrue(any("sample_expansion" in note for note in notes))
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ class OOSReportRequest(BaseModel):
     oos_stability_profile: Literal[
         "stability_auto",
         "evidence_balanced",
+        "sample_expansion",
         "variance_control",
         "alpha_focus",
     ] = "stability_auto"

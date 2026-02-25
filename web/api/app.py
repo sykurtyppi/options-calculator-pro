@@ -51,15 +51,34 @@ app.add_middleware(
 _OOS_STABILITY_PROFILES: Dict[str, Dict[str, Any]] = {
     "evidence_balanced": {
         "execution_profiles": ["institutional"],
-        "hold_days_grid": [7],
-        "trades_per_day_grid": [4],
-        "entry_days_grid": [7],
+        "hold_days_grid": [1, 3],
+        "trades_per_day_grid": [2],
+        "entry_days_grid": [3, 5],
         "exit_days_grid": [1],
         "defaults": {
             "min_signal_score": 0.50,
             "min_crush_confidence": 0.30,
-            "min_crush_magnitude": 0.06,
-            "min_crush_edge": 0.02,
+            "min_crush_magnitude": 0.07,
+            "min_crush_edge": 0.03,
+            "target_entry_dte": 6,
+            "entry_dte_band": 4,
+            "min_daily_share_volume": 2_500_000,
+            "max_abs_momentum_5d": 0.11,
+            "lookback_days": 1095,
+            "max_backtest_symbols": 50,
+        },
+    },
+    "sample_expansion": {
+        "execution_profiles": ["institutional"],
+        "hold_days_grid": [1, 3],
+        "trades_per_day_grid": [2, 3],
+        "entry_days_grid": [3, 5, 7],
+        "exit_days_grid": [1],
+        "defaults": {
+            "min_signal_score": 0.45,
+            "min_crush_confidence": 0.25,
+            "min_crush_magnitude": 0.05,
+            "min_crush_edge": 0.015,
             "target_entry_dte": 6,
             "entry_dte_band": 6,
             "min_daily_share_volume": 1_000_000,
@@ -70,19 +89,19 @@ _OOS_STABILITY_PROFILES: Dict[str, Dict[str, Any]] = {
     },
     "variance_control": {
         "execution_profiles": ["institutional_tight", "institutional"],
-        "hold_days_grid": [1, 3],
-        "trades_per_day_grid": [1, 2],
-        "entry_days_grid": [3, 5],
+        "hold_days_grid": [1],
+        "trades_per_day_grid": [2],
+        "entry_days_grid": [5, 7],
         "exit_days_grid": [1],
         "defaults": {
-            "min_signal_score": 0.55,
-            "min_crush_confidence": 0.40,
-            "min_crush_magnitude": 0.07,
-            "min_crush_edge": 0.03,
+            "min_signal_score": 0.65,
+            "min_crush_confidence": 0.50,
+            "min_crush_magnitude": 0.09,
+            "min_crush_edge": 0.025,
             "target_entry_dte": 6,
             "entry_dte_band": 4,
-            "min_daily_share_volume": 2_500_000,
-            "max_abs_momentum_5d": 0.08,
+            "min_daily_share_volume": 10_000_000,
+            "max_abs_momentum_5d": 0.09,
             "lookback_days": 1095,
             "max_backtest_symbols": 50,
         },
@@ -90,18 +109,18 @@ _OOS_STABILITY_PROFILES: Dict[str, Dict[str, Any]] = {
     "alpha_focus": {
         "execution_profiles": ["institutional_tight"],
         "hold_days_grid": [1],
-        "trades_per_day_grid": [1],
-        "entry_days_grid": [2, 3],
+        "trades_per_day_grid": [1, 2],
+        "entry_days_grid": [5, 7],
         "exit_days_grid": [1],
         "defaults": {
-            "min_signal_score": 0.60,
-            "min_crush_confidence": 0.45,
-            "min_crush_magnitude": 0.08,
-            "min_crush_edge": 0.035,
+            "min_signal_score": 0.65,
+            "min_crush_confidence": 0.50,
+            "min_crush_magnitude": 0.09,
+            "min_crush_edge": 0.03,
             "target_entry_dte": 6,
             "entry_dte_band": 3,
             "min_daily_share_volume": 5_000_000,
-            "max_abs_momentum_5d": 0.07,
+            "max_abs_momentum_5d": 0.08,
             "lookback_days": 1095,
             "max_backtest_symbols": 50,
         },
@@ -110,6 +129,7 @@ _OOS_STABILITY_PROFILES: Dict[str, Dict[str, Any]] = {
 
 _OOS_AUTO_PROFILE_ORDER: Tuple[str, ...] = (
     "evidence_balanced",
+    "sample_expansion",
     "variance_control",
     "alpha_focus",
 )
@@ -230,7 +250,7 @@ def _oos_report_card_from_result(result: Optional[Dict[str, Any]]) -> Dict[str, 
     return report_card if isinstance(report_card, dict) else {}
 
 
-def _oos_result_score(result: Optional[Dict[str, Any]]) -> Tuple[int, int, float, float, float, int, int]:
+def _oos_result_score(result: Optional[Dict[str, Any]]) -> Tuple[int, int, int, int, float, float, float]:
     report_card = _oos_report_card_from_result(result)
     verdict = report_card.get("verdict", {}) if isinstance(report_card, dict) else {}
     sample = report_card.get("sample", {}) if isinstance(report_card, dict) else {}
@@ -246,7 +266,7 @@ def _oos_result_score(result: Optional[Dict[str, Any]]) -> Tuple[int, int, float
     ci_positive_count = int(alpha_low > 0.0) + int(sharpe_low > 0.0) + int(pnl_low > 0.0)
     total_trades = int(sample.get("total_test_trades", 0) or 0)
     splits = int(sample.get("splits", 0) or 0)
-    return overall_pass, ci_positive_count, alpha_low, sharpe_low, pnl_low, total_trades, splits
+    return overall_pass, ci_positive_count, total_trades, splits, alpha_low, sharpe_low, pnl_low
 
 
 def _oos_profile_summary(profile_name: str, result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -281,6 +301,36 @@ def _oos_sample_insufficient(result: Optional[Dict[str, Any]]) -> bool:
         if isinstance(gate, dict) and gate.get("passed") is False:
             return True
     return False
+
+
+def _oos_sample_bottleneck_note(result: Optional[Dict[str, Any]]) -> Optional[str]:
+    report_card = _oos_report_card_from_result(result)
+    if not report_card:
+        return None
+    gates = report_card.get("gates", {}) if isinstance(report_card, dict) else {}
+    if not isinstance(gates, dict):
+        return None
+
+    alpha_gate = gates.get("alpha_ci_positive", {}) if isinstance(gates.get("alpha_ci_positive"), dict) else {}
+    sharpe_gate = gates.get("sharpe_ci_positive", {}) if isinstance(gates.get("sharpe_ci_positive"), dict) else {}
+    pnl_gate = gates.get("pnl_ci_positive", {}) if isinstance(gates.get("pnl_ci_positive"), dict) else {}
+    split_gate = gates.get("min_splits", {}) if isinstance(gates.get("min_splits"), dict) else {}
+    trades_gate = gates.get("min_total_test_trades", {}) if isinstance(gates.get("min_total_test_trades"), dict) else {}
+    per_split_gate = gates.get("min_trades_per_split", {}) if isinstance(gates.get("min_trades_per_split"), dict) else {}
+
+    ci_all_positive = bool(alpha_gate.get("passed")) and bool(sharpe_gate.get("passed")) and bool(pnl_gate.get("passed"))
+    sample_failed = (
+        split_gate.get("passed") is False
+        or trades_gate.get("passed") is False
+        or per_split_gate.get("passed") is False
+    )
+    if ci_all_positive and sample_failed:
+        return (
+            "Signal quality passed CI gates but OOS sample size is insufficient. "
+            "Increase history (e.g. run backfill with >=4 years) or use `sample_expansion` "
+            "to build evidence before enforcing strict sample floors."
+        )
+    return None
 
 
 @app.get("/api/health")
@@ -468,6 +518,9 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
         sample = report_card.get("sample", {}) if isinstance(report_card, dict) else {}
         metrics = report_card.get("metrics", {}) if isinstance(report_card, dict) else {}
         gates = report_card.get("gates", {}) if isinstance(report_card, dict) else {}
+        sample_bottleneck_note = _oos_sample_bottleneck_note(result)
+        if sample_bottleneck_note:
+            notes.append(sample_bottleneck_note)
         summary = {
             "splits": int(result.get("splits", 0)),
             "best_params": result.get("best_params", {}),

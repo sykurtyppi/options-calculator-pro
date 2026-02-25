@@ -11,11 +11,11 @@ const DEFAULT_OOS_PARAMS = {
   backtest_end_date: '',
   min_signal_score: '0.50',
   min_crush_confidence: '0.30',
-  min_crush_magnitude: '0.06',
-  min_crush_edge: '0.02',
+  min_crush_magnitude: '0.07',
+  min_crush_edge: '0.03',
   target_entry_dte: '6',
-  entry_dte_band: '6',
-  min_daily_share_volume: '1000000',
+  entry_dte_band: '4',
+  min_daily_share_volume: '2500000',
   max_abs_momentum_5d: '0.11',
   oos_train_days: '189',
   oos_test_days: '42',
@@ -30,40 +30,50 @@ const OOS_PROFILE_PRESETS = {
   stability_auto: {
     min_signal_score: '0.50',
     min_crush_confidence: '0.30',
-    min_crush_magnitude: '0.06',
-    min_crush_edge: '0.02',
-    min_daily_share_volume: '1000000',
+    min_crush_magnitude: '0.07',
+    min_crush_edge: '0.03',
+    min_daily_share_volume: '2500000',
     max_abs_momentum_5d: '0.11',
     target_entry_dte: '6',
-    entry_dte_band: '6'
+    entry_dte_band: '4'
   },
   evidence_balanced: {
     min_signal_score: '0.50',
     min_crush_confidence: '0.30',
-    min_crush_magnitude: '0.06',
-    min_crush_edge: '0.02',
+    min_crush_magnitude: '0.07',
+    min_crush_edge: '0.03',
+    min_daily_share_volume: '2500000',
+    max_abs_momentum_5d: '0.11',
+    target_entry_dte: '6',
+    entry_dte_band: '4'
+  },
+  sample_expansion: {
+    min_signal_score: '0.45',
+    min_crush_confidence: '0.25',
+    min_crush_magnitude: '0.05',
+    min_crush_edge: '0.015',
     min_daily_share_volume: '1000000',
     max_abs_momentum_5d: '0.11',
     target_entry_dte: '6',
     entry_dte_band: '6'
   },
   variance_control: {
-    min_signal_score: '0.55',
-    min_crush_confidence: '0.40',
-    min_crush_magnitude: '0.07',
-    min_crush_edge: '0.03',
-    min_daily_share_volume: '2500000',
-    max_abs_momentum_5d: '0.08',
+    min_signal_score: '0.65',
+    min_crush_confidence: '0.50',
+    min_crush_magnitude: '0.09',
+    min_crush_edge: '0.025',
+    min_daily_share_volume: '10000000',
+    max_abs_momentum_5d: '0.09',
     target_entry_dte: '6',
     entry_dte_band: '4'
   },
   alpha_focus: {
-    min_signal_score: '0.60',
-    min_crush_confidence: '0.45',
-    min_crush_magnitude: '0.08',
-    min_crush_edge: '0.035',
+    min_signal_score: '0.65',
+    min_crush_confidence: '0.50',
+    min_crush_magnitude: '0.09',
+    min_crush_edge: '0.03',
     min_daily_share_volume: '5000000',
-    max_abs_momentum_5d: '0.07',
+    max_abs_momentum_5d: '0.08',
     target_entry_dte: '6',
     entry_dte_band: '3'
   }
@@ -72,6 +82,7 @@ const OOS_PROFILE_PRESETS = {
 const OOS_PROFILE_LABELS = {
   stability_auto: 'Stability Auto',
   evidence_balanced: 'Evidence Balanced',
+  sample_expansion: 'Sample Expansion',
   variance_control: 'Variance Control',
   alpha_focus: 'Alpha Focus'
 }
