@@ -26,6 +26,10 @@ class EdgeSnapshot:
     rationale: List[str]
 
 
+def _utc_today_date():
+    return datetime.now(timezone.utc).date()
+
+
 def _safe_float(value: Any, default: float = np.nan) -> float:
     try:
         if value is None:
@@ -97,7 +101,7 @@ def _term_structure_points(
     near_term_spread_pct: Optional[float] = None
     near_term_dte: Optional[int] = None
 
-    today = datetime.now().date()
+    today = _utc_today_date()
     expirations = list(getattr(ticker, "options", []) or [])
     for exp in expirations[:max_expiries]:
         try:
@@ -165,7 +169,7 @@ def _term_structure_points(
 
 
 def _next_earnings_days(ticker: yf.Ticker) -> Optional[int]:
-    today = datetime.now().date()
+    today = _utc_today_date()
     get_dates = getattr(ticker, "get_earnings_dates", None)
     if callable(get_dates):
         try:
@@ -321,7 +325,7 @@ def _historical_earnings_move_profile(ticker: yf.Ticker, close: pd.Series) -> Di
             except Exception:
                 earnings_dates = []
 
-    today = pd.Timestamp(datetime.now().date())
+    today = pd.Timestamp(_utc_today_date())
     past_events = sorted({ts for ts in earnings_dates if ts <= today})
     event_moves: List[float] = []
 

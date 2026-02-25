@@ -1,6 +1,29 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
+const OOS_TIMEOUT_MS = 180000
+
+const DEFAULT_OOS_PARAMS = {
+  lookback_days: '730',
+  max_backtest_symbols: '20',
+  backtest_start_date: '2023-01-01',
+  backtest_end_date: '',
+  min_signal_score: '0.50',
+  min_crush_confidence: '0.30',
+  min_crush_magnitude: '0.06',
+  min_crush_edge: '0.02',
+  target_entry_dte: '6',
+  entry_dte_band: '6',
+  min_daily_share_volume: '1000000',
+  max_abs_momentum_5d: '0.11',
+  oos_train_days: '252',
+  oos_test_days: '63',
+  oos_step_days: '63',
+  oos_top_n_train: '1',
+  oos_min_splits: '8',
+  oos_min_total_test_trades: '80',
+  oos_min_trades_per_split: '5.0'
+}
 
 function Metric({ label, value, accent = false, tone = 'default' }) {
   return (
@@ -67,6 +90,16 @@ function toneNegativeMetric(value, goodMax = 1.25, warnMax = 2.0) {
   return 'bad'
 }
 
+function parseIntOr(value, fallback) {
+  const parsed = Number.parseInt(value, 10)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function parseFloatOr(value, fallback) {
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
 function App() {
   const [symbol, setSymbol] = useState('AAPL')
   const [loading, setLoading] = useState(false)
@@ -76,6 +109,21 @@ function App() {
   const [oosLoading, setOosLoading] = useState(false)
   const [oosError, setOosError] = useState('')
   const [oosResult, setOosResult] = useState(null)
+  const [oosParams, setOosParams] = useState(DEFAULT_OOS_PARAMS)
+  const [oosElapsedSec, setOosElapsedSec] = useState(0)
+
+  const oosAbortRef = useRef(null)
+
+  useEffect(() => {
+    if (!oosLoading) {
+      setOosElapsedSec(0)
+      return undefined
+    }
+    const timer = setInterval(() => {
+      setOosElapsedSec((prev) => prev + 1)
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [oosLoading])
 
   const normalizedSymbol = useMemo(() => symbol.trim().toUpperCase(), [symbol])
   const hardGateReasons = useMemo(() => {
@@ -89,6 +137,7 @@ function App() {
     }
     return reasons
   }, [result, oosResult])
+
   const shortLegAligned = useMemo(() => {
     const earningsDte = result?.metrics?.days_to_earnings
     const nearTermDte = result?.metrics?.near_term_dte
@@ -96,11 +145,47 @@ function App() {
     if (nearTermDte === null || nearTermDte === undefined) return null
     return Number(earningsDte) < Number(nearTermDte)
   }, [result])
+
   const noTradeBlocked = hardGateReasons.length > 0
   const recommendationValue = result ? (noTradeBlocked ? 'No Trade' : (result?.recommendation || '--')) : '--'
   const confidenceValue = result
     ? `${Number(result.confidence_pct).toFixed(1)}%${result?.metrics?.confidence_capped ? ' (capped)' : ''}`
     : '--'
+
+  function updateOosParam(key, value) {
+    setOosParams((prev) => ({ ...prev, [key]: value }))
+  }
+
+  function buildOosPayload() {
+    return {
+      lookback_days: parseIntOr(oosParams.lookback_days, 730),
+      max_backtest_symbols: parseIntOr(oosParams.max_backtest_symbols, 20),
+      backtest_start_date: oosParams.backtest_start_date || null,
+      backtest_end_date: oosParams.backtest_end_date || null,
+      min_signal_score: parseFloatOr(oosParams.min_signal_score, 0.5),
+      min_crush_confidence: parseFloatOr(oosParams.min_crush_confidence, 0.3),
+      min_crush_magnitude: parseFloatOr(oosParams.min_crush_magnitude, 0.06),
+      min_crush_edge: parseFloatOr(oosParams.min_crush_edge, 0.02),
+      target_entry_dte: parseIntOr(oosParams.target_entry_dte, 6),
+      entry_dte_band: parseIntOr(oosParams.entry_dte_band, 6),
+      min_daily_share_volume: parseIntOr(oosParams.min_daily_share_volume, 1000000),
+      max_abs_momentum_5d: parseFloatOr(oosParams.max_abs_momentum_5d, 0.11),
+      oos_train_days: parseIntOr(oosParams.oos_train_days, 252),
+      oos_test_days: parseIntOr(oosParams.oos_test_days, 63),
+      oos_step_days: parseIntOr(oosParams.oos_step_days, 63),
+      oos_top_n_train: parseIntOr(oosParams.oos_top_n_train, 1),
+      oos_min_splits: parseIntOr(oosParams.oos_min_splits, 8),
+      oos_min_total_test_trades: parseIntOr(oosParams.oos_min_total_test_trades, 80),
+      oos_min_trades_per_split: parseFloatOr(oosParams.oos_min_trades_per_split, 5.0)
+    }
+  }
+
+  function cancelOosReportCard() {
+    if (oosAbortRef.current) {
+      oosAbortRef.current.abort('cancelled')
+      oosAbortRef.current = null
+    }
+  }
 
   async function runAnalysis(e) {
     e?.preventDefault()
@@ -127,14 +212,26 @@ function App() {
   }
 
   async function runOosReportCard() {
+    if (oosAbortRef.current) {
+      oosAbortRef.current.abort('new_request')
+      oosAbortRef.current = null
+    }
+
+    const controller = new AbortController()
+    oosAbortRef.current = controller
+    const timeoutId = setTimeout(() => controller.abort('timeout'), OOS_TIMEOUT_MS)
+
     setOosLoading(true)
     setOosError('')
     setOosResult(null)
+
     try {
+      const payload = buildOosPayload()
       const res = await fetch(`${API_BASE}/api/oos/report-card`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
+        body: JSON.stringify(payload),
+        signal: controller.signal
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
@@ -143,8 +240,21 @@ function App() {
       const body = await res.json()
       setOosResult(body)
     } catch (err) {
-      setOosError(String(err.message || err))
+      if (err?.name === 'AbortError') {
+        const reason = controller.signal.reason
+        if (reason === 'timeout') {
+          setOosError(`OOS run timed out after ${Math.floor(OOS_TIMEOUT_MS / 1000)}s.`)
+        } else {
+          setOosError('OOS run cancelled.')
+        }
+      } else {
+        setOosError(String(err.message || err))
+      }
     } finally {
+      clearTimeout(timeoutId)
+      if (oosAbortRef.current === controller) {
+        oosAbortRef.current = null
+      }
       setOosLoading(false)
     }
   }
@@ -254,12 +364,107 @@ function App() {
         </section>
 
         <section className="oos-block">
+          <div className="oos-controls">
+            <label className="oos-field">
+              <span>Backtest Start</span>
+              <input type="date" value={oosParams.backtest_start_date} onChange={(e) => updateOosParam('backtest_start_date', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Backtest End</span>
+              <input type="date" value={oosParams.backtest_end_date} onChange={(e) => updateOosParam('backtest_end_date', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Lookback Days</span>
+              <input type="number" value={oosParams.lookback_days} onChange={(e) => updateOosParam('lookback_days', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Max Symbols</span>
+              <input type="number" value={oosParams.max_backtest_symbols} onChange={(e) => updateOosParam('max_backtest_symbols', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Min Signal</span>
+              <input type="number" step="0.01" value={oosParams.min_signal_score} onChange={(e) => updateOosParam('min_signal_score', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Min Crush Conf</span>
+              <input type="number" step="0.01" value={oosParams.min_crush_confidence} onChange={(e) => updateOosParam('min_crush_confidence', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Min Crush Magn</span>
+              <input type="number" step="0.01" value={oosParams.min_crush_magnitude} onChange={(e) => updateOosParam('min_crush_magnitude', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Min Crush Edge</span>
+              <input type="number" step="0.01" value={oosParams.min_crush_edge} onChange={(e) => updateOosParam('min_crush_edge', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Target Entry DTE</span>
+              <input type="number" value={oosParams.target_entry_dte} onChange={(e) => updateOosParam('target_entry_dte', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Entry DTE Band</span>
+              <input type="number" value={oosParams.entry_dte_band} onChange={(e) => updateOosParam('entry_dte_band', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Min Share Volume</span>
+              <input type="number" value={oosParams.min_daily_share_volume} onChange={(e) => updateOosParam('min_daily_share_volume', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Max |Momentum 5d|</span>
+              <input type="number" step="0.01" value={oosParams.max_abs_momentum_5d} onChange={(e) => updateOosParam('max_abs_momentum_5d', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Train Days</span>
+              <input type="number" value={oosParams.oos_train_days} onChange={(e) => updateOosParam('oos_train_days', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Test Days</span>
+              <input type="number" value={oosParams.oos_test_days} onChange={(e) => updateOosParam('oos_test_days', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Step Days</span>
+              <input type="number" value={oosParams.oos_step_days} onChange={(e) => updateOosParam('oos_step_days', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Top-N Train</span>
+              <input type="number" value={oosParams.oos_top_n_train} onChange={(e) => updateOosParam('oos_top_n_train', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Min Splits</span>
+              <input type="number" value={oosParams.oos_min_splits} onChange={(e) => updateOosParam('oos_min_splits', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Min Total Trades</span>
+              <input type="number" value={oosParams.oos_min_total_test_trades} onChange={(e) => updateOosParam('oos_min_total_test_trades', e.target.value)} />
+            </label>
+            <label className="oos-field">
+              <span>Min Trades/Split</span>
+              <input type="number" step="0.1" value={oosParams.oos_min_trades_per_split} onChange={(e) => updateOosParam('oos_min_trades_per_split', e.target.value)} />
+            </label>
+          </div>
+
           <div className="oos-head">
             <h2>Walk-Forward OOS Report Card</h2>
-            <button onClick={runOosReportCard} disabled={oosLoading}>
-              {oosLoading ? 'Building...' : 'Run OOS Report Card'}
-            </button>
+            <div className="oos-actions">
+              <button onClick={runOosReportCard} disabled={oosLoading}>
+                {oosLoading ? `Building... ${oosElapsedSec}s` : 'Run OOS Report Card'}
+              </button>
+              {oosLoading && (
+                <button type="button" className="secondary-button" onClick={cancelOosReportCard}>
+                  Cancel
+                </button>
+              )}
+            </div>
           </div>
+
+          <p className="oos-help">OOS runs can take 30-120s depending on symbols, lookback, and splits.</p>
+
+          {oosLoading && (
+            <div className="oos-message">
+              OOS validation in progress ({oosElapsedSec}s elapsed). Results appear when complete.
+            </div>
+          )}
+
           {oosError && <div className="error-banner">{oosError}</div>}
           {oosResult && (
             <>

@@ -246,6 +246,54 @@ button:disabled {
   gap: 12px;
 }
 
+.oos-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.secondary-button {
+  border: 1px solid var(--line);
+  background: #0d2232;
+  color: #d3e2ee;
+}
+
+.oos-help {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.oos-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.oos-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.oos-field span {
+  color: var(--muted);
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.oos-field input {
+  height: 36px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: #071926;
+  color: var(--text);
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+}
+
 .oos-message {
   margin-top: 10px;
   border: 1px solid #335c77;

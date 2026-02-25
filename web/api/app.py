@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import math
+import os
 from pathlib import Path
 from typing import Any, Dict
 import sys
@@ -30,9 +31,18 @@ app = FastAPI(
     description="Single-ticker IV crush edge analysis and OOS robustness reports.",
 )
 
+origins_env = os.getenv("OPTIONS_CALCULATOR_ALLOWED_ORIGINS", "")
+if origins_env.strip():
+    allowed_origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()]
+else:
+    allowed_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

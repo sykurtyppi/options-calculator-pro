@@ -38,3 +38,6 @@ Backend health check: `http://127.0.0.1:8000/api/health`
 ## Notes
 - OOS artifacts are written to `exports/reports` at runtime.
 - Free data feeds can cause sparse earnings/timing coverage; hard no-trade gating is enforced in the API.
+- API auth is not implemented yet; run this service on localhost/private networks only.
+- Allowed browser origins default to `http://localhost:5173` and `http://127.0.0.1:5173`.
+  Override with `OPTIONS_CALCULATOR_ALLOWED_ORIGINS` as a comma-separated list.

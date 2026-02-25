@@ -10,6 +10,7 @@ import sys
 import os
 from pathlib import Path
 from datetime import datetime
+import functools
 from typing import Optional, Dict, Any
 import json
 
@@ -56,7 +57,7 @@ class PerformanceFilter(logging.Filter):
             process = psutil.Process()
             memory_mb = process.memory_info().rss / 1024 / 1024
             record.memory = f"{memory_mb:.1f}MB"
-        except:
+        except Exception:
             record.memory = "N/A"
         
         return True
@@ -171,8 +172,17 @@ def setup_logger(
         log_dir = Path.home() / ".options_calculator_pro" / "logs"
     else:
         log_dir = Path(log_dir)
-    
-    log_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        try:
+            fallback_root = Path(os.getenv("TMPDIR", "/tmp"))
+            log_dir = fallback_root / ".options_calculator_pro" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            file_output = False
+            json_output = False
     
     # Performance filter
     perf_filter = PerformanceFilter()
@@ -195,63 +205,70 @@ def setup_logger(
     
     # File handler with rotation
     if file_output:
-        log_file = log_dir / f"{name}.log"
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file,
-            maxBytes=max_file_size,
-            backupCount=backup_count,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(logging.DEBUG)  # File gets all levels
-        
-        # Detailed formatter for file
-        file_format = (
-            "%(asctime)s | %(levelname)-8s | %(process)d.%(thread)d | "
-            "%(name)s.%(module)s.%(funcName)s:%(lineno)d | %(message)s | "
-            "[%(runtime)s, %(memory)s]"
-        )
-        file_formatter = logging.Formatter(file_format, datefmt="%Y-%m-%d %H:%M:%S")
-        file_handler.setFormatter(file_formatter)
-        file_handler.addFilter(perf_filter)
-        
-        logger.addHandler(file_handler)
+        try:
+            log_file = log_dir / f"{name}.log"
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=max_file_size,
+                backupCount=backup_count,
+                encoding='utf-8'
+            )
+            file_handler.setLevel(logging.DEBUG)  # File gets all levels
+
+            # Detailed formatter for file
+            file_format = (
+                "%(asctime)s | %(levelname)-8s | %(process)d.%(thread)d | "
+                "%(name)s.%(module)s.%(funcName)s:%(lineno)d | %(message)s | "
+                "[%(runtime)s, %(memory)s]"
+            )
+            file_formatter = logging.Formatter(file_format, datefmt="%Y-%m-%d %H:%M:%S")
+            file_handler.setFormatter(file_formatter)
+            file_handler.addFilter(perf_filter)
+            logger.addHandler(file_handler)
+        except Exception:
+            file_output = False
     
     # JSON structured logging handler
     if json_output:
-        json_file = log_dir / f"{name}_structured.jsonl"
-        json_handler = logging.handlers.RotatingFileHandler(
-            json_file,
-            maxBytes=max_file_size,
-            backupCount=backup_count,
-            encoding='utf-8'
-        )
-        json_handler.setLevel(logging.INFO)
-        
-        json_formatter = JSONFormatter()
-        json_handler.setFormatter(json_formatter)
-        json_handler.addFilter(perf_filter)
-        
-        logger.addHandler(json_handler)
+        try:
+            json_file = log_dir / f"{name}_structured.jsonl"
+            json_handler = logging.handlers.RotatingFileHandler(
+                json_file,
+                maxBytes=max_file_size,
+                backupCount=backup_count,
+                encoding='utf-8'
+            )
+            json_handler.setLevel(logging.INFO)
+
+            json_formatter = JSONFormatter()
+            json_handler.setFormatter(json_formatter)
+            json_handler.addFilter(perf_filter)
+            logger.addHandler(json_handler)
+        except Exception:
+            json_output = False
     
     # Error handler for critical errors
-    error_file = log_dir / f"{name}_errors.log"
-    error_handler = logging.handlers.RotatingFileHandler(
-        error_file,
-        maxBytes=max_file_size // 2,
-        backupCount=backup_count,
-        encoding='utf-8'
-    )
-    error_handler.setLevel(logging.ERROR)
-    
-    error_format = (
-        "%(asctime)s | %(levelname)-8s | %(process)d.%(thread)d | "
-        "%(name)s.%(module)s.%(funcName)s:%(lineno)d | %(message)s\n"
-        "Stack Trace:\n%(stack_info)s\n"
-    )
-    error_formatter = logging.Formatter(error_format, datefmt="%Y-%m-%d %H:%M:%S")
-    error_handler.setFormatter(error_formatter)
-    
-    logger.addHandler(error_handler)
+    if file_output:
+        try:
+            error_file = log_dir / f"{name}_errors.log"
+            error_handler = logging.handlers.RotatingFileHandler(
+                error_file,
+                maxBytes=max_file_size // 2,
+                backupCount=backup_count,
+                encoding='utf-8'
+            )
+            error_handler.setLevel(logging.ERROR)
+
+            error_format = (
+                "%(asctime)s | %(levelname)-8s | %(process)d.%(thread)d | "
+                "%(name)s.%(module)s.%(funcName)s:%(lineno)d | %(message)s\n"
+                "Stack Trace:\n%(stack_info)s\n"
+            )
+            error_formatter = logging.Formatter(error_format, datefmt="%Y-%m-%d %H:%M:%S")
+            error_handler.setFormatter(error_formatter)
+            logger.addHandler(error_handler)
+        except Exception:
+            file_output = False
     
     # Log setup completion
     logger.info(f"Logging system initialized: level={level}, console={console_output}, "
@@ -269,6 +286,7 @@ def get_trading_logger(name: str = "trading") -> TradingLogAdapter:
 
 def log_function_call(func):
     """Decorator to log function calls with timing"""
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
         logger = logging.getLogger(f"options_calculator_pro.{func.__module__}")
         
@@ -353,7 +371,7 @@ class LogAnalyzer:
                                     "timestamp": timestamp_str,
                                     "message": line.strip()
                                 })
-                        except:
+                        except Exception:
                             continue
         except Exception as e:
             return {"error": f"Failed to analyze logs: {e}"}

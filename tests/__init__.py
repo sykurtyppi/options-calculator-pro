@@ -4,7 +4,6 @@ Comprehensive testing infrastructure for all application components
 """
 
 import sys
-import os
 import logging
 from pathlib import Path
 
@@ -22,16 +21,13 @@ if str(project_root) not in sys.path:
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('tests/test_output.log')
-    ]
+    handlers=[logging.StreamHandler()]
 )
 
 # Test configuration
 TEST_CONFIG = {
     'use_mock_data': True,
-    'test_data_dir': 'tests/fixtures',
+    'test_data_dir': str(Path(__file__).parent / 'fixtures'),
     'timeout_seconds': 30,
     'skip_slow_tests': False,
     'test_api_keys': {

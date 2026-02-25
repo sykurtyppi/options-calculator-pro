@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 # Institutional ticker universe (top 50 optionable stocks)
 INSTITUTIONAL_UNIVERSE = [
     # Mega-cap tech
-    'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'META', 'TSLA', 'NFLX', 'NVDA', 'AMD',
+    'AAPL', 'MSFT', 'GOOGL', 'ORCL', 'AMZN', 'META', 'TSLA', 'NFLX', 'NVDA', 'AMD',
 
     # Financial services
     'JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'BLK', 'AXP', 'V', 'MA',

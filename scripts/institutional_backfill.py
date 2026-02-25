@@ -111,9 +111,85 @@ class InstitutionalDataCollector:
     async def _engineer_ml_features(self, symbols: List[str]) -> bool:
         """Engineering additional ML features"""
         try:
-            # This would implement sophisticated feature engineering
-            # For now, features are calculated in _calculate_and_store_features
-            self.logger.info("🔧 Advanced feature engineering completed")
+            import sqlite3
+
+            rebuilt_symbols = 0
+            skipped_symbols = 0
+            missing_price_history: List[str] = []
+
+            with sqlite3.connect(self.db.db_path) as conn:
+                for symbol in symbols:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM daily_prices WHERE symbol = ?",
+                        (symbol,),
+                    )
+                    price_rows = int(cursor.fetchone()[0] or 0)
+
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM ml_features WHERE symbol = ?",
+                        (symbol,),
+                    )
+                    feature_rows = int(cursor.fetchone()[0] or 0)
+
+                    if price_rows == 0:
+                        missing_price_history.append(symbol)
+                        continue
+
+                    # Recompute features only when coverage is clearly incomplete.
+                    coverage = float(feature_rows) / float(price_rows) if price_rows > 0 else 0.0
+                    if feature_rows >= 120 and coverage >= 0.80:
+                        skipped_symbols += 1
+                        continue
+
+                    hist_data = pd.read_sql_query(
+                        """
+                        SELECT
+                            date,
+                            open_price AS Open,
+                            high_price AS High,
+                            low_price AS Low,
+                            close_price AS Close,
+                            volume AS Volume,
+                            adj_close AS "Adj Close",
+                            rsi_14 AS RSI_14,
+                            bb_position AS BB_Position
+                        FROM daily_prices
+                        WHERE symbol = ?
+                        ORDER BY date ASC
+                        """,
+                        conn,
+                        params=(symbol,),
+                        parse_dates=["date"],
+                    )
+
+                    if hist_data.empty:
+                        missing_price_history.append(symbol)
+                        continue
+
+                    hist_data.set_index("date", inplace=True)
+                    for col in ("Open", "High", "Low", "Close", "Volume", "Adj Close"):
+                        hist_data[col] = pd.to_numeric(hist_data[col], errors="coerce")
+                    hist_data.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
+
+                    if hist_data.empty:
+                        missing_price_history.append(symbol)
+                        continue
+
+                    await self.db._calculate_and_store_features(symbol, hist_data)
+                    rebuilt_symbols += 1
+
+            self.logger.info(
+                "🔧 ML feature engineering completed: rebuilt=%d, skipped=%d, missing_price_history=%d",
+                rebuilt_symbols,
+                skipped_symbols,
+                len(missing_price_history),
+            )
+            if missing_price_history:
+                self.logger.warning(
+                    "⚠️ Symbols with no usable price history for feature engineering: %s",
+                    ", ".join(missing_price_history[:10]),
+                )
             return True
 
         except Exception as e:

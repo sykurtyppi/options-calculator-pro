@@ -22,7 +22,7 @@ class OOSReportRequest(BaseModel):
     lookback_days: int = 730
     max_backtest_symbols: int = 20
     backtest_start_date: Optional[str] = "2023-01-01"
-    backtest_end_date: Optional[str] = "2025-12-31"
+    backtest_end_date: Optional[str] = None
     min_signal_score: float = 0.50
     min_crush_confidence: float = 0.30
     min_crush_magnitude: float = 0.06
