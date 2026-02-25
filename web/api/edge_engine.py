@@ -14,6 +14,9 @@ TS_SLOPE_TARGET = -0.004
 TS_SLOPE_BAND = 0.025
 MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE = 18.0
 MIN_SHORT_LEG_DTE = 2
+MIN_NEAR_BACK_IV_RATIO_FOR_EVENT = 1.02
+MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_TRADE = 400.0
+MOVE_UNCERTAINTY_Z_SCORE = 1.28
 
 
 @dataclass
@@ -92,7 +95,19 @@ def _term_structure_points(
     ticker: yf.Ticker,
     current_price: float,
     max_expiries: int = 6,
-) -> tuple[List[float], List[float], float, float, float, float, Optional[float], Optional[float], Optional[int]]:
+) -> tuple[
+    List[float],
+    List[float],
+    float,
+    float,
+    float,
+    float,
+    Optional[float],
+    Optional[float],
+    Optional[int],
+    Optional[float],
+    Optional[float],
+]:
     days: List[float] = []
     ivs: List[float] = []
     oi_values: List[float] = []
@@ -100,6 +115,7 @@ def _term_structure_points(
     near_term_implied_move_pct: Optional[float] = None
     near_term_spread_pct: Optional[float] = None
     near_term_dte: Optional[int] = None
+    near_term_liquidity_proxy: Optional[float] = None
 
     today = _utc_today_date()
     expirations = list(getattr(ticker, "options", []) or [])
@@ -132,6 +148,12 @@ def _term_structure_points(
                 if np.isfinite(call_mid) and np.isfinite(put_mid) and current_price > 0:
                     near_term_implied_move_pct = float(((call_mid + put_mid) / current_price) * 100.0)
                     near_term_dte = int(dte)
+                    near_term_liquidity_proxy = float(
+                        max(call_stats["oi"] or 0.0, 0.0)
+                        + max(put_stats["oi"] or 0.0, 0.0)
+                        + max(call_stats["volume"] or 0.0, 0.0)
+                        + max(put_stats["volume"] or 0.0, 0.0)
+                    )
 
                 spread_candidates = [call_stats.get("spread_pct"), put_stats.get("spread_pct")]
                 spread_candidates = [float(v) for v in spread_candidates if v is not None and np.isfinite(v) and v >= 0]
@@ -141,7 +163,19 @@ def _term_structure_points(
             continue
 
     if len(days) < 2:
-        return days, ivs, np.nan, np.nan, 0.0, 0.0, near_term_implied_move_pct, near_term_spread_pct, near_term_dte
+        return (
+            days,
+            ivs,
+            np.nan,
+            np.nan,
+            0.0,
+            0.0,
+            near_term_implied_move_pct,
+            near_term_spread_pct,
+            near_term_dte,
+            None,
+            near_term_liquidity_proxy,
+        )
 
     order = np.argsort(np.array(days, dtype=float))
     days_arr = np.array(days, dtype=float)[order]
@@ -151,6 +185,11 @@ def _term_structure_points(
     iv45 = float(np.interp(45.0, days_arr, ivs_arr))
     iv0 = float(np.interp(0.0, days_arr, ivs_arr))
     slope_0_45 = float((iv45 - iv0) / 45.0)
+    near_back_iv_ratio = (
+        float(ivs_arr[0] / ivs_arr[1])
+        if len(ivs_arr) >= 2 and np.isfinite(ivs_arr[0]) and np.isfinite(ivs_arr[1]) and ivs_arr[1] > 0
+        else None
+    )
 
     avg_oi = float(np.mean(oi_values)) if oi_values else 0.0
     avg_opt_vol = float(np.mean(vol_values)) if vol_values else 0.0
@@ -165,6 +204,8 @@ def _term_structure_points(
         near_term_implied_move_pct,
         near_term_spread_pct,
         near_term_dte,
+        near_back_iv_ratio,
+        near_term_liquidity_proxy,
     )
 
 
@@ -288,6 +329,7 @@ def _historical_earnings_move_profile(ticker: yf.Ticker, close: pd.Series) -> Di
             "median_move_pct": None,
             "p90_move_pct": None,
             "avg_last4_move_pct": None,
+            "std_move_pct": None,
             "source": "none",
         }
 
@@ -305,6 +347,7 @@ def _historical_earnings_move_profile(ticker: yf.Ticker, close: pd.Series) -> Di
             "median_move_pct": None,
             "p90_move_pct": None,
             "avg_last4_move_pct": None,
+            "std_move_pct": None,
             "source": "none",
         }
 
@@ -358,17 +401,24 @@ def _historical_earnings_move_profile(ticker: yf.Ticker, close: pd.Series) -> Di
                 "median_move_pct": None,
                 "p90_move_pct": None,
                 "avg_last4_move_pct": None,
+                "std_move_pct": None,
                 "source": "none",
             }
         if daily_moves.size >= 5:
             low_clip, high_clip = np.percentile(daily_moves, [1.0, 99.0])
             daily_moves = np.clip(daily_moves, low_clip, high_clip)
         avg_last4 = float(np.mean(daily_moves[-4:]))
+        std_move = (
+            float(np.std(daily_moves, ddof=1))
+            if daily_moves.size > 1
+            else 0.0
+        )
         return {
             "event_count": int(daily_moves.size),
             "median_move_pct": float(np.median(daily_moves)),
             "p90_move_pct": float(np.percentile(daily_moves, 90)),
             "avg_last4_move_pct": avg_last4,
+            "std_move_pct": std_move,
             "source": "daily_fallback",
         }
 
@@ -377,11 +427,17 @@ def _historical_earnings_move_profile(ticker: yf.Ticker, close: pd.Series) -> Di
         low_clip, high_clip = np.percentile(moves, [1.0, 99.0])
         moves = np.clip(moves, low_clip, high_clip)
     avg_last4 = float(np.mean(moves[-4:]))
+    std_move = (
+        float(np.std(moves, ddof=1))
+        if moves.size > 1
+        else 0.0
+    )
     return {
         "event_count": int(moves.size),
         "median_move_pct": float(np.median(moves)),
         "p90_move_pct": float(np.percentile(moves, 90)),
         "avg_last4_move_pct": avg_last4,
+        "std_move_pct": std_move,
         "source": "earnings_history",
     }
 
@@ -401,6 +457,28 @@ def _compute_move_anchor(
     if np.isfinite(median_val):
         return float(median_val)
     return None
+
+
+def _compute_move_uncertainty_pct(
+    move_std_pct: float,
+    sample_size: int,
+    move_source: str,
+) -> Optional[float]:
+    std_val = _safe_float(move_std_pct, np.nan)
+    if not np.isfinite(std_val) or std_val <= 0 or sample_size <= 0:
+        return None
+
+    source = str(move_source or "none")
+    if source == "earnings_history":
+        n_eff = float(sample_size)
+    elif source == "daily_fallback":
+        # Daily fallback has many rows but weaker event specificity.
+        n_eff = float(np.clip(sample_size * 0.35, 1.0, 10.0))
+    else:
+        n_eff = float(np.clip(sample_size * 0.25, 1.0, 6.0))
+
+    uncertainty = MOVE_UNCERTAINTY_Z_SCORE * std_val / np.sqrt(max(n_eff, 1.0))
+    return float(np.clip(uncertainty, 0.03, 6.0))
 
 
 def _estimate_transaction_cost_pct(liquidity: float, spread_pct: Optional[float]) -> float:
@@ -457,11 +535,14 @@ def analyze_single_ticker(symbol: str) -> EdgeSnapshot:
         implied_move_pct,
         near_term_spread_pct,
         near_term_dte,
+        near_back_iv_ratio,
+        near_term_liquidity_proxy,
     ) = _term_structure_points(ticker, current_price=current_price)
     move_profile = _historical_earnings_move_profile(ticker, close)
     median_earnings_move_pct = _safe_float(move_profile.get("median_move_pct"), np.nan)
     p90_earnings_move_pct = _safe_float(move_profile.get("p90_move_pct"), np.nan)
     avg_last4_move_pct = _safe_float(move_profile.get("avg_last4_move_pct"), np.nan)
+    move_std_pct = _safe_float(move_profile.get("std_move_pct"), np.nan)
     move_anchor_pct = _compute_move_anchor(median_earnings_move_pct, avg_last4_move_pct)
     move_anchor_pct_val = _safe_float(move_anchor_pct, np.nan)
     move_sample_size = int(move_profile.get("event_count", 0) or 0)
@@ -472,6 +553,11 @@ def analyze_single_ticker(symbol: str) -> EdgeSnapshot:
         sample_confidence = float(np.clip(move_sample_size / 40.0, 0.10, 0.60))
     else:
         sample_confidence = 0.10
+    move_uncertainty_pct = _compute_move_uncertainty_pct(
+        move_std_pct=move_std_pct,
+        sample_size=move_sample_size,
+        move_source=move_source,
+    )
     tx_cost_pct = _estimate_transaction_cost_pct(liquidity=liquidity, spread_pct=near_term_spread_pct)
 
     iv_rv = float(iv30 / rv30) if np.isfinite(iv30) and np.isfinite(rv30) and rv30 > 0 else np.nan
@@ -493,9 +579,19 @@ def analyze_single_ticker(symbol: str) -> EdgeSnapshot:
         if np.isfinite(_safe_float(implied_move_pct, np.nan)) and np.isfinite(move_anchor_pct_val) and move_anchor_pct_val > 0
         else np.nan
     )
-    expected_gross_edge_pct = (
+    confidence_adjusted_gross_edge_pct = (
         float(raw_gross_edge_pct * sample_confidence)
         if np.isfinite(raw_gross_edge_pct)
+        else np.nan
+    )
+    uncertainty_penalty_pct = (
+        float((move_uncertainty_pct or 0.0) * (0.60 + 0.40 * (1.0 - sample_confidence)))
+        if move_uncertainty_pct is not None
+        else (0.35 if move_source != "earnings_history" else 0.0)
+    )
+    expected_gross_edge_pct = (
+        float(confidence_adjusted_gross_edge_pct - uncertainty_penalty_pct)
+        if np.isfinite(confidence_adjusted_gross_edge_pct)
         else np.nan
     )
     expected_net_edge_pct = (
@@ -547,6 +643,16 @@ def analyze_single_ticker(symbol: str) -> EdgeSnapshot:
     if np.isfinite(spread_val) and spread_val > MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE:
         hard_gate_reasons.append(
             f"Near-term spread too wide ({spread_val:.1f}% > {MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE:.1f}%)."
+        )
+    near_back_ratio_val = _safe_float(near_back_iv_ratio, np.nan)
+    if np.isfinite(near_back_ratio_val) and near_back_ratio_val < MIN_NEAR_BACK_IV_RATIO_FOR_EVENT:
+        hard_gate_reasons.append(
+            f"Near/back IV premium too weak ({near_back_ratio_val:.2f}x < {MIN_NEAR_BACK_IV_RATIO_FOR_EVENT:.2f}x)."
+        )
+    near_term_liquidity_val = _safe_float(near_term_liquidity_proxy, np.nan)
+    if np.isfinite(near_term_liquidity_val) and near_term_liquidity_val < MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_TRADE:
+        hard_gate_reasons.append(
+            f"Near-term liquidity too low ({near_term_liquidity_val:.0f} < {MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_TRADE:.0f})."
         )
     if move_source != "earnings_history":
         hard_gate_reasons.append("Earnings move profile is not from true earnings history.")
@@ -614,18 +720,36 @@ def analyze_single_ticker(symbol: str) -> EdgeSnapshot:
             else "Near-term spread unavailable."
         ),
         (
+            f"Near/back IV premium={near_back_iv_ratio:.2f}x "
+            f"(gate >= {MIN_NEAR_BACK_IV_RATIO_FOR_EVENT:.2f}x)."
+            if np.isfinite(_safe_float(near_back_iv_ratio, np.nan))
+            else "Near/back IV premium unavailable."
+        ),
+        (
+            f"Near-term liquidity proxy={near_term_liquidity_proxy:.0f} "
+            f"(gate >= {MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_TRADE:.0f})."
+            if np.isfinite(_safe_float(near_term_liquidity_proxy, np.nan))
+            else "Near-term liquidity proxy unavailable."
+        ),
+        (
             f"Hard gate status=FAIL ({'; '.join(hard_gate_reasons)})"
             if hard_no_trade
             else "Hard gate status=PASS."
         ),
         (
             f"Expected net edge={expected_net_edge_pct:+.2f}% "
-            f"(gross {expected_gross_edge_pct:+.2f}% after sample-adjustment - cost {tx_cost_pct:.2f}%; "
+            f"(gross {expected_gross_edge_pct:+.2f}% after sample/uncertainty adjustment - cost {tx_cost_pct:.2f}%; "
             f"implied/anchor={implied_vs_anchor_ratio:.2f}x)."
             if np.isfinite(expected_net_edge_pct)
             and np.isfinite(expected_gross_edge_pct)
             and np.isfinite(implied_vs_anchor_ratio)
             else f"Expected net edge unavailable; cost baseline={tx_cost_pct:.2f}%."
+        ),
+        (
+            f"Anchor uncertainty penalty={uncertainty_penalty_pct:.2f}% "
+            f"(move std={move_std_pct:.2f}%, source={move_source})."
+            if np.isfinite(_safe_float(move_std_pct, np.nan))
+            else "Anchor uncertainty unavailable."
         ),
         (
             f"Drawdown risk estimate={drawdown_risk_pct:.2f}% "
@@ -652,12 +776,22 @@ def analyze_single_ticker(symbol: str) -> EdgeSnapshot:
         "smile_concave": bool(smile_state.get("concave", False)),
         "smile_points": int(smile_state.get("points", 0) or 0),
         "term_structure_slope_0_45": float(ts_slope_0_45) if np.isfinite(ts_slope_0_45) else None,
+        "near_back_iv_ratio": float(near_back_iv_ratio) if np.isfinite(_safe_float(near_back_iv_ratio, np.nan)) else None,
+        "min_near_back_iv_ratio_for_event": MIN_NEAR_BACK_IV_RATIO_FOR_EVENT,
         "near_term_dte": near_term_dte,
+        "near_term_liquidity_proxy": (
+            float(near_term_liquidity_proxy)
+            if np.isfinite(_safe_float(near_term_liquidity_proxy, np.nan))
+            else None
+        ),
+        "min_near_term_liquidity_proxy_for_trade": MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_TRADE,
         "implied_move_pct": float(implied_move_pct) if np.isfinite(_safe_float(implied_move_pct, np.nan)) else None,
         "earnings_move_median_pct": float(median_earnings_move_pct) if np.isfinite(median_earnings_move_pct) else None,
         "earnings_move_p90_pct": float(p90_earnings_move_pct) if np.isfinite(p90_earnings_move_pct) else None,
         "earnings_move_avg_last4_pct": float(avg_last4_move_pct) if np.isfinite(avg_last4_move_pct) else None,
+        "earnings_move_std_pct": float(move_std_pct) if np.isfinite(move_std_pct) else None,
         "earnings_move_anchor_pct": float(move_anchor_pct_val) if np.isfinite(move_anchor_pct_val) else None,
+        "move_uncertainty_pct": float(move_uncertainty_pct) if move_uncertainty_pct is not None else None,
         "implied_vs_anchor_ratio": float(implied_vs_anchor_ratio) if np.isfinite(implied_vs_anchor_ratio) else None,
         "earnings_move_sample_size": move_sample_size,
         "earnings_move_source": move_source,
@@ -671,6 +805,12 @@ def analyze_single_ticker(symbol: str) -> EdgeSnapshot:
         "confidence_cap_pct": HARD_NO_TRADE_CONFIDENCE_CAP_PCT,
         "tx_cost_estimate_pct": tx_cost_pct,
         "raw_gross_edge_pct": float(raw_gross_edge_pct) if np.isfinite(raw_gross_edge_pct) else None,
+        "confidence_adjusted_gross_edge_pct": (
+            float(confidence_adjusted_gross_edge_pct)
+            if np.isfinite(confidence_adjusted_gross_edge_pct)
+            else None
+        ),
+        "uncertainty_penalty_pct": float(uncertainty_penalty_pct),
         "expected_gross_edge_pct": float(expected_gross_edge_pct) if np.isfinite(expected_gross_edge_pct) else None,
         "expected_net_edge_pct": float(expected_net_edge_pct) if np.isfinite(expected_net_edge_pct) else None,
         "base_drawdown_risk_pct": float(base_drawdown_risk_pct),

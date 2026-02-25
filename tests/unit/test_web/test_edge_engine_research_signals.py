@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from web.api.edge_engine import (
+    _compute_move_uncertainty_pct,
     _compute_move_anchor,
     _historical_earnings_move_profile,
 )
@@ -55,9 +56,11 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         self.assertEqual(profile["source"], "earnings_history")
         self.assertEqual(profile["event_count"], 5)
         self.assertIn("avg_last4_move_pct", profile)
+        self.assertIn("std_move_pct", profile)
         # Last 4 target moves are 5,6,7,8.
         self.assertAlmostEqual(profile["avg_last4_move_pct"], 6.5, places=1)
         self.assertGreater(profile["p90_move_pct"], profile["median_move_pct"])
+        self.assertGreater(profile["std_move_pct"], 0.0)
 
     def test_historical_profile_daily_fallback_has_avg_last4(self):
         dates = pd.bdate_range("2024-01-02", periods=80)
@@ -71,6 +74,22 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         self.assertEqual(profile["source"], "daily_fallback")
         self.assertGreater(profile["event_count"], 0)
         self.assertIsNotNone(profile["avg_last4_move_pct"])
+        self.assertIn("std_move_pct", profile)
+
+    def test_move_uncertainty_scales_with_source_quality(self):
+        earnings_uncertainty = _compute_move_uncertainty_pct(
+            move_std_pct=2.0,
+            sample_size=8,
+            move_source="earnings_history",
+        )
+        fallback_uncertainty = _compute_move_uncertainty_pct(
+            move_std_pct=2.0,
+            sample_size=8,
+            move_source="daily_fallback",
+        )
+        self.assertIsNotNone(earnings_uncertainty)
+        self.assertIsNotNone(fallback_uncertainty)
+        self.assertGreater(fallback_uncertainty, earnings_uncertainty)
 
 
 if __name__ == "__main__":

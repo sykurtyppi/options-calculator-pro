@@ -332,7 +332,21 @@ function App() {
               value={fmtPctPoints(result?.metrics?.near_term_spread_pct, 2)}
               tone={toneNegativeMetric(result?.metrics?.near_term_spread_pct, 8.0, 18.0)}
             />
+            <Metric
+              label="Near/Back IV"
+              value={fmtNum(result?.metrics?.near_back_iv_ratio, 2)}
+              tone={tonePositiveMetric(
+                result?.metrics?.near_back_iv_ratio,
+                result?.metrics?.min_near_back_iv_ratio_for_event ?? 1.02,
+                1.0
+              )}
+            />
             <Metric label="Tx Cost Est" value={fmtPctPoints(result?.metrics?.tx_cost_estimate_pct, 2)} />
+            <Metric
+              label="Move Uncertainty"
+              value={fmtPctPoints(result?.metrics?.move_uncertainty_pct, 2)}
+              tone={toneNegativeMetric(result?.metrics?.move_uncertainty_pct, 1.0, 2.0)}
+            />
             <Metric label="DTE" value={result?.metrics?.days_to_earnings ?? '--'} />
             <Metric label="IV30" value={fmtNum(result?.metrics?.iv30, 4)} />
             <Metric label="RV30" value={fmtNum(result?.metrics?.rv30, 4)} />
