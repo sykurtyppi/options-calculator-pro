@@ -17,7 +17,8 @@ import logging
 import os
 import json
 import itertools
-from datetime import datetime, timedelta
+import math
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 import pandas as pd
 import numpy as np
@@ -28,24 +29,115 @@ import asyncio
 from utils.logger import setup_logger as get_logger
 from services.execution_cost_model import ExecutionCostModel
 
+# Optional MarketData.app client — imported lazily so the module loads even
+# when market_data_client is not yet on the path.
+try:
+    from services.market_data_client import MarketDataClient as _MarketDataClient
+except ImportError:
+    _MarketDataClient = None  # type: ignore
+
 logger = get_logger(__name__)
 
-# Institutional ticker universe (top 50 optionable stocks)
+# Full S&P 500 optionable universe (~504 symbols), organised by GICS sector.
+# Tier 1 (original 100) have existing snapshots + labels.
+# Tier 2 (404 added 2026-03-01) are being backfilled.
 INSTITUTIONAL_UNIVERSE = [
-    # Mega-cap tech
+    # ── Tier 1 — Original 100 ─────────────────────────────────────────────────
+    # Mega-cap tech & consumer internet
     'AAPL', 'MSFT', 'GOOGL', 'ORCL', 'AMZN', 'META', 'TSLA', 'NFLX', 'NVDA', 'AMD',
 
-    # Financial services
+    # Financial services core
     'JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'BLK', 'AXP', 'V', 'MA',
 
-    # Healthcare & biotech
+    # Healthcare & biotech core
     'JNJ', 'PFE', 'UNH', 'ABBV', 'TMO', 'ABT', 'MRK', 'CVS', 'LLY', 'GILD',
 
-    # Consumer & retail
+    # Consumer & retail core
     'HD', 'PG', 'KO', 'PEP', 'WMT', 'MCD', 'NKE', 'SBUX', 'TGT', 'LOW',
 
-    # Industrial & energy
-    'CAT', 'BA', 'GE', 'MMM', 'HON', 'XOM', 'CVX', 'SLB', 'COP', 'EOG'
+    # Industrial & energy core
+    'CAT', 'BA', 'GE', 'MMM', 'HON', 'XOM', 'CVX', 'SLB', 'COP', 'EOG',
+
+    # Enterprise software & cloud
+    'CRM', 'ADBE', 'NOW', 'INTU', 'PANW', 'CRWD', 'SNPS', 'CDNS', 'FTNT', 'DDOG',
+
+    # Semiconductors & equipment
+    'AMAT', 'MU', 'LRCX', 'KLAC', 'MRVL', 'ON', 'TXN', 'QCOM', 'AVGO', 'ADI',
+
+    # Biotech & medical devices
+    'VRTX', 'REGN', 'ISRG', 'MDT', 'SYK', 'BSX', 'EW', 'DXCM', 'IDXX', 'ALGN',
+
+    # Consumer discretionary & specialty retail
+    'COST', 'TJX', 'DLTR', 'DG', 'ROST', 'EBAY', 'BKNG', 'MAR', 'HLT', 'YUM',
+
+    # Financial services expansion
+    'CME', 'SCHW', 'CB', 'SPGI', 'MCO', 'ICE', 'BK', 'STT', 'FITB', 'CFG',
+
+    # ── Tier 2 — S&P 500 expansion (404 symbols added 2026-03-01) ─────────────
+    # Communication services
+    'CMCSA', 'DIS', 'CHTR', 'T', 'VZ', 'TMUS', 'GOOG', 'NWS', 'NWSA', 'WBD',
+    'FOXA', 'FOX', 'LYV', 'TKO', 'OMC', 'TTD', 'NDAQ',
+
+    # IT services, infrastructure & hardware
+    'ACN', 'ADP', 'ADSK', 'ANET', 'AKAM', 'APP', 'CDW', 'CSCO', 'CSGP', 'CTSH',
+    'DELL', 'EA', 'EPAM', 'FFIV', 'FICO', 'FIS', 'FISV', 'GEN', 'GDDY', 'GPN',
+    'GLW', 'HPE', 'HPQ', 'IBM', 'INTC', 'IT', 'JKHY', 'KEYS', 'MCHP', 'MPWR',
+    'MSI', 'MSCI', 'NTAP', 'NXPI', 'PAYC', 'PAYX', 'PLTR', 'PTC', 'Q', 'SMCI',
+    'SWKS', 'TEL', 'TER', 'TTWO', 'TYL', 'VRSK', 'VRSN', 'WDC', 'WDAY', 'ZBRA',
+    'CIEN',
+
+    # Healthcare expansion
+    'A', 'AMGN', 'BAX', 'BDX', 'BIIB', 'BMY', 'CAH', 'CI', 'CNC', 'COO',
+    'COR', 'CRL', 'DGX', 'DHR', 'DVA', 'ELV', 'GEHC', 'HCA', 'HOLX', 'HSIC',
+    'HUM', 'INCY', 'IQV', 'LH', 'MCK', 'MOH', 'MRNA', 'MTD', 'PODD', 'RMD',
+    'RVTY', 'SOLV', 'STE', 'TECH', 'UHS', 'VTRS', 'WAT', 'ZBH', 'ZTS',
+
+    # Financials expansion II (insurance, asset mgmt, fintech)
+    'ACGL', 'AFL', 'AIG', 'AIZ', 'AJG', 'ALL', 'AMP', 'AON', 'APO', 'ARES',
+    'BEN', 'BRK-B', 'BRO', 'BX', 'CBOE', 'CBRE', 'CINF', 'COF', 'COIN', 'CPAY',
+    'EFX', 'EG', 'ERIE', 'FDS', 'GL', 'HBAN', 'HIG', 'HOOD', 'IBKR', 'IVZ',
+    'KEY', 'KKR', 'L', 'MET', 'MTB', 'NTRS', 'PFG', 'PGR', 'PNC', 'PRU',
+    'PYPL', 'RF', 'RJF', 'SYF', 'TFC', 'TROW', 'TRV', 'USB', 'WRB', 'WTW',
+
+    # Real estate & REITs
+    'AMT', 'ARE', 'AVB', 'BXP', 'CCI', 'CPT', 'DLR', 'DOC', 'EQIX', 'EQR',
+    'ESS', 'EXR', 'FRT', 'HST', 'INVH', 'IRM', 'KIM', 'MAA', 'O', 'PLD',
+    'PSA', 'REG', 'SBAC', 'SPG', 'UDR', 'VICI', 'VTR', 'WELL',
+
+    # Industrials expansion (aerospace, defense, transport, machinery)
+    'ALLE', 'AME', 'AOS', 'APH', 'AXON', 'BLDR', 'BR', 'CARR', 'CHRW', 'CMI',
+    'CPRT', 'CSX', 'CTAS', 'DE', 'DOV', 'EME', 'EMR', 'ETN', 'EXPD', 'F',
+    'FAST', 'FDX', 'FIX', 'FTV', 'GD', 'GEV', 'GM', 'GNRC', 'GPC', 'GWW',
+    'HII', 'HUBB', 'HWM', 'IEX', 'IR', 'ITW', 'J', 'JBHT', 'JBL', 'JCI',
+    'LDOS', 'LHX', 'LII', 'LMT', 'LNT', 'LUV', 'MAS', 'NDSN', 'NOC', 'NSC',
+    'ODFL', 'OTIS', 'PCAR', 'PH', 'PNR', 'PWR', 'ROK', 'ROL', 'ROP', 'RSG',
+    'RTX', 'SNA', 'SWK', 'TDG', 'TDY', 'TRMB', 'TT', 'TXT', 'UAL', 'UNP',
+    'UPS', 'URI', 'VLTO', 'WAB', 'WM', 'XYL',
+
+    # Energy expansion
+    'APA', 'BKR', 'CEG', 'CTRA', 'DVN', 'EQT', 'EXE', 'FANG', 'FSLR', 'HAL',
+    'KMI', 'MPC', 'NRG', 'OKE', 'OXY', 'PSX', 'TRGP', 'VLO', 'VST', 'WMB',
+
+    # Materials (chemicals, mining, packaging, construction)
+    'ALB', 'APD', 'BALL', 'CF', 'CRH', 'DD', 'DOW', 'ECL', 'FCX', 'IFF',
+    'IP', 'LIN', 'LW', 'LYB', 'MLM', 'MOS', 'NEM', 'NUE', 'PKG', 'PPG',
+    'SHW', 'STLD', 'SW', 'VMC', 'WY',
+
+    # Consumer staples expansion
+    'ADM', 'AMCR', 'AVY', 'BF-B', 'BG', 'CAG', 'CHD', 'CL', 'CLX', 'CPB',
+    'CTVA', 'EL', 'GIS', 'HRL', 'HSY', 'KDP', 'KHC', 'KMB', 'KR', 'KVUE',
+    'MDLZ', 'MKC', 'MO', 'MNST', 'PM', 'SJM', 'STZ', 'SYY', 'TAP', 'TSN',
+
+    # Consumer discretionary expansion (autos, leisure, media, homebuilders)
+    'ABNB', 'APTV', 'AZO', 'BBY', 'CCL', 'CMG', 'CVNA', 'DAL', 'DASH', 'DECK',
+    'DHI', 'DPZ', 'DRI', 'EXPE', 'GRMN', 'HAS', 'LEN', 'LULU', 'LVS', 'MGM',
+    'MTCH', 'NCLH', 'NVR', 'ORLY', 'PHM', 'POOL', 'RCL', 'RL', 'STX',
+    'TPL', 'TPR', 'TSCO', 'UBER', 'ULTA', 'WSM', 'WST', 'WYNN',
+
+    # Utilities
+    'AEE', 'AEP', 'AES', 'ATO', 'AWK', 'CMS', 'CNP', 'D', 'DTE', 'DUK',
+    'ED', 'EIX', 'ES', 'ETR', 'EVRG', 'EXC', 'FE', 'NEE', 'NI', 'PCG',
+    'PEG', 'PNW', 'PPL', 'SO', 'SRE', 'WEC', 'XEL',
 ]
 
 @dataclass
@@ -164,9 +256,20 @@ class InstitutionalMLDatabase:
     Designed for systematic backtesting and professional trading systems
     """
 
-    def __init__(self, db_path: Optional[str] = None):
-        """Initialize institutional ML database"""
+    def __init__(self, db_path: Optional[str] = None, mda_client: Optional[Any] = None):
+        """Initialize institutional ML database.
+
+        Parameters
+        ----------
+        db_path    : Path to SQLite file. Defaults to ~/.options_calculator_pro/institutional_ml.db
+        mda_client : Optional MarketDataClient instance. When provided, MarketData.app
+                     is used for earnings dates (accurate BMO/AMC) and historical IV
+                     snapshots. Falls back to yfinance when None or unavailable.
+        """
         self.logger = logger
+
+        # MarketData.app client for enhanced data quality
+        self.mda_client: Optional[Any] = mda_client
 
         # Database path
         if db_path is None:
@@ -873,8 +976,12 @@ class InstitutionalMLDatabase:
 
             pnl_per_trade = np.array([trade.pnl_per_contract * trade.contracts for trade in trades], dtype=float)
             return_series = np.array([trade.net_return_pct for trade in trades], dtype=float)
-            hold_days = max(1, int(strategy_params.get('hold_days', 7)))
-            annualization_factor = np.sqrt(252 / hold_days)
+            realized_hold_days = np.array(
+                [max(1.0, float(getattr(trade, 'hold_days', 1.0) or 1.0)) for trade in trades],
+                dtype=float,
+            )
+            hold_days_for_annualization = float(np.clip(np.nanmean(realized_hold_days), 1.0, 252.0))
+            annualization_factor = np.sqrt(252.0 / hold_days_for_annualization)
             return_std = float(np.std(return_series))
 
             win_rate = float(np.mean(pnl_per_trade > 0))
@@ -1167,6 +1274,9 @@ class InstitutionalMLDatabase:
                     row_hold_days = hold_days_default
                 else:
                     row_hold_days = exit_idx - entry_idx
+                # In earnings-window mode, keep event-anchored exits but enforce hold_days
+                # as a hard risk cap so this parameter remains operational in sweeps.
+                row_hold_days = min(row_hold_days, hold_days_default)
                 row_hold_days = int(np.clip(row_hold_days, 1, 21))
 
                 row = next(symbol_df.iloc[[entry_idx]].itertuples(index=False))
@@ -1189,8 +1299,11 @@ class InstitutionalMLDatabase:
         window_end = end_date + timedelta(days=30)
 
         cached = self._get_cached_earnings_dates(symbol, window_start, window_end)
+        # Accept both 'yfinance' and 'marketdata_app' as true (non-proxy) sources.
+        _TRUE_SOURCES = {'yfinance', 'marketdata_app'}
         true_dates = sorted(
-            {(event_date, release_timing) for event_date, source, release_timing in cached if source == 'yfinance'},
+            {(event_date, release_timing) for event_date, source, release_timing in cached
+             if source in _TRUE_SOURCES},
             key=lambda item: item[0]
         )
         if true_dates:
@@ -1310,8 +1423,58 @@ class InstitutionalMLDatabase:
 
     def _fetch_and_cache_earnings_dates(self, symbol: str, window_start: datetime,
                                       window_end: datetime) -> List[Dict[str, Any]]:
-        """Fetch earnings dates from yfinance and cache them."""
-        event_rows: List[Dict[str, Any]] = []
+        """Fetch earnings dates and cache them.
+
+        Uses MarketData.app when self.mda_client is available — provides accurate
+        BMO/AMC release_timing without the heuristic guessing required for yfinance.
+        Falls back to yfinance automatically.
+        """
+        # ── Primary: MarketData.app (accurate reportTime = BMO/AMC) ──────────
+        if self.mda_client is not None:
+            try:
+                mda_df = self.mda_client.get_earnings(symbol, countback=60)
+                if mda_df is not None and not mda_df.empty:
+                    event_rows: List[Dict[str, Any]] = []
+                    for _, row in mda_df.iterrows():
+                        rd = row.get("report_date")
+                        if rd is None:
+                            continue
+                        try:
+                            dt = datetime.combine(rd, datetime.min.time())
+                        except Exception:
+                            continue
+                        if not (window_start <= dt <= window_end):
+                            continue
+
+                        # reportTime from MDApp: 'before market open' | 'after market close'
+                        rt_raw = str(row.get("reportTime") or "").lower()
+                        if "before" in rt_raw:
+                            release_timing = "BMO"
+                        elif "after" in rt_raw:
+                            release_timing = "AMC"
+                        elif "during" in rt_raw:
+                            release_timing = "INTRADAY"
+                        else:
+                            release_timing = "UNKNOWN"
+
+                        event_rows.append({
+                            "event_date": dt,
+                            "release_timing": release_timing,
+                        })
+
+                    dedup = {}
+                    for ev in event_rows:
+                        key = ev["event_date"].strftime("%Y-%m-%d")
+                        dedup[key] = ev
+                    event_rows = [dedup[k] for k in sorted(dedup.keys())]
+                    if event_rows:
+                        self._cache_earnings_dates(symbol, event_rows, source="marketdata_app")
+                    return event_rows
+            except Exception as e:
+                self.logger.debug("MDApp earnings fetch failed for %s, falling back to yfinance: %s", symbol, e)
+
+        # ── Fallback: yfinance (release timing inferred via heuristic) ────────
+        event_rows = []
         try:
             ticker = yf.Ticker(symbol)
             earnings_df = None
@@ -1329,7 +1492,9 @@ class InstitutionalMLDatabase:
             for idx, ts in enumerate(pd.to_datetime(earnings_df.index)):
                 ts_obj = pd.Timestamp(ts)
                 if ts_obj.tzinfo is not None:
-                    ts_obj = ts_obj.tz_localize(None)
+                    # tz_localize(None) raises TypeError on already-aware timestamps;
+                    # use tz_convert(None) to correctly strip the timezone.
+                    ts_obj = ts_obj.tz_convert(None)
                 dt = ts_obj.to_pydatetime()
                 if window_start <= dt <= window_end:
                     release_timing = self._infer_release_timing_from_earnings_row(
@@ -1447,8 +1612,8 @@ class InstitutionalMLDatabase:
         return proxy_dates
 
     def capture_earnings_option_snapshots(self, symbols: Optional[List[str]] = None,
-                                        lookback_days: int = 14,
-                                        lookahead_days: int = 45,
+                                        lookback_days: int = 30,
+                                        lookahead_days: int = 90,
                                         max_expiries: int = 2,
                                         require_true_earnings: bool = False,
                                         allow_proxy_earnings: bool = True) -> Dict[str, Any]:
@@ -1479,6 +1644,7 @@ class InstitutionalMLDatabase:
         no_iv_events = 0
         chain_errors = 0
         eligible_events = 0
+        events_outside_window = 0
 
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -1537,6 +1703,7 @@ class InstitutionalMLDatabase:
                             release_timing = str(event.get('release_timing', 'UNKNOWN')).upper()
                             relative_day = (today - event_date).days
                             if relative_day < -lookahead_days or relative_day > lookback_days:
+                                events_outside_window += 1
                                 continue
                             eligible_events += 1
 
@@ -1625,13 +1792,21 @@ class InstitutionalMLDatabase:
         )
         self.logger.info(
             "📸 Snapshot diagnostics: no-price=%d, no-events=%d, no-expiries=%d, "
-            "no-iv=%d, chain-errors=%d",
+            "no-iv=%d, chain-errors=%d, outside-window=%d",
             no_price_symbols,
             no_event_symbols,
             no_expiry_symbols,
             no_iv_events,
             chain_errors,
+            events_outside_window,
         )
+        if eligible_events == 0 and events_outside_window > 0:
+            self.logger.warning(
+                "⚠️ 0 eligible events in current snapshot window. Increase lookback/lookahead "
+                "(current lookback=%d, lookahead=%d).",
+                lookback_days,
+                lookahead_days,
+            )
         return {
             'captured': int(captured),
             'attempts': int(attempts),
@@ -1645,8 +1820,591 @@ class InstitutionalMLDatabase:
                 'no_expiry_symbols': int(no_expiry_symbols),
                 'no_iv_events': int(no_iv_events),
                 'chain_errors': int(chain_errors),
+                'events_outside_window': int(events_outside_window),
             },
         }
+
+    def capture_historical_iv_snapshots_mda(
+        self,
+        symbols: Optional[List[str]] = None,
+        lookback_years: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Backfill historical IV snapshots using MarketData.app historical option chains.
+
+        For each past earnings event, fetches the option chain at T-5 (pre) and T+1 (post)
+        and stores ATM front/back IV in earnings_option_snapshots. This is the key enabler
+        for training the ML crush model with real IV decay labels instead of synthetic -18%.
+
+        Credit usage: ~1 credit per 1,000 historical contracts — extremely cheap.
+        Requires self.mda_client to be set.
+
+        Returns a summary dict with counts per symbol.
+        """
+        if self.mda_client is None or not self.mda_client.is_available():
+            self.logger.warning(
+                "capture_historical_iv_snapshots_mda: no MDApp client available. "
+                "Set MARKETDATA_TOKEN env var and pass mda_client to InstitutionalMLDatabase."
+            )
+            return {"captured": 0, "skipped": 0, "errors": 0, "reason": "no_mda_client"}
+
+        if symbols is None:
+            symbols = INSTITUTIONAL_UNIVERSE
+        symbols = [str(s).strip().upper() for s in symbols if str(s).strip()]
+
+        today = datetime.now().date()
+        cutoff = today - timedelta(days=lookback_years * 365)
+
+        captured = 0
+        skipped = 0
+        errors = 0
+        attempts = 0
+        events_considered = 0
+        no_chain_rows = 0
+        no_expiry_pairs = 0
+        no_underlying = 0
+        no_iv_values = 0
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            for symbol in symbols:
+                try:
+                    # Resolve historical earnings events with robust fallback:
+                    # cached events -> fetch+cache (MDApp or yfinance) -> skip.
+                    window_start_dt = datetime.combine(cutoff, datetime.min.time())
+                    window_end_dt = datetime.combine(today - timedelta(days=1), datetime.min.time())
+
+                    cached_events = self._get_cached_earnings_dates(
+                        symbol=symbol,
+                        window_start=window_start_dt,
+                        window_end=window_end_dt,
+                    )
+
+                    past_events: List[Dict[str, Any]] = []
+                    if cached_events:
+                        # Prefer true events (MDApp/yfinance) over proxy schedule.
+                        true_events = [row for row in cached_events if str(row[1]).lower() != "proxy"]
+                        source_rows = true_events if true_events else cached_events
+                        for event_date_dt, _source, release_timing in source_rows:
+                            try:
+                                report_date = event_date_dt.date()
+                                if report_date < cutoff or report_date >= today:
+                                    continue
+                                past_events.append(
+                                    {
+                                        "report_date": report_date,
+                                        "release_timing": str(release_timing or "UNKNOWN").upper(),
+                                    }
+                                )
+                            except Exception:
+                                continue
+                    else:
+                        fetched_events = self._fetch_and_cache_earnings_dates(
+                            symbol=symbol,
+                            window_start=window_start_dt,
+                            window_end=window_end_dt,
+                        )
+                        for event in fetched_events or []:
+                            try:
+                                event_dt = pd.Timestamp(event.get("event_date")).to_pydatetime()
+                                report_date = event_dt.date()
+                                if report_date < cutoff or report_date >= today:
+                                    continue
+                                past_events.append(
+                                    {
+                                        "report_date": report_date,
+                                        "release_timing": str(event.get("release_timing", "UNKNOWN")).upper(),
+                                    }
+                                )
+                            except Exception:
+                                continue
+
+                    if not past_events:
+                        skipped += 1
+                        continue
+
+                    # Snapshot-date underlying close for ATM reference (not today's price).
+                    symbol_prices = pd.read_sql_query(
+                        """
+                        SELECT date, close_price
+                        FROM daily_prices
+                        WHERE symbol = ?
+                        ORDER BY date ASC
+                        """,
+                        conn,
+                        params=(symbol,),
+                    )
+                    if symbol_prices.empty:
+                        skipped += 1
+                        continue
+                    symbol_prices["date"] = pd.to_datetime(symbol_prices["date"], errors="coerce").dt.normalize()
+                    symbol_prices["close_price"] = pd.to_numeric(symbol_prices["close_price"], errors="coerce")
+                    symbol_prices = symbol_prices.dropna(subset=["date", "close_price"])
+                    if symbol_prices.empty:
+                        skipped += 1
+                        continue
+                    close_by_date = (
+                        symbol_prices.groupby("date", as_index=True)["close_price"]
+                        .last()
+                        .sort_index()
+                    )
+                    trading_dates = close_by_date.index
+
+                    def _underlying_price_at_snapshot(snap_date: date) -> float:
+                        ts = pd.Timestamp(snap_date).normalize()
+                        asof = close_by_date[close_by_date.index <= ts]
+                        if asof.empty:
+                            return float("nan")
+                        px = float(asof.iloc[-1])
+                        return px if np.isfinite(px) and px > 0 else float("nan")
+
+                    def _align_snapshot_trade_date(
+                        target_date: date,
+                        phase: str,
+                    ) -> Optional[pd.Timestamp]:
+                        """
+                        Align requested snapshot date to an actual trading session.
+
+                        MDApp historical option-chain endpoint returns 404 for non-session
+                        dates (weekends/holidays). We map:
+                          - pre  snapshots -> nearest session on/before target date
+                          - post snapshots -> nearest session on/after target date
+                        """
+                        ts = pd.Timestamp(target_date).normalize()
+                        if phase == "post":
+                            future = trading_dates[trading_dates >= ts]
+                            if len(future) > 0:
+                                return pd.Timestamp(future[0]).normalize()
+                            asof = trading_dates[trading_dates <= ts]
+                            if len(asof) > 0:
+                                return pd.Timestamp(asof[-1]).normalize()
+                            return None
+                        asof = trading_dates[trading_dates <= ts]
+                        if len(asof) == 0:
+                            future = trading_dates[trading_dates >= ts]
+                            if len(future) == 0:
+                                return None
+                            return pd.Timestamp(future[0]).normalize()
+                        return pd.Timestamp(asof[-1]).normalize()
+
+                    def _underlying_price_from_chain(chain: "pd.DataFrame") -> float:
+                        """
+                        Prefer chain-sourced underlying price for historical option data.
+
+                        MarketData.app historical option chains are delivered as-traded and
+                        not adjusted for corporate actions. Using chain `underlyingPrice`
+                        avoids split-adjustment mismatches with adjusted equity histories.
+                        """
+                        if chain is None or chain.empty:
+                            return float("nan")
+                        values = pd.to_numeric(chain.get("underlyingPrice"), errors="coerce").dropna()
+                        if values.empty:
+                            return float("nan")
+                        px = float(np.nanmedian(values.values))
+                        return px if np.isfinite(px) and px > 0 else float("nan")
+
+                    def _select_event_bracketing_expiries(
+                        expiration_values: List[str],
+                        event_date: date,
+                        min_snap_date: Optional[date] = None,
+                    ) -> Tuple[Optional[str], Optional[str]]:
+                        parsed: List[date] = []
+                        for value in expiration_values:
+                            try:
+                                parsed.append(datetime.strptime(str(value), "%Y-%m-%d").date())
+                            except Exception:
+                                continue
+                        parsed = sorted(set(parsed))
+                        if len(parsed) < 2:
+                            return None, None
+                        short_idx = 0
+                        for i, exp_date in enumerate(parsed):
+                            if exp_date >= event_date:
+                                # For post-chain snapshots, skip expirations that expire ON the
+                                # snapshot date — those options have DTE=0 and no valid IV.
+                                # This happens when earnings fall on Thursday and T+1 is a weekly
+                                # expiry Friday (common for AAPL, AMZN, and other mega-caps).
+                                if min_snap_date is not None and exp_date <= min_snap_date:
+                                    continue
+                                short_idx = i
+                                break
+                        short_exp = parsed[short_idx]
+                        if short_idx + 1 < len(parsed):
+                            long_exp = parsed[short_idx + 1]
+                        else:
+                            long_exp = parsed[1] if len(parsed) > 1 else None
+                        if long_exp is None:
+                            return None, None
+                        return short_exp.strftime("%Y-%m-%d"), long_exp.strftime("%Y-%m-%d")
+
+                    # De-duplicate by event date, preserving best known release timing.
+                    dedup_events: Dict[date, Dict[str, Any]] = {}
+                    for ev in past_events:
+                        report_date = ev.get("report_date")
+                        if report_date is None:
+                            continue
+                        try:
+                            rd = report_date if isinstance(report_date, date) else pd.Timestamp(report_date).date()
+                        except Exception:
+                            continue
+                        timing = str(ev.get("release_timing", "UNKNOWN")).upper()
+                        if timing not in {"BMO", "AMC", "INTRADAY"}:
+                            timing = "UNKNOWN"
+                        existing = dedup_events.get(rd)
+                        if existing is None or existing.get("release_timing") == "UNKNOWN":
+                            dedup_events[rd] = {"report_date": rd, "release_timing": timing}
+
+                    # Newest first: if provider entitlement is depth-limited, we prioritize
+                    # recent events and naturally avoid older unsupported ranges sooner.
+                    for rd in sorted(dedup_events.keys(), reverse=True):
+                        event = dedup_events[rd]
+                        release_timing = str(event.get("release_timing", "UNKNOWN")).upper()
+                        event_date_str = rd.strftime("%Y-%m-%d")
+                        events_considered += 1
+
+                        for rel_day, phase in [(-5, "pre"), (1, "post")]:
+                            raw_snap_date = rd + timedelta(days=rel_day)
+                            if raw_snap_date < cutoff or raw_snap_date >= today:
+                                continue
+                            aligned_ts = _align_snapshot_trade_date(raw_snap_date, phase)
+                            if aligned_ts is None:
+                                continue
+                            snap_date = aligned_ts.date()
+                            if snap_date < cutoff or snap_date >= today:
+                                continue
+                            snap_date_str = aligned_ts.strftime("%Y-%m-%d")
+
+                            try:
+                                attempts += 1
+                                chain_df = self.mda_client.get_option_chain(
+                                    symbol,
+                                    expiration="all",
+                                    strike_limit=5,
+                                    date=snap_date_str,
+                                )
+                                if chain_df is None or chain_df.empty:
+                                    no_chain_rows += 1
+                                    continue
+
+                                # Select expiries that bracket the earnings event date.
+                                # For post-chain snapshots, pass snap_date so same-day expirations
+                                # (DTE=0) are skipped — they produce undefined BS IV.
+                                exp_dates = [str(v) for v in chain_df["expiration_date"].dropna().unique()]
+                                _min_snap = snap_date if phase == "post" else None
+                                short_exp, long_exp = _select_event_bracketing_expiries(
+                                    exp_dates, rd, min_snap_date=_min_snap
+                                )
+                                if short_exp is None or long_exp is None:
+                                    no_expiry_pairs += 1
+                                    continue
+
+                                snapshot_underlying = _underlying_price_from_chain(chain_df)
+                                if not np.isfinite(snapshot_underlying) or snapshot_underlying <= 0:
+                                    snapshot_underlying = _underlying_price_at_snapshot(snap_date)
+                                if not np.isfinite(snapshot_underlying) or snapshot_underlying <= 0:
+                                    no_underlying += 1
+                                    continue
+
+                                def _atm_iv_from_df(df: "pd.DataFrame", exp: str) -> Tuple[float, float]:
+                                    grp = df[df["expiration_date"] == exp].copy()
+                                    grp["strike"] = pd.to_numeric(grp.get("strike"), errors="coerce")
+                                    grp = grp.dropna(subset=["strike"])
+                                    grp = grp[grp["strike"] > 0]
+                                    if grp.empty:
+                                        return float("nan"), float("nan")
+
+                                    # MDApp historical chain data may omit IV/Greeks depending on plan.
+                                    # Fallback: derive implied volatility from option price + BSM inversion.
+                                    grp["derived_iv"] = grp.apply(
+                                        lambda row: self._resolve_row_implied_volatility(
+                                            row=row,
+                                            underlying_price=snapshot_underlying,
+                                            risk_free_rate=0.03,
+                                            snapshot_date=snap_date,
+                                        ),
+                                        axis=1,
+                                    )
+                                    valid = grp[
+                                        pd.to_numeric(grp["derived_iv"], errors="coerce").notna()
+                                        & (pd.to_numeric(grp["derived_iv"], errors="coerce") > 0)
+                                    ].copy()
+                                    if valid.empty:
+                                        return float("nan"), float("nan")
+
+                                    strike_distance = (valid["strike"] - snapshot_underlying).abs()
+                                    min_distance = float(strike_distance.min())
+                                    near_atm = valid[strike_distance <= (min_distance + 1e-9)]
+                                    if near_atm.empty:
+                                        return float("nan"), float("nan")
+
+                                    return (
+                                        float(pd.to_numeric(near_atm["derived_iv"], errors="coerce").mean()),
+                                        float(pd.to_numeric(near_atm["strike"], errors="coerce").mean()),
+                                    )
+
+                                front_iv, atm_strike = _atm_iv_from_df(chain_df, short_exp)
+                                back_iv, _ = _atm_iv_from_df(chain_df, long_exp)
+
+                                if not (np.isfinite(front_iv) and np.isfinite(back_iv)
+                                        and front_iv > 0 and back_iv > 0):
+                                    no_iv_values += 1
+                                    continue
+
+                                term_ratio = float(front_iv / max(back_iv, 1e-6))
+
+                                cursor.execute(
+                                    """
+                                    INSERT OR REPLACE INTO earnings_option_snapshots
+                                    (symbol, event_date, capture_date, relative_day,
+                                     release_timing, snapshot_phase,
+                                     short_expiry, long_expiry, atm_strike,
+                                     front_iv, back_iv, term_ratio,
+                                     underlying_price, source)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (
+                                        symbol,
+                                        event_date_str,
+                                        snap_date_str,
+                                        int(rel_day),
+                                        release_timing,
+                                        phase,
+                                        short_exp,
+                                        long_exp,
+                                        float(atm_strike) if np.isfinite(atm_strike) else None,
+                                        float(front_iv),
+                                        float(back_iv),
+                                        term_ratio,
+                                        float(snapshot_underlying),
+                                        "marketdata_app_historical",
+                                    ),
+                                )
+                                captured += 1
+
+                            except Exception as exc:
+                                self.logger.debug(
+                                    "Historical snapshot failed %s @ %s: %s", symbol, snap_date_str, exc
+                                )
+                                errors += 1
+                                continue
+
+                except Exception as exc:
+                    self.logger.warning("Historical snapshot error for %s: %s", symbol, exc)
+                    errors += 1
+                    continue
+
+            conn.commit()
+
+        self.logger.info(
+            "MDApp historical IV backfill: captured=%d, attempts=%d, events=%d, skipped=%d, errors=%d, symbols=%d",
+            captured, attempts, events_considered, skipped, errors, len(symbols),
+        )
+        self.logger.info(
+            "MDApp historical snapshot diagnostics: no-chain=%d, no-expiry-pair=%d, no-underlying=%d, no-iv=%d",
+            no_chain_rows, no_expiry_pairs, no_underlying, no_iv_values,
+        )
+        if attempts > 0 and captured == 0 and no_chain_rows == attempts:
+            self.logger.warning(
+                "⚠️ Historical chain endpoint returned no rows for all attempted dates. "
+                "Check MarketData historical-options entitlement and date support."
+            )
+        return {
+            "captured": captured,
+            "skipped": skipped,
+            "errors": errors,
+            "symbols_processed": len(symbols),
+            "attempts": attempts,
+            "events_considered": events_considered,
+            "diagnostics": {
+                "no_chain_rows": no_chain_rows,
+                "no_expiry_pairs": no_expiry_pairs,
+                "no_underlying": no_underlying,
+                "no_iv_values": no_iv_values,
+            },
+        }
+
+    @staticmethod
+    def _normal_cdf(x: float) -> float:
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    @classmethod
+    def _black_scholes_price(
+        cls,
+        underlying_price: float,
+        strike: float,
+        time_to_expiry_years: float,
+        risk_free_rate: float,
+        volatility: float,
+        is_call: bool,
+    ) -> float:
+        if (
+            not np.isfinite(underlying_price)
+            or not np.isfinite(strike)
+            or not np.isfinite(time_to_expiry_years)
+            or not np.isfinite(volatility)
+            or underlying_price <= 0
+            or strike <= 0
+            or time_to_expiry_years <= 0
+            or volatility <= 0
+        ):
+            return float("nan")
+
+        sqrt_t = math.sqrt(time_to_expiry_years)
+        sigma_sqrt_t = volatility * sqrt_t
+        if sigma_sqrt_t <= 0:
+            return float("nan")
+        d1 = (
+            math.log(underlying_price / strike)
+            + (risk_free_rate + 0.5 * volatility * volatility) * time_to_expiry_years
+        ) / sigma_sqrt_t
+        d2 = d1 - sigma_sqrt_t
+        discounted_strike = strike * math.exp(-risk_free_rate * time_to_expiry_years)
+
+        if is_call:
+            return underlying_price * cls._normal_cdf(d1) - discounted_strike * cls._normal_cdf(d2)
+        return discounted_strike * cls._normal_cdf(-d2) - underlying_price * cls._normal_cdf(-d1)
+
+    @classmethod
+    def _implied_volatility_from_price(
+        cls,
+        option_price: float,
+        underlying_price: float,
+        strike: float,
+        time_to_expiry_years: float,
+        risk_free_rate: float,
+        is_call: bool,
+    ) -> float:
+        if (
+            not np.isfinite(option_price)
+            or option_price <= 0
+            or not np.isfinite(underlying_price)
+            or underlying_price <= 0
+            or not np.isfinite(strike)
+            or strike <= 0
+            or not np.isfinite(time_to_expiry_years)
+            or time_to_expiry_years <= 0
+        ):
+            return float("nan")
+
+        discounted_strike = strike * math.exp(-risk_free_rate * time_to_expiry_years)
+        intrinsic = max(underlying_price - strike, 0.0) if is_call else max(strike - underlying_price, 0.0)
+        upper_bound = underlying_price if is_call else discounted_strike
+        if option_price <= intrinsic + 1e-8 or option_price >= upper_bound:
+            return float("nan")
+
+        low_vol = 1e-4
+        high_vol = 5.0
+        low_price = cls._black_scholes_price(
+            underlying_price, strike, time_to_expiry_years, risk_free_rate, low_vol, is_call
+        )
+        high_price = cls._black_scholes_price(
+            underlying_price, strike, time_to_expiry_years, risk_free_rate, high_vol, is_call
+        )
+        if not np.isfinite(low_price) or not np.isfinite(high_price):
+            return float("nan")
+        if option_price < low_price or option_price > high_price:
+            return float("nan")
+
+        for _ in range(80):
+            mid_vol = 0.5 * (low_vol + high_vol)
+            mid_price = cls._black_scholes_price(
+                underlying_price, strike, time_to_expiry_years, risk_free_rate, mid_vol, is_call
+            )
+            if not np.isfinite(mid_price):
+                return float("nan")
+            diff = mid_price - option_price
+            if abs(diff) < 1e-6:
+                return float(mid_vol)
+            if diff > 0:
+                high_vol = mid_vol
+            else:
+                low_vol = mid_vol
+        return float(0.5 * (low_vol + high_vol))
+
+    @staticmethod
+    def _extract_option_market_price(row: "pd.Series") -> float:
+        def _to_float(value: Any) -> float:
+            try:
+                return float(value)
+            except Exception:
+                return float("nan")
+
+        mid = _to_float(row.get("mid"))
+        if np.isfinite(mid) and mid > 0:
+            return mid
+
+        bid = _to_float(row.get("bid"))
+        ask = _to_float(row.get("ask"))
+        if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0:
+            return float((bid + ask) / 2.0)
+
+        last_price = _to_float(row.get("lastPrice"))
+        if np.isfinite(last_price) and last_price > 0:
+            return last_price
+        return float("nan")
+
+    def _resolve_row_implied_volatility(
+        self,
+        row: "pd.Series",
+        underlying_price: float,
+        risk_free_rate: float = 0.03,
+        snapshot_date: Optional[date] = None,
+    ) -> float:
+        iv = pd.to_numeric(pd.Series([row.get("impliedVolatility")]), errors="coerce").iloc[0]
+        if np.isfinite(iv) and iv > 0:
+            return float(iv)
+
+        option_price = self._extract_option_market_price(row)
+        strike = pd.to_numeric(pd.Series([row.get("strike")]), errors="coerce").iloc[0]
+        if not (np.isfinite(option_price) and option_price > 0 and np.isfinite(strike) and strike > 0):
+            return float("nan")
+
+        dte = pd.to_numeric(pd.Series([row.get("dte")]), errors="coerce").iloc[0]
+        if not np.isfinite(dte) or dte <= 0:
+            exp_value = row.get("expiration_date")
+            try:
+                exp_date = pd.Timestamp(exp_value).date()
+                if snapshot_date is not None:
+                    dte = (exp_date - snapshot_date).days
+                else:
+                    dte = float("nan")
+            except Exception:
+                dte = float("nan")
+        if not np.isfinite(dte) or dte <= 0:
+            return float("nan")
+
+        side = str(row.get("side", "")).strip().lower()
+        if side not in {"call", "put"}:
+            # If side is unknown, estimate both and keep whichever is valid.
+            call_iv = self._implied_volatility_from_price(
+                option_price=option_price,
+                underlying_price=float(underlying_price),
+                strike=float(strike),
+                time_to_expiry_years=float(dte) / 365.0,
+                risk_free_rate=float(risk_free_rate),
+                is_call=True,
+            )
+            if np.isfinite(call_iv) and call_iv > 0:
+                return float(call_iv)
+            put_iv = self._implied_volatility_from_price(
+                option_price=option_price,
+                underlying_price=float(underlying_price),
+                strike=float(strike),
+                time_to_expiry_years=float(dte) / 365.0,
+                risk_free_rate=float(risk_free_rate),
+                is_call=False,
+            )
+            return float(put_iv) if np.isfinite(put_iv) and put_iv > 0 else float("nan")
+
+        return self._implied_volatility_from_price(
+            option_price=option_price,
+            underlying_price=float(underlying_price),
+            strike=float(strike),
+            time_to_expiry_years=float(dte) / 365.0,
+            risk_free_rate=float(risk_free_rate),
+            is_call=(side == "call"),
+        )
 
     def _extract_atm_iv_from_chain(self, option_chain: Any, underlying_price: float) -> Tuple[float, float]:
         """Extract ATM implied volatility from call/put chain pair."""
@@ -1738,7 +2496,16 @@ class InstitutionalMLDatabase:
                 continue
 
             pre_row = pre_candidates.sort_values('capture_date').iloc[-1]
-            post_row = post_candidates.sort_values('capture_date').iloc[0]
+            expiry_aligned_post = post_candidates[
+                (post_candidates['short_expiry'] == pre_row['short_expiry'])
+                & (post_candidates['long_expiry'] == pre_row['long_expiry'])
+            ]
+            if not expiry_aligned_post.empty:
+                post_row = expiry_aligned_post.sort_values('capture_date').iloc[0]
+                expiry_aligned = True
+            else:
+                post_row = post_candidates.sort_values('capture_date').iloc[0]
+                expiry_aligned = False
 
             pre_front = float(pre_row['front_iv'])
             post_front = float(post_row['front_iv'])
@@ -1758,6 +2525,9 @@ class InstitutionalMLDatabase:
             pre_dist = abs(abs(int(pre_row['relative_day'])) - min_pre_days)
             post_dist = abs(int(post_row['relative_day']) - min_post_days)
             quality_score = float(np.clip(1.0 - 0.04 * pre_dist - 0.06 * post_dist, 0.10, 1.00))
+            if not expiry_aligned:
+                # Penalize labels where pre/post snapshots do not share the same expiry pair.
+                quality_score = float(np.clip(quality_score * 0.75, 0.10, 1.00))
 
             label_rows.append({
                 'symbol': str(symbol),
@@ -3797,198 +4567,228 @@ class InstitutionalMLDatabase:
             },
         }
 
-    async def train_ml_model_on_historical_spreads(self) -> dict:
+    def _build_crush_training_data(self) -> pd.DataFrame:
         """
-        Train ML model on collected historical calendar spread data
+        Build real training data for the IV crush classifier.
 
-        Returns:
-            Dictionary with model performance metrics
+        Joins earnings_iv_decay_labels (real pre/post IV snapshots) with
+        daily_prices (for realized vol context). Returns one row per earnings
+        event with engineered features and a binary label.
+
+        Features
+        --------
+        near_back_ratio : pre_front_iv / pre_back_iv  — steepness of term structure
+        log_front_iv    : log(pre_front_iv)            — absolute IV level
+        iv_rv_approx    : pre_front_iv / realized_vol  — vol overpricing proxy
+
+        Label
+        -----
+        crush_happened  : 1 if front_iv_crush_pct < -0.10 (≥10% IV crush), else 0
+
+        Note: uses two separate queries + pandas merge to avoid SQLite correlated-
+        subquery limitations inside COALESCE.
+        """
+        labels_query = """
+            SELECT
+                symbol,
+                event_date,
+                pre_capture_date,
+                pre_front_iv,
+                pre_back_iv,
+                front_iv_crush_pct,
+                quality_score
+            FROM earnings_iv_decay_labels
+            WHERE quality_score >= 0.40
+              AND pre_front_iv  IS NOT NULL AND pre_front_iv  > 0.01
+              AND pre_back_iv   IS NOT NULL AND pre_back_iv   > 0.01
+              AND front_iv_crush_pct IS NOT NULL
+            ORDER BY symbol, event_date
+        """
+        prices_query = """
+            SELECT symbol, date, realized_vol_30d
+            FROM daily_prices
+            WHERE realized_vol_30d IS NOT NULL AND realized_vol_30d > 0
         """
         try:
-            from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-            from sklearn.model_selection import train_test_split, cross_val_score
-            from sklearn.metrics import mean_squared_error, accuracy_score, classification_report
-            from sklearn.preprocessing import StandardScaler
-            import numpy as np
-            import joblib
-            import os
-
-            self.logger.info("🧠 Starting ML model training on calendar spread data")
-
-            # Get training dataset from available data (simulate calendar spread performance)
             with sqlite3.connect(self.db_path) as conn:
-                query = """
-                    SELECT
-                        f.symbol,
-                        f.date,
-                        f.underlying_price as current_price,
-                        f.rsi_14,
-                        p.macd_signal,
-                        f.bb_position,
-                        (f.iv_rank * 100.0) as volatility_rank,
-                        f.price_momentum_5d as momentum_5d,
-                        f.price_momentum_20d as momentum_20d,
-                        p.volume,
-                        p.realized_vol_30d,
-                        p.realized_vol_60d,
-                        f.forward_return_21d
-                    FROM ml_features f
-                    LEFT JOIN daily_prices p ON f.symbol = p.symbol AND f.date = p.date
-                    WHERE f.forward_return_21d IS NOT NULL
-                    ORDER BY f.symbol, f.date
-                """
+                df_labels = pd.read_sql_query(labels_query, conn)
+                df_prices = pd.read_sql_query(prices_query, conn)
+        except Exception as exc:
+            self.logger.error("_build_crush_training_data query failed: %s", exc)
+            return pd.DataFrame()
 
-                df_raw = pd.read_sql_query(query, conn)
+        if df_labels.empty:
+            return pd.DataFrame()
 
-                # Deterministic proxy target for calendar spread performance
-                df_raw['calendar_pnl'] = self._simulate_calendar_spread_pnl(df_raw)
+        # Nearest-date join in pandas: for each earnings event find the closest
+        # daily_prices row within ±4 days of the pre-capture date.
+        df_labels["pre_capture_date"] = pd.to_datetime(
+            df_labels["pre_capture_date"], errors="coerce"
+        )
+        df_prices["date"] = pd.to_datetime(df_prices["date"], errors="coerce")
 
-                # Filter for complete data
-                df = df_raw.dropna(subset=['forward_return_21d', 'calendar_pnl'])
+        rv_rows: list = []
+        for _, row in df_labels.iterrows():
+            sym = row["symbol"]
+            pre_dt = row["pre_capture_date"]
+            sym_p = df_prices[df_prices["symbol"] == sym].copy()
+            if sym_p.empty or pd.isnull(pre_dt):
+                rv_rows.append(float(row["pre_front_iv"]) * 0.75)
+                continue
+            sym_p = sym_p.copy()
+            sym_p["days_away"] = (sym_p["date"] - pre_dt).abs().dt.days
+            close = sym_p[sym_p["days_away"] < 5].nsmallest(1, "days_away")
+            if close.empty:
+                rv_rows.append(float(row["pre_front_iv"]) * 0.75)
+            else:
+                rv_rows.append(float(close["realized_vol_30d"].iloc[0]))
 
-            if len(df) < 50:
-                self.logger.warning(f"⚠️ Only {len(df)} training samples - need more data for robust ML")
-                return None
+        df_labels = df_labels.copy()
+        df_labels["realized_vol_30d"] = rv_rows
+        df_labels["near_back_ratio"] = (
+            df_labels["pre_front_iv"] / df_labels["pre_back_iv"].clip(lower=0.01)
+        ).clip(0.50, 4.0)
+        df_labels["log_front_iv"] = np.log(df_labels["pre_front_iv"].clip(lower=0.01))
+        df_labels["iv_rv_approx"] = (
+            df_labels["pre_front_iv"] / df_labels["realized_vol_30d"].clip(lower=0.05)
+        ).clip(0.50, 5.0)
+        df_labels["crush_happened"] = (df_labels["front_iv_crush_pct"] < -0.10).astype(int)
+        return df_labels
 
-            self.logger.info(f"📊 Training on {len(df)} feature samples")
+    def train_ml_model_on_historical_spreads(self) -> dict:
+        """
+        Train a calibrated logistic regression classifier to predict IV crush probability.
 
-            # Feature engineering - select available features for calendar spreads
-            feature_columns = [
-                'current_price', 'rsi_14', 'macd_signal', 'bb_position',
-                'volatility_rank', 'momentum_5d', 'momentum_20d',
-                'volume', 'realized_vol_30d', 'realized_vol_60d'
-            ]
+        Uses REAL pre/post-earnings IV snapshots from earnings_iv_decay_labels as
+        training labels — NOT synthetic formulas.
 
-            # Clean and prepare features
-            df_clean = df[feature_columns + ['calendar_pnl', 'forward_return_21d']].dropna()
+        Features (3): near_back_ratio, log_front_iv, iv_rv_approx
+        Label       : crush_happened (front_iv_crush_pct < -0.10)
+        Algorithm   : LogisticRegression + CalibratedClassifierCV(isotonic)
+                      — appropriate for 100–500 labeled events; does not overfit
+                        the way Random Forest does on small samples
 
-            if len(df_clean) < 30:
-                self.logger.error(f"❌ Only {len(df_clean)} clean samples - insufficient for training")
-                return None
+        Saves to ~/.options_calculator_pro/models/
+          - crush_classifier.pkl   (calibrated LR)
+          - crush_scaler.pkl       (StandardScaler)
+          - crush_model_meta.json  (feature names, training stats)
+        """
+        import os
+        import json
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.calibration import CalibratedClassifierCV
+            from sklearn.model_selection import StratifiedKFold, cross_val_score
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
+            import joblib
+        except ImportError as exc:
+            self.logger.error("scikit-learn not installed: %s", exc)
+            return {"error": "scikit-learn required", "trained": False}
 
-            X = df_clean[feature_columns].values
-            y_regression = df_clean['calendar_pnl'].values  # For PnL prediction
-            y_classification = (df_clean['calendar_pnl'] > 0).astype(int)  # For win/loss prediction
+        self.logger.info("Starting ML crush classifier training on real IV decay labels")
 
-            # Split data
-            X_train, X_test, y_reg_train, y_reg_test, y_cls_train, y_cls_test = train_test_split(
-                X, y_regression, y_classification, test_size=0.3, random_state=42
+        df = self._build_crush_training_data()
+        if df.empty:
+            self.logger.warning(
+                "No earnings_iv_decay_labels found — run capture_historical_iv_snapshots_mda "
+                "or capture_earnings_option_snapshots first to collect real IV data."
             )
+            return {"error": "no_training_data", "trained": False, "n_events": 0}
 
-            # Scale features
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_test_scaled = scaler.transform(X_test)
+        feature_cols = ["near_back_ratio", "log_front_iv", "iv_rv_approx"]
+        df_clean = df[feature_cols + ["crush_happened"]].dropna()
+        n = len(df_clean)
 
-            # Train return prediction model (Regression)
-            self.logger.info("🎯 Training return prediction model...")
-            return_model = RandomForestRegressor(
-                n_estimators=100,
-                max_depth=10,
-                min_samples_split=5,
-                min_samples_leaf=2,
-                random_state=42
+        if n < 30:
+            self.logger.warning(
+                "Only %d clean training events — need ≥30. Collect more earnings snapshots.", n
             )
-            return_model.fit(X_train_scaled, y_reg_train)
+            return {"error": "insufficient_events", "trained": False, "n_events": n}
 
-            # Train direction prediction model (Classification)
-            self.logger.info("🎯 Training direction prediction model...")
-            direction_model = RandomForestClassifier(
-                n_estimators=100,
-                max_depth=10,
-                min_samples_split=5,
-                min_samples_leaf=2,
-                random_state=42
-            )
-            direction_model.fit(X_train_scaled, y_cls_train)
+        X = df_clean[feature_cols].values
+        y = df_clean["crush_happened"].values
+        crush_rate = float(y.mean())
+        self.logger.info("Training on %d events — crush rate %.1f%%", n, crush_rate * 100)
 
-            # Evaluate models
-            return_pred = return_model.predict(X_test_scaled)
-            direction_pred = direction_model.predict(X_test_scaled)
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
 
-            # Calculate metrics
-            mse = mean_squared_error(y_reg_test, return_pred)
-            rmse = np.sqrt(mse)
-            accuracy = accuracy_score(y_cls_test, direction_pred)
+        # Calibrated logistic regression — correct for small-N classification
+        # cv=3 keeps ~33 samples per fold even at n=100
+        cv_folds = min(5, max(3, n // 30))
+        base_lr = LogisticRegression(C=0.5, max_iter=1000, random_state=42, class_weight="balanced")
+        clf = CalibratedClassifierCV(estimator=base_lr, method="isotonic", cv=cv_folds)
+        clf.fit(X_scaled, y)
 
-            # Cross-validation scores
-            cv_scores_reg = cross_val_score(return_model, X_train_scaled, y_reg_train, cv=5, scoring='neg_mean_squared_error')
-            cv_scores_cls = cross_val_score(direction_model, X_train_scaled, y_cls_train, cv=5, scoring='accuracy')
+        # Out-of-fold cross-validation metrics
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        cv_auc = cross_val_score(base_lr, X_scaled, y, cv=skf, scoring="roc_auc")
+        cv_acc = cross_val_score(base_lr, X_scaled, y, cv=skf, scoring="accuracy")
 
-            # Feature importance
-            feature_importance = dict(zip(feature_columns, return_model.feature_importances_))
-            top_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:5]
+        # In-sample calibration quality (Brier score — lower is better, 0.25 = random)
+        probs = clf.predict_proba(X_scaled)[:, 1]
+        brier = float(brier_score_loss(y, probs))
+        try:
+            auc = float(roc_auc_score(y, probs))
+        except Exception:
+            auc = float("nan")
 
-            # Save models
-            model_dir = os.path.expanduser("~/.options_calculator_pro/models")
-            os.makedirs(model_dir, exist_ok=True)
+        # Save models and metadata
+        model_dir = os.path.expanduser("~/.options_calculator_pro/models")
+        os.makedirs(model_dir, exist_ok=True)
+        clf_path = os.path.join(model_dir, "crush_classifier.pkl")
+        scaler_path = os.path.join(model_dir, "crush_scaler.pkl")
+        meta_path = os.path.join(model_dir, "crush_model_meta.json")
 
-            return_model_path = os.path.join(model_dir, "calendar_spread_return_model.pkl")
-            direction_model_path = os.path.join(model_dir, "calendar_spread_direction_model.pkl")
-            scaler_path = os.path.join(model_dir, "feature_scaler.pkl")
+        joblib.dump(clf, clf_path)
+        joblib.dump(scaler, scaler_path)
 
-            joblib.dump(return_model, return_model_path)
-            joblib.dump(direction_model, direction_model_path)
-            joblib.dump(scaler, scaler_path)
+        from datetime import datetime as _dt
+        meta = {
+            "trained_at": _dt.utcnow().isoformat(),
+            "n_events": n,
+            "crush_rate": crush_rate,
+            "features": feature_cols,
+            "label": "front_iv_crush_pct < -0.10",
+            "algorithm": "LogisticRegression + CalibratedClassifierCV(isotonic)",
+            "cv_folds": cv_folds,
+            "cv_auc_mean": float(cv_auc.mean()),
+            "cv_auc_std": float(cv_auc.std()),
+            "cv_accuracy_mean": float(cv_acc.mean()),
+            "insample_auc": auc,
+            "insample_brier": brier,
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
 
-            results = {
-                'training_samples': len(df_clean),
-                'test_samples': len(X_test),
-                'return_rmse': rmse,
-                'return_cv_score': -cv_scores_reg.mean(),
-                'direction_accuracy': accuracy,
-                'direction_cv_score': cv_scores_cls.mean(),
-                'top_features': top_features,
-                'model_paths': {
-                    'return_model': return_model_path,
-                    'direction_model': direction_model_path,
-                    'scaler': scaler_path
-                }
-            }
-
-            self.logger.info("✅ ML model training completed successfully")
-            self.logger.info(f"📊 Return RMSE: {rmse:.4f}")
-            self.logger.info(f"🎯 Direction Accuracy: {accuracy:.1%}")
-            self.logger.info(f"🔝 Top Features: {[f[0] for f in top_features]}")
-
-            return results
-
-        except Exception as e:
-            self.logger.error(f"❌ ML model training failed: {e}")
-            return None
+        self.logger.info(
+            "ML crush classifier saved — n=%d, CV AUC=%.3f±%.3f, Brier=%.3f",
+            n, cv_auc.mean(), cv_auc.std(), brier,
+        )
+        return {
+            "trained": True,
+            "n_events": n,
+            "crush_rate_pct": round(crush_rate * 100, 1),
+            "cv_auc": round(float(cv_auc.mean()), 3),
+            "cv_auc_std": round(float(cv_auc.std()), 3),
+            "cv_accuracy": round(float(cv_acc.mean()), 3),
+            "insample_auc": round(auc, 3) if np.isfinite(auc) else None,
+            "insample_brier": round(brier, 4),
+            "model_paths": {
+                "classifier": clf_path,
+                "scaler": scaler_path,
+                "meta": meta_path,
+            },
+        }
 
     def _simulate_calendar_spread_pnl(self, df) -> pd.Series:
-        """
-        Deterministic calendar-spread-style P&L proxy for ML target generation.
-        """
-        volatility_rank = pd.to_numeric(df['volatility_rank'], errors='coerce').fillna(50.0)
-        momentum_5d = pd.to_numeric(df['momentum_5d'], errors='coerce').fillna(0.0)
-        rsi_14 = pd.to_numeric(df['rsi_14'], errors='coerce').fillna(50.0)
-        bb_position = pd.to_numeric(df['bb_position'], errors='coerce').fillna(0.5)
-        forward_return_21d = pd.to_numeric(df['forward_return_21d'], errors='coerce').fillna(0.0)
-        realized_vol_30d = pd.to_numeric(df['realized_vol_30d'], errors='coerce').fillna(0.22).clip(lower=0.05, upper=2.0)
-
-        vol_component = np.clip((volatility_rank - 45.0) / 55.0, -0.35, 0.70)
-        trend_penalty = np.clip(np.abs(momentum_5d) / 0.06, 0.0, 1.5) * 0.22
-        rsi_component = 1.0 - np.clip(np.abs(rsi_14 - 50.0) / 35.0, 0.0, 1.0)
-        bb_component = 1.0 - np.clip(np.abs(bb_position - 0.5) / 0.5, 0.0, 1.0)
-        expected_move_21d = np.clip(realized_vol_30d * np.sqrt(21 / 252), 0.015, 0.25)
-        move_ratio = np.abs(forward_return_21d) / expected_move_21d
-        stability_component = np.clip(1.0 - move_ratio, -1.0, 1.0)
-
-        return_on_debit = (
-            0.14
-            + 0.30 * vol_component
-            + 0.12 * rsi_component
-            + 0.10 * bb_component
-            + 0.24 * stability_component
-            - trend_penalty
+        """Deprecated synthetic P&L proxy — superseded by _build_crush_training_data."""
+        self.logger.warning(
+            "_simulate_calendar_spread_pnl is deprecated; use real earnings_iv_decay_labels."
         )
-        return_on_debit = np.clip(return_on_debit, -1.0, 1.4)
-
-        debit_per_contract = np.clip(df['current_price'].astype(float) * 0.012, 35.0, 1200.0)
-        pnl = np.clip(debit_per_contract * return_on_debit, -250.0, 350.0)
-        return pd.Series(pnl, index=df.index)
+        return pd.Series(0.0, index=df.index)
 
 # Async wrapper for synchronous usage
 def run_backfill(db: InstitutionalMLDatabase, symbols: List[str] = None, years: int = 2):

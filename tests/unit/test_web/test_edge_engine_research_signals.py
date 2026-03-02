@@ -10,21 +10,6 @@ from web.api.edge_engine import (
 )
 
 
-class _TickerWithEarnings:
-    def __init__(self, earnings_dates):
-        self._earnings_dates = [pd.Timestamp(d) for d in earnings_dates]
-
-    def get_earnings_dates(self, limit=24):
-        _ = limit
-        return pd.DataFrame({"eps": [0.0] * len(self._earnings_dates)}, index=pd.DatetimeIndex(self._earnings_dates))
-
-
-class _TickerNoEarnings:
-    def get_earnings_dates(self, limit=24):
-        _ = limit
-        return pd.DataFrame()
-
-
 class TestEdgeEngineResearchSignals(unittest.TestCase):
     def test_compute_move_anchor_blends_recent_and_median(self):
         anchor = _compute_move_anchor(median_move_pct=4.0, avg_last4_move_pct=6.0)
@@ -36,21 +21,25 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         self.assertIsNone(_compute_move_anchor(np.nan, np.nan))
 
     def test_historical_profile_returns_recent_avg_field(self):
+        """Profile with AMC-tagged events → source='earnings_history'."""
         dates = pd.bdate_range("2024-01-02", periods=140)
         prices = pd.Series(100.0 + np.linspace(0, 1.0, len(dates)), index=dates)
 
         earnings_positions = [20, 40, 60, 80, 100]
         target_moves = [4.0, 5.0, 6.0, 7.0, 8.0]
-        earnings_dates = [dates[i] for i in earnings_positions]
+        earnings_events = [
+            {"event_date": pd.Timestamp(dates[i]), "release_timing": "after market close"}
+            for i in earnings_positions
+        ]
         for pos, move in zip(earnings_positions, target_moves):
-            pre_idx = pos - 1
+            pre_idx = pos
             post_idx = pos + 1
             pre_px = float(prices.iloc[pre_idx])
             prices.iloc[post_idx] = pre_px * (1.0 + move / 100.0)
 
         profile = _historical_earnings_move_profile(
-            ticker=_TickerWithEarnings(earnings_dates),
             close=prices,
+            earnings_events=earnings_events,
         )
 
         self.assertEqual(profile["source"], "earnings_history")
@@ -62,13 +51,35 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         self.assertGreater(profile["p90_move_pct"], profile["median_move_pct"])
         self.assertGreater(profile["std_move_pct"], 0.0)
 
+    def test_historical_profile_bmo_alignment_uses_prev_to_event_close(self):
+        dates = pd.bdate_range("2024-01-02", periods=80)
+        prices = pd.Series(np.linspace(100.0, 104.0, len(dates)), index=dates)
+        event_pos = 30
+        target_move = 6.0
+        pre_idx = event_pos - 1
+        post_idx = event_pos
+        pre_px = float(prices.iloc[pre_idx])
+        prices.iloc[post_idx] = pre_px * (1.0 + target_move / 100.0)
+
+        profile = _historical_earnings_move_profile(
+            close=prices,
+            earnings_events=[
+                {"event_date": pd.Timestamp(dates[event_pos]), "release_timing": "before market open"}
+            ],
+        )
+        self.assertEqual(profile["source"], "earnings_history")
+        self.assertEqual(profile["event_count"], 1)
+        self.assertAlmostEqual(profile["median_move_pct"], target_move, places=2)
+
     def test_historical_profile_daily_fallback_has_avg_last4(self):
+        """Empty earnings_dates list → falls back to daily move profile."""
         dates = pd.bdate_range("2024-01-02", periods=80)
         prices = pd.Series(np.linspace(100.0, 110.0, len(dates)), index=dates)
 
+        # Pass empty list to trigger daily_fallback path
         profile = _historical_earnings_move_profile(
-            ticker=_TickerNoEarnings(),
             close=prices,
+            earnings_events=[],
         )
 
         self.assertEqual(profile["source"], "daily_fallback")

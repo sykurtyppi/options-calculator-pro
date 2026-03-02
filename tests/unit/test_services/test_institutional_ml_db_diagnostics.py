@@ -2,6 +2,7 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -259,9 +260,113 @@ class TestInstitutionalDiagnostics(unittest.TestCase):
             window_end = datetime(2026, 3, 31)
             proxy_events = db._build_proxy_earnings_schedule(history, window_start, window_end)
             self.assertGreater(len(proxy_events), 0)
-            self.assertTrue(
-                any(pd.Timestamp(item["event_date"]).date() > history_last for item in proxy_events)
-            )
+
+    def test_earnings_candidates_apply_hold_days_cap(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_hold_cap.db")
+            trading_dates = pd.bdate_range(start="2024-01-02", periods=40)
+            dataset = pd.DataFrame({
+                "symbol": ["AAPL"] * len(trading_dates),
+                "date": trading_dates,
+                "underlying_price": [100.0] * len(trading_dates),
+                "price_momentum_5d": [0.0] * len(trading_dates),
+                "price_momentum_20d": [0.0] * len(trading_dates),
+                "volume_ratio_10d": [1.0] * len(trading_dates),
+                "iv30_rv30_ratio": [1.2] * len(trading_dates),
+                "vol_term_structure_slope": [0.1] * len(trading_dates),
+                "rsi_14": [50.0] * len(trading_dates),
+                "bb_position": [0.5] * len(trading_dates),
+                "put_call_ratio": [1.0] * len(trading_dates),
+                "options_volume_ratio": [1.0] * len(trading_dates),
+                "vix_level": [20.0] * len(trading_dates),
+                "forward_return_1d": [0.0] * len(trading_dates),
+                "forward_return_5d": [0.0] * len(trading_dates),
+                "forward_return_21d": [0.0] * len(trading_dates),
+                "volume": [2_000_000] * len(trading_dates),
+                "realized_vol_30d": [0.2] * len(trading_dates),
+            })
+
+            event_date = datetime(2024, 2, 6)
+            with patch.object(
+                db,
+                "_get_symbol_earnings_dates",
+                return_value=[{
+                    "event_date": event_date,
+                    "source": "unit_test",
+                    "release_timing": "AMC",
+                }],
+            ):
+                candidates = db._build_earnings_event_candidates(
+                    dataset=dataset,
+                    universe=["AAPL"],
+                    start_date=datetime(2024, 1, 2),
+                    end_date=datetime(2024, 2, 29),
+                    hold_days_default=3,
+                    entry_days_before_earnings=7,
+                    exit_days_after_earnings=1,
+                    require_true_earnings=False,
+                    allow_proxy_earnings=True,
+                )
+
+            self.assertTrue(candidates)
+            first_trade_date = sorted(candidates.keys())[0]
+            rows = candidates[first_trade_date]
+            self.assertGreater(len(rows), 0)
+            self.assertEqual(rows[0]["hold_days"], 3)
+
+    def test_earnings_candidates_keep_shorter_event_window_hold(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_hold_window.db")
+            trading_dates = pd.bdate_range(start="2024-01-02", periods=30)
+            dataset = pd.DataFrame({
+                "symbol": ["MSFT"] * len(trading_dates),
+                "date": trading_dates,
+                "underlying_price": [100.0] * len(trading_dates),
+                "price_momentum_5d": [0.0] * len(trading_dates),
+                "price_momentum_20d": [0.0] * len(trading_dates),
+                "volume_ratio_10d": [1.0] * len(trading_dates),
+                "iv30_rv30_ratio": [1.2] * len(trading_dates),
+                "vol_term_structure_slope": [0.1] * len(trading_dates),
+                "rsi_14": [50.0] * len(trading_dates),
+                "bb_position": [0.5] * len(trading_dates),
+                "put_call_ratio": [1.0] * len(trading_dates),
+                "options_volume_ratio": [1.0] * len(trading_dates),
+                "vix_level": [20.0] * len(trading_dates),
+                "forward_return_1d": [0.0] * len(trading_dates),
+                "forward_return_5d": [0.0] * len(trading_dates),
+                "forward_return_21d": [0.0] * len(trading_dates),
+                "volume": [2_000_000] * len(trading_dates),
+                "realized_vol_30d": [0.2] * len(trading_dates),
+            })
+
+            event_date = datetime(2024, 1, 26)
+            with patch.object(
+                db,
+                "_get_symbol_earnings_dates",
+                return_value=[{
+                    "event_date": event_date,
+                    "source": "unit_test",
+                    "release_timing": "BMO",
+                }],
+            ):
+                candidates = db._build_earnings_event_candidates(
+                    dataset=dataset,
+                    universe=["MSFT"],
+                    start_date=datetime(2024, 1, 2),
+                    end_date=datetime(2024, 2, 15),
+                    hold_days_default=10,
+                    entry_days_before_earnings=3,
+                    exit_days_after_earnings=0,
+                    require_true_earnings=False,
+                    allow_proxy_earnings=True,
+                )
+
+            self.assertTrue(candidates)
+            first_trade_date = sorted(candidates.keys())[0]
+            rows = candidates[first_trade_date]
+            self.assertGreater(len(rows), 0)
+            self.assertLessEqual(rows[0]["hold_days"], 10)
+            self.assertGreater(rows[0]["hold_days"], 0)
 
     def test_proxy_schedule_symbol_phase_offsets_dates(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

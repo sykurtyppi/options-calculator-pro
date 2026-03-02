@@ -18,7 +18,8 @@ env/
 # VS Code
 .vscode/
 
-# Local app config
+# Local app config and secrets
+.env
 config.json
 *.log
 
@@ -29,7 +30,6 @@ models/*.pkl
 
 # Web frontend build artifacts
 web/frontend/node_modules/
-web/frontend/dist/
 npm-debug.log*
 
 # Ignore those external repos if you keep them in the folder

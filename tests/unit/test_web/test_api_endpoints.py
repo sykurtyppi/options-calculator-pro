@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 try:
@@ -11,6 +11,13 @@ except Exception:  # pragma: no cover - optional dependency in constrained envir
 
 import web.api.app as app_module
 from web.api.edge_engine import EdgeSnapshot
+
+
+def _make_mock_mda_client():
+    """Return a no-op MarketDataClient mock (is_available=False → pure yfinance path)."""
+    m = MagicMock()
+    m.is_available.return_value = False
+    return m
 
 
 class _StubCollector:
@@ -184,7 +191,8 @@ class TestApiEndpoints(unittest.TestCase):
             rationale=["signal check"],
         )
         with patch.object(app_module, "analyze_single_ticker", return_value=snapshot):
-            response = self.client.post("/api/edge/analyze", json={"symbol": "AAPL"})
+            with patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()):
+                response = self.client.post("/api/edge/analyze", json={"symbol": "AAPL"})
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -192,6 +200,29 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(payload["recommendation"], "Watchlist")
         self.assertAlmostEqual(payload["confidence_pct"], 77.7, places=3)
         self.assertEqual(payload["metrics"]["iv_rv30"], 1.31)
+
+    def test_edge_analyze_new_metrics_in_response(self):
+        """Verify earnings_release_time and data_source are included when set."""
+        snapshot = EdgeSnapshot(
+            symbol="MSFT",
+            recommendation="Strong Edge",
+            confidence_pct=82.5,
+            setup_score=0.78,
+            metrics={
+                "iv_rv30": 1.35,
+                "earnings_release_time": "after market close",
+                "data_source": "marketdata_app",
+            },
+            rationale=["MDApp data sourced"],
+        )
+        with patch.object(app_module, "analyze_single_ticker", return_value=snapshot):
+            with patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()):
+                response = self.client.post("/api/edge/analyze", json={"symbol": "MSFT"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["metrics"]["earnings_release_time"], "after market close")
+        self.assertEqual(payload["metrics"]["data_source"], "marketdata_app")
 
     def test_oos_report_card_serializes_numpy(self):
         with patch.object(app_module, "InstitutionalDataCollector", _StubCollector):
@@ -305,9 +336,86 @@ class TestApiEndpoints(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        notes = payload["summary"].get("notes", [])
-        self.assertTrue(any("sample size is insufficient" in note.lower() for note in notes))
-        self.assertTrue(any("sample_expansion" in note for note in notes))
+        # Bottleneck note now goes to warnings, not notes
+        warnings = payload["summary"].get("warnings", [])
+        self.assertTrue(any("sample size is insufficient" in w.lower() for w in warnings))
+        self.assertTrue(any("sample_expansion" in w for w in warnings))
+
+    def test_oos_report_card_flags_sparse_alpha_note(self):
+        """Sparse alpha rate < 0.5 across enough splits should surface a warning."""
+        class _SparseAlphaStubCollector:
+            def __init__(self):
+                self.db = type("StubDB", (), {"db_path": str(Path(tempfile.gettempdir()) / "stub_oos_sparse.sqlite")})()
+
+            def run_oos_validation(self, **_kwargs):
+                return {
+                    "splits": np.int64(10),
+                    "best_params": {},
+                    "report_card": {
+                        "verdict": {"grade": "D", "overall_pass": False},
+                        "sample": {"splits": np.int64(10), "total_test_trades": np.int64(30), "avg_trades_per_split": np.float64(3.0)},
+                        "metrics": {
+                            "alpha": {"mean": np.float64(0.30), "low": np.float64(0.05)},
+                            "sharpe": {"mean": np.float64(2.1), "low": np.float64(-1.0)},
+                            "pnl": {"mean": np.float64(10.0), "low": np.float64(-5.0)},
+                            "win_rate": {"mean": np.float64(0.60), "low": np.float64(0.45)},
+                            "positive_alpha_split_rate": np.float64(0.30),  # < 0.5 → warning
+                            "positive_pnl_split_rate": np.float64(0.30),
+                        },
+                        "gates": {
+                            "alpha_ci_positive": {"passed": True},
+                            "sharpe_ci_positive": {"passed": False},
+                            "pnl_ci_positive": {"passed": False},
+                            "min_splits": {"required": 8, "actual": 10, "passed": True},
+                            "min_total_test_trades": {"required": 80, "actual": 30, "passed": False},
+                            "min_trades_per_split": {"required": 5.0, "actual": 3.0, "passed": False},
+                        },
+                    },
+                    "csv_path": Path("exports/reports/oos_sparse.csv"),
+                    "markdown_path": Path("exports/reports/oos_sparse.md"),
+                    "json_path": Path("exports/reports/oos_sparse.json"),
+                    "report_card_markdown_path": Path("exports/reports/oos_sparse_report_card.md"),
+                    "report_card_json_path": Path("exports/reports/oos_sparse_report_card.json"),
+                }
+
+        with patch.object(app_module, "InstitutionalDataCollector", _SparseAlphaStubCollector):
+            response = self.client.post(
+                "/api/oos/report-card",
+                json={"oos_stability_profile": "variance_control"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        warnings = payload["summary"].get("warnings", [])
+        self.assertTrue(any("30%" in w or "positive" in w.lower() for w in warnings),
+                        f"Expected sparse-alpha warning in {warnings}")
+
+    def test_oos_validation_timeout_returns_gracefully(self):
+        """A hung run_oos_validation should return a warning, not block the request."""
+        import time
+
+        class _TimeoutStubCollector:
+            def __init__(self):
+                self.db = type("StubDB", (), {"db_path": str(Path(tempfile.gettempdir()) / "stub_oos_timeout.sqlite")})()
+
+            def run_oos_validation(self, **_kwargs):
+                # Simulate a hung call by sleeping longer than the patched timeout
+                time.sleep(10)
+                return None  # pragma: no cover
+
+        with patch.object(app_module, "_OOS_VALIDATION_TIMEOUT_SECONDS", 0.1):
+            with patch.object(app_module, "InstitutionalDataCollector", _TimeoutStubCollector):
+                response = self.client.post(
+                    "/api/oos/report-card",
+                    json={"oos_stability_profile": "variance_control"},
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["summary"]["status"], "no_oos_rows")
+        warnings = payload["summary"].get("warnings", [])
+        self.assertTrue(any("did not complete" in w.lower() or "timeout" in w.lower() for w in warnings),
+                        f"Expected timeout warning in {warnings}")
 
 
 if __name__ == "__main__":

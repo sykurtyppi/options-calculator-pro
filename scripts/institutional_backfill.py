@@ -14,6 +14,7 @@ Usage:
     python scripts/institutional_backfill.py --symbols AAPL,MSFT,GOOGL --years 2
     python scripts/institutional_backfill.py --full-universe --years 1
     python scripts/institutional_backfill.py --backtest-only
+    python scripts/institutional_backfill.py --full-universe --capture-historical-mda-snapshots
 """
 
 import asyncio
@@ -21,17 +22,27 @@ import argparse
 import sys
 import os
 import json
+import sqlite3
 import pandas as pd
+import numpy as np
 from pathlib import Path
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+from typing import List, Optional, Dict, Any, Tuple
+from datetime import datetime, timedelta
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+# Load .env for CLI workflows (backfill/training scripts run outside FastAPI app).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(project_root / ".env")
+except Exception:
+    pass
+
 from services.institutional_ml_db import InstitutionalMLDatabase, INSTITUTIONAL_UNIVERSE
 from utils.logger import setup_logger
+from services.market_data_client import MarketDataClient
 
 logger = setup_logger(__name__)
 
@@ -51,12 +62,33 @@ def _parse_csv_floats(value: str) -> List[float]:
 class InstitutionalDataCollector:
     """Professional data collection orchestrator"""
 
-    def __init__(self, db_path: Optional[str] = None):
-        self.db = InstitutionalMLDatabase(db_path)
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        marketdata_token: Optional[str] = None,
+        enable_marketdata: bool = True,
+    ):
+        self.mda_client: Optional[MarketDataClient] = None
+        if enable_marketdata:
+            try:
+                candidate = MarketDataClient(token=marketdata_token)
+                if candidate.is_available():
+                    self.mda_client = candidate
+                else:
+                    logger.info(
+                        "ℹ️ MarketData.app client disabled (no token configured). "
+                        "Set MARKETDATA_TOKEN or pass --marketdata-token."
+                    )
+            except Exception as exc:
+                logger.warning("⚠️ Failed to initialize MarketData.app client: %s", exc)
+
+        self.db = InstitutionalMLDatabase(db_path, mda_client=self.mda_client)
         self.logger = logger
 
     async def run_full_backfill(self, symbols: List[str], years: int = 2,
-                              batch_size: int = 5) -> bool:
+                              batch_size: int = 5,
+                              capture_historical_mda_snapshots: bool = False,
+                              mda_lookback_years: int = 2) -> bool:
         """
         Run comprehensive institutional data backfill
 
@@ -94,6 +126,20 @@ class InstitutionalDataCollector:
                 self.logger.warning("⚠️ Feature engineering had issues but continuing")
 
             self.logger.info("✅ Phase 2 completed")
+
+            # 2b. Historical option-chain snapshots (MarketData.app)
+            if capture_historical_mda_snapshots:
+                self.logger.info("📸 Phase 2b: Historical MDApp IV snapshot backfill")
+                snapshot_result = self.capture_historical_iv_snapshots_mda(
+                    symbols=symbols,
+                    lookback_years=mda_lookback_years,
+                )
+                self.logger.info(
+                    "✅ Phase 2b completed: captured=%d, skipped=%d, errors=%d",
+                    int(snapshot_result.get("captured", 0)),
+                    int(snapshot_result.get("skipped", 0)),
+                    int(snapshot_result.get("errors", 0)),
+                )
 
             # 3. Data quality validation
             self.logger.info("🔍 Phase 3: Data quality validation")
@@ -389,8 +435,8 @@ class InstitutionalDataCollector:
             return None
 
     def capture_earnings_snapshots(self, symbols: List[str],
-                                 lookback_days: int = 14,
-                                 lookahead_days: int = 45,
+                                 lookback_days: int = 30,
+                                 lookahead_days: int = 90,
                                  max_expiries: int = 2,
                                  require_true_earnings: bool = False,
                                  allow_proxy_earnings: bool = True) -> Dict[str, Any]:
@@ -420,7 +466,43 @@ class InstitutionalDataCollector:
                 f"no-events={diagnostics.get('no_event_symbols', 0)}, "
                 f"no-expiries={diagnostics.get('no_expiry_symbols', 0)}, "
                 f"no-iv={diagnostics.get('no_iv_events', 0)}, "
-                f"chain-errors={diagnostics.get('chain_errors', 0)}"
+                f"chain-errors={diagnostics.get('chain_errors', 0)}, "
+                f"outside-window={diagnostics.get('events_outside_window', 0)}"
+            )
+        return result
+
+    def capture_historical_iv_snapshots_mda(
+        self,
+        symbols: List[str],
+        lookback_years: int = 2,
+    ) -> Dict[str, Any]:
+        """Backfill historical IV snapshots from MarketData.app chains."""
+        symbols = [s.strip().upper() for s in symbols if s.strip()]
+        if not symbols:
+            symbols = INSTITUTIONAL_UNIVERSE[:10]
+        result = self.db.capture_historical_iv_snapshots_mda(
+            symbols=symbols,
+            lookback_years=max(1, int(lookback_years)),
+        )
+        self.logger.info(
+            "📚 Historical MDApp snapshots: captured=%d, attempts=%d, events=%d, "
+            "skipped=%d, errors=%d, symbols=%d",
+            int(result.get("captured", 0)),
+            int(result.get("attempts", 0)),
+            int(result.get("events_considered", 0)),
+            int(result.get("skipped", 0)),
+            int(result.get("errors", 0)),
+            int(result.get("symbols_processed", 0)),
+        )
+        diagnostics = result.get("diagnostics") or {}
+        if diagnostics:
+            self.logger.info(
+                "📚 Historical MDApp diagnostics: no-chain=%d, no-expiry-pair=%d, "
+                "no-underlying=%d, no-iv=%d",
+                int(diagnostics.get("no_chain_rows", 0)),
+                int(diagnostics.get("no_expiry_pairs", 0)),
+                int(diagnostics.get("no_underlying", 0)),
+                int(diagnostics.get("no_iv_values", 0)),
             )
         return result
 
@@ -586,10 +668,496 @@ class InstitutionalDataCollector:
             'session_id': session_id,
         }
 
+    def _normalize_session_filter(self, session_id: Optional[str]) -> Optional[str]:
+        """Normalize optional session filter where all/all_sessions means no filter."""
+        if not session_id:
+            return None
+        normalized = str(session_id).strip()
+        if not normalized:
+            return None
+        if normalized.lower() in {"all", "all_sessions", "*"}:
+            return None
+        return normalized
+
+    def _load_forward_tracker_trades(self, session_id: Optional[str],
+                                   lookback_days: int,
+                                   min_confidence: float) -> Tuple[pd.DataFrame, str]:
+        """Load trade-level frame for forward/paper tracking diagnostics."""
+        lookback_days = max(1, int(lookback_days))
+        min_confidence = float(np.clip(float(min_confidence), 0.0, 1.0))
+        scope_session = self._normalize_session_filter(session_id)
+        scope_label = scope_session or "all_sessions"
+        cutoff_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        query = """
+            SELECT
+                t.session_id,
+                t.symbol,
+                t.trade_date,
+                t.event_date,
+                t.contracts,
+                t.debit_per_contract,
+                t.transaction_cost_per_contract,
+                t.gross_return_pct,
+                t.net_return_pct,
+                t.pnl_per_contract,
+                t.crush_confidence,
+                t.crush_edge_score,
+                t.predicted_front_iv_crush_pct,
+                l.front_iv_crush_pct AS realized_front_iv_crush_pct
+            FROM backtest_trades t
+            LEFT JOIN earnings_iv_decay_labels l
+              ON t.symbol = l.symbol
+             AND t.event_date = l.event_date
+            WHERE t.trade_date >= ?
+              AND t.crush_confidence >= ?
+        """
+        params: List[Any] = [cutoff_date, min_confidence]
+        if scope_session:
+            query += " AND t.session_id = ?"
+            params.append(scope_session)
+        query += " ORDER BY t.trade_date, t.symbol"
+
+        try:
+            with sqlite3.connect(self.db.db_path) as conn:
+                df = pd.read_sql_query(query, conn, params=params)
+        except Exception as exc:
+            self.logger.warning("⚠️ Forward tracker query failed: %s", exc)
+            return pd.DataFrame(), scope_label
+
+        if df.empty:
+            return df, scope_label
+
+        df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce').dt.normalize()
+        df['event_date'] = pd.to_datetime(df['event_date'], errors='coerce').dt.normalize()
+        df = df.dropna(subset=['trade_date']).copy()
+        numeric_cols = [
+            'contracts',
+            'debit_per_contract',
+            'transaction_cost_per_contract',
+            'gross_return_pct',
+            'net_return_pct',
+            'pnl_per_contract',
+            'crush_confidence',
+            'crush_edge_score',
+            'predicted_front_iv_crush_pct',
+            'realized_front_iv_crush_pct',
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        if 'contracts' in df.columns:
+            df['contracts'] = df['contracts'].fillna(1).clip(lower=1)
+        return df, scope_label
+
+    def _load_forward_fill_log(self, fill_log_path: Optional[str],
+                             lookback_days: int) -> Tuple[pd.DataFrame, Dict[str, Any], Optional[str]]:
+        """Load optional external fill/latency log and aggregate by trade_date."""
+        empty_summary = {
+            'fill_events': 0,
+            'mean_slippage_bps': np.nan,
+            'p95_slippage_bps': np.nan,
+            'mean_fill_latency_seconds': np.nan,
+            'p95_fill_latency_seconds': np.nan,
+            'mean_fill_quality_score': np.nan,
+        }
+        if not fill_log_path:
+            return pd.DataFrame(), empty_summary, "No forward fill log provided."
+
+        source_path = Path(str(fill_log_path)).expanduser()
+        if not source_path.is_absolute():
+            source_path = project_root / source_path
+        if not source_path.exists():
+            return pd.DataFrame(), empty_summary, f"Fill log not found: {source_path}"
+
+        try:
+            raw = pd.read_csv(source_path)
+        except Exception as exc:
+            return pd.DataFrame(), empty_summary, f"Unable to parse fill log ({exc})"
+
+        if raw.empty:
+            return pd.DataFrame(), empty_summary, "Fill log is empty."
+
+        df = raw.copy()
+        cols_lower = {str(col).lower(): col for col in df.columns}
+
+        def _pick_column(candidates: List[str]) -> Optional[str]:
+            for name in candidates:
+                if name in cols_lower:
+                    return cols_lower[name]
+            return None
+
+        trade_date_col = _pick_column([
+            'trade_date', 'date', 'fill_date', 'fill_timestamp', 'fill_ts',
+            'signal_timestamp', 'signal_ts',
+        ])
+        if not trade_date_col:
+            return pd.DataFrame(), empty_summary, "Fill log missing a trade-date/timestamp column."
+
+        trade_date = pd.to_datetime(df[trade_date_col], errors='coerce')
+        if trade_date.isna().all():
+            return pd.DataFrame(), empty_summary, "Fill log has no parseable trade dates."
+        df['trade_date'] = trade_date.dt.normalize()
+
+        slippage_col = _pick_column(['slippage_bps', 'slippage_bp', 'slippage'])
+        if slippage_col:
+            slippage_series = pd.to_numeric(df[slippage_col], errors='coerce')
+            # If values look like fractional pct, convert to bps.
+            median_abs = float(np.nanmedian(np.abs(slippage_series.to_numpy(dtype=float))))
+            if np.isfinite(median_abs) and median_abs <= 1.0:
+                slippage_series = slippage_series * 10000.0
+            df['slippage_bps'] = slippage_series
+        else:
+            df['slippage_bps'] = np.nan
+
+        latency_col = _pick_column(['fill_latency_seconds', 'latency_seconds', 'fill_latency_sec'])
+        signal_ts_col = _pick_column(['signal_timestamp', 'signal_ts'])
+        fill_ts_col = _pick_column(['fill_timestamp', 'fill_ts'])
+        if latency_col:
+            df['fill_latency_seconds'] = pd.to_numeric(df[latency_col], errors='coerce')
+        elif signal_ts_col and fill_ts_col:
+            signal_ts = pd.to_datetime(df[signal_ts_col], errors='coerce')
+            fill_ts = pd.to_datetime(df[fill_ts_col], errors='coerce')
+            df['fill_latency_seconds'] = (fill_ts - signal_ts).dt.total_seconds()
+        else:
+            df['fill_latency_seconds'] = np.nan
+
+        fill_quality_col = _pick_column(['fill_quality_score', 'fill_quality', 'fill_score'])
+        if fill_quality_col:
+            df['fill_quality_score'] = pd.to_numeric(df[fill_quality_col], errors='coerce')
+        else:
+            df['fill_quality_score'] = np.nan
+
+        cutoff_date = pd.Timestamp((datetime.now() - timedelta(days=max(1, int(lookback_days)))).date())
+        df = df[df['trade_date'] >= cutoff_date].copy()
+        if df.empty:
+            return pd.DataFrame(), empty_summary, "Fill log has no rows in selected lookback."
+
+        daily = (
+            df.groupby('trade_date', as_index=False)
+            .agg(
+                fill_events=('trade_date', 'count'),
+                avg_live_slippage_bps=('slippage_bps', 'mean'),
+                p95_live_slippage_bps=('slippage_bps', lambda x: float(np.nanpercentile(x, 95)) if len(x) else np.nan),
+                avg_fill_latency_seconds=('fill_latency_seconds', 'mean'),
+                p95_fill_latency_seconds=('fill_latency_seconds', lambda x: float(np.nanpercentile(x, 95)) if len(x) else np.nan),
+                avg_fill_quality_score=('fill_quality_score', 'mean'),
+            )
+        )
+
+        summary = {
+            'fill_events': int(len(df)),
+            'mean_slippage_bps': float(np.nanmean(df['slippage_bps'])) if df['slippage_bps'].notna().any() else np.nan,
+            'p95_slippage_bps': float(np.nanpercentile(df['slippage_bps'].dropna(), 95))
+            if df['slippage_bps'].notna().any() else np.nan,
+            'mean_fill_latency_seconds': float(np.nanmean(df['fill_latency_seconds']))
+            if df['fill_latency_seconds'].notna().any() else np.nan,
+            'p95_fill_latency_seconds': float(np.nanpercentile(df['fill_latency_seconds'].dropna(), 95))
+            if df['fill_latency_seconds'].notna().any() else np.nan,
+            'mean_fill_quality_score': float(np.nanmean(df['fill_quality_score']))
+            if df['fill_quality_score'].notna().any() else np.nan,
+        }
+        return daily, summary, None
+
+    def _compute_forward_tracker_metrics(self, trades_df: pd.DataFrame,
+                                       scope_label: str,
+                                       lookback_days: int,
+                                       min_confidence: float,
+                                       fill_daily_df: Optional[pd.DataFrame] = None,
+                                       fill_summary: Optional[Dict[str, Any]] = None,
+                                       fill_note: Optional[str] = None) -> Tuple[Dict[str, Any], pd.DataFrame]:
+        """Compute daily and aggregate forward paper-trading diagnostics."""
+        if trades_df is None or trades_df.empty:
+            return {
+                'session_scope': scope_label,
+                'lookback_days': int(lookback_days),
+                'min_confidence': float(min_confidence),
+                'trade_count': 0,
+                'labeled_trade_count': 0,
+                'label_coverage': 0.0,
+                'total_pnl': 0.0,
+                'max_drawdown': 0.0,
+                'mean_predicted_front_iv_crush_pct': np.nan,
+                'mean_realized_front_iv_crush_pct': np.nan,
+                'crush_prediction_mae': np.nan,
+                'crush_directional_accuracy': np.nan,
+                'mean_predicted_crush_edge_score': np.nan,
+                'mean_execution_drag_bps': np.nan,
+                'p95_execution_drag_bps': np.nan,
+                'mean_tx_cost_per_contract': np.nan,
+                'mean_tx_cost_pct_of_debit': np.nan,
+                'fill_metrics': fill_summary or {},
+                'fill_note': fill_note,
+                'status': 'insufficient_data',
+            }, pd.DataFrame()
+
+        frame = trades_df.copy()
+        frame['contracts'] = pd.to_numeric(frame['contracts'], errors='coerce').fillna(1.0).clip(lower=1.0)
+        frame['pnl_dollars'] = (
+            pd.to_numeric(frame['pnl_per_contract'], errors='coerce').fillna(0.0)
+            * frame['contracts']
+        )
+        frame['execution_drag_pct'] = (
+            pd.to_numeric(frame['gross_return_pct'], errors='coerce').fillna(0.0)
+            - pd.to_numeric(frame['net_return_pct'], errors='coerce').fillna(0.0)
+        )
+        frame['execution_drag_bps'] = frame['execution_drag_pct'] * 10000.0
+        frame['tx_cost_pct_of_debit'] = (
+            pd.to_numeric(frame['transaction_cost_per_contract'], errors='coerce').fillna(0.0)
+            / pd.to_numeric(frame['debit_per_contract'], errors='coerce').replace(0, np.nan)
+        )
+
+        labeled = frame.dropna(subset=['realized_front_iv_crush_pct']).copy()
+        if labeled.empty:
+            crush_mae = np.nan
+            crush_directional_accuracy = np.nan
+        else:
+            crush_mae = float(
+                (labeled['predicted_front_iv_crush_pct'] - labeled['realized_front_iv_crush_pct']).abs().mean()
+            )
+            crush_directional_accuracy = float(
+                ((labeled['predicted_front_iv_crush_pct'] < 0) == (labeled['realized_front_iv_crush_pct'] < 0)).mean()
+            )
+
+        daily = (
+            frame.groupby('trade_date', as_index=False)
+            .agg(
+                trades=('symbol', 'count'),
+                labeled_trades=('realized_front_iv_crush_pct', lambda x: int(np.isfinite(x).sum())),
+                daily_pnl=('pnl_dollars', 'sum'),
+                avg_gross_return_pct=('gross_return_pct', 'mean'),
+                avg_net_return_pct=('net_return_pct', 'mean'),
+                avg_execution_drag_bps=('execution_drag_bps', 'mean'),
+                avg_tx_cost_per_contract=('transaction_cost_per_contract', 'mean'),
+                avg_tx_cost_pct_of_debit=('tx_cost_pct_of_debit', 'mean'),
+                avg_predicted_front_iv_crush_pct=('predicted_front_iv_crush_pct', 'mean'),
+                avg_realized_front_iv_crush_pct=('realized_front_iv_crush_pct', 'mean'),
+                avg_predicted_crush_edge_score=('crush_edge_score', 'mean'),
+                avg_crush_confidence=('crush_confidence', 'mean'),
+            )
+            .sort_values('trade_date')
+            .reset_index(drop=True)
+        )
+        daily['cumulative_pnl'] = daily['daily_pnl'].cumsum()
+        daily['running_peak_pnl'] = daily['cumulative_pnl'].cummax()
+        daily['drawdown'] = daily['cumulative_pnl'] - daily['running_peak_pnl']
+        if fill_daily_df is not None and not fill_daily_df.empty:
+            merged = fill_daily_df.copy()
+            merged['trade_date'] = pd.to_datetime(merged['trade_date'], errors='coerce').dt.normalize()
+            daily = daily.merge(merged, on='trade_date', how='left')
+
+        trade_count = int(len(frame))
+        max_drawdown = float(daily['drawdown'].min()) if not daily.empty else 0.0
+        summary = {
+            'session_scope': scope_label,
+            'lookback_days': int(lookback_days),
+            'min_confidence': float(min_confidence),
+            'trade_count': trade_count,
+            'labeled_trade_count': int(len(labeled)),
+            'label_coverage': float(len(labeled) / trade_count) if trade_count > 0 else 0.0,
+            'total_pnl': float(frame['pnl_dollars'].sum()),
+            'mean_daily_pnl': float(daily['daily_pnl'].mean()) if not daily.empty else np.nan,
+            'max_drawdown': max_drawdown,
+            'mean_predicted_front_iv_crush_pct': float(frame['predicted_front_iv_crush_pct'].mean()),
+            'mean_realized_front_iv_crush_pct': (
+                float(labeled['realized_front_iv_crush_pct'].mean()) if not labeled.empty else np.nan
+            ),
+            'crush_prediction_mae': crush_mae,
+            'crush_directional_accuracy': crush_directional_accuracy,
+            'mean_predicted_crush_edge_score': float(frame['crush_edge_score'].mean()),
+            'mean_execution_drag_bps': float(frame['execution_drag_bps'].mean()),
+            'p95_execution_drag_bps': float(np.percentile(frame['execution_drag_bps'], 95)),
+            'mean_tx_cost_per_contract': float(frame['transaction_cost_per_contract'].mean()),
+            'mean_tx_cost_pct_of_debit': (
+                float(frame['tx_cost_pct_of_debit'].mean())
+                if frame['tx_cost_pct_of_debit'].notna().any() else np.nan
+            ),
+            'fill_metrics': fill_summary or {},
+            'fill_note': fill_note,
+            'status': 'ok' if trade_count >= 20 else 'insufficient_data',
+        }
+        return summary, daily
+
+    @staticmethod
+    def _grade_rank(grade: Optional[str]) -> float:
+        """Convert grade string (A/B/C/...) into sortable numeric rank."""
+        if not grade:
+            return 0.0
+        text = str(grade).strip().upper()
+        if not text:
+            return 0.0
+        base = text[0]
+        mapping = {'A': 5.0, 'B': 4.0, 'C': 3.0, 'D': 2.0, 'E': 1.0, 'F': 0.0}
+        rank = float(mapping.get(base, 0.0))
+        if '+' in text:
+            rank += 0.25
+        elif '-' in text:
+            rank -= 0.25
+        return rank
+
+    def run_forward_paper_tracker(self, session_id: Optional[str] = None,
+                                lookback_days: int = 120,
+                                min_confidence: float = 0.35,
+                                output_dir: str = "exports/reports",
+                                fill_log_path: Optional[str] = None,
+                                write_artifacts: bool = True) -> Optional[dict]:
+        """Track forward paper performance: predicted vs realized crush edge and execution realism."""
+        lookback_days = max(1, int(lookback_days))
+        min_confidence = float(np.clip(float(min_confidence), 0.0, 1.0))
+        trades_df, scope_label = self._load_forward_tracker_trades(
+            session_id=session_id,
+            lookback_days=lookback_days,
+            min_confidence=min_confidence,
+        )
+        fill_daily, fill_summary, fill_note = self._load_forward_fill_log(
+            fill_log_path=fill_log_path,
+            lookback_days=lookback_days,
+        )
+        summary, daily = self._compute_forward_tracker_metrics(
+            trades_df=trades_df,
+            scope_label=scope_label,
+            lookback_days=lookback_days,
+            min_confidence=min_confidence,
+            fill_daily_df=fill_daily,
+            fill_summary=fill_summary,
+            fill_note=fill_note,
+        )
+
+        if not write_artifacts:
+            return {
+                'summary': summary,
+                'daily_rows': int(len(daily)),
+                'session_scope': scope_label,
+                'status': summary.get('status'),
+            }
+
+        output_path = Path(output_dir)
+        if not output_path.is_absolute():
+            output_path = project_root / output_path
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = output_path / f"forward_paper_tracker_{timestamp}.csv"
+        md_path = output_path / f"forward_paper_tracker_{timestamp}.md"
+        json_path = output_path / f"forward_paper_tracker_{timestamp}.json"
+
+        if daily.empty:
+            pd.DataFrame(columns=['trade_date']).to_csv(csv_path, index=False)
+        else:
+            daily_out = daily.copy()
+            daily_out['trade_date'] = daily_out['trade_date'].dt.strftime('%Y-%m-%d')
+            daily_out.to_csv(csv_path, index=False)
+
+        with md_path.open("w", encoding="utf-8") as f:
+            f.write("# Forward Paper Trading Tracker\n\n")
+            f.write(f"- Generated: {datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"- Session scope: `{summary.get('session_scope', 'all_sessions')}`\n")
+            f.write(f"- Lookback days: `{summary.get('lookback_days')}`\n")
+            f.write(f"- Min confidence filter: `{summary.get('min_confidence'):.2f}`\n")
+            f.write(f"- Status: `{summary.get('status')}`\n\n")
+
+            f.write("## Prediction vs Realization\n\n")
+            f.write(f"- Trades: `{summary.get('trade_count', 0)}`\n")
+            f.write(f"- Labeled trades: `{summary.get('labeled_trade_count', 0)}`\n")
+            f.write(f"- Label coverage: `{summary.get('label_coverage', 0.0):.2%}`\n")
+            f.write(
+                f"- Mean predicted front IV crush: "
+                f"`{summary.get('mean_predicted_front_iv_crush_pct', float('nan')):.2%}`\n"
+            )
+            f.write(
+                f"- Mean realized front IV crush: "
+                f"`{summary.get('mean_realized_front_iv_crush_pct', float('nan')):.2%}`\n"
+            )
+            f.write(f"- Crush MAE: `{summary.get('crush_prediction_mae', float('nan')):.4f}`\n")
+            f.write(
+                f"- Crush directional accuracy: "
+                f"`{summary.get('crush_directional_accuracy', float('nan')):.2%}`\n"
+            )
+            f.write(
+                f"- Mean predicted crush-edge score: "
+                f"`{summary.get('mean_predicted_crush_edge_score', float('nan')):.4f}`\n\n"
+            )
+
+            f.write("## Execution Realism\n\n")
+            f.write(f"- Total PnL: `${summary.get('total_pnl', 0.0):.2f}`\n")
+            f.write(f"- Mean daily PnL: `${summary.get('mean_daily_pnl', float('nan')):.2f}`\n")
+            f.write(f"- Max drawdown: `${summary.get('max_drawdown', 0.0):.2f}`\n")
+            f.write(
+                f"- Mean execution drag: "
+                f"`{summary.get('mean_execution_drag_bps', float('nan')):.2f} bps`\n"
+            )
+            f.write(
+                f"- P95 execution drag: "
+                f"`{summary.get('p95_execution_drag_bps', float('nan')):.2f} bps`\n"
+            )
+            f.write(
+                f"- Mean tx cost per contract: "
+                f"`${summary.get('mean_tx_cost_per_contract', float('nan')):.2f}`\n"
+            )
+            f.write(
+                f"- Mean tx cost / debit: "
+                f"`{summary.get('mean_tx_cost_pct_of_debit', float('nan')):.2%}`\n"
+            )
+            fill_metrics = summary.get('fill_metrics', {}) or {}
+            f.write(
+                f"- Mean live slippage (fill log): "
+                f"`{float(fill_metrics.get('mean_slippage_bps', np.nan)):.2f} bps`\n"
+            )
+            f.write(
+                f"- Mean fill latency (fill log): "
+                f"`{float(fill_metrics.get('mean_fill_latency_seconds', np.nan)):.2f}s`\n"
+            )
+            f.write(
+                f"- Mean fill quality (fill log): "
+                f"`{float(fill_metrics.get('mean_fill_quality_score', np.nan)):.4f}`\n"
+            )
+            if summary.get('fill_note'):
+                f.write(f"- Fill log note: `{summary.get('fill_note')}`\n")
+
+            if not daily.empty:
+                preview_cols = [
+                    'trade_date', 'trades', 'daily_pnl', 'cumulative_pnl', 'drawdown',
+                    'avg_predicted_front_iv_crush_pct', 'avg_realized_front_iv_crush_pct',
+                    'avg_execution_drag_bps', 'avg_tx_cost_pct_of_debit',
+                ]
+                available_cols = [col for col in preview_cols if col in daily.columns]
+                preview_df = daily[available_cols].tail(20).copy()
+                if 'trade_date' in preview_df.columns:
+                    preview_df['trade_date'] = preview_df['trade_date'].dt.strftime('%Y-%m-%d')
+                f.write("\n## Daily Tracker (Latest 20 rows)\n\n")
+                f.write("```text\n")
+                f.write(preview_df.to_string(index=False))
+                f.write("\n```\n")
+
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump({
+                'generated_at': datetime.now().isoformat(timespec='seconds'),
+                'summary': summary,
+                'daily_rows': int(len(daily)),
+                'source_fill_log': str(fill_log_path) if fill_log_path else None,
+                'source_csv': str(csv_path),
+            }, f, indent=2, default=str)
+
+        self.logger.info(f"✅ Forward paper tracker saved: {csv_path}")
+        self.logger.info(f"✅ Forward paper tracker summary saved: {md_path}")
+        self.logger.info(f"✅ Forward paper tracker JSON saved: {json_path}")
+        return {
+            'csv_path': str(csv_path),
+            'markdown_path': str(md_path),
+            'json_path': str(json_path),
+            'session_scope': scope_label,
+            'summary': summary,
+            'rows': int(len(daily)),
+            'status': summary.get('status'),
+        }
+
     def _resolve_session_for_reports(self, session_id: Optional[str] = None) -> Optional[str]:
         """Resolve report session scope (explicit session id preferred, fallback latest)."""
         if session_id:
-            return str(session_id)
+            normalized = str(session_id).strip()
+            if normalized.lower() in {"all", "all_sessions", "*"}:
+                return None
+            return normalized
         sessions_df = self.db.get_backtest_results()
         if sessions_df.empty:
             return None
@@ -826,6 +1394,300 @@ class InstitutionalDataCollector:
             'session_id': resolved_session,
         }
 
+    def run_trade_stress_test(self, session_id: Optional[str] = None,
+                            simulations: int = 5000,
+                            confidence_level: float = 0.95,
+                            drawdown_limit: float = -600.0,
+                            loss_limit: float = 0.0,
+                            seed: Optional[int] = 42,
+                            output_dir: str = "exports/reports",
+                            min_reliable_trades: int = 20) -> Optional[dict]:
+        """Run bootstrap Monte Carlo stress test on trade-level PnL paths."""
+        requested_scope = str(session_id or "").strip().lower()
+        use_all_sessions = requested_scope in {"all", "all_sessions", "*"}
+        resolved_session = "all_sessions" if use_all_sessions else self._resolve_session_for_reports(session_id)
+        if not resolved_session:
+            self.logger.warning("⚠️ Stress test unavailable: no backtest session found")
+            return None
+
+        simulations = max(500, int(simulations))
+        confidence_level = float(np.clip(float(confidence_level), 0.50, 0.99))
+        drawdown_limit = float(drawdown_limit)
+        loss_limit = float(loss_limit)
+        min_reliable_trades = max(3, int(min_reliable_trades))
+        rng = np.random.default_rng(seed if seed is not None else None)
+
+        if use_all_sessions:
+            try:
+                with sqlite3.connect(self.db.db_path) as conn:
+                    trades_df = pd.read_sql_query(
+                        "SELECT * FROM backtest_trades",
+                        conn,
+                    )
+            except Exception as exc:
+                self.logger.warning("⚠️ Stress test unavailable: failed loading all-session trades (%s)", exc)
+                return None
+        else:
+            trades_df = self.db.get_backtest_trades(resolved_session)
+        if trades_df.empty:
+            self.logger.warning("⚠️ Stress test unavailable: no trades for session %s", resolved_session)
+            return None
+        if 'pnl' in trades_df.columns:
+            pnl_series = pd.to_numeric(trades_df['pnl'], errors='coerce').dropna().to_numpy(dtype=float)
+        elif 'pnl_per_contract' in trades_df.columns:
+            contracts_vec = (
+                pd.to_numeric(trades_df['contracts'], errors='coerce').fillna(1.0).to_numpy(dtype=float)
+                if 'contracts' in trades_df.columns
+                else np.ones(len(trades_df), dtype=float)
+            )
+            pnl_per_contract = pd.to_numeric(trades_df['pnl_per_contract'], errors='coerce').to_numpy(dtype=float)
+            pnl_series = (contracts_vec * pnl_per_contract)
+            pnl_series = pnl_series[np.isfinite(pnl_series)]
+        else:
+            self.logger.warning(
+                "⚠️ Stress test unavailable: trade records missing pnl and pnl_per_contract columns"
+            )
+            return None
+        if pnl_series.size < 3:
+            self.logger.warning(
+                "⚠️ Stress test unavailable: insufficient trades for session %s (n=%d)",
+                resolved_session,
+                int(pnl_series.size),
+            )
+            return None
+
+        returns_series = None
+        if 'net_return_pct' in trades_df.columns:
+            returns_series = pd.to_numeric(
+                trades_df['net_return_pct'],
+                errors='coerce',
+            ).dropna().to_numpy(dtype=float)
+            if returns_series.size != pnl_series.size:
+                returns_series = None
+
+        trade_count = int(pnl_series.size)
+        simulation_horizon_trades = trade_count
+        if use_all_sessions and trade_count > min_reliable_trades:
+            simulation_horizon_trades = max(min_reliable_trades, 20)
+        sample_reliability = float(min(1.0, trade_count / float(min_reliable_trades)))
+        sample_size_note = (
+            f"Trade sample underpowered: {trade_count} trades < {min_reliable_trades} reliable minimum."
+            if trade_count < min_reliable_trades
+            else None
+        )
+        sampled_idx = rng.integers(0, trade_count, size=(simulations, simulation_horizon_trades))
+        sampled_pnl = pnl_series[sampled_idx]
+        cumulative = np.cumsum(sampled_pnl, axis=1)
+        peaks = np.maximum.accumulate(cumulative, axis=1)
+        sampled_drawdown = np.min(cumulative - peaks, axis=1)
+        sampled_total_pnl = np.sum(sampled_pnl, axis=1)
+        sampled_win_rate = np.mean(sampled_pnl > 0.0, axis=1)
+
+        def _max_drawdown(pnl_path: np.ndarray) -> float:
+            if pnl_path.size == 0:
+                return 0.0
+            cum = np.cumsum(pnl_path)
+            running_peak = np.maximum.accumulate(cum)
+            return float(np.min(cum - running_peak))
+
+        base_path = pnl_series[-simulation_horizon_trades:]
+        base_total_pnl = float(np.sum(base_path))
+        base_max_drawdown = _max_drawdown(base_path)
+        base_win_rate = float(np.mean(base_path > 0.0))
+
+        var_cutoff = float(np.percentile(sampled_total_pnl, (1.0 - confidence_level) * 100.0))
+        tail_mask = sampled_total_pnl <= var_cutoff
+        cvar_total_pnl = float(sampled_total_pnl[tail_mask].mean()) if bool(np.any(tail_mask)) else var_cutoff
+
+        prob_loss = float(np.mean(sampled_total_pnl <= loss_limit))
+        prob_drawdown_breach = float(np.mean(sampled_drawdown <= drawdown_limit))
+        robustness_score = float(
+            np.clip(
+                1.0 - 0.60 * prob_loss - 0.40 * prob_drawdown_breach,
+                0.0,
+                1.0,
+            )
+        )
+        if prob_loss > 0.50 or prob_drawdown_breach > 0.40:
+            status = "fail"
+        elif prob_loss > 0.35 or prob_drawdown_breach > 0.25:
+            status = "advisory"
+        else:
+            status = "pass"
+        if trade_count < min_reliable_trades:
+            status = "advisory" if status == "pass" else status
+            if trade_count < max(5, min_reliable_trades // 3):
+                status = "fail"
+            robustness_score = float(np.clip(robustness_score * sample_reliability, 0.0, 1.0))
+
+        sampled_sharpe = None
+        base_sharpe = None
+        if returns_series is not None and returns_series.size > 2:
+            hold_days_avg = 1.0
+            if 'hold_days' in trades_df.columns:
+                hold_days_vec = pd.to_numeric(trades_df['hold_days'], errors='coerce').dropna().to_numpy(dtype=float)
+                if hold_days_vec.size > 0:
+                    hold_days_avg = float(max(1.0, hold_days_vec.mean()))
+            annualization = float(np.sqrt(252.0 / hold_days_avg))
+            returns_sampled = returns_series[sampled_idx]
+            sample_ret_mean = returns_sampled.mean(axis=1)
+            sample_ret_std = returns_sampled.std(axis=1, ddof=0)
+            sampled_sharpe = np.full(sample_ret_mean.shape, np.nan, dtype=float)
+            stable_std = sample_ret_std > 1e-9
+            sampled_sharpe[stable_std] = (
+                sample_ret_mean[stable_std] / sample_ret_std[stable_std]
+            ) * annualization
+
+            base_returns = returns_series[-simulation_horizon_trades:]
+            base_ret_std = float(np.std(base_returns, ddof=0))
+            base_ret_mean = float(np.mean(base_returns))
+            if base_ret_std > 1e-9:
+                base_sharpe = float((base_ret_mean / base_ret_std) * annualization)
+
+        output_path = Path(output_dir)
+        if not output_path.is_absolute():
+            output_path = project_root / output_path
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = output_path / f"earnings_trade_stress_test_{timestamp}.csv"
+        md_path = output_path / f"earnings_trade_stress_test_{timestamp}.md"
+        json_path = output_path / f"earnings_trade_stress_test_{timestamp}.json"
+
+        summary_df = pd.DataFrame([{
+            'session_id': resolved_session,
+            'simulations': simulations,
+            'trade_count': trade_count,
+            'simulation_horizon_trades': simulation_horizon_trades,
+            'base_total_pnl': base_total_pnl,
+            'base_max_drawdown': base_max_drawdown,
+            'base_win_rate': base_win_rate,
+            'base_sharpe': base_sharpe if base_sharpe is not None else np.nan,
+            'sim_p05_total_pnl': float(np.percentile(sampled_total_pnl, 5)),
+            'sim_p50_total_pnl': float(np.percentile(sampled_total_pnl, 50)),
+            'sim_p95_total_pnl': float(np.percentile(sampled_total_pnl, 95)),
+            'sim_var_total_pnl': var_cutoff,
+            'sim_cvar_total_pnl': cvar_total_pnl,
+            'sim_mean_max_drawdown': float(np.mean(sampled_drawdown)),
+            'sim_p95_max_drawdown': float(np.percentile(sampled_drawdown, 5)),
+            'sim_mean_win_rate': float(np.mean(sampled_win_rate)),
+            'sim_p05_win_rate': float(np.percentile(sampled_win_rate, 5)),
+            'sim_p95_win_rate': float(np.percentile(sampled_win_rate, 95)),
+            'prob_total_pnl_le_loss_limit': prob_loss,
+            'prob_drawdown_breach': prob_drawdown_breach,
+            'robustness_score': robustness_score,
+            'sample_reliability': sample_reliability,
+            'min_reliable_trades': min_reliable_trades,
+            'status': status,
+            'confidence_level': confidence_level,
+            'drawdown_limit': drawdown_limit,
+            'loss_limit': loss_limit,
+        }])
+        summary_df.to_csv(csv_path, index=False)
+
+        with md_path.open("w", encoding="utf-8") as f:
+            f.write("# Earnings Trade Stress Test\n\n")
+            f.write(f"- Generated: {datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"- Session: `{resolved_session}`\n")
+            f.write(f"- Simulations: `{simulations}`\n")
+            f.write(f"- Trade count: `{trade_count}`\n")
+            f.write(f"- Simulation horizon trades: `{simulation_horizon_trades}`\n")
+            f.write(f"- Min reliable trades: `{min_reliable_trades}`\n")
+            f.write(f"- Sample reliability: `{sample_reliability:.2f}`\n")
+            f.write(f"- Status: `{status}`\n")
+            f.write(f"- Robustness score: `{robustness_score:.3f}`\n\n")
+            if sample_size_note:
+                f.write(f"- Sample note: {sample_size_note}\n\n")
+            f.write("## Risk Metrics\n\n")
+            f.write(f"- Probability total PnL <= {loss_limit:.2f}: `{prob_loss:.2%}`\n")
+            f.write(f"- Probability max drawdown <= {drawdown_limit:.2f}: `{prob_drawdown_breach:.2%}`\n")
+            f.write(f"- Total PnL VaR({confidence_level:.0%}): `${var_cutoff:.2f}`\n")
+            f.write(f"- Total PnL CVaR({confidence_level:.0%}): `${cvar_total_pnl:.2f}`\n")
+            f.write(f"- Total PnL P05 / P50 / P95: `${np.percentile(sampled_total_pnl, 5):.2f}` / `${np.percentile(sampled_total_pnl, 50):.2f}` / `${np.percentile(sampled_total_pnl, 95):.2f}`\n")
+            f.write(f"- Max drawdown mean / P05(worst): `${np.mean(sampled_drawdown):.2f}` / `${np.percentile(sampled_drawdown, 5):.2f}`\n")
+            f.write("\n## Base Session\n\n")
+            f.write(f"- Base total PnL: `${base_total_pnl:.2f}`\n")
+            f.write(f"- Base max drawdown: `${base_max_drawdown:.2f}`\n")
+            f.write(f"- Base win rate: `{base_win_rate:.2%}`\n")
+            if base_sharpe is not None:
+                f.write(f"- Base Sharpe: `{base_sharpe:.4f}`\n")
+
+        def _finite_stat(values: Optional[np.ndarray], fn) -> Optional[float]:
+            if values is None:
+                return None
+            finite = np.asarray(values, dtype=float)
+            finite = finite[np.isfinite(finite)]
+            if finite.size == 0:
+                return None
+            return float(fn(finite))
+
+        payload = {
+            'generated_at': datetime.now().isoformat(timespec='seconds'),
+            'session_id': resolved_session,
+            'simulations': simulations,
+            'confidence_level': confidence_level,
+            'drawdown_limit': drawdown_limit,
+            'loss_limit': loss_limit,
+            'trade_count': trade_count,
+            'simulation_horizon_trades': simulation_horizon_trades,
+            'min_reliable_trades': min_reliable_trades,
+            'sample_reliability': sample_reliability,
+            'sample_size_note': sample_size_note,
+            'status': status,
+            'robustness_score': robustness_score,
+            'base': {
+                'total_pnl': base_total_pnl,
+                'max_drawdown': base_max_drawdown,
+                'win_rate': base_win_rate,
+                'sharpe': base_sharpe,
+            },
+            'simulation': {
+                'mean_total_pnl': float(np.mean(sampled_total_pnl)),
+                'median_total_pnl': float(np.percentile(sampled_total_pnl, 50)),
+                'p05_total_pnl': float(np.percentile(sampled_total_pnl, 5)),
+                'p95_total_pnl': float(np.percentile(sampled_total_pnl, 95)),
+                'var_total_pnl': var_cutoff,
+                'cvar_total_pnl': cvar_total_pnl,
+                'mean_max_drawdown': float(np.mean(sampled_drawdown)),
+                'p05_max_drawdown': float(np.percentile(sampled_drawdown, 5)),
+                'mean_win_rate': float(np.mean(sampled_win_rate)),
+                'p05_win_rate': float(np.percentile(sampled_win_rate, 5)),
+                'p95_win_rate': float(np.percentile(sampled_win_rate, 95)),
+                'prob_total_pnl_le_loss_limit': prob_loss,
+                'prob_drawdown_breach': prob_drawdown_breach,
+                'mean_sharpe': _finite_stat(sampled_sharpe, np.mean),
+                'p05_sharpe': _finite_stat(sampled_sharpe, lambda a: np.percentile(a, 5)),
+                'p95_sharpe': _finite_stat(sampled_sharpe, lambda a: np.percentile(a, 95)),
+            },
+            'paths': {
+                'csv': str(csv_path),
+                'markdown': str(md_path),
+                'json': str(json_path),
+            },
+        }
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+
+        self.logger.info(f"✅ Stress test summary saved: {md_path}")
+        self.logger.info(f"✅ Stress test JSON saved: {json_path}")
+        return {
+            'session_id': resolved_session,
+            'status': status,
+            'robustness_score': robustness_score,
+            'trade_count': trade_count,
+            'simulation_horizon_trades': simulation_horizon_trades,
+            'min_reliable_trades': min_reliable_trades,
+            'sample_reliability': sample_reliability,
+            'sample_size_note': sample_size_note,
+            'prob_total_pnl_le_loss_limit': prob_loss,
+            'prob_drawdown_breach': prob_drawdown_breach,
+            'var_total_pnl': var_cutoff,
+            'cvar_total_pnl': cvar_total_pnl,
+            'csv_path': str(csv_path),
+            'markdown_path': str(md_path),
+            'json_path': str(json_path),
+        }
+
     def run_parameter_sweep(self, execution_profiles: List[str],
                           hold_days_grid: List[int],
                           signal_threshold_grid: List[float],
@@ -848,6 +1710,7 @@ class InstitutionalDataCollector:
                           allow_proxy_earnings: bool = True,
                           output_dir: str = "exports/reports",
                           top_n: int = 20,
+                          min_trades_for_ranking: int = 0,
                           start_date: Optional[str] = None,
                           end_date: Optional[str] = None) -> Optional[dict]:
         """Run a multi-parameter walk-forward sweep and persist ranked results."""
@@ -868,6 +1731,7 @@ class InstitutionalDataCollector:
         min_crush_confidence = max(0.0, min(1.0, float(min_crush_confidence)))
         min_crush_magnitude = max(0.0, min(1.0, float(min_crush_magnitude)))
         min_crush_edge = max(0.0, min(1.0, float(min_crush_edge)))
+        min_trades_for_ranking = max(0, int(min_trades_for_ranking))
 
         base_params = {
             'strategy_type': 'calendar_spread',
@@ -923,15 +1787,53 @@ class InstitutionalDataCollector:
             ascending=[False, False, False]
         ).reset_index(drop=True)
         ranked.to_csv(csv_path, index=False)
-        top_rows = ranked.head(top_n).copy()
+        ranked_for_selection = ranked
+        excluded_by_trade_count = 0
+        if min_trades_for_ranking > 0 and 'total_trades' in ranked.columns:
+            ranked_for_selection = ranked[ranked['total_trades'] >= min_trades_for_ranking].copy()
+            excluded_by_trade_count = int(len(ranked) - len(ranked_for_selection))
+            if ranked_for_selection.empty:
+                self.logger.warning(
+                    "⚠️ Sweep min-trades filter removed all rows (min_trades=%d); "
+                    "falling back to full ranking",
+                    min_trades_for_ranking,
+                )
+                ranked_for_selection = ranked
+                excluded_by_trade_count = 0
+            elif excluded_by_trade_count > 0:
+                self.logger.info(
+                    "🧮 Sweep min-trades filter: excluded %d/%d rows (min_trades=%d)",
+                    excluded_by_trade_count,
+                    int(len(ranked)),
+                    min_trades_for_ranking,
+                )
+        top_rows = ranked_for_selection.head(top_n).copy()
+        inactive_sweep_params: List[str] = []
+        param_columns = [col for col in ranked.columns if col.startswith("param_")]
+        for param_col in param_columns:
+            if ranked[param_col].nunique(dropna=False) <= 1:
+                continue
+            grouping_cols = [col for col in param_columns if col != param_col]
+            if not grouping_cols:
+                continue
+            pnl_std = ranked.groupby(grouping_cols, dropna=False)['total_pnl'].std(ddof=0).fillna(0.0)
+            sharpe_std = ranked.groupby(grouping_cols, dropna=False)['sharpe_ratio'].std(ddof=0).fillna(0.0)
+            if bool((pnl_std <= 1e-9).all()) and bool((sharpe_std <= 1e-9).all()):
+                inactive_sweep_params.append(param_col[6:])
+        if inactive_sweep_params:
+            joined = ", ".join(inactive_sweep_params)
+            self.logger.warning(
+                "⚠️ Sweep dimensions with no observed impact on PnL/Sharpe: %s",
+                joined,
+            )
 
         with md_path.open("w", encoding="utf-8") as f:
             f.write("# Earnings Walk-Forward Parameter Sweep\n\n")
             f.write(f"- Generated: {datetime.now().isoformat(timespec='seconds')}\n")
             f.write(f"- Total combinations: {len(ranked)}\n")
-            f.write(f"- Top rows shown: {min(top_n, len(ranked))}\n\n")
+            f.write(f"- Top rows shown: {min(top_n, len(ranked_for_selection))}\n\n")
 
-            best = ranked.iloc[0]
+            best = ranked_for_selection.iloc[0]
             f.write("## Best Configuration\n\n")
             f.write(f"- Session: `{best['session_id']}`\n")
             f.write(f"- Alpha score: `{best['alpha_score']:.4f}`\n")
@@ -939,6 +1841,11 @@ class InstitutionalDataCollector:
             f.write(f"- Win rate: `{best['win_rate']:.2%}`\n")
             f.write(f"- Total PnL: `${best['total_pnl']:.2f}`\n")
             f.write(f"- Max drawdown: `${best['max_drawdown']:.2f}`\n\n")
+            if min_trades_for_ranking > 0 and 'total_trades' in best.index:
+                f.write(
+                    f"- Min trades for ranking: `{min_trades_for_ranking}` "
+                    f"(excluded rows: `{excluded_by_trade_count}`)\n\n"
+                )
 
             f.write("## Top Results\n\n")
             columns = [
@@ -953,10 +1860,15 @@ class InstitutionalDataCollector:
             f.write("```text\n")
             f.write(top_table)
             f.write("\n```\n")
+            if inactive_sweep_params:
+                f.write("\n## Inactive Sweep Dimensions\n\n")
+                f.write("No measurable PnL/Sharpe change detected for:\n")
+                for name in inactive_sweep_params:
+                    f.write(f"- `{name}`\n")
 
         best_params = {
             key[6:]: best[key]
-            for key in ranked.columns
+            for key in ranked_for_selection.columns
             if key.startswith("param_")
         }
         with json_path.open("w", encoding="utf-8") as f:
@@ -974,6 +1886,9 @@ class InstitutionalDataCollector:
                 'best_crush_prediction_mae': float(best['crush_prediction_mae']) if 'crush_prediction_mae' in best else None,
                 'best_crush_directional_accuracy': float(best['crush_directional_accuracy']) if 'crush_directional_accuracy' in best else None,
                 'best_params': best_params,
+                'inactive_sweep_params': inactive_sweep_params,
+                'min_trades_for_ranking': min_trades_for_ranking,
+                'excluded_rows_by_min_trades': excluded_by_trade_count,
                 'source_csv': str(csv_path),
             }, f, indent=2, default=str)
 
@@ -985,9 +1900,12 @@ class InstitutionalDataCollector:
             'markdown_path': str(md_path),
             'json_path': str(json_path),
             'rows': int(len(ranked)),
-            'top_rows': int(min(top_n, len(ranked))),
+            'top_rows': int(min(top_n, len(ranked_for_selection))),
             'best_params': best_params,
             'best_session_id': str(best['session_id']),
+            'inactive_sweep_params': inactive_sweep_params,
+            'min_trades_for_ranking': min_trades_for_ranking,
+            'excluded_rows_by_min_trades': excluded_by_trade_count,
         }
 
     def run_oos_validation(self, execution_profiles: List[str],
@@ -1309,6 +2227,28 @@ class InstitutionalDataCollector:
             by=['test_alpha_score', 'test_sharpe_ratio', 'test_total_pnl'],
             ascending=[False, False, False]
         ).iloc[0]
+        # Build per-split timeseries for API consumers (chart data)
+        def _safe_f(v, default=0.0):
+            try:
+                f = float(v)
+                return f if (f == f) else default  # NaN check
+            except (TypeError, ValueError):
+                return default
+
+        splits_detail = [
+            {
+                "split": int(row.get("split_index", i + 1)),
+                "test_start": str(row.get("test_start", "")),
+                "test_end": str(row.get("test_end", "")),
+                "pnl": _safe_f(row.get("test_total_pnl")),
+                "alpha": _safe_f(row.get("test_alpha_score")),
+                "sharpe": _safe_f(row.get("test_sharpe_ratio")),
+                "win_rate": _safe_f(row.get("test_win_rate")),
+                "trades": int(row.get("test_total_trades") or 0),
+            }
+            for i, (_, row) in enumerate(oos_df.iterrows())
+        ]
+
         return {
             'csv_path': str(csv_path),
             'markdown_path': str(md_path),
@@ -1319,6 +2259,440 @@ class InstitutionalDataCollector:
             'best_params': best_params,
             'report_card': report_card,
             'best_test_session_id': str(best_split['test_session_id']),
+            'splits_detail': splits_detail,
+        }
+
+    def run_readiness_report(self, execution_profiles: List[str],
+                           hold_days_grid: List[int],
+                           signal_threshold_grid: List[float],
+                           trades_per_day_grid: List[int],
+                           entry_days_grid: List[int],
+                           exit_days_grid: List[int],
+                           target_entry_dte: int = 6,
+                           entry_dte_band: int = 6,
+                           min_daily_share_volume: int = 1_000_000,
+                           max_abs_momentum_5d: float = 0.11,
+                           train_days: int = 252,
+                           test_days: int = 63,
+                           step_days: int = 63,
+                           top_n_train: int = 1,
+                           position_contracts: int = 1,
+                           lookback_days: int = 365,
+                           max_backtest_symbols: int = 10,
+                           use_crush_confidence_gate: bool = True,
+                           allow_global_crush_profile: bool = True,
+                           min_crush_confidence: float = 0.45,
+                           min_crush_magnitude: float = 0.08,
+                           min_crush_edge: float = 0.02,
+                           require_true_earnings: bool = False,
+                           allow_proxy_earnings: bool = True,
+                           min_splits: int = 8,
+                           min_total_test_trades: int = 80,
+                           min_trades_per_split: float = 5.0,
+                           sweep_output_dir: str = "exports/reports",
+                           oos_output_dir: str = "exports/reports",
+                           tuning_output_dir: str = "exports/reports",
+                           readiness_output_dir: str = "exports/reports",
+                           sweep_top_n: int = 20,
+                           sweep_min_trades: int = 12,
+                           tuning_session_id: Optional[str] = None,
+                           tuning_min_confidence: float = 0.35,
+                           tuning_min_trades: int = 30,
+                           tuning_use_composite_signal: bool = True,
+                           run_stress_test: bool = True,
+                           stress_session_id: Optional[str] = None,
+                           stress_simulations: int = 5000,
+                           stress_confidence_level: float = 0.95,
+                           stress_drawdown_limit: float = -600.0,
+                           stress_loss_limit: float = 0.0,
+                           stress_seed: Optional[int] = 42,
+                           stress_min_trades: int = 20,
+                           stress_output_dir: str = "exports/reports",
+                           promotion_min_oos_grade: str = "A",
+                           promotion_min_live_trades: int = 50,
+                           promotion_live_lookback_days: int = 120,
+                           promotion_live_session_id: Optional[str] = None,
+                           promotion_live_min_confidence: float = 0.35,
+                           forward_fill_log_path: Optional[str] = None,
+                           start_date: Optional[str] = None,
+                           end_date: Optional[str] = None) -> Optional[dict]:
+        """Run sweep + OOS + threshold tuning and emit a consolidated readiness report."""
+        self.logger.info("🧪 Running consolidated readiness workflow")
+
+        sweep_result = self.run_parameter_sweep(
+            execution_profiles=execution_profiles,
+            hold_days_grid=hold_days_grid,
+            signal_threshold_grid=signal_threshold_grid,
+            trades_per_day_grid=trades_per_day_grid,
+            entry_days_grid=entry_days_grid,
+            exit_days_grid=exit_days_grid,
+            target_entry_dte=target_entry_dte,
+            entry_dte_band=entry_dte_band,
+            min_daily_share_volume=min_daily_share_volume,
+            max_abs_momentum_5d=max_abs_momentum_5d,
+            position_contracts=position_contracts,
+            lookback_days=lookback_days,
+            max_backtest_symbols=max_backtest_symbols,
+            use_crush_confidence_gate=use_crush_confidence_gate,
+            allow_global_crush_profile=allow_global_crush_profile,
+            min_crush_confidence=min_crush_confidence,
+            min_crush_magnitude=min_crush_magnitude,
+            min_crush_edge=min_crush_edge,
+            require_true_earnings=require_true_earnings,
+            allow_proxy_earnings=allow_proxy_earnings,
+            output_dir=sweep_output_dir,
+            top_n=sweep_top_n,
+            min_trades_for_ranking=sweep_min_trades,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if not sweep_result:
+            self.logger.warning("⚠️ Readiness workflow stopped: parameter sweep produced no results")
+            return None
+
+        oos_result = self.run_oos_validation(
+            execution_profiles=execution_profiles,
+            hold_days_grid=hold_days_grid,
+            signal_threshold_grid=signal_threshold_grid,
+            trades_per_day_grid=trades_per_day_grid,
+            entry_days_grid=entry_days_grid,
+            exit_days_grid=exit_days_grid,
+            target_entry_dte=target_entry_dte,
+            entry_dte_band=entry_dte_band,
+            min_daily_share_volume=min_daily_share_volume,
+            max_abs_momentum_5d=max_abs_momentum_5d,
+            train_days=train_days,
+            test_days=test_days,
+            step_days=step_days,
+            top_n_train=top_n_train,
+            position_contracts=position_contracts,
+            lookback_days=lookback_days,
+            max_backtest_symbols=max_backtest_symbols,
+            use_crush_confidence_gate=use_crush_confidence_gate,
+            allow_global_crush_profile=allow_global_crush_profile,
+            min_crush_confidence=min_crush_confidence,
+            min_crush_magnitude=min_crush_magnitude,
+            min_crush_edge=min_crush_edge,
+            require_true_earnings=require_true_earnings,
+            allow_proxy_earnings=allow_proxy_earnings,
+            min_splits=min_splits,
+            min_total_test_trades=min_total_test_trades,
+            min_trades_per_split=min_trades_per_split,
+            output_dir=oos_output_dir,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if not oos_result:
+            self.logger.warning("⚠️ Readiness workflow stopped: OOS validation produced no results")
+            return None
+
+        preferred_tuning_session = (
+            tuning_session_id
+            or str(oos_result.get('best_test_session_id') or "")
+            or str(sweep_result.get('best_session_id') or "")
+            or None
+        )
+        tuning_result = self.run_threshold_tuning(
+            session_id=preferred_tuning_session,
+            min_confidence=tuning_min_confidence,
+            min_trades=tuning_min_trades,
+            use_composite_signal=tuning_use_composite_signal,
+            output_dir=tuning_output_dir,
+        )
+        if not tuning_result:
+            self.logger.warning("⚠️ Readiness workflow: threshold tuning produced no decile report")
+        elif (
+            preferred_tuning_session
+            and not tuning_result.get('recommended')
+            and str(tuning_result.get('reason', '')) == 'insufficient_trade_count_for_thresholds'
+        ):
+            self.logger.info(
+                "ℹ️ Threshold tuning had thin sample on scoped session; retrying across all sessions"
+            )
+            broader_tuning_result = self.run_threshold_tuning(
+                session_id="all_sessions",
+                min_confidence=tuning_min_confidence,
+                min_trades=tuning_min_trades,
+                use_composite_signal=tuning_use_composite_signal,
+                output_dir=tuning_output_dir,
+            )
+            if broader_tuning_result and int(broader_tuning_result.get('candidate_rows', 0)) >= int(
+                tuning_result.get('candidate_rows', 0)
+            ):
+                tuning_result = broader_tuning_result
+
+        stress_result = None
+        if run_stress_test:
+            stress_result = self.run_trade_stress_test(
+                session_id=stress_session_id or str(oos_result.get('best_test_session_id') or ""),
+                simulations=stress_simulations,
+                confidence_level=stress_confidence_level,
+                drawdown_limit=stress_drawdown_limit,
+                loss_limit=stress_loss_limit,
+                seed=stress_seed,
+                min_reliable_trades=stress_min_trades,
+                output_dir=stress_output_dir,
+            )
+            if (
+                not stress_session_id
+                and stress_result
+                and int(stress_result.get('trade_count', 0) or 0) < int(stress_min_trades)
+            ):
+                self.logger.info(
+                    "ℹ️ Stress test sample was underpowered (n=%d < min=%d); retrying on all sessions",
+                    int(stress_result.get('trade_count', 0) or 0),
+                    int(stress_min_trades),
+                )
+                broader_stress_result = self.run_trade_stress_test(
+                    session_id="all_sessions",
+                    simulations=stress_simulations,
+                    confidence_level=stress_confidence_level,
+                    drawdown_limit=stress_drawdown_limit,
+                    loss_limit=stress_loss_limit,
+                    seed=stress_seed,
+                    min_reliable_trades=stress_min_trades,
+                    output_dir=stress_output_dir,
+                )
+                if broader_stress_result and int(broader_stress_result.get('trade_count', 0) or 0) >= int(
+                    stress_result.get('trade_count', 0) or 0
+                ):
+                    stress_result = broader_stress_result
+
+        promotion_min_live_trades = max(0, int(promotion_min_live_trades))
+        promotion_live_lookback_days = max(1, int(promotion_live_lookback_days))
+        promotion_live_min_confidence = float(np.clip(float(promotion_live_min_confidence), 0.0, 1.0))
+        required_oos_grade = str(promotion_min_oos_grade or "A").strip().upper() or "A"
+        forward_tracker_result = self.run_forward_paper_tracker(
+            session_id=promotion_live_session_id or "all_sessions",
+            lookback_days=promotion_live_lookback_days,
+            min_confidence=promotion_live_min_confidence,
+            output_dir=readiness_output_dir,
+            fill_log_path=forward_fill_log_path,
+            write_artifacts=True,
+        )
+        forward_summary = dict((forward_tracker_result or {}).get('summary') or {})
+        live_trade_count = int(forward_summary.get('trade_count', 0) or 0)
+
+        report_card = oos_result.get('report_card', {}) if isinstance(oos_result, dict) else {}
+        verdict = report_card.get('verdict', {}) if isinstance(report_card, dict) else {}
+        oos_grade = str(verdict.get('grade', 'n/a') if isinstance(verdict, dict) else 'n/a')
+        oos_pass = bool(verdict.get('overall_pass', False))
+        threshold_recommended = bool((tuning_result or {}).get('recommended', False))
+        inactive_sweep_params = list(sweep_result.get('inactive_sweep_params', []) or [])
+        stress_status = str((stress_result or {}).get('status', 'not_run'))
+        stress_fail = stress_status in {'fail', 'insufficient_data'}
+        stress_advisory = stress_status == 'advisory'
+        if run_stress_test and stress_result is None:
+            stress_fail = True
+
+        if oos_pass and threshold_recommended and not inactive_sweep_params and not stress_advisory and not stress_fail:
+            readiness_status = "ready"
+        elif oos_pass and not stress_fail:
+            readiness_status = "ready_with_advisories"
+        else:
+            readiness_status = "not_ready"
+
+        grade_gate_pass = self._grade_rank(oos_grade) >= self._grade_rank(required_oos_grade)
+        live_trade_gate_pass = live_trade_count >= promotion_min_live_trades
+        promotion_gate_pass = bool(grade_gate_pass or live_trade_gate_pass)
+        if readiness_status != "not_ready" and not promotion_gate_pass:
+            readiness_status = "ready_with_advisories"
+        readiness_pass = readiness_status != "not_ready"
+        production_ready = readiness_pass and promotion_gate_pass
+
+        advisories: List[str] = []
+        if inactive_sweep_params:
+            advisories.append(
+                "Some sweep dimensions had no observed PnL/Sharpe impact: "
+                + ", ".join(inactive_sweep_params)
+            )
+        if not threshold_recommended:
+            reason = (tuning_result or {}).get('reason', 'no_tuning_result')
+            advisories.append(f"No threshold recommendation available (reason={reason}).")
+        if stress_status == 'advisory':
+            sample_note = str((stress_result or {}).get('sample_size_note') or "").strip()
+            if sample_note:
+                advisories.append(f"Stress test advisory: {sample_note}")
+            else:
+                advisories.append(
+                    "Stress test indicates elevated tail-risk "
+                    f"(p_loss={(stress_result or {}).get('prob_total_pnl_le_loss_limit', float('nan')):.2%}, "
+                    f"p_dd_breach={(stress_result or {}).get('prob_drawdown_breach', float('nan')):.2%})."
+                )
+        elif stress_status == 'fail':
+            sample_note = str((stress_result or {}).get('sample_size_note') or "").strip()
+            if sample_note:
+                advisories.append(f"Stress test failed: {sample_note}")
+            else:
+                advisories.append(
+                    "Stress test failed tail-risk thresholds "
+                    f"(p_loss={(stress_result or {}).get('prob_total_pnl_le_loss_limit', float('nan')):.2%}, "
+                    f"p_dd_breach={(stress_result or {}).get('prob_drawdown_breach', float('nan')):.2%})."
+                )
+        elif run_stress_test and stress_result is None:
+            advisories.append(
+                "Stress test could not run due to insufficient trade history for the selected session."
+            )
+        if not oos_pass:
+            advisories.append(f"OOS report card did not pass (grade={oos_grade}).")
+        if not promotion_gate_pass:
+            advisories.append(
+                "Promotion gate not met: require "
+                f"OOS grade >= {required_oos_grade} OR >= {promotion_min_live_trades} live trades "
+                f"in last {promotion_live_lookback_days} days "
+                f"(actual grade={oos_grade}, live_trades={live_trade_count})."
+            )
+        fill_note = str(forward_summary.get('fill_note') or "").strip()
+        if fill_note:
+            advisories.append(f"Forward fill quality note: {fill_note}")
+
+        readiness_output_path = Path(readiness_output_dir)
+        if not readiness_output_path.is_absolute():
+            readiness_output_path = project_root / readiness_output_path
+        readiness_output_path.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        readiness_md_path = readiness_output_path / f"earnings_readiness_report_{timestamp}.md"
+        readiness_json_path = readiness_output_path / f"earnings_readiness_report_{timestamp}.json"
+
+        with readiness_md_path.open("w", encoding="utf-8") as f:
+            f.write("# Earnings Strategy Readiness Report\n\n")
+            f.write(f"- Generated: {datetime.now().isoformat(timespec='seconds')}\n")
+            f.write(f"- Readiness pass: `{readiness_pass}`\n")
+            f.write(f"- Readiness status: `{readiness_status}`\n")
+            f.write(f"- Production-ready: `{production_ready}`\n")
+            f.write(f"- OOS pass: `{oos_pass}`\n")
+            f.write(f"- Threshold recommended: `{threshold_recommended}`\n")
+            f.write(f"- Stress status: `{stress_status}`\n")
+            f.write(f"- OOS grade: `{oos_grade}`\n")
+            f.write(f"- Promotion gate pass: `{promotion_gate_pass}`\n\n")
+
+            f.write("## Core Metrics\n\n")
+            f.write(f"- Sweep rows: `{sweep_result.get('rows', 0)}`\n")
+            f.write(f"- OOS splits: `{oos_result.get('splits', 0)}`\n")
+            f.write(
+                f"- OOS best test session: `{oos_result.get('best_test_session_id', 'n/a')}`\n"
+            )
+            if tuning_result:
+                f.write(f"- Threshold candidates: `{tuning_result.get('candidate_rows', 0)}`\n")
+                f.write(f"- Suggested threshold: `{tuning_result.get('best_threshold')}`\n")
+            if stress_result:
+                f.write(f"- Stress robustness score: `{stress_result.get('robustness_score', float('nan')):.3f}`\n")
+                f.write(
+                    f"- Stress P(loss<=limit): "
+                    f"`{stress_result.get('prob_total_pnl_le_loss_limit', float('nan')):.2%}`\n"
+                )
+                f.write(
+                    f"- Stress P(drawdown breach): "
+                    f"`{stress_result.get('prob_drawdown_breach', float('nan')):.2%}`\n"
+                )
+                sample_note = str(stress_result.get('sample_size_note') or "").strip()
+                if sample_note:
+                    f.write(f"- Stress sample note: `{sample_note}`\n")
+            f.write(
+                f"- Forward live trades (last {promotion_live_lookback_days}d): "
+                f"`{live_trade_count}`\n"
+            )
+            f.write(
+                f"- Forward max drawdown: "
+                f"`${float(forward_summary.get('max_drawdown', 0.0)):.2f}`\n"
+            )
+            f.write(
+                f"- Forward mean execution drag: "
+                f"`{float(forward_summary.get('mean_execution_drag_bps', float('nan'))):.2f} bps`\n"
+            )
+            f.write("\n")
+
+            f.write("## Promotion Gate\n\n")
+            f.write(f"- Required minimum OOS grade: `{required_oos_grade}`\n")
+            f.write(f"- Grade gate pass: `{grade_gate_pass}`\n")
+            f.write(
+                f"- Required minimum live trades ({promotion_live_lookback_days}d): "
+                f"`{promotion_min_live_trades}`\n"
+            )
+            f.write(f"- Live trade gate pass: `{live_trade_gate_pass}`\n")
+            f.write(f"- Promotion gate pass (grade OR live trades): `{promotion_gate_pass}`\n\n")
+
+            if advisories:
+                f.write("## Advisories\n\n")
+                for note in advisories:
+                    f.write(f"- {note}\n")
+                f.write("\n")
+
+            f.write("## Artifact Paths\n\n")
+            f.write(f"- Sweep CSV: `{sweep_result.get('csv_path', 'n/a')}`\n")
+            f.write(f"- Sweep summary: `{sweep_result.get('markdown_path', 'n/a')}`\n")
+            f.write(f"- OOS CSV: `{oos_result.get('csv_path', 'n/a')}`\n")
+            f.write(f"- OOS summary: `{oos_result.get('markdown_path', 'n/a')}`\n")
+            f.write(f"- OOS report card: `{oos_result.get('report_card_markdown_path', 'n/a')}`\n")
+            f.write(
+                f"- Threshold tuning summary: "
+                f"`{(tuning_result or {}).get('markdown_path', 'n/a')}`\n"
+            )
+            f.write(
+                f"- Stress summary: "
+                f"`{(stress_result or {}).get('markdown_path', 'n/a')}`\n"
+            )
+            f.write(
+                f"- Forward paper tracker summary: "
+                f"`{(forward_tracker_result or {}).get('markdown_path', 'n/a')}`\n"
+            )
+            f.write(f"- Readiness JSON: `{readiness_json_path}`\n")
+
+        with readiness_json_path.open("w", encoding="utf-8") as f:
+            json.dump({
+                'generated_at': datetime.now().isoformat(timespec='seconds'),
+                'readiness_pass': readiness_pass,
+                'readiness_status': readiness_status,
+                'production_ready': production_ready,
+                'promotion_gate_pass': promotion_gate_pass,
+                'oos_pass': oos_pass,
+                'threshold_recommended': threshold_recommended,
+                'stress_status': stress_status,
+                'oos_grade': oos_grade,
+                'promotion_gate': {
+                    'required_oos_grade': required_oos_grade,
+                    'grade_gate_pass': grade_gate_pass,
+                    'required_live_trades': promotion_min_live_trades,
+                    'live_trade_count': live_trade_count,
+                    'live_trade_lookback_days': promotion_live_lookback_days,
+                    'live_trade_gate_pass': live_trade_gate_pass,
+                    'promotion_gate_pass': promotion_gate_pass,
+                },
+                'inactive_sweep_params': inactive_sweep_params,
+                'advisories': advisories,
+                'sweep': sweep_result,
+                'oos': oos_result,
+                'threshold_tuning': tuning_result,
+                'stress_test': stress_result,
+                'forward_tracker': forward_tracker_result,
+                'artifact_paths': {
+                    'readiness_markdown': str(readiness_md_path),
+                    'readiness_json': str(readiness_json_path),
+                },
+            }, f, indent=2, default=str)
+
+        self.logger.info(f"✅ Readiness report saved: {readiness_md_path}")
+        self.logger.info(f"✅ Readiness JSON saved: {readiness_json_path}")
+        return {
+            'readiness_pass': readiness_pass,
+            'readiness_status': readiness_status,
+            'production_ready': production_ready,
+            'promotion_gate_pass': promotion_gate_pass,
+            'oos_pass': oos_pass,
+            'threshold_recommended': threshold_recommended,
+            'stress_status': stress_status,
+            'oos_grade': oos_grade,
+            'inactive_sweep_params': inactive_sweep_params,
+            'advisories': advisories,
+            'markdown_path': str(readiness_md_path),
+            'json_path': str(readiness_json_path),
+            'sweep_result': sweep_result,
+            'oos_result': oos_result,
+            'tuning_result': tuning_result,
+            'stress_result': stress_result,
+            'forward_tracker_result': forward_tracker_result,
+            'best_test_session_id': oos_result.get('best_test_session_id'),
         }
 
 def parse_arguments():
@@ -1394,6 +2768,31 @@ def parse_arguments():
         '--db-path',
         type=str,
         help='Custom database path'
+    )
+
+    parser.add_argument(
+        '--marketdata-token',
+        type=str,
+        help='Optional MarketData.app token override (otherwise uses MARKETDATA_TOKEN env var)'
+    )
+
+    parser.add_argument(
+        '--disable-marketdata',
+        action='store_true',
+        help='Disable MarketData.app usage even if token is configured'
+    )
+
+    parser.add_argument(
+        '--capture-historical-mda-snapshots',
+        action='store_true',
+        help='Backfill historical earnings option-IV snapshots from MarketData.app for ML labels'
+    )
+
+    parser.add_argument(
+        '--mda-lookback-years',
+        type=int,
+        default=2,
+        help='Years of earnings history to pull for MDApp historical snapshots (default: 2)'
     )
 
     parser.add_argument(
@@ -1545,6 +2944,12 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--readiness-report',
+        action='store_true',
+        help='Run sweep + OOS + threshold tuning and export a consolidated readiness report'
+    )
+
+    parser.add_argument(
         '--sweep-profiles',
         type=str,
         default='institutional,institutional_tight',
@@ -1601,17 +3006,24 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--sweep-min-trades',
+        type=int,
+        default=12,
+        help='Minimum trades required for a config to be eligible as sweep winner (default: 12)'
+    )
+
+    parser.add_argument(
         '--snapshot-lookback-days',
         type=int,
-        default=14,
-        help='Days back from today to capture earnings snapshots (default: 14)'
+        default=30,
+        help='Days back from today to capture earnings snapshots (default: 30)'
     )
 
     parser.add_argument(
         '--snapshot-lookahead-days',
         type=int,
-        default=45,
-        help='Days ahead from today to capture earnings snapshots (default: 45)'
+        default=90,
+        help='Days ahead from today to capture earnings snapshots (default: 90)'
     )
 
     parser.add_argument(
@@ -1682,6 +3094,13 @@ def parse_arguments():
         type=str,
         default='exports/reports',
         help='Directory for OOS CSV/summary outputs'
+    )
+
+    parser.add_argument(
+        '--readiness-output-dir',
+        type=str,
+        default='exports/reports',
+        help='Directory for consolidated readiness markdown/json outputs'
     )
 
     parser.add_argument(
@@ -1804,6 +3223,73 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--stress-test',
+        action='store_true',
+        help='Run bootstrap Monte Carlo stress test for trade-level tail risk'
+    )
+
+    parser.add_argument(
+        '--stress-session-id',
+        type=str,
+        help='Optional session ID for stress test (default: latest/best available)'
+    )
+
+    parser.add_argument(
+        '--stress-simulations',
+        type=int,
+        default=5000,
+        help='Number of Monte Carlo bootstrap simulations for stress test (default: 5000)'
+    )
+
+    parser.add_argument(
+        '--stress-confidence-level',
+        type=float,
+        default=0.95,
+        help='Confidence level for VaR/CVaR in stress test [0.5-0.99] (default: 0.95)'
+    )
+
+    parser.add_argument(
+        '--stress-drawdown-limit',
+        type=float,
+        default=-600.0,
+        help='Drawdown breach threshold in dollars for stress test (default: -600)'
+    )
+
+    parser.add_argument(
+        '--stress-loss-limit',
+        type=float,
+        default=0.0,
+        help='Loss threshold in dollars for stress probability metric (default: 0)'
+    )
+
+    parser.add_argument(
+        '--stress-seed',
+        type=int,
+        default=42,
+        help='Random seed for stress simulation reproducibility (default: 42)'
+    )
+
+    parser.add_argument(
+        '--stress-min-trades',
+        type=int,
+        default=20,
+        help='Minimum trade count considered statistically reliable for stress verdicts (default: 20)'
+    )
+
+    parser.add_argument(
+        '--stress-output-dir',
+        type=str,
+        default='exports/reports',
+        help='Directory for stress-test CSV/summary outputs'
+    )
+
+    parser.add_argument(
+        '--disable-readiness-stress-test',
+        action='store_true',
+        help='Disable automatic stress-test step inside --readiness-report'
+    )
+
+    parser.add_argument(
         '--backtest-start-date',
         type=str,
         help='Optional backtest start date (YYYY-MM-DD)'
@@ -1838,7 +3324,11 @@ async def main():
     logger.info("=" * 60)
 
     # Initialize collector
-    collector = InstitutionalDataCollector(args.db_path)
+    collector = InstitutionalDataCollector(
+        db_path=args.db_path,
+        marketdata_token=args.marketdata_token,
+        enable_marketdata=not args.disable_marketdata,
+    )
 
     try:
         if args.backtest_only:
@@ -1864,6 +3354,12 @@ async def main():
                     allow_proxy_earnings=allow_proxy_earnings,
                 )
 
+            if args.capture_historical_mda_snapshots:
+                collector.capture_historical_iv_snapshots_mda(
+                    symbols=aux_symbols,
+                    lookback_years=args.mda_lookback_years,
+                )
+
             if args.calibrate_iv_decay:
                 collector.calibrate_iv_decay_labels(
                     min_pre_days=args.label_min_pre_days,
@@ -1872,7 +3368,12 @@ async def main():
                     max_post_days=args.label_max_post_days,
                 )
 
-            if args.capture_snapshots or args.calibrate_iv_decay or args.snapshot_status:
+            if (
+                args.capture_snapshots
+                or args.capture_historical_mda_snapshots
+                or args.calibrate_iv_decay
+                or args.snapshot_status
+            ):
                 collector.report_snapshot_pairing_status(
                     min_pre_days=args.label_min_pre_days,
                     max_pre_days=args.label_max_pre_days,
@@ -1882,18 +3383,87 @@ async def main():
 
             scorecard_requested = bool(args.crush_scorecard)
             analysis_requested = bool(
-                args.parameter_sweep
+                args.readiness_report
+                or args.parameter_sweep
                 or args.oos_validation
+                or args.stress_test
                 or scorecard_requested
                 or args.regime_diagnostics
                 or args.threshold_tuning
             )
             snapshot_only_mode = bool(
-                (args.capture_snapshots or args.calibrate_iv_decay or args.snapshot_status)
+                (
+                    args.capture_snapshots
+                    or args.capture_historical_mda_snapshots
+                    or args.calibrate_iv_decay
+                    or args.snapshot_status
+                )
                 and not analysis_requested
                 and not args.run_sample_backtest
             )
-            if args.oos_validation:
+            if args.readiness_report:
+                readiness_result = collector.run_readiness_report(
+                    execution_profiles=_parse_csv_strings(args.sweep_profiles),
+                    hold_days_grid=_parse_csv_ints(args.sweep_hold_days),
+                    signal_threshold_grid=_parse_csv_floats(args.sweep_min_signal_scores),
+                    trades_per_day_grid=_parse_csv_ints(args.sweep_max_trades_per_day),
+                    entry_days_grid=_parse_csv_ints(args.sweep_entry_days_before),
+                    exit_days_grid=_parse_csv_ints(args.sweep_exit_days_after),
+                    target_entry_dte=args.target_entry_dte,
+                    entry_dte_band=args.entry_dte_band,
+                    min_daily_share_volume=args.min_daily_share_volume,
+                    max_abs_momentum_5d=args.max_abs_momentum_5d,
+                    train_days=args.oos_train_days,
+                    test_days=args.oos_test_days,
+                    step_days=args.oos_step_days,
+                    top_n_train=args.oos_top_n_train,
+                    position_contracts=args.position_contracts,
+                    lookback_days=args.lookback_days,
+                    max_backtest_symbols=args.max_backtest_symbols,
+                    use_crush_confidence_gate=use_crush_confidence_gate,
+                    allow_global_crush_profile=allow_global_crush_profile,
+                    min_crush_confidence=args.min_crush_confidence,
+                    min_crush_magnitude=args.min_crush_magnitude,
+                    min_crush_edge=args.min_crush_edge,
+                    require_true_earnings=args.require_true_earnings,
+                    allow_proxy_earnings=allow_proxy_earnings,
+                    min_splits=args.oos_min_splits,
+                    min_total_test_trades=args.oos_min_total_test_trades,
+                    min_trades_per_split=args.oos_min_trades_per_split,
+                    sweep_output_dir=args.sweep_output_dir,
+                    oos_output_dir=args.oos_output_dir,
+                    tuning_output_dir=args.tuning_output_dir,
+                    readiness_output_dir=args.readiness_output_dir,
+                    sweep_top_n=args.sweep_top_n,
+                    sweep_min_trades=args.sweep_min_trades,
+                    tuning_session_id=args.tuning_session_id,
+                    tuning_min_confidence=args.tuning_min_confidence,
+                    tuning_min_trades=args.tuning_min_trades,
+                    tuning_use_composite_signal=not args.tuning_raw_setup_score,
+                    run_stress_test=not args.disable_readiness_stress_test,
+                    stress_session_id=args.stress_session_id,
+                    stress_simulations=args.stress_simulations,
+                    stress_confidence_level=args.stress_confidence_level,
+                    stress_drawdown_limit=args.stress_drawdown_limit,
+                    stress_loss_limit=args.stress_loss_limit,
+                    stress_seed=args.stress_seed,
+                    stress_min_trades=args.stress_min_trades,
+                    stress_output_dir=args.stress_output_dir,
+                    start_date=args.backtest_start_date,
+                    end_date=args.backtest_end_date,
+                )
+                if readiness_result:
+                    logger.info(
+                        "✅ Readiness workflow completed: "
+                        f"pass={readiness_result.get('readiness_pass', False)}, "
+                        f"oos_grade={readiness_result.get('oos_grade', 'n/a')}"
+                    )
+                    latest_session_id = str(
+                        readiness_result.get('best_test_session_id') or latest_session_id or ""
+                    )
+                else:
+                    logger.warning("⚠️ Readiness workflow did not produce results")
+            elif args.oos_validation:
                 oos_result = collector.run_oos_validation(
                     execution_profiles=_parse_csv_strings(args.sweep_profiles),
                     hold_days_grid=_parse_csv_ints(args.sweep_hold_days),
@@ -1960,6 +3530,7 @@ async def main():
                     allow_proxy_earnings=allow_proxy_earnings,
                     output_dir=args.sweep_output_dir,
                     top_n=args.sweep_top_n,
+                    min_trades_for_ranking=args.sweep_min_trades,
                     start_date=args.backtest_start_date,
                     end_date=args.backtest_end_date,
                 )
@@ -2023,7 +3594,7 @@ async def main():
                 else:
                     logger.warning("⚠️ Regime diagnostics did not produce results")
 
-            if args.threshold_tuning:
+            if args.threshold_tuning and not args.readiness_report:
                 tuning_result = collector.run_threshold_tuning(
                     session_id=args.tuning_session_id or latest_session_id,
                     min_confidence=args.tuning_min_confidence,
@@ -2052,6 +3623,26 @@ async def main():
                         )
                 else:
                     logger.warning("⚠️ Threshold tuning did not produce results")
+
+            if args.stress_test and not args.readiness_report:
+                stress_result = collector.run_trade_stress_test(
+                    session_id=args.stress_session_id or latest_session_id,
+                    simulations=args.stress_simulations,
+                    confidence_level=args.stress_confidence_level,
+                    drawdown_limit=args.stress_drawdown_limit,
+                    loss_limit=args.stress_loss_limit,
+                    seed=args.stress_seed,
+                    min_reliable_trades=args.stress_min_trades,
+                    output_dir=args.stress_output_dir,
+                )
+                if stress_result:
+                    logger.info(
+                        "✅ Stress test completed: "
+                        f"status={stress_result.get('status')}, "
+                        f"robustness={stress_result.get('robustness_score', float('nan')):.3f}"
+                    )
+                else:
+                    logger.warning("⚠️ Stress test did not produce results")
             return
 
         # Determine symbol list
@@ -2073,7 +3664,9 @@ async def main():
         success = await collector.run_full_backfill(
             symbols=symbols,
             years=args.years,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            capture_historical_mda_snapshots=args.capture_historical_mda_snapshots,
+            mda_lookback_years=args.mda_lookback_years,
         )
 
         if success:
@@ -2098,7 +3691,70 @@ async def main():
                     max_post_days=args.label_max_post_days,
                 )
 
-            if args.oos_validation:
+            if args.readiness_report:
+                logger.info("🧪 Running post-backfill consolidated readiness workflow...")
+                readiness_result = collector.run_readiness_report(
+                    execution_profiles=_parse_csv_strings(args.sweep_profiles),
+                    hold_days_grid=_parse_csv_ints(args.sweep_hold_days),
+                    signal_threshold_grid=_parse_csv_floats(args.sweep_min_signal_scores),
+                    trades_per_day_grid=_parse_csv_ints(args.sweep_max_trades_per_day),
+                    entry_days_grid=_parse_csv_ints(args.sweep_entry_days_before),
+                    exit_days_grid=_parse_csv_ints(args.sweep_exit_days_after),
+                    target_entry_dte=args.target_entry_dte,
+                    entry_dte_band=args.entry_dte_band,
+                    min_daily_share_volume=args.min_daily_share_volume,
+                    max_abs_momentum_5d=args.max_abs_momentum_5d,
+                    train_days=args.oos_train_days,
+                    test_days=args.oos_test_days,
+                    step_days=args.oos_step_days,
+                    top_n_train=args.oos_top_n_train,
+                    position_contracts=args.position_contracts,
+                    lookback_days=args.lookback_days,
+                    max_backtest_symbols=args.max_backtest_symbols,
+                    use_crush_confidence_gate=use_crush_confidence_gate,
+                    allow_global_crush_profile=allow_global_crush_profile,
+                    min_crush_confidence=args.min_crush_confidence,
+                    min_crush_magnitude=args.min_crush_magnitude,
+                    min_crush_edge=args.min_crush_edge,
+                    require_true_earnings=args.require_true_earnings,
+                    allow_proxy_earnings=allow_proxy_earnings,
+                    min_splits=args.oos_min_splits,
+                    min_total_test_trades=args.oos_min_total_test_trades,
+                    min_trades_per_split=args.oos_min_trades_per_split,
+                    sweep_output_dir=args.sweep_output_dir,
+                    oos_output_dir=args.oos_output_dir,
+                    tuning_output_dir=args.tuning_output_dir,
+                    readiness_output_dir=args.readiness_output_dir,
+                    sweep_top_n=args.sweep_top_n,
+                    sweep_min_trades=args.sweep_min_trades,
+                    tuning_session_id=args.tuning_session_id,
+                    tuning_min_confidence=args.tuning_min_confidence,
+                    tuning_min_trades=args.tuning_min_trades,
+                    tuning_use_composite_signal=not args.tuning_raw_setup_score,
+                    run_stress_test=not args.disable_readiness_stress_test,
+                    stress_session_id=args.stress_session_id,
+                    stress_simulations=args.stress_simulations,
+                    stress_confidence_level=args.stress_confidence_level,
+                    stress_drawdown_limit=args.stress_drawdown_limit,
+                    stress_loss_limit=args.stress_loss_limit,
+                    stress_seed=args.stress_seed,
+                    stress_min_trades=args.stress_min_trades,
+                    stress_output_dir=args.stress_output_dir,
+                    start_date=args.backtest_start_date,
+                    end_date=args.backtest_end_date,
+                )
+                if readiness_result:
+                    logger.info(
+                        "✅ Readiness workflow finished "
+                        f"(pass={readiness_result.get('readiness_pass', False)}, "
+                        f"oos_grade={readiness_result.get('oos_grade', 'n/a')})"
+                    )
+                    latest_session_id = str(
+                        readiness_result.get('best_test_session_id') or latest_session_id or ""
+                    )
+                else:
+                    logger.warning("⚠️ Readiness workflow did not produce results")
+            elif args.oos_validation:
                 logger.info("🧪 Running post-backfill OOS validation...")
                 oos_result = collector.run_oos_validation(
                     execution_profiles=_parse_csv_strings(args.sweep_profiles),
@@ -2167,6 +3823,7 @@ async def main():
                     allow_proxy_earnings=allow_proxy_earnings,
                     output_dir=args.sweep_output_dir,
                     top_n=args.sweep_top_n,
+                    min_trades_for_ranking=args.sweep_min_trades,
                     start_date=args.backtest_start_date,
                     end_date=args.backtest_end_date,
                 )
@@ -2247,7 +3904,7 @@ async def main():
                 else:
                     logger.warning("⚠️ Regime diagnostics did not produce results")
 
-            if args.threshold_tuning:
+            if args.threshold_tuning and not args.readiness_report:
                 logger.info("🧪 Running decile threshold tuning...")
                 tuning_result = collector.run_threshold_tuning(
                     session_id=args.tuning_session_id or latest_session_id,
@@ -2260,6 +3917,27 @@ async def main():
                     logger.info("✅ Threshold tuning finished and reports were generated")
                 else:
                     logger.warning("⚠️ Threshold tuning did not produce results")
+
+            if args.stress_test and not args.readiness_report:
+                logger.info("🧪 Running trade-level stress test...")
+                stress_result = collector.run_trade_stress_test(
+                    session_id=args.stress_session_id or latest_session_id,
+                    simulations=args.stress_simulations,
+                    confidence_level=args.stress_confidence_level,
+                    drawdown_limit=args.stress_drawdown_limit,
+                    loss_limit=args.stress_loss_limit,
+                    seed=args.stress_seed,
+                    min_reliable_trades=args.stress_min_trades,
+                    output_dir=args.stress_output_dir,
+                )
+                if stress_result:
+                    logger.info(
+                        "✅ Stress test finished: "
+                        f"status={stress_result.get('status')}, "
+                        f"robustness={stress_result.get('robustness_score', float('nan')):.3f}"
+                    )
+                else:
+                    logger.warning("⚠️ Stress test did not produce results")
 
         else:
             logger.error("❌ Backfill failed - check logs for details")

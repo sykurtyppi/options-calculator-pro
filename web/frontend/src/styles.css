@@ -304,6 +304,473 @@ button:disabled {
   background: rgba(18, 41, 59, 0.45);
 }
 
+.oos-warning {
+  margin-top: 6px;
+  border: 1px solid #8a6120;
+  border-left: 3px solid #c8902a;
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  color: #f0c060;
+  background: rgba(120, 75, 0, 0.18);
+  font-size: 0.88rem;
+}
+
+/* ── Section title ───────────────────────────────────────────────────────── */
+
+.section-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text);
+}
+
+/* ── Section header row (title + data-source badge) ──────────────────────── */
+
+.section-header-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.data-source-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.header-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── Badges ──────────────────────────────────────────────────────────────── */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.badge-default {
+  background: rgba(60, 90, 110, 0.45);
+  border-color: rgba(100, 140, 165, 0.3);
+  color: #aac4d8;
+}
+
+/* BMO — teal/green to signal pre-market timing */
+.badge-bmo {
+  background: rgba(22, 100, 80, 0.45);
+  border-color: rgba(36, 178, 133, 0.5);
+  color: #52e8b2;
+}
+
+/* AMC — amber/orange to signal post-market timing */
+.badge-amc {
+  background: rgba(110, 72, 14, 0.45);
+  border-color: rgba(210, 140, 40, 0.5);
+  color: #ffc060;
+}
+
+/* Intraday — blue-violet */
+.badge-intraday {
+  background: rgba(60, 50, 120, 0.45);
+  border-color: rgba(130, 100, 220, 0.5);
+  color: #c0a8f0;
+}
+
+/* MarketData.app — cyan accent */
+.badge-mda {
+  background: rgba(15, 70, 100, 0.55);
+  border-color: rgba(40, 160, 210, 0.5);
+  color: #60c8f0;
+}
+
+/* yfinance fallback — neutral/muted */
+.badge-yf {
+  background: rgba(30, 50, 65, 0.55);
+  border-color: rgba(80, 110, 130, 0.4);
+  color: #88aabb;
+}
+
+/* ── Watchlist strip ─────────────────────────────────────────────────────── */
+
+.watchlist-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(10, 25, 38, 0.45);
+}
+.watchlist-label {
+  font-size: 0.70rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-right: 4px;
+  flex-shrink: 0;
+}
+.watchlist-chip {
+  display: inline-flex;
+  align-items: stretch;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  overflow: hidden;
+  transition: border-color 0.12s;
+}
+.watchlist-chip:hover { border-color: rgba(88, 166, 255, 0.45); }
+.watchlist-chip-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  height: auto;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 0.78rem;
+}
+.chip-symbol { font-family: var(--font-mono); font-weight: 700; letter-spacing: 0.04em; }
+.chip-conf   { font-family: var(--font-mono); color: var(--muted); font-size: 0.70rem; }
+.watchlist-chip-remove {
+  display: flex;
+  align-items: center;
+  padding: 0 7px;
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--line);
+  border-radius: 0;
+  height: auto;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.watchlist-chip-remove:hover { color: #f87171; background: rgba(239,68,68,0.08); }
+.rec-chip-consider  { border-color: rgba(36,178,110,0.40); }
+.rec-chip-watchlist { border-color: rgba(200,160,40,0.35); }
+.rec-chip-no-trade  { border-color: rgba(220,60,60,0.35); }
+.rec-chip-pass      { border-color: rgba(80,120,145,0.28); }
+
+/* ── Star button ─────────────────────────────────────────────────────────── */
+
+.star-btn {
+  padding: 3px 9px;
+  font-size: 14px;
+  line-height: 1;
+  background: rgba(88,166,255,0.07);
+  border: 1px solid rgba(88,166,255,0.22);
+  border-radius: 5px;
+  color: #8b949e;
+  cursor: pointer;
+  height: auto;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.star-btn.starred   { color: #f0a020; border-color: rgba(240,160,32,0.50); background: rgba(240,160,32,0.10); }
+.star-btn:hover     { border-color: rgba(240,160,32,0.40); color: #f0a020; }
+
+/* ── Alert banner ────────────────────────────────────────────────────────── */
+
+.alert-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 10px;
+  border: 1px solid rgba(52,211,153,0.45);
+  border-left: 3px solid var(--accent);
+  background: rgba(16,80,58,0.28);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  color: #a7f3d0;
+}
+.alert-icon { color: var(--accent); font-size: 0.9rem; flex-shrink: 0; margin-top: 1px; }
+.alert-text { font-size: 0.875rem; line-height: 1.5; }
+
+/* ── Alert config panel ──────────────────────────────────────────────────── */
+
+.alert-config-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 8px 0 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(52,211,153,0.18);
+  border-radius: var(--radius-sm);
+  background: rgba(10,32,44,0.55);
+}
+
+/* ── Calendar payoff breakeven annotation ────────────────────────────────── */
+
+.breakeven-note {
+  margin-top: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: #8b949e;
+  border-left: 2px solid rgba(240,160,32,0.4);
+  background: rgba(240,160,32,0.04);
+  border-radius: 0 4px 4px 0;
+}
+
+/* ── Kelly note ──────────────────────────────────────────────────────────── */
+
+.kelly-note {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-left: 2px solid rgba(88, 166, 255, 0.3);
+  background: rgba(88, 166, 255, 0.04);
+  border-radius: 0 4px 4px 0;
+  font-size: 11px;
+  color: #8b949e;
+  line-height: 1.5;
+}
+
+/* ── Vol regime badges ───────────────────────────────────────────────────── */
+
+.badge-regime-high {
+  background: rgba(239, 68, 68, 0.13);
+  border-color: rgba(239, 68, 68, 0.32);
+  color: #f87171;
+}
+.badge-regime-elevated {
+  background: rgba(245, 158, 11, 0.13);
+  border-color: rgba(245, 158, 11, 0.32);
+  color: #fbbf24;
+}
+.badge-regime-normal {
+  background: rgba(139, 148, 158, 0.12);
+  border-color: rgba(139, 148, 158, 0.28);
+  color: #8b949e;
+}
+.badge-regime-low {
+  background: rgba(34, 197, 94, 0.13);
+  border-color: rgba(34, 197, 94, 0.32);
+  color: #4ade80;
+}
+
+/* ── Ticker tier badges (Fix 1) ──────────────────────────────────────────── */
+.badge-tier-mega {
+  background: rgba(88, 166, 255, 0.13);
+  border-color: rgba(88, 166, 255, 0.35);
+  color: #58a6ff;
+}
+.badge-tier-large {
+  background: rgba(34, 197, 94, 0.12);
+  border-color: rgba(34, 197, 94, 0.30);
+  color: #4ade80;
+}
+.badge-tier-mid {
+  background: rgba(139, 148, 158, 0.12);
+  border-color: rgba(139, 148, 158, 0.28);
+  color: #8b949e;
+}
+.badge-tier-small {
+  background: rgba(245, 158, 11, 0.13);
+  border-color: rgba(245, 158, 11, 0.32);
+  color: #fbbf24;
+}
+.badge-tier-micro {
+  background: rgba(239, 68, 68, 0.13);
+  border-color: rgba(239, 68, 68, 0.32);
+  color: #f87171;
+}
+
+/* ── Export button ───────────────────────────────────────────────────────── */
+
+.export-btn {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: rgba(88, 166, 255, 0.10);
+  border: 1px solid rgba(88, 166, 255, 0.28);
+  border-radius: 5px;
+  color: #58a6ff;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.export-btn:hover {
+  background: rgba(88, 166, 255, 0.20);
+  border-color: rgba(88, 166, 255, 0.50);
+}
+
+/* ── Vol term structure chart ────────────────────────────────────────────── */
+
+.vol-chart-wrapper {
+  margin-top: 18px;
+  padding: 14px 4px 6px;
+  border-top: 1px solid var(--line);
+}
+.vol-chart-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #8b949e;
+  margin-bottom: 10px;
+  padding-left: 6px;
+}
+
+/* ── Recommendation strip ────────────────────────────────────────────────── */
+
+.rec-strip {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(10, 28, 42, 0.7);
+  padding: 10px 14px;
+}
+
+.rec-left,
+.rec-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Base rec-badge */
+.rec-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 5px;
+  padding: 4px 12px;
+  font-size: 0.82rem;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+}
+
+/* Recommendation variants */
+.rec-strong-edge {
+  background: rgba(22, 110, 78, 0.55);
+  border-color: rgba(36, 178, 110, 0.6);
+  color: #50e8b0;
+}
+
+.rec-moderate-edge {
+  background: rgba(18, 85, 65, 0.5);
+  border-color: rgba(36, 160, 100, 0.5);
+  color: #44d49a;
+}
+
+.rec-weak-edge {
+  background: rgba(80, 72, 14, 0.5);
+  border-color: rgba(200, 160, 40, 0.5);
+  color: #e8c050;
+}
+
+.rec-borderline {
+  background: rgba(60, 55, 14, 0.5);
+  border-color: rgba(180, 150, 40, 0.45);
+  color: #d4b040;
+}
+
+.rec-no-trade,
+.rec--- {
+  background: rgba(110, 24, 28, 0.55);
+  border-color: rgba(220, 60, 60, 0.5);
+  color: #ff9090;
+}
+
+.rec-confidence {
+  font-size: 0.83rem;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+.rec-detail {
+  font-size: 0.78rem;
+  color: #8aacbe;
+  font-family: var(--font-mono);
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid rgba(80, 120, 145, 0.2);
+  background: rgba(18, 45, 62, 0.5);
+}
+
+/* Edge quality colouring on rec-detail */
+.edge-quality-strong-edge  { color: #50e8b0; border-color: rgba(36, 178, 110, 0.35); }
+.edge-quality-moderate-edge { color: #44d49a; border-color: rgba(36, 160, 100, 0.3); }
+.edge-quality-weak-edge    { color: #e8c050; border-color: rgba(200, 160, 40, 0.3); }
+.edge-quality-borderline   { color: #d4b040; border-color: rgba(180, 150, 40, 0.3); }
+.edge-quality-no-trade     { color: #ff9090; border-color: rgba(220, 60, 60, 0.3); }
+
+/* ── Metrics group ───────────────────────────────────────────────────────── */
+
+.metrics-group {
+  margin-top: 16px;
+}
+
+.metrics-group-label {
+  font-size: 0.73rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 2px;
+}
+
+/* ── Metric sub-text ─────────────────────────────────────────────────────── */
+
+.metric-sub {
+  margin-top: 3px;
+  font-size: 0.68rem;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  line-height: 1.3;
+  opacity: 0.85;
+}
+
+/* ── OOS tags and notes ──────────────────────────────────────────────────── */
+
+.oos-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgba(60, 110, 160, 0.4);
+  border: 1px solid rgba(80, 140, 200, 0.4);
+  color: #80c0f0;
+}
+
+.oos-notes {
+  font-size: 0.82rem;
+  line-height: 1.55;
+  color: #a0b8cc;
+}
+
+/* ── Responsive ──────────────────────────────────────────────────────────── */
+
 @media (max-width: 860px) {
   .symbol-form {
     grid-template-columns: 1fr;
@@ -316,4 +783,27 @@ button:disabled {
   .status-chip {
     align-self: flex-start;
   }
+
+  .rec-strip {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .section-header-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+
+.app-footer {
+  text-align: center;
+  padding: 28px 0 12px;
+  margin-top: 32px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  border-top: 1px solid rgba(80, 120, 145, 0.12);
 }
