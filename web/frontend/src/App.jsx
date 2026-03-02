@@ -1141,7 +1141,7 @@ export default function App() {
               )}
             </div>
           </div>
-          <p className="oos-help">Walk-forward validation across OOS splits. Typically 30–120 s.</p>
+          <p className="oos-help">Strategy-level walk-forward validation across the full S&amp;P 500 backfill universe — not ticker-specific. Results are the same regardless of which ticker you searched because the test measures whether the IV crush signal works as a repeatable strategy across many symbols. Typically 30–120 s.</p>
 
           <div className="oos-controls">
             <label className="oos-field">
