@@ -9,6 +9,6 @@ yfinance==1.2.0
 pandas==3.0.1
 numpy==2.4.2
 lxml==6.0.2
-psutil==5.9.8
+psutil==7.0.0
 pytest==9.0.2
 httpx==0.28.1

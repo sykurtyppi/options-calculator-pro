@@ -995,6 +995,105 @@ class InstitutionalDataCollector:
             rank -= 0.25
         return rank
 
+    @staticmethod
+    def _evaluate_forward_quality_gate(
+        forward_summary: Dict[str, Any],
+        *,
+        require_status_ok: bool = True,
+        max_drawdown: Optional[float] = -5000.0,
+        max_execution_drag_bps: Optional[float] = 200.0,
+        min_directional_accuracy: Optional[float] = 0.55,
+        require_fill_log: bool = False,
+    ) -> Tuple[bool, Dict[str, Any], List[str]]:
+        """Evaluate optional forward-realism quality gates used for promotion."""
+        summary = dict(forward_summary or {})
+        details: Dict[str, Any] = {}
+        advisories: List[str] = []
+
+        status_text = str(summary.get('status', '')).strip().lower()
+        status_ok = (not require_status_ok) or status_text == 'ok'
+        details['status_ok'] = bool(status_ok)
+        details['status'] = status_text
+        if not status_ok:
+            advisories.append(
+                f"Forward tracker status is `{status_text or 'unknown'}` (requires `ok`)."
+            )
+
+        max_drawdown_value = float(summary.get('max_drawdown', np.nan))
+        if max_drawdown is None:
+            drawdown_ok = True
+        else:
+            drawdown_ok = bool(np.isfinite(max_drawdown_value) and max_drawdown_value >= float(max_drawdown))
+            if not drawdown_ok:
+                advisories.append(
+                    "Forward max drawdown gate failed "
+                    f"(actual=${max_drawdown_value:.2f}, required>={float(max_drawdown):.2f})."
+                )
+        details['drawdown_ok'] = bool(drawdown_ok)
+        details['max_drawdown'] = max_drawdown_value
+        details['max_drawdown_limit'] = None if max_drawdown is None else float(max_drawdown)
+
+        execution_drag_value = float(summary.get('mean_execution_drag_bps', np.nan))
+        if max_execution_drag_bps is None:
+            execution_drag_ok = True
+        else:
+            execution_drag_ok = bool(
+                np.isfinite(execution_drag_value) and execution_drag_value <= float(max_execution_drag_bps)
+            )
+            if not execution_drag_ok:
+                advisories.append(
+                    "Forward execution-drag gate failed "
+                    f"(actual={execution_drag_value:.2f} bps, required<={float(max_execution_drag_bps):.2f} bps)."
+                )
+        details['execution_drag_ok'] = bool(execution_drag_ok)
+        details['mean_execution_drag_bps'] = execution_drag_value
+        details['max_execution_drag_bps'] = (
+            None if max_execution_drag_bps is None else float(max_execution_drag_bps)
+        )
+
+        directional_accuracy_value = float(summary.get('crush_directional_accuracy', np.nan))
+        if min_directional_accuracy is None:
+            directional_accuracy_ok = True
+        else:
+            directional_accuracy_ok = bool(
+                np.isfinite(directional_accuracy_value)
+                and directional_accuracy_value >= float(min_directional_accuracy)
+            )
+            if not directional_accuracy_ok:
+                advisories.append(
+                    "Forward directional-accuracy gate failed "
+                    f"(actual={directional_accuracy_value:.2%}, required>={float(min_directional_accuracy):.2%})."
+                )
+        details['directional_accuracy_ok'] = bool(directional_accuracy_ok)
+        details['crush_directional_accuracy'] = directional_accuracy_value
+        details['min_directional_accuracy'] = (
+            None if min_directional_accuracy is None else float(min_directional_accuracy)
+        )
+
+        fill_metrics = summary.get('fill_metrics') or {}
+        fill_events = int(fill_metrics.get('fill_events', 0) or 0)
+        if require_fill_log:
+            fill_log_ok = fill_events > 0
+            if not fill_log_ok:
+                advisories.append(
+                    "Forward fill-log gate failed (no usable fill events found in fill log window)."
+                )
+        else:
+            fill_log_ok = True
+        details['fill_log_ok'] = bool(fill_log_ok)
+        details['fill_events'] = fill_events
+        details['require_fill_log'] = bool(require_fill_log)
+
+        overall_pass = bool(
+            status_ok
+            and drawdown_ok
+            and execution_drag_ok
+            and directional_accuracy_ok
+            and fill_log_ok
+        )
+        details['overall_pass'] = overall_pass
+        return overall_pass, details, advisories
+
     def run_forward_paper_tracker(self, session_id: Optional[str] = None,
                                 lookback_days: int = 120,
                                 min_confidence: float = 0.35,
@@ -1714,12 +1813,25 @@ class InstitutionalDataCollector:
                           start_date: Optional[str] = None,
                           end_date: Optional[str] = None) -> Optional[dict]:
         """Run a multi-parameter walk-forward sweep and persist ranked results."""
-        execution_profiles = [p.strip().lower() for p in execution_profiles if p.strip()]
-        hold_days_grid = [max(1, int(v)) for v in hold_days_grid]
-        signal_threshold_grid = [max(0.0, min(1.0, float(v))) for v in signal_threshold_grid]
-        trades_per_day_grid = [max(1, int(v)) for v in trades_per_day_grid]
-        entry_days_grid = [max(1, int(v)) for v in entry_days_grid]
-        exit_days_grid = [max(0, int(v)) for v in exit_days_grid]
+        def _dedupe_preserve_order(values: List[Any]) -> List[Any]:
+            unique: List[Any] = []
+            seen: set[str] = set()
+            for value in values:
+                key = repr(value)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(value)
+            return unique
+
+        execution_profiles = _dedupe_preserve_order([p.strip().lower() for p in execution_profiles if p.strip()])
+        hold_days_grid = _dedupe_preserve_order([max(1, int(v)) for v in hold_days_grid])
+        signal_threshold_grid = _dedupe_preserve_order(
+            [max(0.0, min(1.0, float(v))) for v in signal_threshold_grid]
+        )
+        trades_per_day_grid = _dedupe_preserve_order([max(1, int(v)) for v in trades_per_day_grid])
+        entry_days_grid = _dedupe_preserve_order([max(1, int(v)) for v in entry_days_grid])
+        exit_days_grid = _dedupe_preserve_order([max(0, int(v)) for v in exit_days_grid])
         position_contracts = max(1, int(position_contracts))
         lookback_days = max(120, int(lookback_days))
         max_backtest_symbols = max(1, int(max_backtest_symbols))
@@ -2313,6 +2425,11 @@ class InstitutionalDataCollector:
                            promotion_live_lookback_days: int = 120,
                            promotion_live_session_id: Optional[str] = None,
                            promotion_live_min_confidence: float = 0.35,
+                           promotion_max_forward_drawdown: Optional[float] = -5000.0,
+                           promotion_max_execution_drag_bps: Optional[float] = 200.0,
+                           promotion_min_forward_directional_accuracy: Optional[float] = 0.55,
+                           promotion_require_forward_status_ok: bool = True,
+                           promotion_require_fill_log: bool = False,
                            forward_fill_log_path: Optional[str] = None,
                            start_date: Optional[str] = None,
                            end_date: Optional[str] = None) -> Optional[dict]:
@@ -2461,6 +2578,16 @@ class InstitutionalDataCollector:
         promotion_min_live_trades = max(0, int(promotion_min_live_trades))
         promotion_live_lookback_days = max(1, int(promotion_live_lookback_days))
         promotion_live_min_confidence = float(np.clip(float(promotion_live_min_confidence), 0.0, 1.0))
+        promotion_require_forward_status_ok = bool(promotion_require_forward_status_ok)
+        promotion_require_fill_log = bool(promotion_require_fill_log)
+        if promotion_max_forward_drawdown is not None:
+            promotion_max_forward_drawdown = float(promotion_max_forward_drawdown)
+        if promotion_max_execution_drag_bps is not None:
+            promotion_max_execution_drag_bps = float(promotion_max_execution_drag_bps)
+        if promotion_min_forward_directional_accuracy is not None:
+            promotion_min_forward_directional_accuracy = float(
+                np.clip(float(promotion_min_forward_directional_accuracy), 0.0, 1.0)
+            )
         required_oos_grade = str(promotion_min_oos_grade or "A").strip().upper() or "A"
         forward_tracker_result = self.run_forward_paper_tracker(
             session_id=promotion_live_session_id or "all_sessions",
@@ -2472,6 +2599,16 @@ class InstitutionalDataCollector:
         )
         forward_summary = dict((forward_tracker_result or {}).get('summary') or {})
         live_trade_count = int(forward_summary.get('trade_count', 0) or 0)
+        forward_quality_gate_pass, forward_quality_gate_details, forward_quality_advisories = (
+            self._evaluate_forward_quality_gate(
+                forward_summary,
+                require_status_ok=promotion_require_forward_status_ok,
+                max_drawdown=promotion_max_forward_drawdown,
+                max_execution_drag_bps=promotion_max_execution_drag_bps,
+                min_directional_accuracy=promotion_min_forward_directional_accuracy,
+                require_fill_log=promotion_require_fill_log,
+            )
+        )
 
         report_card = oos_result.get('report_card', {}) if isinstance(oos_result, dict) else {}
         verdict = report_card.get('verdict', {}) if isinstance(report_card, dict) else {}
@@ -2494,11 +2631,11 @@ class InstitutionalDataCollector:
 
         grade_gate_pass = self._grade_rank(oos_grade) >= self._grade_rank(required_oos_grade)
         live_trade_gate_pass = live_trade_count >= promotion_min_live_trades
-        promotion_gate_pass = bool(grade_gate_pass or live_trade_gate_pass)
+        promotion_gate_pass = bool((grade_gate_pass or live_trade_gate_pass) and forward_quality_gate_pass)
         if readiness_status != "not_ready" and not promotion_gate_pass:
             readiness_status = "ready_with_advisories"
         readiness_pass = readiness_status != "not_ready"
-        production_ready = readiness_pass and promotion_gate_pass
+        production_ready = (readiness_status == "ready") and promotion_gate_pass
 
         advisories: List[str] = []
         if inactive_sweep_params:
@@ -2542,6 +2679,7 @@ class InstitutionalDataCollector:
                 f"in last {promotion_live_lookback_days} days "
                 f"(actual grade={oos_grade}, live_trades={live_trade_count})."
             )
+        advisories.extend(forward_quality_advisories)
         fill_note = str(forward_summary.get('fill_note') or "").strip()
         if fill_note:
             advisories.append(f"Forward fill quality note: {fill_note}")
@@ -2611,7 +2749,18 @@ class InstitutionalDataCollector:
                 f"`{promotion_min_live_trades}`\n"
             )
             f.write(f"- Live trade gate pass: `{live_trade_gate_pass}`\n")
-            f.write(f"- Promotion gate pass (grade OR live trades): `{promotion_gate_pass}`\n\n")
+            f.write(
+                f"- Forward quality gate pass: `{forward_quality_gate_pass}` "
+                f"(status_ok={forward_quality_gate_details.get('status_ok')}, "
+                f"drawdown_ok={forward_quality_gate_details.get('drawdown_ok')}, "
+                f"execution_drag_ok={forward_quality_gate_details.get('execution_drag_ok')}, "
+                f"directional_accuracy_ok={forward_quality_gate_details.get('directional_accuracy_ok')}, "
+                f"fill_log_ok={forward_quality_gate_details.get('fill_log_ok')})\n"
+            )
+            f.write(
+                f"- Promotion gate pass ((grade OR live trades) AND forward quality): "
+                f"`{promotion_gate_pass}`\n\n"
+            )
 
             if advisories:
                 f.write("## Advisories\n\n")
@@ -2657,6 +2806,8 @@ class InstitutionalDataCollector:
                     'live_trade_count': live_trade_count,
                     'live_trade_lookback_days': promotion_live_lookback_days,
                     'live_trade_gate_pass': live_trade_gate_pass,
+                    'forward_quality_gate_pass': forward_quality_gate_pass,
+                    'forward_quality_gate': forward_quality_gate_details,
                     'promotion_gate_pass': promotion_gate_pass,
                 },
                 'inactive_sweep_params': inactive_sweep_params,
@@ -2679,6 +2830,7 @@ class InstitutionalDataCollector:
             'readiness_status': readiness_status,
             'production_ready': production_ready,
             'promotion_gate_pass': promotion_gate_pass,
+            'forward_quality_gate_pass': forward_quality_gate_pass,
             'oos_pass': oos_pass,
             'threshold_recommended': threshold_recommended,
             'stress_status': stress_status,
@@ -3125,6 +3277,79 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        '--promotion-min-oos-grade',
+        type=str,
+        default='A',
+        help='Minimum OOS report-card grade required for automatic promotion gate pass (default: A)'
+    )
+
+    parser.add_argument(
+        '--promotion-min-live-trades',
+        type=int,
+        default=50,
+        help='Minimum forward live trades needed for promotion gate pass if grade gate fails (default: 50)'
+    )
+
+    parser.add_argument(
+        '--promotion-live-lookback-days',
+        type=int,
+        default=120,
+        help='Lookback window (days) for forward live-trade gate in readiness report (default: 120)'
+    )
+
+    parser.add_argument(
+        '--promotion-live-session-id',
+        type=str,
+        help='Optional session scope for forward live-trade gate (default: all_sessions)'
+    )
+
+    parser.add_argument(
+        '--promotion-live-min-confidence',
+        type=float,
+        default=0.35,
+        help='Minimum confidence filter for forward live-trade gate [0-1] (default: 0.35)'
+    )
+
+    parser.add_argument(
+        '--promotion-max-forward-drawdown',
+        type=float,
+        default=-5000.0,
+        help='Maximum allowed forward max drawdown in dollars for promotion gate (default: -5000)'
+    )
+
+    parser.add_argument(
+        '--promotion-max-forward-execution-drag-bps',
+        type=float,
+        default=200.0,
+        help='Maximum allowed mean forward execution drag (bps) for promotion gate (default: 200)'
+    )
+
+    parser.add_argument(
+        '--promotion-min-forward-directional-accuracy',
+        type=float,
+        default=0.55,
+        help='Minimum forward crush directional accuracy [0-1] for promotion gate (default: 0.55)'
+    )
+
+    parser.add_argument(
+        '--disable-promotion-forward-status-gate',
+        action='store_true',
+        help='Disable requirement that forward tracker status must be `ok` in promotion gate'
+    )
+
+    parser.add_argument(
+        '--promotion-require-fill-log',
+        action='store_true',
+        help='Require at least one fill-log event in forward window for promotion gate pass'
+    )
+
+    parser.add_argument(
+        '--forward-fill-log-path',
+        type=str,
+        help='Optional CSV path with live fill/slippage/latency columns for forward realism diagnostics'
+    )
+
+    parser.add_argument(
         '--crush-scorecard',
         action='store_true',
         help='Generate rolling predicted-vs-realized IV-crush scorecard report'
@@ -3449,6 +3674,17 @@ async def main():
                     stress_seed=args.stress_seed,
                     stress_min_trades=args.stress_min_trades,
                     stress_output_dir=args.stress_output_dir,
+                    promotion_min_oos_grade=args.promotion_min_oos_grade,
+                    promotion_min_live_trades=args.promotion_min_live_trades,
+                    promotion_live_lookback_days=args.promotion_live_lookback_days,
+                    promotion_live_session_id=args.promotion_live_session_id,
+                    promotion_live_min_confidence=args.promotion_live_min_confidence,
+                    promotion_max_forward_drawdown=args.promotion_max_forward_drawdown,
+                    promotion_max_execution_drag_bps=args.promotion_max_forward_execution_drag_bps,
+                    promotion_min_forward_directional_accuracy=args.promotion_min_forward_directional_accuracy,
+                    promotion_require_forward_status_ok=not args.disable_promotion_forward_status_gate,
+                    promotion_require_fill_log=args.promotion_require_fill_log,
+                    forward_fill_log_path=args.forward_fill_log_path,
                     start_date=args.backtest_start_date,
                     end_date=args.backtest_end_date,
                 )
@@ -3740,6 +3976,17 @@ async def main():
                     stress_seed=args.stress_seed,
                     stress_min_trades=args.stress_min_trades,
                     stress_output_dir=args.stress_output_dir,
+                    promotion_min_oos_grade=args.promotion_min_oos_grade,
+                    promotion_min_live_trades=args.promotion_min_live_trades,
+                    promotion_live_lookback_days=args.promotion_live_lookback_days,
+                    promotion_live_session_id=args.promotion_live_session_id,
+                    promotion_live_min_confidence=args.promotion_live_min_confidence,
+                    promotion_max_forward_drawdown=args.promotion_max_forward_drawdown,
+                    promotion_max_execution_drag_bps=args.promotion_max_forward_execution_drag_bps,
+                    promotion_min_forward_directional_accuracy=args.promotion_min_forward_directional_accuracy,
+                    promotion_require_forward_status_ok=not args.disable_promotion_forward_status_gate,
+                    promotion_require_fill_log=args.promotion_require_fill_log,
+                    forward_fill_log_path=args.forward_fill_log_path,
                     start_date=args.backtest_start_date,
                     end_date=args.backtest_end_date,
                 )

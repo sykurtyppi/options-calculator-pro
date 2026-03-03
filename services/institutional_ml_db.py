@@ -917,8 +917,11 @@ class InstitutionalMLDatabase:
             Session ID for tracking results
         """
         strategy_params = dict(strategy_params or {})
+        quiet_backtest = bool(strategy_params.get('suppress_backtest_logs', False))
+        info_log = self.logger.debug if quiet_backtest else self.logger.info
+        warn_log = self.logger.debug if quiet_backtest else self.logger.warning
         session_id = f"backtest_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-        self.logger.info(f"🎯 Starting calendar spread backtest: {session_id}")
+        info_log(f"🎯 Starting calendar spread backtest: {session_id}")
 
         try:
             now = datetime.now()
@@ -970,7 +973,7 @@ class InstitutionalMLDatabase:
             trades = self._run_walk_forward_backtest(session, strategy_params)
             total_trades = len(trades)
             if total_trades == 0:
-                self.logger.warning("⚠️ No valid trades generated for current backtest window")
+                warn_log("⚠️ No valid trades generated for current backtest window")
                 self._update_backtest_results(session)
                 return session_id
 
@@ -1000,7 +1003,7 @@ class InstitutionalMLDatabase:
             self._update_backtest_results(session)
             self._store_backtest_trades(session_id, trades)
 
-            self.logger.info(f"✅ Backtest completed: {total_trades} trades, {win_rate:.1%} win rate, {pnl:.2f} PnL")
+            info_log(f"✅ Backtest completed: {total_trades} trades, {win_rate:.1%} win rate, {pnl:.2f} PnL")
             return session_id
 
         except Exception as e:
@@ -1150,7 +1153,8 @@ class InstitutionalMLDatabase:
                 if trade is not None:
                     trades.append(trade)
 
-        self.logger.info(
+        walk_forward_log = self.logger.debug if bool(strategy_params.get('suppress_backtest_logs', False)) else self.logger.info
+        walk_forward_log(
             f"📈 Walk-forward generated {len(trades)} trades over {dataset['date'].nunique()} trading days"
         )
         return trades
@@ -4089,9 +4093,18 @@ class InstitutionalMLDatabase:
             normalized_grid: Dict[str, List[Any]] = {}
             for key, values in parameter_grid.items():
                 if isinstance(values, (list, tuple)):
-                    normalized_grid[key] = list(values)
+                    raw_values = list(values)
                 else:
-                    normalized_grid[key] = [values]
+                    raw_values = [values]
+                deduped: List[Any] = []
+                seen: set[str] = set()
+                for value in raw_values:
+                    marker = repr(value)
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    deduped.append(value)
+                normalized_grid[key] = deduped
             if not normalized_grid:
                 return pd.DataFrame()
 
@@ -4104,6 +4117,7 @@ class InstitutionalMLDatabase:
                 sweep_params = dict(base_params or {})
                 combo_mapping = dict(zip(grid_keys, combo_values))
                 sweep_params.update(combo_mapping)
+                sweep_params['suppress_backtest_logs'] = True
 
                 session_id = self.run_calendar_spread_backtest(sweep_params)
                 session_df = self.get_backtest_results(session_id)

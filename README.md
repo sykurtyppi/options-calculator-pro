@@ -25,6 +25,31 @@ pip install -r web/api/requirements-web.txt -c web/api/constraints-web.txt
 python -m uvicorn web.api.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
+## MarketData.app Setup (Recommended)
+Create `.env` from `.env.example` and set:
+
+```bash
+MARKETDATA_TOKEN=your_real_token
+```
+
+Token resolution order:
+1. `--marketdata-token` CLI flag
+2. `MARKETDATA_TOKEN` environment variable
+
+If no token is configured, the stack automatically falls back to yfinance.
+
+## Optional Share-Code Auth
+Auth is disabled by default. To enable login protection for shared deployments, set:
+
+```bash
+ENABLE_SHARE_AUTH=true
+SHARE_PASSWORD=your_access_code
+SESSION_SECRET=long_random_secret
+```
+
+When enabled, unauthenticated API requests return `401` and browser routes redirect to `/login`.
+`/api/health` remains public for health checks.
+
 ## Run Frontend
 ```bash
 cd /path/to/options_calculator_pro/web/frontend
@@ -35,11 +60,37 @@ npm run dev
 Frontend default URL: `http://127.0.0.1:5173`  
 Backend health check: `http://127.0.0.1:8000/api/health`
 
+## Run Tests (Parity Setup)
+Use both root and web dependency sets so API/runtime tests match the deployed stack:
+
+```bash
+cd /path/to/options_calculator_pro
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r web/api/requirements-web.txt -c web/api/constraints-web.txt
+pytest -q
+```
+
 ## Notes
 - OOS artifacts are written to `exports/reports` at runtime.
 - Free data feeds can cause sparse earnings/timing coverage; hard no-trade gating is enforced in the API.
 - OOS defaults are evidence-first (`lookback=1095`, `max_backtest_symbols=50`, `train/test/step=189/42/42`).
 - If OOS sample gates fail, the API can run one adaptive retry to improve split/trade coverage.
-- API auth is not implemented yet; run this service on localhost/private networks only.
+- Share-code auth is optional and disabled by default; enable it for shared deployments.
 - Allowed browser origins default to `http://localhost:5173` and `http://127.0.0.1:5173`.
   Override with `OPTIONS_CALCULATOR_ALLOWED_ORIGINS` as a comma-separated list.
+- Historical IV-crush label backfill from MarketData.app is available via:
+  - `python scripts/institutional_backfill.py --full-universe --capture-historical-mda-snapshots --mda-lookback-years 2`
+  - Optional token override: `--marketdata-token <TOKEN>`
+- Readiness report promotion gates can be tuned from CLI:
+  - `--promotion-min-oos-grade`
+  - `--promotion-min-live-trades`
+  - `--promotion-live-lookback-days`
+  - `--promotion-live-session-id`
+  - `--promotion-live-min-confidence`
+  - `--promotion-max-forward-drawdown`
+  - `--promotion-max-forward-execution-drag-bps`
+  - `--promotion-min-forward-directional-accuracy`
+  - `--disable-promotion-forward-status-gate`
+  - `--promotion-require-fill-log`
+  - `--forward-fill-log-path` (for real fill/slippage diagnostics)
