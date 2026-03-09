@@ -1046,7 +1046,15 @@ class InstitutionalMLDatabase:
         if dataset.empty:
             self.logger.warning("⚠️ No feature data available for walk-forward simulation")
             return []
-        crush_profiles = self._load_iv_crush_profiles(session.universe)
+        # Use an as-of cutoff to avoid leaking future earnings-label information
+        # into walk-forward profile estimates.
+        crush_profile_as_of = strategy_params.get('crush_profile_as_of')
+        if not crush_profile_as_of:
+            crush_profile_as_of = session.start_date.strftime('%Y-%m-%d')
+        crush_profiles = self._load_iv_crush_profiles(
+            session.universe,
+            as_of_date=crush_profile_as_of,
+        )
 
         trades: List[BacktestTrade] = []
         daily_candidates: Dict[pd.Timestamp, List[Dict[str, Any]]] = {}
@@ -2880,13 +2888,16 @@ class InstitutionalMLDatabase:
             profile = symbol_profile
             profile_source = 'symbol'
 
-        expected_crush_pct = float(profile.get('expected_front_iv_crush_pct', profile.get('median_front_iv_crush_pct', -0.18)))
-        sample_size = float(profile.get('sample_size', 0.0))
-        confidence = profile.get('confidence', None)
-        if confidence is None or not np.isfinite(float(confidence)):
+        expected_crush_pct = self._safe_numeric(
+            profile.get('expected_front_iv_crush_pct', profile.get('median_front_iv_crush_pct', -0.18)),
+            -0.18,
+        )
+        sample_size = max(0.0, self._safe_numeric(profile.get('sample_size', 0.0), 0.0))
+        confidence = self._safe_numeric(profile.get('confidence', np.nan), np.nan)
+        if not np.isfinite(confidence):
             confidence = float(np.clip(sample_size / 8.0, 0.0, 1.0))
         else:
-            confidence = float(np.clip(float(confidence), 0.0, 1.0))
+            confidence = float(np.clip(confidence, 0.0, 1.0))
         crush_magnitude = float(max(0.0, -expected_crush_pct))
         crush_signal = float(np.clip((iv_rv_ratio - 0.95) / 0.60, 0.0, 1.0))
         edge_score = float(crush_magnitude * confidence * crush_signal)
@@ -2941,10 +2952,13 @@ class InstitutionalMLDatabase:
                 iv_rv_ratio=iv_rv_ratio,
                 crush_profiles=crush_profiles,
             )
-        predicted_front_iv_crush_pct = float(crush_context.get('expected_front_iv_crush_pct', -0.18))
-        crush_confidence = float(np.clip(float(crush_context.get('confidence', 0.0)), 0.0, 1.0))
-        crush_edge_score = float(max(0.0, float(crush_context.get('edge_score', 0.0))))
-        crush_profile_sample_size = float(max(0.0, float(crush_context.get('sample_size', 0.0))))
+        predicted_front_iv_crush_pct = self._safe_numeric(
+            crush_context.get('expected_front_iv_crush_pct', -0.18),
+            -0.18,
+        )
+        crush_confidence = float(np.clip(self._safe_numeric(crush_context.get('confidence', 0.0), 0.0), 0.0, 1.0))
+        crush_edge_score = float(max(0.0, self._safe_numeric(crush_context.get('edge_score', 0.0), 0.0)))
+        crush_profile_sample_size = float(max(0.0, self._safe_numeric(crush_context.get('sample_size', 0.0), 0.0)))
         crush_adjustment = 0.12 * np.clip(crush_edge_score / 0.10, 0.0, 1.5)
 
         gross_return_pct = float(np.clip(
@@ -3172,7 +3186,8 @@ class InstitutionalMLDatabase:
             self.logger.error(f"❌ Failed to get backtest trades: {e}")
             return pd.DataFrame()
 
-    def _load_iv_crush_profiles(self, universe: List[str]) -> Dict[str, Dict[str, float]]:
+    def _load_iv_crush_profiles(self, universe: List[str],
+                              as_of_date: Optional[Any] = None) -> Dict[str, Dict[str, float]]:
         """Load expected IV-crush profile with shrinkage and confidence calibration."""
         default_profile = {
             'expected_front_iv_crush_pct': -0.18,
@@ -3184,8 +3199,30 @@ class InstitutionalMLDatabase:
             'profile_source': 'prior',
         }
 
+        as_of_cutoff: Optional[str] = None
+        if as_of_date is not None:
+            if isinstance(as_of_date, str):
+                parsed = pd.to_datetime(as_of_date, errors='coerce')
+            elif isinstance(as_of_date, (datetime, date)):
+                parsed = pd.Timestamp(as_of_date)
+            else:
+                parsed = pd.to_datetime(as_of_date, errors='coerce')
+            if pd.notna(parsed):
+                as_of_cutoff = pd.Timestamp(parsed).strftime('%Y-%m-%d')
+
         placeholders = ",".join(["?"] * len(universe)) if universe else "?"
-        symbol_filter = f"WHERE symbol IN ({placeholders})" if universe else "WHERE 1=0"
+        symbol_clauses: List[str] = []
+        symbol_params: List[Any] = []
+        if universe:
+            symbol_clauses.append(f"symbol IN ({placeholders})")
+            symbol_params.extend(universe)
+        else:
+            symbol_clauses.append("1=0")
+        if as_of_cutoff:
+            symbol_clauses.append("event_date < ?")
+            symbol_params.append(as_of_cutoff)
+        symbol_filter = "WHERE " + " AND ".join(symbol_clauses)
+
         query = f"""
             SELECT symbol,
                    COUNT(*) as sample_size,
@@ -3210,16 +3247,19 @@ class InstitutionalMLDatabase:
 
         try:
             with sqlite3.connect(self.db_path) as conn:
-                rows = conn.execute(query, universe if universe else ['__none__']).fetchall()
-                global_row = conn.execute(
-                    """
+                rows = conn.execute(query, symbol_params).fetchall()
+                global_query = """
                     SELECT COUNT(*) as sample_size,
                            AVG(front_iv_crush_pct) as avg_front_iv_crush_pct,
                            AVG(front_iv_crush_pct * front_iv_crush_pct) as avg_front_iv_sq,
                            AVG(quality_score) as avg_quality_score
                     FROM earnings_iv_decay_labels
-                    """
-                ).fetchone()
+                """
+                global_params: List[Any] = []
+                if as_of_cutoff:
+                    global_query += " WHERE event_date < ?"
+                    global_params.append(as_of_cutoff)
+                global_row = conn.execute(global_query, global_params).fetchone()
 
             global_profile = dict(default_profile)
             if global_row and global_row[0]:

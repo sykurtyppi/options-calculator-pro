@@ -59,6 +59,44 @@ def _parse_csv_floats(value: str) -> List[float]:
     return [float(item.strip()) for item in str(value).split(',') if item.strip()]
 
 
+def _log_marketdata_budget_snapshot(logger_obj, client: Optional[MarketDataClient], label: str) -> None:
+    """Log a concise MarketData.app budget snapshot when client is available."""
+    if client is None:
+        return
+    try:
+        status = client.get_budget_status()
+    except Exception as exc:
+        logger_obj.debug("Unable to read MDApp budget snapshot (%s): %s", label, exc)
+        return
+
+    used = float(status.get("estimated_credits_used", 0.0))
+    limit = int(status.get("daily_credit_limit", 0) or 0)
+    remaining = float(status.get("estimated_credits_remaining", 0.0))
+    calls = int(status.get("calls_used", 0) or 0)
+    reserve_mode = bool(status.get("reserve_mode", False))
+    blocked = list(status.get("blocked_endpoints_402", []) or [])
+    blocked_txt = ", ".join(blocked) if blocked else "none"
+
+    if limit > 0:
+        logger_obj.info(
+            "📉 MDApp budget [%s]: used≈%.0f/%d credits, remaining≈%.0f, calls=%d, reserve_mode=%s, blocked_402=%s",
+            label,
+            used,
+            limit,
+            remaining,
+            calls,
+            reserve_mode,
+            blocked_txt,
+        )
+    else:
+        logger_obj.info(
+            "📉 MDApp budget [%s]: budget cap disabled, calls=%d, blocked_402=%s",
+            label,
+            calls,
+            blocked_txt,
+        )
+
+
 class InstitutionalDataCollector:
     """Professional data collection orchestrator"""
 
@@ -750,6 +788,158 @@ class InstitutionalDataCollector:
             df['contracts'] = df['contracts'].fillna(1).clip(lower=1)
         return df, scope_label
 
+    def _load_forward_trade_log(self, trade_log_path: Optional[str],
+                              lookback_days: int,
+                              min_confidence: float) -> Tuple[pd.DataFrame, str, Optional[str]]:
+        """Load optional external forward trade outcomes CSV for live/paper validation."""
+        if not trade_log_path:
+            return pd.DataFrame(), "", None
+
+        source_path = Path(str(trade_log_path)).expanduser()
+        if not source_path.is_absolute():
+            source_path = project_root / source_path
+        if not source_path.exists():
+            return pd.DataFrame(), "", f"Forward trade log not found: {source_path}"
+
+        try:
+            raw = pd.read_csv(source_path)
+        except Exception as exc:
+            return pd.DataFrame(), "", f"Unable to parse forward trade log ({exc})"
+
+        if raw.empty:
+            return pd.DataFrame(), "", "Forward trade log is empty."
+
+        df = raw.copy()
+        cols_lower = {str(col).strip().lower(): col for col in df.columns}
+
+        def _pick_column(candidates: List[str]) -> Optional[str]:
+            for name in candidates:
+                if name in cols_lower:
+                    return cols_lower[name]
+            return None
+
+        def _pick_numeric(candidates: List[str], default: float = np.nan) -> pd.Series:
+            col = _pick_column(candidates)
+            if col is None:
+                return pd.Series(default, index=df.index, dtype=float)
+            return pd.to_numeric(df[col], errors='coerce')
+
+        trade_date_col = _pick_column([
+            'trade_date', 'date', 'entry_date', 'opened_at', 'timestamp', 'trade_timestamp',
+        ])
+        if not trade_date_col:
+            return pd.DataFrame(), "", "Forward trade log missing a trade-date/timestamp column."
+
+        df['trade_date'] = pd.to_datetime(df[trade_date_col], errors='coerce').dt.normalize()
+        df = df.dropna(subset=['trade_date']).copy()
+        if df.empty:
+            return pd.DataFrame(), "", "Forward trade log has no parseable trade dates."
+
+        cutoff_date = pd.Timestamp((datetime.now() - timedelta(days=max(1, int(lookback_days)))).date())
+        df = df[df['trade_date'] >= cutoff_date].copy()
+        if df.empty:
+            return pd.DataFrame(), "", "Forward trade log has no rows in selected lookback."
+
+        symbol_col = _pick_column(['symbol', 'ticker', 'underlying'])
+        if symbol_col:
+            df['symbol'] = df[symbol_col].astype(str).str.upper().str.strip()
+            df['symbol'] = df['symbol'].replace('', np.nan).fillna('UNKNOWN')
+        else:
+            df['symbol'] = 'UNKNOWN'
+
+        event_date_col = _pick_column(['event_date', 'earnings_date'])
+        if event_date_col:
+            df['event_date'] = pd.to_datetime(df[event_date_col], errors='coerce').dt.normalize()
+        else:
+            df['event_date'] = pd.NaT
+
+        df['contracts'] = _pick_numeric(['contracts', 'qty', 'quantity', 'size'], default=1.0).fillna(1.0).clip(lower=1.0)
+        df['debit_per_contract'] = _pick_numeric(
+            ['debit_per_contract', 'debit', 'entry_debit', 'entry_price', 'cost_per_contract'],
+            default=np.nan,
+        )
+        df['transaction_cost_per_contract'] = _pick_numeric(
+            ['transaction_cost_per_contract', 'tx_cost_per_contract', 'commission_per_contract', 'fees_per_contract'],
+            default=0.0,
+        ).fillna(0.0)
+        df['gross_return_pct'] = _pick_numeric(
+            ['gross_return_pct', 'gross_return', 'return_gross_pct'],
+            default=np.nan,
+        )
+        df['net_return_pct'] = _pick_numeric(
+            ['net_return_pct', 'net_return', 'return_pct', 'return_net_pct'],
+            default=np.nan,
+        )
+        df['pnl_per_contract'] = _pick_numeric(
+            ['pnl_per_contract', 'pnl', 'pnl_per_ctr', 'profit_per_contract'],
+            default=np.nan,
+        )
+        df['crush_confidence'] = _pick_numeric(
+            ['crush_confidence', 'confidence', 'predicted_crush_confidence'],
+            default=1.0,
+        ).fillna(1.0).clip(lower=0.0, upper=1.0)
+        df['crush_edge_score'] = _pick_numeric(
+            ['crush_edge_score', 'edge_score', 'predicted_crush_edge'],
+            default=0.0,
+        ).fillna(0.0)
+        df['predicted_front_iv_crush_pct'] = _pick_numeric(
+            ['predicted_front_iv_crush_pct', 'predicted_iv_crush_pct', 'predicted_crush_pct'],
+            default=np.nan,
+        )
+        df['realized_front_iv_crush_pct'] = _pick_numeric(
+            ['realized_front_iv_crush_pct', 'actual_front_iv_crush_pct', 'realized_iv_crush_pct', 'actual_crush_pct'],
+            default=np.nan,
+        )
+
+        # Derive missing PnL/return fields when the log provides only one side.
+        missing_net = df['net_return_pct'].isna()
+        can_derive_net = missing_net & df['pnl_per_contract'].notna() & df['debit_per_contract'].notna() & (df['debit_per_contract'] != 0)
+        if can_derive_net.any():
+            df.loc[can_derive_net, 'net_return_pct'] = (
+                df.loc[can_derive_net, 'pnl_per_contract'] / df.loc[can_derive_net, 'debit_per_contract']
+            )
+
+        missing_pnl = df['pnl_per_contract'].isna()
+        can_derive_pnl = missing_pnl & df['net_return_pct'].notna() & df['debit_per_contract'].notna()
+        if can_derive_pnl.any():
+            df.loc[can_derive_pnl, 'pnl_per_contract'] = (
+                df.loc[can_derive_pnl, 'net_return_pct'] * df.loc[can_derive_pnl, 'debit_per_contract']
+            )
+
+        missing_gross = df['gross_return_pct'].isna() & df['net_return_pct'].notna()
+        if missing_gross.any():
+            df.loc[missing_gross, 'gross_return_pct'] = df.loc[missing_gross, 'net_return_pct']
+
+        # If debit is absent but PnL and return are present, infer a synthetic debit baseline.
+        missing_debit = df['debit_per_contract'].isna()
+        can_infer_debit = missing_debit & df['pnl_per_contract'].notna() & df['net_return_pct'].notna() & (df['net_return_pct'].abs() > 1e-9)
+        if can_infer_debit.any():
+            df.loc[can_infer_debit, 'debit_per_contract'] = (
+                df.loc[can_infer_debit, 'pnl_per_contract'] / df.loc[can_infer_debit, 'net_return_pct']
+            )
+        df['debit_per_contract'] = df['debit_per_contract'].abs()
+
+        df = df[df['crush_confidence'] >= float(np.clip(float(min_confidence), 0.0, 1.0))].copy()
+        if df.empty:
+            return pd.DataFrame(), "", (
+                "Forward trade log has no rows passing min_confidence filter "
+                f"({float(min_confidence):.2f})."
+            )
+
+        df['session_id'] = 'trade_log'
+        normalized = df[
+            [
+                'session_id', 'symbol', 'trade_date', 'event_date', 'contracts',
+                'debit_per_contract', 'transaction_cost_per_contract',
+                'gross_return_pct', 'net_return_pct', 'pnl_per_contract',
+                'crush_confidence', 'crush_edge_score',
+                'predicted_front_iv_crush_pct', 'realized_front_iv_crush_pct',
+            ]
+        ].copy()
+        normalized = normalized.sort_values(['trade_date', 'symbol']).reset_index(drop=True)
+        scope_label = f"trade_log:{source_path.name}"
+        return normalized, scope_label, None
+
     def _load_forward_fill_log(self, fill_log_path: Optional[str],
                              lookback_days: int) -> Tuple[pd.DataFrame, Dict[str, Any], Optional[str]]:
         """Load optional external fill/latency log and aggregate by trade_date."""
@@ -802,10 +992,19 @@ class InstitutionalDataCollector:
         slippage_col = _pick_column(['slippage_bps', 'slippage_bp', 'slippage'])
         if slippage_col:
             slippage_series = pd.to_numeric(df[slippage_col], errors='coerce')
-            # If values look like fractional pct, convert to bps.
-            median_abs = float(np.nanmedian(np.abs(slippage_series.to_numpy(dtype=float))))
-            if np.isfinite(median_abs) and median_abs <= 1.0:
-                slippage_series = slippage_series * 10000.0
+            slippage_key = str(slippage_col).strip().lower()
+            valid_abs = np.abs(slippage_series.dropna().to_numpy(dtype=float))
+            median_abs = float(np.median(valid_abs)) if valid_abs.size else np.nan
+            # Normalize to basis points:
+            # - explicit *_bps / *_bp columns are assumed already in bps
+            # - generic slippage column may be decimal (0.001 = 10bps) or percent points (0.50 = 50bps)
+            if "bps" in slippage_key or slippage_key.endswith("_bp") or slippage_key.endswith("bp"):
+                pass
+            elif np.isfinite(median_abs):
+                if median_abs <= 0.05:
+                    slippage_series = slippage_series * 10000.0
+                elif median_abs <= 5.0:
+                    slippage_series = slippage_series * 100.0
             df['slippage_bps'] = slippage_series
         else:
             df['slippage_bps'] = np.nan
@@ -863,6 +1062,7 @@ class InstitutionalDataCollector:
                                        scope_label: str,
                                        lookback_days: int,
                                        min_confidence: float,
+                                       data_source: str = "backtest_trades",
                                        fill_daily_df: Optional[pd.DataFrame] = None,
                                        fill_summary: Optional[Dict[str, Any]] = None,
                                        fill_note: Optional[str] = None) -> Tuple[Dict[str, Any], pd.DataFrame]:
@@ -886,6 +1086,7 @@ class InstitutionalDataCollector:
                 'p95_execution_drag_bps': np.nan,
                 'mean_tx_cost_per_contract': np.nan,
                 'mean_tx_cost_pct_of_debit': np.nan,
+                'data_source': str(data_source or "backtest_trades"),
                 'fill_metrics': fill_summary or {},
                 'fill_note': fill_note,
                 'status': 'insufficient_data',
@@ -972,9 +1173,14 @@ class InstitutionalDataCollector:
                 float(frame['tx_cost_pct_of_debit'].mean())
                 if frame['tx_cost_pct_of_debit'].notna().any() else np.nan
             ),
+            'data_source': str(data_source or "backtest_trades"),
             'fill_metrics': fill_summary or {},
             'fill_note': fill_note,
-            'status': 'ok' if trade_count >= 20 else 'insufficient_data',
+            'status': (
+                'insufficient_data'
+                if trade_count < 20
+                else ('ok' if str(data_source).strip().lower() == 'trade_log' else 'simulated_backtest')
+            ),
         }
         return summary, daily
 
@@ -994,6 +1200,36 @@ class InstitutionalDataCollector:
         elif '-' in text:
             rank -= 0.25
         return rank
+
+    @staticmethod
+    def _resolve_promotion_live_session(
+        promotion_live_session_id: Optional[str],
+        oos_result: Optional[Dict[str, Any]],
+        sweep_result: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """
+        Resolve which session scope to use for forward tracker diagnostics.
+
+        Preference order:
+          1) explicit CLI selection
+          2) best OOS test session
+          3) best sweep session
+          4) all sessions (fallback)
+        """
+        if promotion_live_session_id:
+            session = str(promotion_live_session_id).strip()
+            if session:
+                return session
+
+        oos_best = str((oos_result or {}).get('best_test_session_id') or "").strip()
+        if oos_best:
+            return oos_best
+
+        sweep_best = str((sweep_result or {}).get('best_session_id') or "").strip()
+        if sweep_best:
+            return sweep_best
+
+        return "all_sessions"
 
     @staticmethod
     def _evaluate_forward_quality_gate(
@@ -1094,32 +1330,77 @@ class InstitutionalDataCollector:
         details['overall_pass'] = overall_pass
         return overall_pass, details, advisories
 
+    @staticmethod
+    def _evaluate_promotion_evidence_gate(
+        *,
+        grade_gate_pass: bool,
+        live_trade_gate_pass: bool,
+        evidence_mode: str = "and",
+    ) -> Tuple[bool, str]:
+        """
+        Combine OOS-grade and live-trade evidence gates.
+
+        evidence_mode:
+          - "and": require both grade and live-trade gates
+          - "or":  require either gate
+        """
+        normalized_mode = str(evidence_mode or "and").strip().lower()
+        if normalized_mode not in {"and", "or"}:
+            normalized_mode = "and"
+        if normalized_mode == "and":
+            return bool(grade_gate_pass and live_trade_gate_pass), normalized_mode
+        return bool(grade_gate_pass or live_trade_gate_pass), normalized_mode
+
     def run_forward_paper_tracker(self, session_id: Optional[str] = None,
                                 lookback_days: int = 120,
                                 min_confidence: float = 0.35,
                                 output_dir: str = "exports/reports",
+                                trade_log_path: Optional[str] = None,
                                 fill_log_path: Optional[str] = None,
                                 write_artifacts: bool = True) -> Optional[dict]:
         """Track forward paper performance: predicted vs realized crush edge and execution realism."""
         lookback_days = max(1, int(lookback_days))
         min_confidence = float(np.clip(float(min_confidence), 0.0, 1.0))
-        trades_df, scope_label = self._load_forward_tracker_trades(
-            session_id=session_id,
+        trade_log_df, trade_scope_label, trade_log_note = self._load_forward_trade_log(
+            trade_log_path=trade_log_path,
             lookback_days=lookback_days,
             min_confidence=min_confidence,
         )
+        if not trade_log_df.empty:
+            trades_df = trade_log_df
+            scope_label = trade_scope_label or "trade_log"
+            data_source = "trade_log"
+        else:
+            trades_df, scope_label = self._load_forward_tracker_trades(
+                session_id=session_id,
+                lookback_days=lookback_days,
+                min_confidence=min_confidence,
+            )
+            data_source = "backtest_trades"
+            if trade_log_path and trade_log_note:
+                self.logger.warning(
+                    "⚠️ Forward trade log unavailable (%s); falling back to simulated backtest trades.",
+                    trade_log_note,
+                )
         fill_daily, fill_summary, fill_note = self._load_forward_fill_log(
             fill_log_path=fill_log_path,
             lookback_days=lookback_days,
         )
+        fill_note_parts: List[str] = []
+        if trade_log_note:
+            fill_note_parts.append(f"Trade log: {trade_log_note}")
+        if fill_note:
+            fill_note_parts.append(f"Fill log: {fill_note}")
+        combined_fill_note = " | ".join(fill_note_parts) if fill_note_parts else None
         summary, daily = self._compute_forward_tracker_metrics(
             trades_df=trades_df,
             scope_label=scope_label,
             lookback_days=lookback_days,
             min_confidence=min_confidence,
+            data_source=data_source,
             fill_daily_df=fill_daily,
             fill_summary=fill_summary,
-            fill_note=fill_note,
+            fill_note=combined_fill_note,
         )
 
         if not write_artifacts:
@@ -1153,6 +1434,7 @@ class InstitutionalDataCollector:
             f.write(f"- Session scope: `{summary.get('session_scope', 'all_sessions')}`\n")
             f.write(f"- Lookback days: `{summary.get('lookback_days')}`\n")
             f.write(f"- Min confidence filter: `{summary.get('min_confidence'):.2f}`\n")
+            f.write(f"- Data source: `{summary.get('data_source', 'backtest_trades')}`\n")
             f.write(f"- Status: `{summary.get('status')}`\n\n")
 
             f.write("## Prediction vs Realization\n\n")
@@ -1233,6 +1515,7 @@ class InstitutionalDataCollector:
                 'generated_at': datetime.now().isoformat(timespec='seconds'),
                 'summary': summary,
                 'daily_rows': int(len(daily)),
+                'source_trade_log': str(trade_log_path) if trade_log_path else None,
                 'source_fill_log': str(fill_log_path) if fill_log_path else None,
                 'source_csv': str(csv_path),
             }, f, indent=2, default=str)
@@ -2422,6 +2705,7 @@ class InstitutionalDataCollector:
                            stress_output_dir: str = "exports/reports",
                            promotion_min_oos_grade: str = "A",
                            promotion_min_live_trades: int = 50,
+                           promotion_evidence_mode: str = "and",
                            promotion_live_lookback_days: int = 120,
                            promotion_live_session_id: Optional[str] = None,
                            promotion_live_min_confidence: float = 0.35,
@@ -2430,6 +2714,7 @@ class InstitutionalDataCollector:
                            promotion_min_forward_directional_accuracy: Optional[float] = 0.55,
                            promotion_require_forward_status_ok: bool = True,
                            promotion_require_fill_log: bool = False,
+                           forward_trade_log_path: Optional[str] = None,
                            forward_fill_log_path: Optional[str] = None,
                            start_date: Optional[str] = None,
                            end_date: Optional[str] = None) -> Optional[dict]:
@@ -2576,6 +2861,13 @@ class InstitutionalDataCollector:
                     stress_result = broader_stress_result
 
         promotion_min_live_trades = max(0, int(promotion_min_live_trades))
+        promotion_evidence_mode = str(promotion_evidence_mode or "and").strip().lower()
+        if promotion_evidence_mode not in {"and", "or"}:
+            self.logger.warning(
+                "⚠️ Invalid promotion evidence mode `%s`; defaulting to `and`",
+                promotion_evidence_mode,
+            )
+            promotion_evidence_mode = "and"
         promotion_live_lookback_days = max(1, int(promotion_live_lookback_days))
         promotion_live_min_confidence = float(np.clip(float(promotion_live_min_confidence), 0.0, 1.0))
         promotion_require_forward_status_ok = bool(promotion_require_forward_status_ok)
@@ -2589,16 +2881,24 @@ class InstitutionalDataCollector:
                 np.clip(float(promotion_min_forward_directional_accuracy), 0.0, 1.0)
             )
         required_oos_grade = str(promotion_min_oos_grade or "A").strip().upper() or "A"
+        forward_tracker_session_id = self._resolve_promotion_live_session(
+            promotion_live_session_id=promotion_live_session_id,
+            oos_result=oos_result,
+            sweep_result=sweep_result,
+        )
         forward_tracker_result = self.run_forward_paper_tracker(
-            session_id=promotion_live_session_id or "all_sessions",
+            session_id=forward_tracker_session_id,
             lookback_days=promotion_live_lookback_days,
             min_confidence=promotion_live_min_confidence,
             output_dir=readiness_output_dir,
+            trade_log_path=forward_trade_log_path,
             fill_log_path=forward_fill_log_path,
             write_artifacts=True,
         )
         forward_summary = dict((forward_tracker_result or {}).get('summary') or {})
-        live_trade_count = int(forward_summary.get('trade_count', 0) or 0)
+        forward_data_source = str(forward_summary.get('data_source') or 'backtest_trades').strip().lower()
+        tracked_trade_count = int(forward_summary.get('trade_count', 0) or 0)
+        live_trade_count = tracked_trade_count if forward_data_source == 'trade_log' else 0
         forward_quality_gate_pass, forward_quality_gate_details, forward_quality_advisories = (
             self._evaluate_forward_quality_gate(
                 forward_summary,
@@ -2631,7 +2931,12 @@ class InstitutionalDataCollector:
 
         grade_gate_pass = self._grade_rank(oos_grade) >= self._grade_rank(required_oos_grade)
         live_trade_gate_pass = live_trade_count >= promotion_min_live_trades
-        promotion_gate_pass = bool((grade_gate_pass or live_trade_gate_pass) and forward_quality_gate_pass)
+        promotion_evidence_gate_pass, promotion_evidence_mode = self._evaluate_promotion_evidence_gate(
+            grade_gate_pass=grade_gate_pass,
+            live_trade_gate_pass=live_trade_gate_pass,
+            evidence_mode=promotion_evidence_mode,
+        )
+        promotion_gate_pass = bool(promotion_evidence_gate_pass and forward_quality_gate_pass)
         if readiness_status != "not_ready" and not promotion_gate_pass:
             readiness_status = "ready_with_advisories"
         readiness_pass = readiness_status != "not_ready"
@@ -2673,16 +2978,36 @@ class InstitutionalDataCollector:
         if not oos_pass:
             advisories.append(f"OOS report card did not pass (grade={oos_grade}).")
         if not promotion_gate_pass:
+            evidence_text = (
+                "OOS grade >= {grade} AND >= {live} live trades in last {days} days"
+                if promotion_evidence_mode == "and"
+                else "OOS grade >= {grade} OR >= {live} live trades in last {days} days"
+            )
             advisories.append(
                 "Promotion gate not met: require "
-                f"OOS grade >= {required_oos_grade} OR >= {promotion_min_live_trades} live trades "
-                f"in last {promotion_live_lookback_days} days "
+                + evidence_text.format(
+                    grade=required_oos_grade,
+                    live=promotion_min_live_trades,
+                    days=promotion_live_lookback_days,
+                )
+                + " "
                 f"(actual grade={oos_grade}, live_trades={live_trade_count})."
+            )
+        if forward_data_source != 'trade_log' and tracked_trade_count > 0:
+            advisories.append(
+                "Forward tracker is using simulated backtest trades; "
+                "these do not count toward live-trade promotion gates. "
+                "Provide --forward-trade-log-path for true forward evidence."
             )
         advisories.extend(forward_quality_advisories)
         fill_note = str(forward_summary.get('fill_note') or "").strip()
         if fill_note:
             advisories.append(f"Forward fill quality note: {fill_note}")
+        if str(forward_summary.get('session_scope', '')).strip().lower() == 'all_sessions':
+            advisories.append(
+                "Forward tracker scope is all sessions; for strict promotion evidence, set "
+                "--promotion-live-session-id to a specific session."
+            )
 
         readiness_output_path = Path(readiness_output_dir)
         if not readiness_output_path.is_absolute():
@@ -2728,6 +3053,13 @@ class InstitutionalDataCollector:
                 if sample_note:
                     f.write(f"- Stress sample note: `{sample_note}`\n")
             f.write(
+                f"- Forward data source: `{forward_summary.get('data_source', 'backtest_trades')}`\n"
+            )
+            f.write(
+                f"- Forward tracked trades (raw): "
+                f"`{tracked_trade_count}`\n"
+            )
+            f.write(
                 f"- Forward live trades (last {promotion_live_lookback_days}d): "
                 f"`{live_trade_count}`\n"
             )
@@ -2744,11 +3076,13 @@ class InstitutionalDataCollector:
             f.write("## Promotion Gate\n\n")
             f.write(f"- Required minimum OOS grade: `{required_oos_grade}`\n")
             f.write(f"- Grade gate pass: `{grade_gate_pass}`\n")
+            f.write(f"- Evidence mode: `{promotion_evidence_mode}`\n")
             f.write(
                 f"- Required minimum live trades ({promotion_live_lookback_days}d): "
                 f"`{promotion_min_live_trades}`\n"
             )
             f.write(f"- Live trade gate pass: `{live_trade_gate_pass}`\n")
+            f.write(f"- Evidence gate pass (grade {promotion_evidence_mode} live): `{promotion_evidence_gate_pass}`\n")
             f.write(
                 f"- Forward quality gate pass: `{forward_quality_gate_pass}` "
                 f"(status_ok={forward_quality_gate_details.get('status_ok')}, "
@@ -2758,7 +3092,7 @@ class InstitutionalDataCollector:
                 f"fill_log_ok={forward_quality_gate_details.get('fill_log_ok')})\n"
             )
             f.write(
-                f"- Promotion gate pass ((grade OR live trades) AND forward quality): "
+                f"- Promotion gate pass ((grade {promotion_evidence_mode} live trades) AND forward quality): "
                 f"`{promotion_gate_pass}`\n\n"
             )
 
@@ -2802,10 +3136,14 @@ class InstitutionalDataCollector:
                 'promotion_gate': {
                     'required_oos_grade': required_oos_grade,
                     'grade_gate_pass': grade_gate_pass,
+                    'evidence_mode': promotion_evidence_mode,
                     'required_live_trades': promotion_min_live_trades,
+                    'tracked_trade_count': tracked_trade_count,
+                    'forward_data_source': forward_data_source,
                     'live_trade_count': live_trade_count,
                     'live_trade_lookback_days': promotion_live_lookback_days,
                     'live_trade_gate_pass': live_trade_gate_pass,
+                    'evidence_gate_pass': promotion_evidence_gate_pass,
                     'forward_quality_gate_pass': forward_quality_gate_pass,
                     'forward_quality_gate': forward_quality_gate_details,
                     'promotion_gate_pass': promotion_gate_pass,
@@ -2845,6 +3183,8 @@ class InstitutionalDataCollector:
             'stress_result': stress_result,
             'forward_tracker_result': forward_tracker_result,
             'best_test_session_id': oos_result.get('best_test_session_id'),
+            'best_sweep_session_id': sweep_result.get('best_session_id'),
+            'promotion_evidence_mode': promotion_evidence_mode,
         }
 
 def parse_arguments():
@@ -3280,14 +3620,22 @@ def parse_arguments():
         '--promotion-min-oos-grade',
         type=str,
         default='A',
-        help='Minimum OOS report-card grade required for automatic promotion gate pass (default: A)'
+        help='Minimum OOS report-card grade used by promotion evidence gate (default: A)'
     )
 
     parser.add_argument(
         '--promotion-min-live-trades',
         type=int,
         default=50,
-        help='Minimum forward live trades needed for promotion gate pass if grade gate fails (default: 50)'
+        help='Minimum forward live trades used by promotion evidence gate (default: 50)'
+    )
+
+    parser.add_argument(
+        '--promotion-evidence-mode',
+        type=str,
+        choices=['and', 'or'],
+        default='and',
+        help='How to combine grade/live evidence in promotion gate: and (strict) or or (lenient).'
     )
 
     parser.add_argument(
@@ -3347,6 +3695,45 @@ def parse_arguments():
         '--forward-fill-log-path',
         type=str,
         help='Optional CSV path with live fill/slippage/latency columns for forward realism diagnostics'
+    )
+
+    parser.add_argument(
+        '--forward-trade-log-path',
+        type=str,
+        help='Optional CSV path with forward paper/live trade outcomes used for true live-trade promotion gating'
+    )
+
+    parser.add_argument(
+        '--forward-paper-tracker',
+        action='store_true',
+        help='Generate forward paper/live tracking report (predicted vs realized crush + execution realism)'
+    )
+
+    parser.add_argument(
+        '--forward-tracker-session-id',
+        type=str,
+        help='Optional session filter for --forward-paper-tracker (default: all sessions)'
+    )
+
+    parser.add_argument(
+        '--forward-tracker-lookback-days',
+        type=int,
+        default=120,
+        help='Lookback window for --forward-paper-tracker (default: 120)'
+    )
+
+    parser.add_argument(
+        '--forward-tracker-min-confidence',
+        type=float,
+        default=0.35,
+        help='Min confidence filter for --forward-paper-tracker [0-1] (default: 0.35)'
+    )
+
+    parser.add_argument(
+        '--forward-tracker-output-dir',
+        type=str,
+        default='exports/reports',
+        help='Output directory for --forward-paper-tracker artifacts'
     )
 
     parser.add_argument(
@@ -3554,6 +3941,7 @@ async def main():
         marketdata_token=args.marketdata_token,
         enable_marketdata=not args.disable_marketdata,
     )
+    _log_marketdata_budget_snapshot(logger, collector.mda_client, "startup")
 
     try:
         if args.backtest_only:
@@ -3613,6 +4001,7 @@ async def main():
                 or args.oos_validation
                 or args.stress_test
                 or scorecard_requested
+                or args.forward_paper_tracker
                 or args.regime_diagnostics
                 or args.threshold_tuning
             )
@@ -3676,6 +4065,7 @@ async def main():
                     stress_output_dir=args.stress_output_dir,
                     promotion_min_oos_grade=args.promotion_min_oos_grade,
                     promotion_min_live_trades=args.promotion_min_live_trades,
+                    promotion_evidence_mode=args.promotion_evidence_mode,
                     promotion_live_lookback_days=args.promotion_live_lookback_days,
                     promotion_live_session_id=args.promotion_live_session_id,
                     promotion_live_min_confidence=args.promotion_live_min_confidence,
@@ -3684,6 +4074,7 @@ async def main():
                     promotion_min_forward_directional_accuracy=args.promotion_min_forward_directional_accuracy,
                     promotion_require_forward_status_ok=not args.disable_promotion_forward_status_gate,
                     promotion_require_fill_log=args.promotion_require_fill_log,
+                    forward_trade_log_path=args.forward_trade_log_path,
                     forward_fill_log_path=args.forward_fill_log_path,
                     start_date=args.backtest_start_date,
                     end_date=args.backtest_end_date,
@@ -3778,7 +4169,7 @@ async def main():
                     "ℹ️ Snapshot-status/calibration-only mode: skipping sample backtest "
                     "(use --run-sample-backtest to force)"
                 )
-            elif not scorecard_requested:
+            elif not scorecard_requested and not args.forward_paper_tracker:
                 session_id = collector.run_sample_backtest(
                     execution_profile=args.execution_profile,
                     hold_days=args.hold_days,
@@ -3806,6 +4197,25 @@ async def main():
                 if session_id:
                     logger.info(f"✅ Backtest completed: {session_id}")
                     latest_session_id = str(session_id)
+
+            if args.forward_paper_tracker:
+                forward_tracker_result = collector.run_forward_paper_tracker(
+                    session_id=args.forward_tracker_session_id or args.promotion_live_session_id or latest_session_id,
+                    lookback_days=args.forward_tracker_lookback_days,
+                    min_confidence=args.forward_tracker_min_confidence,
+                    output_dir=args.forward_tracker_output_dir,
+                    trade_log_path=args.forward_trade_log_path,
+                    fill_log_path=args.forward_fill_log_path,
+                    write_artifacts=True,
+                )
+                if forward_tracker_result:
+                    logger.info(
+                        "✅ Forward paper tracker completed: "
+                        f"status={forward_tracker_result.get('status')}, "
+                        f"rows={forward_tracker_result.get('rows', 0)}"
+                    )
+                else:
+                    logger.warning("⚠️ Forward paper tracker did not produce results")
 
             if scorecard_requested:
                 scorecard_result = collector.run_crush_scorecard(
@@ -3978,6 +4388,7 @@ async def main():
                     stress_output_dir=args.stress_output_dir,
                     promotion_min_oos_grade=args.promotion_min_oos_grade,
                     promotion_min_live_trades=args.promotion_min_live_trades,
+                    promotion_evidence_mode=args.promotion_evidence_mode,
                     promotion_live_lookback_days=args.promotion_live_lookback_days,
                     promotion_live_session_id=args.promotion_live_session_id,
                     promotion_live_min_confidence=args.promotion_live_min_confidence,
@@ -3986,6 +4397,7 @@ async def main():
                     promotion_min_forward_directional_accuracy=args.promotion_min_forward_directional_accuracy,
                     promotion_require_forward_status_ok=not args.disable_promotion_forward_status_gate,
                     promotion_require_fill_log=args.promotion_require_fill_log,
+                    forward_trade_log_path=args.forward_trade_log_path,
                     forward_fill_log_path=args.forward_fill_log_path,
                     start_date=args.backtest_start_date,
                     end_date=args.backtest_end_date,
@@ -4079,7 +4491,7 @@ async def main():
                     latest_session_id = str(sweep_result.get('best_session_id') or latest_session_id or "")
                 else:
                     logger.warning("⚠️ Parameter sweep did not produce results")
-            elif not args.crush_scorecard:
+            elif not args.crush_scorecard and not args.forward_paper_tracker:
                 logger.info("🎯 Running post-backfill validation backtest...")
                 session_id = collector.run_sample_backtest(
                     execution_profile=args.execution_profile,
@@ -4125,6 +4537,26 @@ async def main():
                         )
                 else:
                     logger.warning("⚠️ Backtest validation failed")
+
+            if args.forward_paper_tracker:
+                logger.info("🧪 Building forward paper tracker...")
+                forward_tracker_result = collector.run_forward_paper_tracker(
+                    session_id=args.forward_tracker_session_id or args.promotion_live_session_id or latest_session_id,
+                    lookback_days=args.forward_tracker_lookback_days,
+                    min_confidence=args.forward_tracker_min_confidence,
+                    output_dir=args.forward_tracker_output_dir,
+                    trade_log_path=args.forward_trade_log_path,
+                    fill_log_path=args.forward_fill_log_path,
+                    write_artifacts=True,
+                )
+                if forward_tracker_result:
+                    logger.info(
+                        "✅ Forward paper tracker finished: "
+                        f"status={forward_tracker_result.get('status')}, "
+                        f"rows={forward_tracker_result.get('rows', 0)}"
+                    )
+                else:
+                    logger.warning("⚠️ Forward paper tracker did not produce results")
 
             if args.crush_scorecard:
                 logger.info("🧪 Building rolling IV-crush scorecard...")
@@ -4196,6 +4628,8 @@ async def main():
     except Exception as e:
         logger.error(f"💥 Fatal error: {e}")
         sys.exit(1)
+    finally:
+        _log_marketdata_budget_snapshot(logger, collector.mda_client, "shutdown")
 
 if __name__ == "__main__":
     # Run async main

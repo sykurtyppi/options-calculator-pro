@@ -569,6 +569,60 @@ class TestInstitutionalDiagnostics(unittest.TestCase):
             self.assertFalse(report["gates"]["min_trades_per_split"]["passed"])
             self.assertIn(report.get("verdict", {}).get("grade"), {"C", "D"})
 
+    def test_crush_context_tolerates_null_profile_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_crush_context_nulls.db")
+
+            context = db._derive_crush_signal_context(
+                symbol="AAPL",
+                iv_rv_ratio=1.25,
+                crush_profiles={
+                    "AAPL": {
+                        "expected_front_iv_crush_pct": None,
+                        "sample_size": None,
+                        "confidence": None,
+                    }
+                },
+            )
+
+            self.assertTrue(np.isfinite(context["expected_front_iv_crush_pct"]))
+            self.assertAlmostEqual(context["expected_front_iv_crush_pct"], -0.18, places=6)
+            self.assertEqual(context["sample_size"], 0.0)
+            self.assertEqual(context["confidence"], 0.0)
+            self.assertGreaterEqual(context["edge_score"], 0.0)
+
+    def test_load_iv_crush_profiles_respects_as_of_cutoff(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_crush_profiles.db")
+            with sqlite3.connect(db.db_path) as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO earnings_iv_decay_labels
+                    (symbol, event_date, release_timing, pre_capture_date, post_capture_date,
+                     pre_front_iv, post_front_iv, pre_back_iv, post_back_iv,
+                     front_iv_crush_pct, back_iv_crush_pct, term_ratio_change,
+                     underlying_move_pct, quality_score, source)
+                    VALUES (?, ?, 'AMC', ?, ?, 0.55, 0.44, 0.42, 0.39, ?, -0.04, -0.03, 0.01, 0.85, 'unit_test')
+                    """,
+                    [
+                        ("AAPL", "2024-01-20", "2024-01-18", "2024-01-22", -0.20),
+                        ("AAPL", "2024-04-25", "2024-04-23", "2024-04-26", -0.05),
+                    ],
+                )
+                conn.commit()
+
+            all_profiles = db._load_iv_crush_profiles(["AAPL"])
+            cutoff_profiles = db._load_iv_crush_profiles(["AAPL"], as_of_date="2024-03-01")
+
+            self.assertIn("AAPL", all_profiles)
+            self.assertIn("AAPL", cutoff_profiles)
+            self.assertEqual(int(all_profiles["AAPL"]["sample_size"]), 2)
+            self.assertEqual(int(cutoff_profiles["AAPL"]["sample_size"]), 1)
+            self.assertLess(
+                cutoff_profiles["AAPL"]["expected_front_iv_crush_pct"],
+                all_profiles["AAPL"]["expected_front_iv_crush_pct"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

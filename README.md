@@ -82,9 +82,17 @@ pytest -q
 - Historical IV-crush label backfill from MarketData.app is available via:
   - `python scripts/institutional_backfill.py --full-universe --capture-historical-mda-snapshots --mda-lookback-years 2`
   - Optional token override: `--marketdata-token <TOKEN>`
+- MarketData budget controls (daily, UTC reset):
+  - `MARKETDATA_DAILY_CREDIT_LIMIT` (default: `100000`)
+  - `MARKETDATA_DAILY_CREDIT_RESERVE` (default: `20000`)
+  - When reserve mode is active, research-tier requests (e.g., historical chain backfills)
+    are paused while critical/production endpoints continue until hard cap.
+  - A per-endpoint HTTP-402 circuit breaker blocks repeated paid-plan failures for the
+    rest of the UTC day to avoid burning calls on unavailable endpoints.
 - Readiness report promotion gates can be tuned from CLI:
   - `--promotion-min-oos-grade`
   - `--promotion-min-live-trades`
+  - `--promotion-evidence-mode` (`and` default for stricter promotion, or `or`)
   - `--promotion-live-lookback-days`
   - `--promotion-live-session-id`
   - `--promotion-live-min-confidence`
@@ -93,4 +101,14 @@ pytest -q
   - `--promotion-min-forward-directional-accuracy`
   - `--disable-promotion-forward-status-gate`
   - `--promotion-require-fill-log`
+  - `--forward-trade-log-path` (for real forward paper/live trade outcomes)
   - `--forward-fill-log-path` (for real fill/slippage diagnostics)
+  - `--forward-paper-tracker` (standalone forward diagnostics report)
+  - `--forward-tracker-session-id`
+  - `--forward-tracker-lookback-days`
+  - `--forward-tracker-min-confidence`
+  - `--forward-tracker-output-dir`
+  - Without `--forward-trade-log-path`, forward tracker status is `simulated_backtest`
+    and live-trade promotion counts stay at 0 by design.
+- Walk-forward crush profiles are now loaded with an as-of cutoff (session start date)
+  to reduce future-label leakage in backtests.
