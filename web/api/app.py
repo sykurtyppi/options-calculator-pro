@@ -32,13 +32,19 @@ except ImportError:
     pass
 
 # ── Access-control config (loaded from .env) ─────────────────────────────────
+_SHARE_AUTH_ENABLED = os.getenv("ENABLE_SHARE_AUTH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 _SHARE_PASSWORD = os.getenv("SHARE_PASSWORD", "")
 _SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-in-env")
 _SESSION_COOKIE = "ops_session"
 _SESSION_MAX_AGE = 7 * 24 * 3600  # 1 week
 
 # Paths that don't require authentication
-_PUBLIC_PATHS = {"/login", "/favicon.ico"}
+_PUBLIC_PATHS = {"/login", "/favicon.ico", "/api/health"}
 
 _LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -126,8 +132,10 @@ def _session_token() -> str:
 
 
 def _valid_session(cookie_val: str) -> bool:
+    if not _SHARE_AUTH_ENABLED:
+        return True
     if not cookie_val or not _SHARE_PASSWORD:
-        return not _SHARE_PASSWORD  # no password set → open access
+        return False
     try:
         return hmac.compare_digest(cookie_val, _session_token())
     except Exception:
@@ -216,7 +224,7 @@ async def login_page():
 async def login_submit(request: Request):
     form = await request.form()
     password = form.get("password", "")
-    if _SHARE_PASSWORD and hmac.compare_digest(str(password), _SHARE_PASSWORD):
+    if _SHARE_AUTH_ENABLED and _SHARE_PASSWORD and hmac.compare_digest(str(password), _SHARE_PASSWORD):
         response = RedirectResponse(url="/", status_code=303)
         response.set_cookie(
             _SESSION_COOKIE,

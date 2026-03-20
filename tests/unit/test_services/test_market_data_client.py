@@ -53,6 +53,18 @@ def _make_earnings_response():
     }
 
 
+def _make_earnings_unix_response():
+    return {
+        "s": "ok",
+        "symbol": ["AAPL"],
+        "fiscalYear": [2025],
+        "fiscalQuarter": [2],
+        "date": [1746057600],
+        "reportDate": [1746144000],
+        "reportTime": ["after market close"],
+    }
+
+
 # ── is_available ──────────────────────────────────────────────────────────────
 
 class TestIsAvailable(unittest.TestCase):
@@ -307,6 +319,22 @@ class TestEarningsNormalization(unittest.TestCase):
         times = df["reportTime"].tolist()
         self.assertIn("after market close", times)
         self.assertIn("before market open", times)
+
+    def test_earnings_string_dates_are_parsed(self):
+        resp = _make_earnings_response()
+        with patch.object(self.client, "_get", return_value=resp):
+            df = self.client.get_earnings("AAPL")
+
+        self.assertEqual(str(df.iloc[0]["report_date"]), "2025-05-01")
+        self.assertEqual(str(df.iloc[1]["report_date"]), "2025-01-30")
+
+    def test_earnings_unix_dates_are_parsed(self):
+        resp = _make_earnings_unix_response()
+        with patch.object(self.client, "_get", return_value=resp):
+            df = self.client.get_earnings("AAPL")
+
+        self.assertEqual(str(df.iloc[0]["event_date"]), "2025-05-01")
+        self.assertEqual(str(df.iloc[0]["report_date"]), "2025-05-02")
 
 
 # ── get_quote ─────────────────────────────────────────────────────────────────

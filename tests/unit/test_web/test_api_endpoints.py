@@ -181,6 +181,22 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertIn("timestamp", payload)
 
+    def test_health_endpoint_remains_public_when_share_auth_enabled(self):
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                response = self.client.get("/api/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+
+    def test_api_requires_auth_when_share_auth_enabled(self):
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                response = self.client.post("/api/edge/analyze", json={"symbol": "AAPL"})
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Unauthorized", response.text)
+
     def test_edge_analyze_endpoint(self):
         snapshot = EdgeSnapshot(
             symbol="AAPL",

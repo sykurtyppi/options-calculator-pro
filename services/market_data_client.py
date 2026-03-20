@@ -291,13 +291,13 @@ class MarketDataClient:
             "surpriseEPSpct": _col("surpriseEPSpct", n),
         })
 
-        # Parse unix timestamps to date objects
-        for unix_col, date_col in (("date_unix", "event_date"), ("reportDate_unix", "report_date")):
-            df[date_col] = pd.to_datetime(
-                pd.to_numeric(df[unix_col], errors="coerce"), unit="s", utc=True, errors="coerce"
-            ).dt.date
+        # Parse mixed unix-timestamp / ISO-date payloads into date objects.
+        for raw_col, date_col in (("date_unix", "event_date"), ("reportDate_unix", "report_date")):
+            df[date_col] = df[raw_col].map(_parse_marketdata_date)
 
         df.drop(columns=["date_unix", "reportDate_unix"], inplace=True)
+        if "report_date" in df.columns:
+            df["report_date"] = df["report_date"].where(df["report_date"].notna(), df["event_date"])
 
         # Normalise reportTime to short form for convenience
         def _normalise_rt(v: Any) -> Optional[str]:
@@ -466,3 +466,26 @@ class MarketDataClient:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         return df
+
+
+def _parse_marketdata_date(value: Any) -> Any:
+    """Parse MarketData date fields that may arrive as unix timestamps or ISO strings."""
+    if value is None or value == "":
+        return pd.NaT
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return pd.NaT
+        if stripped.isdigit():
+            value = int(stripped)
+        else:
+            parsed = pd.to_datetime(stripped, utc=True, errors="coerce")
+            return parsed.date() if not pd.isna(parsed) else pd.NaT
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        parsed = pd.to_datetime(value, unit="s", utc=True, errors="coerce")
+        return parsed.date() if not pd.isna(parsed) else pd.NaT
+
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    return parsed.date() if not pd.isna(parsed) else pd.NaT

@@ -77,6 +77,7 @@ pytest -q
 - OOS defaults are evidence-first (`lookback=1095`, `max_backtest_symbols=50`, `train/test/step=189/42/42`).
 - If OOS sample gates fail, the API can run one adaptive retry to improve split/trade coverage.
 - Share-code auth is optional and disabled by default; enable it for shared deployments.
+  Auth is enforced only when `ENABLE_SHARE_AUTH=true` and `SHARE_PASSWORD` is set.
 - Allowed browser origins default to `http://localhost:5173` and `http://127.0.0.1:5173`.
   Override with `OPTIONS_CALCULATOR_ALLOWED_ORIGINS` as a comma-separated list.
 - Historical IV-crush label backfill from MarketData.app is available via:
