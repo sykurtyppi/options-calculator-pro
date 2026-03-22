@@ -194,6 +194,16 @@ def _nearest_atm_option_stats(
 
 
 def _normalize_release_timing(value: Any) -> str:
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        if any((value.hour, value.minute, value.second, value.microsecond)):
+            total_minutes = (value.hour * 60) + value.minute
+            if total_minutes < (9 * 60 + 30):
+                return "before market open"
+            if total_minutes >= (16 * 60):
+                return "after market close"
+            return "during market hours"
     text = str(value or "").strip().lower()
     if not text:
         return "unknown"
@@ -498,8 +508,12 @@ def _term_structure_from_mda_chain(
 
     iv30 = float(np.interp(30.0, days_arr, ivs_arr))
     iv45 = float(np.interp(45.0, days_arr, ivs_arr))
-    iv0 = float(np.interp(0.0, days_arr, ivs_arr))
-    slope_0_45 = float((iv45 - iv0) / 45.0)
+    # FIX 1: slope between first real listed tenor and tenor nearest 45d.
+    # np.interp(0.0, ...) clamps to shortest expiry — calling it "0-45d" is wrong.
+    _ts_near_dte = float(days_arr[0])
+    _ts_far_idx  = int(np.argmin(np.abs(days_arr - 45.0)))
+    _ts_far_dte  = float(days_arr[_ts_far_idx])
+    slope_0_45   = float((ivs_arr[_ts_far_idx] - ivs_arr[0]) / max(_ts_far_dte - _ts_near_dte, 1.0))
     near_back_iv_ratio = (
         float(ivs_arr[0] / ivs_arr[1])
         if len(ivs_arr) >= 2 and np.isfinite(ivs_arr[0]) and np.isfinite(ivs_arr[1]) and ivs_arr[1] > 0
@@ -520,6 +534,8 @@ def _term_structure_from_mda_chain(
         near_term_dte,
         near_back_iv_ratio,
         near_term_liquidity_proxy,
+        _ts_near_dte,
+        _ts_far_dte,
     )
 
 
@@ -743,8 +759,11 @@ def _term_structure_points_yf(
     ivs_arr = np.array(ivs, dtype=float)[order]
     iv30 = float(np.interp(30.0, days_arr, ivs_arr))
     iv45 = float(np.interp(45.0, days_arr, ivs_arr))
-    iv0 = float(np.interp(0.0, days_arr, ivs_arr))
-    slope_0_45 = float((iv45 - iv0) / 45.0)
+    # FIX 1: slope between first real listed tenor and tenor nearest 45d.
+    _ts_near_dte = float(days_arr[0])
+    _ts_far_idx  = int(np.argmin(np.abs(days_arr - 45.0)))
+    _ts_far_dte  = float(days_arr[_ts_far_idx])
+    slope_0_45   = float((ivs_arr[_ts_far_idx] - ivs_arr[0]) / max(_ts_far_dte - _ts_near_dte, 1.0))
     near_back_iv_ratio = (
         float(ivs_arr[0] / ivs_arr[1])
         if len(ivs_arr) >= 2 and np.isfinite(ivs_arr[0]) and np.isfinite(ivs_arr[1]) and ivs_arr[1] > 0
@@ -756,6 +775,7 @@ def _term_structure_points_yf(
         days_arr.tolist(), ivs_arr.tolist(), iv30, iv45, slope_0_45,
         max(avg_oi, avg_opt_vol), near_term_implied_move_pct, near_term_spread_pct,
         near_term_dte, near_back_iv_ratio, near_term_liquidity_proxy,
+        _ts_near_dte, _ts_far_dte,
     )
 
 
@@ -889,8 +909,10 @@ def _historical_earnings_move_profile(
                 event_ts_raw = item.get("event_date")
                 timing = _normalize_release_timing(item.get("release_timing"))
             else:
+                # Raw timestamp (not a dict) — infer BMO/AMC from time-of-day
+                # instead of silently collapsing to "unknown".
                 event_ts_raw = item
-                timing = "unknown"
+                timing = _normalize_release_timing(item)
             if event_ts_raw is None:
                 continue
             event_ts = pd.Timestamp(event_ts_raw).normalize()
@@ -1027,7 +1049,10 @@ def _yang_zhang_rv30(hist: pd.DataFrame, window: int = 30) -> float:
     if n < 5:
         return np.nan
 
-    rs = (h * (h - c) + l * (l - c)).clip(lower=0.0)  # Rogers-Satchell daily variance
+    # FIX 9: do NOT clip individual RS values — negative RS is mathematically
+    # valid (price traded below open all day) and clipping introduces upward
+    # bias in the YZ estimator. Clip only the final combined variance before sqrt.
+    rs = h * (h - c) + l * (l - c)  # Rogers-Satchell daily variance (unclipped)
     k = 0.34 / (1.34 + (n + 1) / max(n - 1, 1))
 
     # Paper specifies sample variance (1/(n-1)), not population variance (1/n)
@@ -1264,17 +1289,31 @@ def _calendar_spread_payoff(
                 be = m1 + (m2 - m1) * (-p1) / (p2 - p1)
                 breakevens.append(round(be, 1))
 
+        # FIX 8: per-contract values (1 contract = 100 shares)
+        payoff_rows_per_contract = [
+            {k: (round(v * 100, 2) if k not in ("move_pct", "price") else v)
+             for k, v in row.items()}
+            for row in payoff_rows
+        ]
         return {
-            "entry_debit":          round(entry_debit, 4),
-            "entry_near_premium":   round(c_near_entry, 4),
-            "entry_back_premium":   round(c_back_entry, 4),
-            "t_near_days":          T_near_days,
-            "t_back_days":          T_back_days,
-            "t_remaining_days":     T_back_days - T_near_days,
-            "iv_near":              iv_near,
-            "iv_back":              iv_back,
-            "breakeven_moves_pct":  breakevens,
-            "payoff_scenarios":     payoff_rows,
+            "entry_debit":                round(entry_debit, 4),
+            "entry_debit_per_contract":   round(entry_debit * 100, 2),   # FIX 8
+            "entry_near_premium":         round(c_near_entry, 4),
+            "entry_back_premium":         round(c_back_entry, 4),
+            "t_near_days":                T_near_days,
+            "t_back_days":                T_back_days,
+            "t_remaining_days":           T_back_days - T_near_days,
+            "iv_near":                    iv_near,
+            "iv_back":                    iv_back,
+            "breakeven_moves_pct":        breakevens,
+            "payoff_scenarios":           payoff_rows,
+            "payoff_scenarios_per_contract": payoff_rows_per_contract,  # FIX 8
+            # FIX 2: make the synthetic nature explicit so the UI can warn users
+            "calendar_is_theoretical":    True,
+            "calendar_note":              (
+                "Priced from interpolated IV30/IV45; back leg = near + 28d. "
+                "Not guaranteed to match a live quoted chain."
+            ),
         }
     except Exception as exc:
         logger.debug("Calendar payoff computation failed: %s", exc)
@@ -1559,6 +1598,7 @@ def analyze_single_ticker(
             days, ivs, iv30, iv45, ts_slope_0_45, liquidity,
             implied_move_pct, near_term_spread_pct, near_term_dte,
             near_back_iv_ratio, near_term_liquidity_proxy,
+            ts_slope_near_dte, ts_slope_far_dte,
         ) = _term_structure_from_mda_chain(chain_df, current_price)
         smile_state = _smile_curvature_from_mda_chain(chain_df, current_price)
     else:
@@ -1566,6 +1606,7 @@ def analyze_single_ticker(
             days, ivs, iv30, iv45, ts_slope_0_45, liquidity,
             implied_move_pct, near_term_spread_pct, near_term_dte,
             near_back_iv_ratio, near_term_liquidity_proxy,
+            ts_slope_near_dte, ts_slope_far_dte,
         ) = _term_structure_points_yf(ticker, current_price)
         smile_state = _smile_curvature_yf(ticker, current_price)
 
@@ -1600,12 +1641,13 @@ def analyze_single_ticker(
                     today_ts = pd.Timestamp(_utc_today_date())
                     parsed_events: List[Dict[str, Any]] = []
                     for ts in edf.index:
-                        ts_norm = pd.Timestamp(ts).tz_localize(None).normalize()
+                        ts_raw = pd.Timestamp(ts).tz_localize(None)
+                        ts_norm = ts_raw.normalize()
                         if ts_norm <= today_ts:
                             parsed_events.append(
                                 {
                                     "event_date": ts_norm,
-                                    "release_timing": _normalize_release_timing(pd.Timestamp(ts).tz_localize(None)),
+                                    "release_timing": _normalize_release_timing(ts_raw),
                                 }
                             )
                     earnings_events_for_profile = parsed_events
@@ -1618,12 +1660,13 @@ def analyze_single_ticker(
                     today_ts = pd.Timestamp(_utc_today_date())
                     parsed_events = []
                     for ts in fallback_edates.index:
-                        ts_norm = pd.Timestamp(ts).tz_localize(None).normalize()
+                        ts_raw = pd.Timestamp(ts).tz_localize(None)
+                        ts_norm = ts_raw.normalize()
                         if ts_norm <= today_ts:
                             parsed_events.append(
                                 {
                                     "event_date": ts_norm,
-                                    "release_timing": _normalize_release_timing(pd.Timestamp(ts).tz_localize(None)),
+                                    "release_timing": _normalize_release_timing(ts_raw),
                                 }
                             )
                     earnings_events_for_profile = parsed_events
@@ -1997,6 +2040,11 @@ def analyze_single_ticker(
     metrics = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "data_source": data_source,
+        # FIX 4: granular source provenance — options and price/RV may differ
+        "data_sources": {
+            "options_source":  "marketdata_app" if use_mda else "yfinance",
+            "price_rv_source": "yfinance",
+        },
         "price_data_stale": _price_stale,
         "price_data_age_days": _price_age_days,
         "current_price": current_price,
@@ -2012,6 +2060,10 @@ def analyze_single_ticker(
         "smile_concave": bool(smile_state.get("concave", False)),
         "smile_points": int(smile_state.get("points", 0) or 0),
         "term_structure_slope_0_45": float(ts_slope_0_45) if np.isfinite(ts_slope_0_45) else None,
+        # FIX 1: actual tenors used for slope — 0-45 label was misleading
+        "term_structure_slope":   float(ts_slope_0_45) if np.isfinite(ts_slope_0_45) else None,
+        "ts_slope_near_dte":      float(ts_slope_near_dte) if ts_slope_near_dte is not None else None,
+        "ts_slope_far_dte":       float(ts_slope_far_dte) if ts_slope_far_dte is not None else None,
         "near_back_iv_ratio": float(near_back_iv_ratio) if np.isfinite(_safe_float(near_back_iv_ratio, np.nan)) else None,
         "min_near_back_iv_ratio_for_event": MIN_NEAR_BACK_IV_RATIO_FOR_EVENT,
         "near_term_dte": near_term_dte,

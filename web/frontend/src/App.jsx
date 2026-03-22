@@ -145,7 +145,21 @@ function releaseTimeBadge(rt) {
   return <Badge>{rt}</Badge>
 }
 
-function dataSourceBadge(ds) {
+function dataSourceBadge(ds, dataSources) {
+  // FIX 4: show granular provenance — options and price/RV may come from different sources
+  if (dataSources) {
+    const optSrc = dataSources.options_source === 'marketdata_app' ? 'MDApp' : 'yfinance'
+    const rvSrc  = dataSources.price_rv_source === 'marketdata_app' ? 'MDApp' : 'yfinance'
+    if (optSrc !== rvSrc) {
+      return (
+        <span style={{ fontSize: 11, color: '#8b949e' }}>
+          <Badge variant={dataSources.options_source === 'marketdata_app' ? 'mda' : 'yf'}>{optSrc}</Badge>
+          <span style={{ margin: '0 4px', opacity: 0.6 }}>·</span>
+          <span style={{ opacity: 0.8 }}>Prices/RV: {rvSrc}</span>
+        </span>
+      )
+    }
+  }
   if (ds === 'marketdata_app') return <Badge variant="mda">MDApp</Badge>
   if (ds === 'yfinance_fallback') return <Badge variant="yf">yfinance</Badge>
   return null
@@ -317,12 +331,17 @@ function OosSplitChart({ splitsDetail }) {
 function CalendarSpreadChart({ calPayoff }) {
   if (!calPayoff?.payoff_scenarios?.length) return null
 
-  const data = calPayoff.payoff_scenarios.map(s => ({
+  // FIX 8: prefer per-contract scenarios (multiplied by 100) so Y-axis reads in dollars/contract
+  const scenarios = calPayoff.payoff_scenarios_per_contract?.length
+    ? calPayoff.payoff_scenarios_per_contract
+    : calPayoff.payoff_scenarios
+
+  const data = scenarios.map(s => ({
     move: Number(s.move_pct),
-    expand: Number((s.iv_expand_20 ?? 0).toFixed(3)),
-    flat: Number((s.iv_flat ?? 0).toFixed(3)),
-    crush25: Number((s.iv_crush_25 ?? 0).toFixed(3)),
-    crush45: Number((s.iv_crush_45 ?? 0).toFixed(3)),
+    expand: Number((s.iv_expand_20 ?? 0).toFixed(2)),
+    flat: Number((s.iv_flat ?? 0).toFixed(2)),
+    crush25: Number((s.iv_crush_25 ?? 0).toFixed(2)),
+    crush45: Number((s.iv_crush_45 ?? 0).toFixed(2)),
   }))
 
   const allVals = data.flatMap(d => [d.expand, d.flat, d.crush25, d.crush45]).filter(v => isFinite(v))
@@ -335,8 +354,10 @@ function CalendarSpreadChart({ calPayoff }) {
   return (
     <div className="vol-chart-wrapper">
       <div className="vol-chart-label">
-        Calendar Spread P&amp;L at Near-Leg Expiry&nbsp;·&nbsp;
-        Entry Debit {calPayoff.entry_debit != null ? `$${Number(calPayoff.entry_debit).toFixed(3)}` : 'n/a'}
+        Calendar Spread P&amp;L at Near-Leg Expiry&nbsp;·&nbsp;$/contract (100 shares)&nbsp;·&nbsp;
+        Entry Debit {calPayoff.entry_debit_per_contract != null
+          ? `$${Number(calPayoff.entry_debit_per_contract).toFixed(2)}/contract`
+          : calPayoff.entry_debit != null ? `$${Number(calPayoff.entry_debit).toFixed(3)}/share` : 'n/a'}
         &nbsp;(near {calPayoff.t_near_days}d / back {calPayoff.t_back_days}d)
       </div>
       {breakevens.length > 0 && (
@@ -752,7 +773,7 @@ export default function App() {
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               {result && (
                 <div className="data-source-row">
-                  {dataSourceBadge(m.data_source)}
+                  {dataSourceBadge(m.data_source, m.data_sources)}
                 </div>
               )}
               <button
@@ -856,8 +877,10 @@ export default function App() {
                     tone={tonePos(m.implied_vs_anchor_ratio, 1.05, 1.0)} />
                   <Metric label="Drawdown Risk" value={fmtPp(m.drawdown_risk_pct, 2)}
                     tone={toneNeg(m.drawdown_risk_pct, 1.25, 2.0)} />
-                  <Metric label="Tx Cost Est" value={fmtPp(m.tx_cost_estimate_pct, 2)}
-                    tone={toneNeg(m.tx_cost_estimate_pct, 0.5, 1.0)} />
+                  {/* FIX 7: clarify this is a model-derived friction score, not a broker-quoted cost */}
+                  <Metric label="Friction Score" value={fmtPp(m.tx_cost_estimate_pct, 2)}
+                    tone={toneNeg(m.tx_cost_estimate_pct, 0.5, 1.0)}
+                    sub="heuristic · not broker-quoted" />
                 </div>
               </div>
 
@@ -939,18 +962,21 @@ export default function App() {
               <div className="metrics-group">
                 <div className="metrics-group-label">Volatility Surface</div>
                 <div className="metrics-grid">
-                  <Metric label="IV30" value={fmtNum(m.iv30, 4)} />
-                  <Metric label="RV30 (YZ)" value={fmtNum(m.rv30, 4)}
-                    sub={m.rv_estimator === 'yang_zhang' ? 'Yang-Zhang' : 'close-to-close'} />
+                  {/* FIX 5: show vol metrics as % (annualized), not raw decimals */}
+                  <Metric label="IV30" value={m.iv30 != null ? `${(m.iv30 * 100).toFixed(1)}%` : 'n/a'}
+                    sub="annualized" />
+                  <Metric label="RV30 (YZ)" value={m.rv30 != null ? `${(m.rv30 * 100).toFixed(1)}%` : 'n/a'}
+                    sub={m.rv_estimator === 'yang_zhang' ? 'Yang-Zhang · annualized' : 'close-to-close · annualized'} />
                   <Metric label="IV / RV30" value={fmtNum(m.iv_rv30, 3)}
                     tone={tonePos(m.iv_rv30, 1.05, 1.0)} />
-                  <Metric label="RV Forecast (HAR)" value={fmtNum(m.rv30_har_forecast, 4)}
-                    sub={m.rv30_har_forecast != null ? 'Corsi 2009 · 1d fwd' : 'n/a (< 35d hist)'} />
+                  <Metric label="RV Forecast (HAR)" value={m.rv30_har_forecast != null ? `${(m.rv30_har_forecast * 100).toFixed(1)}%` : 'n/a'}
+                    sub={m.rv30_har_forecast != null ? 'Corsi 2009 · 1d fwd · annualized' : 'n/a (< 35d hist)'} />
                   <Metric label="IV / RV (fwd)" value={fmtNum(m.iv_rv_har, 3)}
                     tone={tonePos(m.iv_rv_har, 1.05, 1.0)}
                     sub="vs HAR forecast" />
+                  {/* FIX 6: relabel Vol Percentile to clarify it uses Rogers-Satchell, not YZ */}
                   <Metric
-                    label="Vol Percentile (1y)"
+                    label="Vol Regime Pct (RS-1y)"
                     value={m.rv_percentile_rank != null ? `${Math.round(m.rv_percentile_rank)}th` : 'n/a'}
                     tone={
                       m.rv_percentile_rank == null ? 'default'
@@ -958,11 +984,18 @@ export default function App() {
                       : m.rv_percentile_rank <= 25 ? 'good'
                       : 'warn'
                     }
-                    sub={m.vol_regime && m.vol_regime !== 'unknown' ? `Regime: ${m.vol_regime}` : null}
+                    sub={m.vol_regime && m.vol_regime !== 'unknown' ? `Regime: ${m.vol_regime} · Rogers-Satchell basis` : 'Rogers-Satchell basis'}
                     accent
                   />
-                  <Metric label="IV45" value={fmtNum(m.iv45, 4)} />
-                  <Metric label="TS Slope 0-45" value={fmtNum(m.term_structure_slope_0_45, 5)} />
+                  <Metric label="IV45" value={m.iv45 != null ? `${(m.iv45 * 100).toFixed(1)}%` : 'n/a'}
+                    sub="annualized" />
+                  {/* FIX 1: label now shows actual tenors, not implied "0-45" */}
+                  <Metric
+                    label={m.ts_slope_near_dte != null && m.ts_slope_far_dte != null
+                      ? `TS Slope (${Math.round(m.ts_slope_near_dte)}d→${Math.round(m.ts_slope_far_dte)}d)`
+                      : 'TS Slope'}
+                    value={fmtNum(m.term_structure_slope ?? m.term_structure_slope_0_45, 5)}
+                  />
                   <Metric label="Near / Back IV" value={fmtNum(m.near_back_iv_ratio, 2)}
                     tone={tonePos(m.near_back_iv_ratio, m.min_near_back_iv_ratio_for_event ?? 1.02, 1.0)} />
                   <Metric label="Smile Curvature" value={fmtNum(m.smile_curvature, 3)}
@@ -992,7 +1025,16 @@ export default function App() {
                       : null}
                   />
                   <Metric label="Near-Term Opt DTE" value={m.near_term_dte ?? 'n/a'} />
-                  <Metric label="Implied Move" value={fmtPp(m.implied_move_pct, 2)} />
+                  <Metric label="Implied Move (Total)" value={fmtPp(m.implied_move_pct, 2)} />
+                  {/* FIX 10: surface the event vs non-event move split */}
+                  {m.event_implied_move_pct != null && (
+                    <Metric label="Event-Implied Move" value={fmtPp(m.event_implied_move_pct, 2)}
+                      sub="earnings-specific component" />
+                  )}
+                  {m.non_event_move_pct != null && m.non_event_move_pct > 0 && (
+                    <Metric label="Non-Event Move" value={fmtPp(m.non_event_move_pct, 2)}
+                      sub="baseline daily vol component" />
+                  )}
                   <Metric label="Anchor Move (Blend)" value={fmtPp(m.earnings_move_anchor_pct, 2)} />
                   <Metric label="Earnings Move (Med)" value={fmtPp(m.earnings_move_median_pct, 2)} />
                   <Metric label="Earnings Move (P90)" value={fmtPp(m.earnings_move_p90_pct, 2)} />
@@ -1067,9 +1109,10 @@ export default function App() {
                 <div className="metrics-group">
                   <div className="metrics-group-label">
                     Calendar Spread · ATM · Short Near / Long Back+28d
-                    {m.calendar_payoff.entry_debit != null && (
+                    {/* FIX 8: show per-contract value prominently */}
+                    {m.calendar_payoff.entry_debit_per_contract != null && (
                       <span style={{ marginLeft: 10, fontWeight: 400, color: '#8b949e', fontSize: 11 }}>
-                        Entry debit ${Number(m.calendar_payoff.entry_debit).toFixed(3)}
+                        Entry debit ${Number(m.calendar_payoff.entry_debit_per_contract).toFixed(2)}/contract
                       </span>
                     )}
                     {m.calendar_spread_quality && (() => {
@@ -1081,6 +1124,17 @@ export default function App() {
                       )
                     })()}
                   </div>
+                  {/* FIX 2: always show theoretical disclaimer — pricing uses interpolated IV, not live chain */}
+                  {m.calendar_payoff.calendar_is_theoretical && (
+                    <div style={{
+                      background: 'rgba(240,160,32,0.08)', border: '1px solid rgba(240,160,32,0.30)',
+                      borderRadius: 6, padding: '6px 12px', marginBottom: 8, fontSize: 11,
+                      color: '#f0a020',
+                    }}>
+                      ⚠ Theoretical illustration — priced from interpolated IV30/IV45, back leg = near+28d.
+                      Not guaranteed to match a live quoted chain. Verify debit with your broker before trading.
+                    </div>
+                  )}
                   {/* Fix 4: warn if breakevens are tighter than implied move */}
                   {m.calendar_be_vs_implied != null && m.calendar_be_vs_implied < 0.70 && (
                     <div style={{
@@ -1114,7 +1168,17 @@ export default function App() {
                 <span><strong>Short-Leg Align:</strong> {shortLegAligned == null ? 'n/a' : shortLegAligned ? 'PASS' : 'FAIL'}</span>
                 <span><strong>Liquidity Gate:</strong> {(m.near_term_liquidity_proxy ?? 0) >= (m.min_near_term_liquidity_proxy_for_trade ?? 400) ? 'PASS' : 'FAIL'}</span>
                 <span><strong>Concavity Surcharge:</strong> {fmtPp(m.concavity_risk_surcharge_pct)}</span>
-                <span><strong>Data:</strong> {m.data_source === 'marketdata_app' ? 'MarketData.app' : 'yfinance'}</span>
+                <span><strong>Data:</strong> {
+                  m.data_sources
+                    ? `Options: ${m.data_sources.options_source === 'marketdata_app' ? 'MDApp' : 'yfinance'} · Prices/RV: ${m.data_sources.price_rv_source === 'marketdata_app' ? 'MDApp' : 'yfinance'}`
+                    : m.data_source === 'marketdata_app' ? 'MarketData.app' : 'yfinance'
+                }</span>
+                {/* FIX 3: stale data warning */}
+                {(m.price_data_stale || (m.price_data_age_days != null && m.price_data_age_days > 1)) && (
+                  <span style={{ color: '#f0a020', fontWeight: 600 }}>
+                    ⚠ Stale data ({m.price_data_age_days}d old)
+                  </span>
+                )}
               </div>
 
               {/* Rationale */}

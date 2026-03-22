@@ -2,11 +2,13 @@ import unittest
 
 import numpy as np
 import pandas as pd
+from datetime import datetime
 
 from web.api.edge_engine import (
     _compute_move_uncertainty_pct,
     _compute_move_anchor,
     _historical_earnings_move_profile,
+    _normalize_release_timing,
 )
 
 
@@ -101,6 +103,18 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         self.assertIsNotNone(earnings_uncertainty)
         self.assertIsNotNone(fallback_uncertainty)
         self.assertGreater(fallback_uncertainty, earnings_uncertainty)
+
+    def test_normalize_release_timing_infers_bmo_from_timestamp(self):
+        inferred = _normalize_release_timing(datetime(2024, 1, 15, 8, 0))
+        self.assertEqual(inferred, "before market open")
+
+    def test_normalize_release_timing_infers_amc_from_timestamp(self):
+        inferred = _normalize_release_timing(datetime(2024, 1, 15, 16, 5))
+        self.assertEqual(inferred, "after market close")
+
+    def test_normalize_release_timing_infers_intraday_from_timestamp(self):
+        inferred = _normalize_release_timing(datetime(2024, 1, 15, 12, 0))
+        self.assertEqual(inferred, "during market hours")
 
 
 if __name__ == "__main__":

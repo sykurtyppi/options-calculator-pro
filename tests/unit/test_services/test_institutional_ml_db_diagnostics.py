@@ -7,7 +7,8 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from services.institutional_ml_db import InstitutionalMLDatabase
+from services.execution_cost_model import ExecutionCostModel
+from services.institutional_ml_db import InstitutionalMLDatabase, SnapshotReplayPair
 
 
 class TestInstitutionalDiagnostics(unittest.TestCase):
@@ -231,6 +232,27 @@ class TestInstitutionalDiagnostics(unittest.TestCase):
                 int(suggested),
                 int(recommendation.get("max_trade_count_for_thresholds", 0)),
             )
+
+    def test_get_training_dataset_excludes_forward_targets_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = f"{tmp_dir}/inst_training_dataset.db"
+            db = InstitutionalMLDatabase(db_path=db_path)
+            self._seed_backtest_data(db)
+
+            dataset = db.get_training_dataset(symbols=["AAPL"])
+            self.assertNotIn("forward_return_1d", dataset.columns)
+            self.assertNotIn("forward_return_5d", dataset.columns)
+            self.assertNotIn("forward_return_21d", dataset.columns)
+            self.assertNotIn("forward_volatility_21d", dataset.columns)
+
+            dataset_with_targets = db.get_training_dataset(
+                symbols=["AAPL"],
+                include_forward_targets=True,
+            )
+            self.assertIn("forward_return_1d", dataset_with_targets.columns)
+            self.assertIn("forward_return_5d", dataset_with_targets.columns)
+            self.assertIn("forward_return_21d", dataset_with_targets.columns)
+            self.assertIn("forward_volatility_21d", dataset_with_targets.columns)
 
     def test_proxy_schedule_generation_requires_sufficient_history(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -504,6 +526,71 @@ class TestInstitutionalDiagnostics(unittest.TestCase):
             self.assertEqual(status["capture_days"], 5)
             self.assertEqual(status["min_relative_day"], -4)
             self.assertEqual(status["max_relative_day"], 1)
+
+    def test_load_snapshot_replay_pair_prefers_expiry_aligned_post_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_replay_pair.db")
+            with sqlite3.connect(db.db_path) as conn:
+                rows = [
+                    ("AAPL", "2026-03-01", "2026-02-25", -4, "AMC", "pre", "2026-03-06", "2026-03-13", 200.0, 0.65, 0.55, 1.18, 205.0, "unit_test"),
+                    ("AAPL", "2026-03-01", "2026-03-02", 1, "AMC", "post", "2026-03-13", "2026-03-20", 200.0, 0.49, 0.50, 0.98, 202.0, "unit_test"),
+                    ("AAPL", "2026-03-01", "2026-03-02", 1, "AMC", "post", "2026-03-06", "2026-03-13", 200.0, 0.48, 0.50, 0.96, 202.0, "unit_test"),
+                ]
+                conn.executemany(
+                    """
+                    INSERT INTO earnings_option_snapshots
+                    (symbol, event_date, capture_date, relative_day, release_timing, snapshot_phase,
+                     short_expiry, long_expiry, atm_strike, front_iv, back_iv, term_ratio,
+                     underlying_price, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                conn.commit()
+
+            pair = db._load_snapshot_replay_pair("AAPL", datetime(2026, 3, 1))
+            self.assertIsNotNone(pair)
+            self.assertEqual(pair.short_expiry, "2026-03-06")
+            self.assertEqual(pair.long_expiry, "2026-03-13")
+            self.assertAlmostEqual(pair.post_front_iv, 0.48, places=6)
+
+    def test_simulate_snapshot_replay_trade_returns_finite_trade(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = InstitutionalMLDatabase(db_path=f"{tmp_dir}/inst_replay_trade.db")
+            pair = SnapshotReplayPair(
+                symbol="AAPL",
+                event_date=datetime(2026, 3, 1),
+                release_timing="AMC",
+                pre_capture_date=datetime(2026, 2, 25),
+                post_capture_date=datetime(2026, 3, 2),
+                short_expiry="2026-03-06",
+                long_expiry="2026-03-13",
+                atm_strike=200.0,
+                pre_front_iv=0.65,
+                pre_back_iv=0.55,
+                post_front_iv=0.48,
+                post_back_iv=0.50,
+                pre_underlying_price=205.0,
+                post_underlying_price=202.0,
+            )
+
+            trade = db._simulate_snapshot_replay_trade(
+                session_id="session_replay_1",
+                setup_score=0.72,
+                contracts=1,
+                execution_profile="institutional",
+                execution_cost_model=ExecutionCostModel("institutional"),
+                snapshot_pair=pair,
+                crush_context={"confidence": 0.8, "edge_score": 0.09, "sample_size": 12.0},
+                daily_share_volume=5_000_000,
+                volume_ratio=1.2,
+            )
+            self.assertIsNotNone(trade)
+            self.assertGreater(trade.debit_per_contract, 0.0)
+            self.assertTrue(np.isfinite(trade.pnl_per_contract))
+            self.assertTrue(np.isfinite(trade.net_return_pct))
+            self.assertEqual(trade.trade_date.date().isoformat(), "2026-02-25")
+            self.assertEqual(trade.event_date.date().isoformat(), "2026-03-01")
 
     def test_oos_report_card_passes_with_confident_sample(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

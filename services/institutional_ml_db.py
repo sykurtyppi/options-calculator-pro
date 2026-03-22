@@ -250,6 +250,25 @@ class BacktestTrade:
     crush_profile_sample_size: float
     execution_profile: str
 
+
+@dataclass(frozen=True)
+class SnapshotReplayPair:
+    """Pre/post earnings option snapshot pair used for replay pricing."""
+    symbol: str
+    event_date: datetime
+    release_timing: str
+    pre_capture_date: datetime
+    post_capture_date: datetime
+    short_expiry: str
+    long_expiry: str
+    atm_strike: float
+    pre_front_iv: float
+    pre_back_iv: float
+    post_front_iv: float
+    post_back_iv: float
+    pre_underlying_price: float
+    post_underlying_price: float
+
 class InstitutionalMLDatabase:
     """
     Institutional-grade ML training database for calendar spreads
@@ -1013,6 +1032,7 @@ class InstitutionalMLDatabase:
     def _run_walk_forward_backtest(self, session: BacktestSession,
                                  strategy_params: Dict[str, Any]) -> List[BacktestTrade]:
         """Generate deterministic trade outcomes from historical feature snapshots."""
+        pricing_mode = str(strategy_params.get('pricing_mode', 'hybrid')).strip().lower() or 'hybrid'
         earnings_event_mode = bool(strategy_params.get('earnings_event_mode', True))
         entry_days_before_earnings = max(1, int(strategy_params.get('entry_days_before_earnings', 7)))
         exit_days_after_earnings = max(0, int(strategy_params.get('exit_days_after_earnings', 1)))
@@ -1024,6 +1044,16 @@ class InstitutionalMLDatabase:
         position_size_contracts = max(1, int(strategy_params.get('position_size_contracts', 1)))
         iv_rv_min = float(strategy_params.get('iv_rv_min', 0.95))
         iv_rv_max = float(strategy_params.get('iv_rv_max', 2.30))
+
+        # Debit gate: reject trades whose entry debit exceeds this per-contract
+        # dollar cap.  None = disabled (no cap).  Calibrated from replay data:
+        # the NFLX Apr-2025 outlier had a $1,269 debit — 3x the next-highest —
+        # and was the single largest loser (-$1,117).  A cap of $600 removes
+        # that outlier without affecting any other event in the current sample.
+        _raw_max_debit = strategy_params.get('max_entry_debit_per_contract', None)
+        max_entry_debit_per_contract: Optional[float] = (
+            float(_raw_max_debit) if _raw_max_debit is not None else None
+        )
         use_crush_confidence_gate = bool(strategy_params.get('use_crush_confidence_gate', True))
         allow_global_crush_profile = bool(strategy_params.get('allow_global_crush_profile', True))
         min_crush_confidence = float(np.clip(float(strategy_params.get('min_crush_confidence', 0.45)), 0.0, 1.0))
@@ -1057,6 +1087,7 @@ class InstitutionalMLDatabase:
         )
 
         trades: List[BacktestTrade] = []
+        snapshot_pair_cache: Dict[Tuple[str, str], Optional[SnapshotReplayPair]] = {}
         daily_candidates: Dict[pd.Timestamp, List[Dict[str, Any]]] = {}
         if earnings_event_mode:
             daily_candidates = self._build_earnings_event_candidates(
@@ -1144,20 +1175,76 @@ class InstitutionalMLDatabase:
 
             scored_rows.sort(key=lambda item: item[0], reverse=True)
             for _, setup_score, row, row_hold_days, event_date, days_to_earnings, crush_context in scored_rows[:max_trades_per_day]:
-                trade = self._simulate_walk_forward_trade(
-                    session_id=session.session_id,
-                    trade_date=pd.Timestamp(trade_date).to_pydatetime(),
-                    row=row,
-                    setup_score=setup_score,
-                    hold_days=row_hold_days,
-                    contracts=position_size_contracts,
-                    execution_profile=execution_cost_model.profile_name,
-                    execution_cost_model=execution_cost_model,
-                    event_date=event_date,
-                    days_to_earnings=days_to_earnings,
-                    crush_context=crush_context,
-                    crush_profiles=crush_profiles,
-                )
+                symbol = str(getattr(row, 'symbol', 'UNKNOWN')).upper()
+                replay_key = (symbol, pd.Timestamp(event_date).strftime('%Y-%m-%d'))
+                snapshot_pair = None
+                if pricing_mode in {'hybrid', 'snapshot_replay'}:
+                    if replay_key not in snapshot_pair_cache:
+                        snapshot_pair_cache[replay_key] = self._load_snapshot_replay_pair(
+                            symbol=symbol,
+                            event_date=pd.Timestamp(event_date).to_pydatetime(),
+                        )
+                    snapshot_pair = snapshot_pair_cache.get(replay_key)
+
+                if snapshot_pair is not None:
+                    self.logger.info(
+                        "📸 REPLAY  %s @ %s — using real option snapshot pair "
+                        "(pre_iv=%.3f post_iv=%.3f)",
+                        symbol,
+                        pd.Timestamp(event_date).strftime('%Y-%m-%d'),
+                        snapshot_pair.pre_front_iv,
+                        snapshot_pair.post_front_iv,
+                    )
+                    trade = self._simulate_snapshot_replay_trade(
+                        session_id=session.session_id,
+                        setup_score=setup_score,
+                        contracts=position_size_contracts,
+                        execution_profile=execution_cost_model.profile_name,
+                        execution_cost_model=execution_cost_model,
+                        snapshot_pair=snapshot_pair,
+                        crush_context=crush_context,
+                        daily_share_volume=getattr(row, 'volume', np.nan),
+                        volume_ratio=getattr(row, 'volume_ratio_10d', 1.0),
+                    )
+                elif pricing_mode == 'snapshot_replay':
+                    self.logger.debug(
+                        "⏭  SKIP    %s @ %s — snapshot_replay mode, no pair found",
+                        symbol,
+                        pd.Timestamp(event_date).strftime('%Y-%m-%d'),
+                    )
+                    trade = None
+                else:
+                    self.logger.info(
+                        "🔮 SYNTHETIC %s @ %s — no snapshot pair, falling back to proxy",
+                        symbol,
+                        pd.Timestamp(event_date).strftime('%Y-%m-%d'),
+                    )
+                    trade = self._simulate_walk_forward_trade(
+                        session_id=session.session_id,
+                        trade_date=pd.Timestamp(trade_date).to_pydatetime(),
+                        row=row,
+                        setup_score=setup_score,
+                        hold_days=row_hold_days,
+                        contracts=position_size_contracts,
+                        execution_profile=execution_cost_model.profile_name,
+                        execution_cost_model=execution_cost_model,
+                        event_date=event_date,
+                        days_to_earnings=days_to_earnings,
+                        crush_context=crush_context,
+                        crush_profiles=crush_profiles,
+                    )
+                # ── Debit gate ────────────────────────────────────────────
+                if trade is not None and max_entry_debit_per_contract is not None:
+                    if trade.debit_per_contract > max_entry_debit_per_contract:
+                        self.logger.info(
+                            "🚫 DEBIT-GATE %s @ %s — debit=%.0f exceeds cap=%.0f, skipping",
+                            symbol,
+                            pd.Timestamp(event_date).strftime('%Y-%m-%d'),
+                            trade.debit_per_contract,
+                            max_entry_debit_per_contract,
+                        )
+                        trade = None
+
                 if trade is not None:
                     trades.append(trade)
 
@@ -2441,6 +2528,236 @@ class InstitutionalMLDatabase:
         except Exception:
             return float('nan'), float('nan')
 
+    def _load_snapshot_replay_pair(
+        self,
+        symbol: str,
+        event_date: datetime,
+        min_pre_days: int = 1,
+        max_pre_days: int = 12,
+        min_post_days: int = 0,
+        max_post_days: int = 5,
+    ) -> Optional[SnapshotReplayPair]:
+        """Load the best available pre/post snapshot pair for replay pricing."""
+        event_date_str = pd.Timestamp(event_date).strftime("%Y-%m-%d")
+        query = """
+            SELECT symbol, event_date, capture_date, relative_day, release_timing, snapshot_phase,
+                   short_expiry, long_expiry, atm_strike, front_iv, back_iv, underlying_price
+            FROM earnings_option_snapshots
+            WHERE symbol = ? AND event_date = ?
+            ORDER BY capture_date
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                df = pd.read_sql_query(query, conn, params=[str(symbol).upper(), event_date_str])
+        except Exception as exc:
+            self.logger.debug("Failed to load replay snapshot pair for %s @ %s: %s", symbol, event_date_str, exc)
+            return None
+
+        if df.empty:
+            return None
+
+        df["capture_date"] = pd.to_datetime(df["capture_date"], errors="coerce")
+        df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
+        df["relative_day"] = pd.to_numeric(df["relative_day"], errors="coerce")
+        for col in ("atm_strike", "front_iv", "back_iv", "underlying_price"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["capture_date", "event_date", "relative_day", "front_iv", "back_iv", "underlying_price"])
+        if df.empty:
+            return None
+
+        pre_candidates = df[
+            (df["relative_day"] <= -max(1, int(min_pre_days)))
+            & (df["relative_day"] >= -max(int(min_pre_days), int(max_pre_days)))
+            & (df["front_iv"] > 0)
+            & (df["back_iv"] > 0)
+        ].sort_values("capture_date")
+        post_candidates = df[
+            (df["relative_day"] >= max(0, int(min_post_days)))
+            & (df["relative_day"] <= max(int(min_post_days), int(max_post_days)))
+            & (df["front_iv"] > 0)
+            & (df["back_iv"] > 0)
+            & ((df["snapshot_phase"] == "post") | (df["relative_day"] > 0))
+        ].sort_values("capture_date")
+
+        if pre_candidates.empty or post_candidates.empty:
+            return None
+
+        pre_row = pre_candidates.iloc[-1]
+        aligned_post = post_candidates[
+            (post_candidates["short_expiry"] == pre_row["short_expiry"])
+            & (post_candidates["long_expiry"] == pre_row["long_expiry"])
+        ]
+        post_row = aligned_post.iloc[0] if not aligned_post.empty else post_candidates.iloc[0]
+
+        strike = float(pre_row["atm_strike"]) if np.isfinite(pre_row["atm_strike"]) else float(post_row["atm_strike"])
+        if not np.isfinite(strike) or strike <= 0:
+            return None
+
+        return SnapshotReplayPair(
+            symbol=str(pre_row["symbol"]).upper(),
+            event_date=pd.Timestamp(pre_row["event_date"]).to_pydatetime(),
+            release_timing=str(pre_row.get("release_timing", "UNKNOWN") or "UNKNOWN").upper(),
+            pre_capture_date=pd.Timestamp(pre_row["capture_date"]).to_pydatetime(),
+            post_capture_date=pd.Timestamp(post_row["capture_date"]).to_pydatetime(),
+            short_expiry=str(pre_row["short_expiry"]),
+            long_expiry=str(pre_row["long_expiry"]),
+            atm_strike=float(strike),
+            pre_front_iv=float(pre_row["front_iv"]),
+            pre_back_iv=float(pre_row["back_iv"]),
+            post_front_iv=float(post_row["front_iv"]),
+            post_back_iv=float(post_row["back_iv"]),
+            pre_underlying_price=float(pre_row["underlying_price"]),
+            post_underlying_price=float(post_row["underlying_price"]),
+        )
+
+    def _calendar_spread_market_value_from_snapshot(
+        self,
+        *,
+        underlying_price: float,
+        strike: float,
+        as_of_date: datetime,
+        short_expiry: str,
+        long_expiry: str,
+        front_iv: float,
+        back_iv: float,
+        risk_free_rate: float = 0.03,
+    ) -> float:
+        """Approximate calendar spread market value from snapshot IVs using BSM."""
+        as_of = pd.Timestamp(as_of_date).date()
+        short_exp = pd.Timestamp(short_expiry).date()
+        long_exp = pd.Timestamp(long_expiry).date()
+        short_t = max((short_exp - as_of).days, 0) / 365.0
+        long_t = max((long_exp - as_of).days, 0) / 365.0
+
+        if not np.isfinite(underlying_price) or underlying_price <= 0 or not np.isfinite(strike) or strike <= 0:
+            return float("nan")
+
+        if short_t > 0 and np.isfinite(front_iv) and front_iv > 0:
+            short_call = self._black_scholes_price(
+                underlying_price=underlying_price,
+                strike=strike,
+                time_to_expiry_years=short_t,
+                risk_free_rate=risk_free_rate,
+                volatility=front_iv,
+                is_call=True,
+            )
+        else:
+            short_call = max(underlying_price - strike, 0.0)
+
+        if long_t > 0 and np.isfinite(back_iv) and back_iv > 0:
+            long_call = self._black_scholes_price(
+                underlying_price=underlying_price,
+                strike=strike,
+                time_to_expiry_years=long_t,
+                risk_free_rate=risk_free_rate,
+                volatility=back_iv,
+                is_call=True,
+            )
+        else:
+            long_call = max(underlying_price - strike, 0.0)
+
+        if not np.isfinite(short_call) or not np.isfinite(long_call):
+            return float("nan")
+        return float((long_call - short_call) * 100.0)
+
+    def _simulate_snapshot_replay_trade(
+        self,
+        *,
+        session_id: str,
+        setup_score: float,
+        contracts: int,
+        execution_profile: str,
+        execution_cost_model: ExecutionCostModel,
+        snapshot_pair: SnapshotReplayPair,
+        crush_context: Optional[Dict[str, Any]] = None,
+        daily_share_volume: Optional[float] = None,
+        volume_ratio: Optional[float] = None,
+    ) -> Optional[BacktestTrade]:
+        """Replay a calendar trade from stored pre/post earnings snapshots."""
+        entry_value = self._calendar_spread_market_value_from_snapshot(
+            underlying_price=snapshot_pair.pre_underlying_price,
+            strike=snapshot_pair.atm_strike,
+            as_of_date=snapshot_pair.pre_capture_date,
+            short_expiry=snapshot_pair.short_expiry,
+            long_expiry=snapshot_pair.long_expiry,
+            front_iv=snapshot_pair.pre_front_iv,
+            back_iv=snapshot_pair.pre_back_iv,
+        )
+        exit_value = self._calendar_spread_market_value_from_snapshot(
+            underlying_price=snapshot_pair.post_underlying_price,
+            strike=snapshot_pair.atm_strike,
+            as_of_date=snapshot_pair.post_capture_date,
+            short_expiry=snapshot_pair.short_expiry,
+            long_expiry=snapshot_pair.long_expiry,
+            front_iv=snapshot_pair.post_front_iv,
+            back_iv=snapshot_pair.post_back_iv,
+        )
+        if not np.isfinite(entry_value) or not np.isfinite(exit_value) or entry_value <= 0:
+            return None
+
+        volume_ratio = float(np.clip(self._safe_numeric(volume_ratio, 1.0), 0.30, 3.0))
+        daily_share_volume = max(1.0, float(self._safe_numeric(daily_share_volume, 1_000_000.0)))
+        option_volume_proxy = max(20.0, np.sqrt(daily_share_volume) * 0.50 * volume_ratio)
+        open_interest_proxy = max(80.0, option_volume_proxy * 6.0)
+        short_spread = float(np.clip(0.04 + 0.16 / (volume_ratio + 0.35), 0.03, 0.30))
+        long_spread = float(np.clip(short_spread + 0.02, 0.05, 0.36))
+        cost_estimate = execution_cost_model.estimate_calendar_round_trip_cost(
+            short_spread=short_spread,
+            long_spread=long_spread,
+            average_volume=option_volume_proxy,
+            open_interest=open_interest_proxy,
+            contracts=contracts,
+        )
+        transaction_cost_per_contract = float(cost_estimate["cost_per_contract"])
+
+        gross_pnl_per_contract = float(exit_value - entry_value)
+        net_pnl_per_contract = float(gross_pnl_per_contract - transaction_cost_per_contract)
+        gross_return_pct = float(gross_pnl_per_contract / entry_value)
+        net_return_pct = float(net_pnl_per_contract / entry_value)
+
+        days_held = max(1, (snapshot_pair.post_capture_date.date() - snapshot_pair.pre_capture_date.date()).days)
+        underlying_return = float(
+            (snapshot_pair.post_underlying_price / snapshot_pair.pre_underlying_price) - 1.0
+        ) if snapshot_pair.pre_underlying_price > 0 else 0.0
+        expected_move = float(max(0.01, snapshot_pair.pre_front_iv * math.sqrt(max(days_held, 1) / 365.0)))
+        move_ratio = float(abs(underlying_return) / max(expected_move, 1e-6))
+        predicted_front_iv_crush_pct = float(
+            (snapshot_pair.post_front_iv - snapshot_pair.pre_front_iv) / max(snapshot_pair.pre_front_iv, 1e-6)
+        )
+
+        if crush_context is None:
+            crush_confidence = 0.0
+            crush_edge_score = 0.0
+            crush_profile_sample_size = 0.0
+        else:
+            crush_confidence = float(np.clip(self._safe_numeric(crush_context.get("confidence", 0.0), 0.0), 0.0, 1.0))
+            crush_edge_score = float(max(0.0, self._safe_numeric(crush_context.get("edge_score", 0.0), 0.0)))
+            crush_profile_sample_size = float(max(0.0, self._safe_numeric(crush_context.get("sample_size", 0.0), 0.0)))
+
+        return BacktestTrade(
+            session_id=session_id,
+            symbol=snapshot_pair.symbol,
+            trade_date=snapshot_pair.pre_capture_date,
+            event_date=snapshot_pair.event_date,
+            days_to_earnings=max(0, (snapshot_pair.event_date.date() - snapshot_pair.pre_capture_date.date()).days),
+            contracts=contracts,
+            hold_days=days_held,
+            setup_score=setup_score,
+            debit_per_contract=float(entry_value),
+            transaction_cost_per_contract=transaction_cost_per_contract,
+            gross_return_pct=gross_return_pct,
+            net_return_pct=net_return_pct,
+            pnl_per_contract=net_pnl_per_contract,
+            underlying_return=underlying_return,
+            expected_move=expected_move,
+            move_ratio=move_ratio,
+            predicted_front_iv_crush_pct=predicted_front_iv_crush_pct,
+            crush_confidence=crush_confidence,
+            crush_edge_score=crush_edge_score,
+            crush_profile_sample_size=crush_profile_sample_size,
+            execution_profile=execution_profile,
+        )
+
     def calibrate_earnings_iv_decay_labels(self, min_pre_days: int = 1,
                                          max_pre_days: int = 12,
                                          min_post_days: int = 0,
@@ -2703,7 +3020,7 @@ class InstitutionalMLDatabase:
         unqualified_events = int(((grouped['pre_count'] == 0) & (grouped['post_count'] == 0)).sum())
 
         if total_events > 0:
-            pairable_event_pct = float(pairable_events / total_events)
+            pairable_event_pct = float(pairable_events / total_events) * 100.0
         else:
             pairable_event_pct = 0.0
 
@@ -3101,7 +3418,8 @@ class InstitutionalMLDatabase:
             self.logger.error(f"❌ Failed to store backtest trades: {e}")
 
     def get_training_dataset(self, symbols: List[str] = None,
-                           start_date: str = None, end_date: str = None) -> pd.DataFrame:
+                           start_date: str = None, end_date: str = None,
+                           include_forward_targets: bool = False) -> pd.DataFrame:
         """
         Get ML training dataset with features and targets
 
@@ -3111,20 +3429,46 @@ class InstitutionalMLDatabase:
             end_date: End date (YYYY-MM-DD)
 
         Returns:
-            DataFrame with features and targets for ML training
+            DataFrame with features and targets for ML training.
+            Forward-looking target columns are excluded by default to reduce
+            accidental leakage in downstream modeling code.
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
+                feature_columns = [
+                    "symbol",
+                    "date",
+                    "underlying_price",
+                    "price_momentum_5d",
+                    "price_momentum_20d",
+                    "volume_ratio_10d",
+                    "iv_rank",
+                    "iv_percentile",
+                    "iv30_rv30_ratio",
+                    "vol_term_structure_slope",
+                    "rsi_14",
+                    "bb_position",
+                    "vix_level",
+                ]
+                if include_forward_targets:
+                    feature_columns.extend([
+                        "forward_return_1d",
+                        "forward_return_5d",
+                        "forward_return_21d",
+                        "forward_volatility_21d",
+                    ])
                 query = """
                     SELECT
-                        f.*,
+                        {feature_columns},
                         p.volume,
                         p.realized_vol_30d,
                         p.realized_vol_60d
                     FROM ml_features f
                     LEFT JOIN daily_prices p ON f.symbol = p.symbol AND f.date = p.date
                     WHERE 1=1
-                """
+                """.format(
+                    feature_columns=", ".join(f"f.{col}" for col in feature_columns)
+                )
 
                 params = []
                 if symbols:
