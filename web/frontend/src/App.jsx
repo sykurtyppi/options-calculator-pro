@@ -87,6 +87,10 @@ function fmtPp(v, d = 2) {
   if (v == null || Number.isNaN(Number(v))) return 'n/a'
   return `${Number(v).toFixed(d)}%`
 }
+function fmtVol(v, d = 1) {
+  if (v == null || Number.isNaN(Number(v))) return 'n/a'
+  return `${(Number(v) * 100).toFixed(d)}%`
+}
 function fmtSpp(v, d = 2) {
   if (v == null || Number.isNaN(Number(v))) return 'n/a'
   const n = Number(v)
@@ -163,6 +167,13 @@ function dataSourceBadge(ds, dataSources) {
   if (ds === 'marketdata_app') return <Badge variant="mda">MDApp</Badge>
   if (ds === 'yfinance_fallback') return <Badge variant="yf">yfinance</Badge>
   return null
+}
+
+function formatTimestamp(ts) {
+  if (!ts) return 'n/a'
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return 'n/a'
+  return d.toLocaleString()
 }
 
 // ── Vol term structure chart ──────────────────────────────────────────────────
@@ -963,13 +974,13 @@ export default function App() {
                 <div className="metrics-group-label">Volatility Surface</div>
                 <div className="metrics-grid">
                   {/* FIX 5: show vol metrics as % (annualized), not raw decimals */}
-                  <Metric label="IV30" value={m.iv30 != null ? `${(m.iv30 * 100).toFixed(1)}%` : 'n/a'}
+                  <Metric label="IV30" value={fmtVol(m.iv30)}
                     sub="annualized" />
-                  <Metric label="RV30 (YZ)" value={m.rv30 != null ? `${(m.rv30 * 100).toFixed(1)}%` : 'n/a'}
+                  <Metric label="RV30 (YZ)" value={fmtVol(m.rv30)}
                     sub={m.rv_estimator === 'yang_zhang' ? 'Yang-Zhang · annualized' : 'close-to-close · annualized'} />
                   <Metric label="IV / RV30" value={fmtNum(m.iv_rv30, 3)}
                     tone={tonePos(m.iv_rv30, 1.05, 1.0)} />
-                  <Metric label="RV Forecast (HAR)" value={m.rv30_har_forecast != null ? `${(m.rv30_har_forecast * 100).toFixed(1)}%` : 'n/a'}
+                  <Metric label="RV Forecast (HAR)" value={fmtVol(m.rv30_har_forecast)}
                     sub={m.rv30_har_forecast != null ? 'Corsi 2009 · 1d fwd · annualized' : 'n/a (< 35d hist)'} />
                   <Metric label="IV / RV (fwd)" value={fmtNum(m.iv_rv_har, 3)}
                     tone={tonePos(m.iv_rv_har, 1.05, 1.0)}
@@ -987,7 +998,7 @@ export default function App() {
                     sub={m.vol_regime && m.vol_regime !== 'unknown' ? `Regime: ${m.vol_regime} · Rogers-Satchell basis` : 'Rogers-Satchell basis'}
                     accent
                   />
-                  <Metric label="IV45" value={m.iv45 != null ? `${(m.iv45 * 100).toFixed(1)}%` : 'n/a'}
+                  <Metric label="IV45" value={fmtVol(m.iv45)}
                     sub="annualized" />
                   {/* FIX 1: label now shows actual tenors, not implied "0-45" */}
                   <Metric
@@ -1063,6 +1074,11 @@ export default function App() {
                     sub="daily decay (short leg earns)" />
                   <Metric label="Theta (Put)" value={m.atm_theta_put != null ? `$${Number(m.atm_theta_put).toFixed(3)}` : 'n/a'}
                     sub="daily decay" />
+                  <Metric
+                    label="Risk-Free Rate"
+                    value={fmtVol(m.pricing_risk_free_rate, 2)}
+                    sub={m.pricing_risk_free_rate_source ? `pricing input · ${m.pricing_risk_free_rate_source}` : 'pricing input'}
+                  />
                 </div>
               </div>
 
@@ -1173,6 +1189,7 @@ export default function App() {
                     ? `Options: ${m.data_sources.options_source === 'marketdata_app' ? 'MDApp' : 'yfinance'} · Prices/RV: ${m.data_sources.price_rv_source === 'marketdata_app' ? 'MDApp' : 'yfinance'}`
                     : m.data_source === 'marketdata_app' ? 'MarketData.app' : 'yfinance'
                 }</span>
+                <span><strong>Updated:</strong> {formatTimestamp(result.generated_at || m.generated_at)}</span>
                 {/* FIX 3: stale data warning */}
                 {(m.price_data_stale || (m.price_data_age_days != null && m.price_data_age_days > 1)) && (
                   <span style={{ color: '#f0a020', fontWeight: 600 }}>

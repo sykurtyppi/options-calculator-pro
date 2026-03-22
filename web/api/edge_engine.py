@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +31,8 @@ _crush_clf = None
 _crush_scaler = None
 _crush_model_loaded: bool = False
 _ml_model_lock = threading.Lock()
+_rf_rate_lock = threading.Lock()
+_rf_rate_cache: Dict[str, Any] = {"ts": 0.0, "rate": None, "source": None}
 
 
 def _try_load_crush_model() -> None:
@@ -134,6 +138,50 @@ def _safe_float(value: Any, default: float = np.nan) -> float:
         return parsed
     except (TypeError, ValueError):
         return float(default)
+
+
+def _get_pricing_risk_free_rate(cache_ttl_seconds: float = 43_200.0) -> Tuple[float, str]:
+    """
+    Resolve the pricing risk-free rate for BSM-style calculations.
+
+    Preference order:
+      1. Explicit env override `OPTIONS_PRICING_RISK_FREE_RATE`
+      2. Latest available 13-week T-bill yield via yfinance `^IRX`
+      3. Conservative static fallback
+    """
+    now = time.time()
+    with _rf_rate_lock:
+        cached_rate = _safe_float(_rf_rate_cache.get("rate"), np.nan)
+        if (
+            np.isfinite(cached_rate)
+            and cached_rate > 0
+            and (now - float(_rf_rate_cache.get("ts") or 0.0)) < cache_ttl_seconds
+        ):
+            return float(cached_rate), str(_rf_rate_cache.get("source") or "cache")
+
+    env_raw = os.getenv("OPTIONS_PRICING_RISK_FREE_RATE", "").strip()
+    env_rate = _safe_float(env_raw, np.nan)
+    if np.isfinite(env_rate) and 0.0 < env_rate < 0.25:
+        with _rf_rate_lock:
+            _rf_rate_cache.update({"ts": now, "rate": float(env_rate), "source": "env"})
+        return float(env_rate), "env"
+
+    try:
+        irx_hist = yf.Ticker("^IRX").history(period="7d", auto_adjust=False)
+        irx_close = pd.to_numeric(irx_hist.get("Close"), errors="coerce").dropna()
+        if not irx_close.empty:
+            irx_rate = float(irx_close.iloc[-1]) / 100.0
+            if np.isfinite(irx_rate) and 0.0 < irx_rate < 0.25:
+                with _rf_rate_lock:
+                    _rf_rate_cache.update({"ts": now, "rate": irx_rate, "source": "yfinance_^IRX"})
+                return irx_rate, "yfinance_^IRX"
+    except Exception as exc:
+        logger.debug("Risk-free rate fetch via ^IRX failed: %s", exc)
+
+    fallback_rate = 0.0525
+    with _rf_rate_lock:
+        _rf_rate_cache.update({"ts": now, "rate": fallback_rate, "source": "fallback_static"})
+    return fallback_rate, "fallback_static"
 
 
 # ─── ATM option stats (unchanged — works on both yfinance and MDApp DataFrames) ──
@@ -1609,6 +1657,7 @@ def analyze_single_ticker(
             ts_slope_near_dte, ts_slope_far_dte,
         ) = _term_structure_points_yf(ticker, current_price)
         smile_state = _smile_curvature_yf(ticker, current_price)
+    options_source = "marketdata_app" if chain_df is not None else "yfinance"
 
     # ── 4. Earnings dates + BMO/AMC timing ───────────────────────────────────
     dte: Optional[int] = None
@@ -1674,9 +1723,15 @@ def analyze_single_ticker(
                     logger.warning("yfinance earnings_dates parsing failed for %s: %s", clean_symbol, exc)
 
     # ATM BSM greeks — placed here because we now have dte resolved from section 4
+    pricing_risk_free_rate, pricing_risk_free_rate_source = _get_pricing_risk_free_rate()
     _bsm_T = float(dte) if dte is not None and dte > 0 else np.nan
     greeks = (
-        _bsm_greeks(S=current_price, T_days=_bsm_T, sigma=float(iv30) if np.isfinite(iv30) else np.nan)
+        _bsm_greeks(
+            S=current_price,
+            T_days=_bsm_T,
+            sigma=float(iv30) if np.isfinite(iv30) else np.nan,
+            r=pricing_risk_free_rate,
+        )
         if np.isfinite(_bsm_T) and np.isfinite(iv30)
         else {k: None for k in ("delta_call", "delta_put", "gamma", "vega", "theta_call", "theta_put")}
     )
@@ -1829,6 +1884,7 @@ def analyze_single_ticker(
             iv_back=float(_cal_iv_back),
             T_near_days=float(_cal_T_near),
             T_back_days=float(_cal_T_back),
+            r=pricing_risk_free_rate,
         )
         if (np.isfinite(_cal_T_near) and np.isfinite(_cal_T_back)
             and np.isfinite(iv30) and iv30 > 0
@@ -2042,12 +2098,14 @@ def analyze_single_ticker(
         "data_source": data_source,
         # FIX 4: granular source provenance — options and price/RV may differ
         "data_sources": {
-            "options_source":  "marketdata_app" if use_mda else "yfinance",
+            "options_source":  options_source,
             "price_rv_source": "yfinance",
         },
         "price_data_stale": _price_stale,
         "price_data_age_days": _price_age_days,
         "current_price": current_price,
+        "pricing_risk_free_rate": float(pricing_risk_free_rate),
+        "pricing_risk_free_rate_source": pricing_risk_free_rate_source,
         "days_to_earnings": dte,
         "earnings_release_time": earnings_release_time,
         "rv30": rv30,

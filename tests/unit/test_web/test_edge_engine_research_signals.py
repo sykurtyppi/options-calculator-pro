@@ -7,6 +7,7 @@ from datetime import datetime
 from web.api.edge_engine import (
     _compute_move_uncertainty_pct,
     _compute_move_anchor,
+    _get_pricing_risk_free_rate,
     _historical_earnings_move_profile,
     _normalize_release_timing,
 )
@@ -115,6 +116,16 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
     def test_normalize_release_timing_infers_intraday_from_timestamp(self):
         inferred = _normalize_release_timing(datetime(2024, 1, 15, 12, 0))
         self.assertEqual(inferred, "during market hours")
+
+    def test_pricing_risk_free_rate_env_override(self):
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"OPTIONS_PRICING_RISK_FREE_RATE": "0.0415"}, clear=False):
+            rate, source = _get_pricing_risk_free_rate(cache_ttl_seconds=0.0)
+
+        self.assertAlmostEqual(rate, 0.0415, places=6)
+        self.assertEqual(source, "env")
 
 
 if __name__ == "__main__":
