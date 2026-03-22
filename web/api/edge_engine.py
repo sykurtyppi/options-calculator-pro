@@ -147,7 +147,7 @@ def _get_pricing_risk_free_rate(cache_ttl_seconds: float = 43_200.0) -> Tuple[fl
     Preference order:
       1. Explicit env override `OPTIONS_PRICING_RISK_FREE_RATE`
       2. Latest available 13-week T-bill yield via yfinance `^IRX`
-      3. Conservative static fallback
+      3. Conservative static fallback near the current short-rate regime
     """
     now = time.time()
     with _rf_rate_lock:
@@ -178,10 +178,38 @@ def _get_pricing_risk_free_rate(cache_ttl_seconds: float = 43_200.0) -> Tuple[fl
     except Exception as exc:
         logger.debug("Risk-free rate fetch via ^IRX failed: %s", exc)
 
-    fallback_rate = 0.0525
+    fallback_rate = 0.0450
     with _rf_rate_lock:
         _rf_rate_cache.update({"ts": now, "rate": fallback_rate, "source": "fallback_static"})
     return fallback_rate, "fallback_static"
+
+
+def _classify_move_risk(
+    p90_earnings_move_pct: Optional[float],
+    event_implied_move_pct: Optional[float],
+    sample_size: int,
+) -> Tuple[str, Optional[float]]:
+    """
+    Soft advisory for how stressed the historical earnings tail is relative to the
+    event-implied move currently priced by the market.
+    """
+    p90_val = _safe_float(p90_earnings_move_pct, np.nan)
+    impl_val = _safe_float(event_implied_move_pct, np.nan)
+    if not np.isfinite(p90_val) or not np.isfinite(impl_val) or impl_val <= 0:
+        return "unknown", None
+
+    ratio = float(p90_val / impl_val)
+    if ratio > 1.15:
+        level = "elevated"
+    elif ratio >= 0.90:
+        level = "moderate"
+    else:
+        level = "low"
+
+    if int(sample_size or 0) < 5 and level == "low":
+        level = "moderate"
+
+    return level, ratio
 
 
 # ─── ATM option stats (unchanged — works on both yfinance and MDApp DataFrames) ──
@@ -1189,7 +1217,7 @@ def _har_rv_forecast(rv_daily: pd.Series, horizon: int = 1) -> Optional[float]:
 
 
 def _bsm_greeks(
-    S: float, T_days: float, sigma: float, r: float = 0.0525
+    S: float, T_days: float, sigma: float, r: float = 0.045
 ) -> Dict[str, Optional[float]]:
     """
     Black-Scholes-Merton ATM option greeks (K = S).
@@ -1199,7 +1227,7 @@ def _bsm_greeks(
     S      : underlying price
     T_days : calendar days to option expiry (use earnings DTE for calendar spread context)
     sigma  : annualised implied vol (iv30)
-    r      : risk-free rate (default ≈ current SOFR, ~5.25%)
+    r      : risk-free rate (default fallback only; callers normally inject a live rate)
 
     Returns greeks for a single ATM option leg:
       delta_call/put  — directional sensitivity (call ∈ [0,1], put ∈ [-1,0])
@@ -1257,7 +1285,7 @@ def _calendar_spread_payoff(
     iv_back: float,
     T_near_days: float,
     T_back_days: float,
-    r: float = 0.0525,
+    r: float = 0.045,
     n_points: int = 41,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -1841,6 +1869,18 @@ def analyze_single_ticker(
     composite_score = float(np.clip(0.60 * setup_score + 0.40 * expectancy_score, 0.0, 1.0))
     confidence_pct_raw = float(np.clip(30.0 + 70.0 * composite_score, 0.0, 100.0))
 
+    # ── Move-risk level: soft advisory — how dangerous is the tail relative to the priced-in move? ──
+    # Ratio = p90 historical move / event-implied move.
+    # > 1.15 → market is under-pricing the historical tail (elevated)
+    # 0.90–1.15 → broadly aligned (moderate)
+    # < 0.90 → historical tail inside implied move (low)
+    # Thin-sample caveat: degrade to "moderate" floor if fewer than 5 events.
+    move_risk_level, move_risk_ratio = _classify_move_risk(
+        p90_earnings_move_pct=(p90_earnings_move_pct if np.isfinite(p90_earnings_move_pct) else None),
+        event_implied_move_pct=(event_implied_move_pct if np.isfinite(event_implied_move_pct) and event_implied_move_pct > 0 else None),
+        sample_size=move_sample_size,
+    )
+
     # ── Grading refinements: apply calibration multipliers to confidence_pct ──
 
     # Fix 2: kurtosis penalty — fat-tailed movers lose confidence
@@ -2207,6 +2247,10 @@ def analyze_single_ticker(
         # Combined confidence calibration
         "confidence_calibration_mult": round(_calibration_mult, 3),
         "confidence_pct_raw": round(confidence_pct_raw, 2),
+        # ── Move-risk advisory (soft signal — not a hard gate) ────────────────
+        "move_risk_level":  move_risk_level,
+        "move_risk_ratio":  round(move_risk_ratio, 3) if move_risk_ratio is not None else None,
+        "move_risk_sample_size": move_sample_size,
     }
 
     return EdgeSnapshot(

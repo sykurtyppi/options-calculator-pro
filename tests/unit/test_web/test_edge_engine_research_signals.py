@@ -3,8 +3,11 @@ import unittest
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from unittest.mock import MagicMock, patch
 
+import web.api.edge_engine as edge_engine
 from web.api.edge_engine import (
+    _classify_move_risk,
     _compute_move_uncertainty_pct,
     _compute_move_anchor,
     _get_pricing_risk_free_rate,
@@ -119,13 +122,68 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
 
     def test_pricing_risk_free_rate_env_override(self):
         import os
-        from unittest.mock import patch
 
+        edge_engine._rf_rate_cache.update({"ts": 0.0, "rate": None, "source": None})
         with patch.dict(os.environ, {"OPTIONS_PRICING_RISK_FREE_RATE": "0.0415"}, clear=False):
             rate, source = _get_pricing_risk_free_rate(cache_ttl_seconds=0.0)
 
         self.assertAlmostEqual(rate, 0.0415, places=6)
         self.assertEqual(source, "env")
+
+    def test_pricing_risk_free_rate_falls_back_when_irx_fetch_fails(self):
+        import os
+
+        edge_engine._rf_rate_cache.update({"ts": 0.0, "rate": None, "source": None})
+        with patch.dict(os.environ, {"OPTIONS_PRICING_RISK_FREE_RATE": ""}, clear=False):
+            with patch.object(edge_engine.yf, "Ticker", side_effect=RuntimeError("network down")):
+                rate, source = _get_pricing_risk_free_rate(cache_ttl_seconds=0.0)
+
+        self.assertAlmostEqual(rate, 0.0450, places=6)
+        self.assertEqual(source, "fallback_static")
+
+    def test_pricing_risk_free_rate_uses_cache_within_ttl(self):
+        import os
+
+        ticker_mock = MagicMock()
+        history_df = pd.DataFrame({"Close": [3.62]})
+        ticker_mock.history.return_value = history_df
+
+        edge_engine._rf_rate_cache.update({"ts": 0.0, "rate": None, "source": None})
+        with patch.dict(os.environ, {"OPTIONS_PRICING_RISK_FREE_RATE": ""}, clear=False):
+            with patch.object(edge_engine.yf, "Ticker", return_value=ticker_mock) as ticker_ctor:
+                rate_1, source_1 = _get_pricing_risk_free_rate(cache_ttl_seconds=3600.0)
+                rate_2, source_2 = _get_pricing_risk_free_rate(cache_ttl_seconds=3600.0)
+
+        self.assertAlmostEqual(rate_1, 0.0362, places=6)
+        self.assertEqual(source_1, "yfinance_^IRX")
+        self.assertAlmostEqual(rate_2, 0.0362, places=6)
+        self.assertEqual(source_2, "yfinance_^IRX")
+        ticker_ctor.assert_called_once_with("^IRX")
+
+    def test_classify_move_risk_elevated(self):
+        level, ratio = _classify_move_risk(9.2, 7.0, sample_size=8)
+        self.assertEqual(level, "elevated")
+        self.assertAlmostEqual(ratio, 9.2 / 7.0, places=6)
+
+    def test_classify_move_risk_moderate(self):
+        level, ratio = _classify_move_risk(7.0, 7.0, sample_size=8)
+        self.assertEqual(level, "moderate")
+        self.assertAlmostEqual(ratio, 1.0, places=6)
+
+    def test_classify_move_risk_low(self):
+        level, ratio = _classify_move_risk(5.5, 7.0, sample_size=8)
+        self.assertEqual(level, "low")
+        self.assertAlmostEqual(ratio, 5.5 / 7.0, places=6)
+
+    def test_classify_move_risk_low_downgrades_on_thin_sample(self):
+        level, ratio = _classify_move_risk(5.5, 7.0, sample_size=4)
+        self.assertEqual(level, "moderate")
+        self.assertAlmostEqual(ratio, 5.5 / 7.0, places=6)
+
+    def test_classify_move_risk_unknown_without_inputs(self):
+        level, ratio = _classify_move_risk(None, 7.0, sample_size=8)
+        self.assertEqual(level, "unknown")
+        self.assertIsNone(ratio)
 
 
 if __name__ == "__main__":

@@ -267,6 +267,25 @@ function VolRegimeBadge({ regime, pct }) {
   return <Badge variant={variant}>{label}</Badge>
 }
 
+// ── Move-risk advisory badge ──────────────────────────────────────────────────
+// Soft signal only — not a hard gate. Reflects p90 / event-implied move ratio.
+function MoveRiskBadge({ level, ratio, sampleSize }) {
+  if (!level || level === 'unknown') return null
+  const map = {
+    low:      { label: 'Move Risk: Low',      variant: 'move-risk-low'      },
+    moderate: { label: 'Move Risk: Moderate', variant: 'move-risk-moderate' },
+    elevated: { label: 'Move Risk: Elevated', variant: 'move-risk-elevated' },
+  }
+  const { label, variant } = map[level] || { label: `Move Risk: ${level}`, variant: 'default' }
+  const ratioLabel = ratio != null ? ` · P90/Impl ${ratio.toFixed(2)}×` : ''
+  const sampleLabel = sampleSize != null ? ` · n=${sampleSize}` : ''
+  return (
+    <Badge variant={variant} title="Soft advisory: p90 historical move vs. event-implied move. Not a hard gate.">
+      {label}{ratioLabel}{sampleLabel}
+    </Badge>
+  )
+}
+
 // ── OOS per-split P&L chart ───────────────────────────────────────────────────
 function OosSplitChart({ splitsDetail }) {
   if (!Array.isArray(splitsDetail) || splitsDetail.length < 2) return null
@@ -841,6 +860,7 @@ export default function App() {
                   {m.earnings_release_time && releaseTimeBadge(m.earnings_release_time)}
                   <VolRegimeBadge regime={m.vol_regime} pct={m.rv_percentile_rank} />
                   <TickerTierBadge tier={m.ticker_tier} mult={m.ticker_tier_mult} />
+                  <MoveRiskBadge level={m.move_risk_level} ratio={m.move_risk_ratio} sampleSize={m.move_risk_sample_size} />
                 </div>
                 <div className="rec-right">
                   <span className="rec-detail">Setup {Number(result.setup_score).toFixed(3)}</span>
@@ -1049,6 +1069,19 @@ export default function App() {
                   <Metric label="Anchor Move (Blend)" value={fmtPp(m.earnings_move_anchor_pct, 2)} />
                   <Metric label="Earnings Move (Med)" value={fmtPp(m.earnings_move_median_pct, 2)} />
                   <Metric label="Earnings Move (P90)" value={fmtPp(m.earnings_move_p90_pct, 2)} />
+                  {/* Move-risk advisory readout */}
+                  {m.move_risk_ratio != null && (
+                    <Metric
+                      label="Move Risk Ratio"
+                      value={`${Number(m.move_risk_ratio).toFixed(2)}×`}
+                      sub={`P90 ÷ Event-Implied · ${m.move_risk_level || 'unknown'} · n=${m.move_risk_sample_size ?? 0}`}
+                      tone={
+                        m.move_risk_level === 'elevated' ? 'bad'
+                        : m.move_risk_level === 'moderate' ? 'warn'
+                        : 'good'
+                      }
+                    />
+                  )}
                   <Metric label="Uncertainty Penalty" value={fmtPp(m.move_uncertainty_pct, 2)}
                     tone={toneNeg(m.move_uncertainty_pct, 1.0, 2.0)} />
                   <Metric label="Sample Confidence" value={fmtNum(m.sample_confidence, 2)}
