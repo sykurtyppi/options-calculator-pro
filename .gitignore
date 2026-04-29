@@ -35,3 +35,21 @@ npm-debug.log*
 # Ignore those external repos if you keep them in the folder
 SuperClaude/
 SuperClaude_Framework/
+
+# Claude / AI tools
+.claude/
+
+# Temp files
+tmp/
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Build artifacts
+web/frontend/dist/
+
+# OS
+.DS_Store
