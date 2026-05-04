@@ -1,144 +1,44 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import {
   LineChart, Line, BarChart, Bar, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip,
   ReferenceLine, ResponsiveContainer, ComposedChart, Area,
 } from 'recharts'
+import ScreenerConsole from './components/screener/ScreenerConsole'
+import SelectorDecisionCard from './components/edge/SelectorDecisionCard'
+import DecisionEvidenceStrip from './components/edge/DecisionEvidenceStrip'
+import CalibrationInsightPanel from './components/edge/CalibrationInsightPanel'
+import RegimeNarrativePanel from './components/edge/RegimeNarrativePanel'
+import OutcomeRiskPanel from './components/edge/OutcomeRiskPanel'
+import WhyStructurePanel from './components/edge/WhyStructurePanel'
+import StructureComparisonTable from './components/edge/StructureComparisonTable'
+import VolSnapshotPanel from './components/edge/VolSnapshotPanel'
+import EvidenceQualityPanel from './components/edge/EvidenceQualityPanel'
+import { Badge, Metric, SectionTitle } from './components/common/DisplayAtoms'
+import { DEFAULT_OOS_PARAMS, OOS_PROFILE_LABELS, OOS_PROFILE_PRESETS, TODAY_ISO } from './config/oosConfig'
+import {
+  fmtMoney,
+  fmtNum,
+  fmtPct,
+  fmtPp,
+  fmtSn,
+  fmtSpp,
+  fmtVol,
+  formatTimestamp,
+  parseFloatOr,
+  parseIntOr,
+  toneNeg,
+  tonePos,
+} from './lib/formatters'
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000'
-const OOS_TIMEOUT_MS = 180_000
-
-const TODAY_ISO = new Date().toISOString().split('T')[0]
-
-const DEFAULT_OOS_PARAMS = {
-  oos_stability_profile: 'stability_auto',
-  lookback_days: '1095',
-  max_backtest_symbols: '50',
-  backtest_start_date: '2023-01-01',
-  backtest_end_date: TODAY_ISO,
-  min_signal_score: '0.50',
-  min_crush_confidence: '0.30',
-  min_crush_magnitude: '0.06',
-  min_crush_edge: '0.025',
-  target_entry_dte: '6',
-  entry_dte_band: '5',
-  min_daily_share_volume: '1500000',
-  max_abs_momentum_5d: '0.11',
-  oos_train_days: '189',
-  oos_test_days: '42',
-  oos_step_days: '42',
-  oos_top_n_train: '1',
-  oos_min_splits: '8',
-  oos_min_total_test_trades: '80',
-  oos_min_trades_per_split: '5.0',
-}
-
-const OOS_PROFILE_PRESETS = {
-  stability_auto: {
-    min_signal_score: '0.50', min_crush_confidence: '0.30', min_crush_magnitude: '0.06',
-    min_crush_edge: '0.025', min_daily_share_volume: '1500000', max_abs_momentum_5d: '0.11',
-    target_entry_dte: '6', entry_dte_band: '5',
-  },
-  evidence_balanced: {
-    min_signal_score: '0.48', min_crush_confidence: '0.28', min_crush_magnitude: '0.06',
-    min_crush_edge: '0.025', min_daily_share_volume: '1500000', max_abs_momentum_5d: '0.11',
-    target_entry_dte: '6', entry_dte_band: '5',
-  },
-  sample_expansion: {
-    min_signal_score: '0.45', min_crush_confidence: '0.25', min_crush_magnitude: '0.05',
-    min_crush_edge: '0.015', min_daily_share_volume: '1000000', max_abs_momentum_5d: '0.11',
-    target_entry_dte: '6', entry_dte_band: '6',
-  },
-  variance_control: {
-    min_signal_score: '0.65', min_crush_confidence: '0.50', min_crush_magnitude: '0.09',
-    min_crush_edge: '0.025', min_daily_share_volume: '10000000', max_abs_momentum_5d: '0.09',
-    target_entry_dte: '6', entry_dte_band: '4',
-  },
-  alpha_focus: {
-    min_signal_score: '0.65', min_crush_confidence: '0.50', min_crush_magnitude: '0.09',
-    min_crush_edge: '0.03', min_daily_share_volume: '5000000', max_abs_momentum_5d: '0.08',
-    target_entry_dte: '6', entry_dte_band: '3',
-  },
-}
-
-const OOS_PROFILE_LABELS = {
-  stability_auto: 'Auto',
-  evidence_balanced: 'Evidence Balanced',
-  sample_expansion: 'Sample Expansion',
-  variance_control: 'Variance Control',
-  alpha_focus: 'Alpha Focus',
-}
-
-// ── Utility formatters ────────────────────────────────────────────────────────
-
-function fmtPct(v) {
-  if (v == null || Number.isNaN(Number(v))) return 'n/a'
-  return `${(Number(v) * 100).toFixed(2)}%`
-}
-function fmtNum(v, d = 3) {
-  if (v == null || Number.isNaN(Number(v))) return 'n/a'
-  return Number(v).toFixed(d)
-}
-function fmtMoney(v) {
-  if (v == null || Number.isNaN(Number(v))) return 'n/a'
-  return `$${Number(v).toFixed(2)}`
-}
-function fmtPp(v, d = 2) {
-  if (v == null || Number.isNaN(Number(v))) return 'n/a'
-  return `${Number(v).toFixed(d)}%`
-}
-function fmtVol(v, d = 1) {
-  if (v == null || Number.isNaN(Number(v))) return 'n/a'
-  return `${(Number(v) * 100).toFixed(d)}%`
-}
-function fmtSpp(v, d = 2) {
-  if (v == null || Number.isNaN(Number(v))) return 'n/a'
-  const n = Number(v)
-  return `${n > 0 ? '+' : ''}${n.toFixed(d)}%`
-}
-function fmtSn(v, d = 2) {
-  if (v == null || Number.isNaN(Number(v))) return 'n/a'
-  const n = Number(v)
-  return `${n > 0 ? '+' : ''}${n.toFixed(d)}`
-}
-
-function tonePos(v, good = 0, warn = 0) {
-  if (v == null || Number.isNaN(Number(v))) return 'default'
-  const n = Number(v)
-  if (n >= good) return 'good'
-  if (n > warn) return 'warn'
-  return 'bad'
-}
-function toneNeg(v, good = 1.25, warn = 2.0) {
-  if (v == null || Number.isNaN(Number(v))) return 'default'
-  const n = Number(v)
-  if (n <= good) return 'good'
-  if (n <= warn) return 'warn'
-  return 'bad'
-}
-
-function parseIntOr(v, fb) { const p = parseInt(v, 10); return Number.isFinite(p) ? p : fb }
-function parseFloatOr(v, fb) { const p = parseFloat(v); return Number.isFinite(p) ? p : fb }
-
-// ── Atoms ─────────────────────────────────────────────────────────────────────
-
-function Metric({ label, value, accent = false, tone = 'default', sub }) {
-  return (
-    <div className="metric-card">
-      <div className="metric-label">{label}</div>
-      <div className={`metric-value ${accent ? 'accent' : ''} tone-${tone}`}>{value}</div>
-      {sub && <div className="metric-sub">{sub}</div>}
-    </div>
-  )
-}
-
-function SectionTitle({ children }) {
-  return <h3 className="section-title">{children}</h3>
-}
-
-function Badge({ children, variant = 'default' }) {
-  return <span className={`badge badge-${variant}`}>{children}</span>
-}
+const LegacyAnalysisPanel = lazy(() => import('./components/edge/LegacyAnalysisPanel'))
+const HistoricalWarehousePanel = lazy(() => import('./components/historical/HistoricalWarehousePanel'))
+const LedgerDiagnosticsPanel = lazy(() => import('./components/diagnostics/LedgerDiagnosticsPanel'))
+const DataQualityDiagnosticsPanel = lazy(() => import('./components/diagnostics/DataQualityDiagnosticsPanel'))
+const ProviderTelemetryPanel = lazy(() => import('./components/diagnostics/ProviderTelemetryPanel'))
+const ForwardPerformancePanel = lazy(() => import('./components/diagnostics/ForwardPerformancePanel'))
+const EvidenceReportPanel = lazy(() => import('./components/diagnostics/EvidenceReportPanel'))
 
 // ── Earnings release time display ─────────────────────────────────────────────
 function releaseTimeBadge(rt) {
@@ -167,13 +67,6 @@ function dataSourceBadge(ds, dataSources) {
   if (ds === 'marketdata_app') return <Badge variant="mda">MDApp</Badge>
   if (ds === 'yfinance_fallback') return <Badge variant="yf">yfinance</Badge>
   return null
-}
-
-function formatTimestamp(ts) {
-  if (!ts) return 'n/a'
-  const d = new Date(ts)
-  if (Number.isNaN(d.getTime())) return 'n/a'
-  return d.toLocaleString()
 }
 
 // ── Vol term structure chart ──────────────────────────────────────────────────
@@ -357,7 +250,140 @@ function OosSplitChart({ splitsDetail }) {
   )
 }
 
-// ── Calendar spread P&L diagram ───────────────────────────────────────────────
+// ── Unified structure payoff diagram (straddle / strangle / calendar) ─────────
+function StructurePayoffChart({ payoff }) {
+  if (!payoff?.payoff_scenarios?.length) return null
+
+  const structure = payoff.structure || ''
+  const isCalendar = structure === 'call_calendar' || structure === 'put_calendar'
+  const isStraddle = structure === 'atm_straddle'
+  const isStrangle = structure === 'otm_strangle'
+
+  const scenarios = payoff.payoff_scenarios_per_contract?.length
+    ? payoff.payoff_scenarios_per_contract
+    : payoff.payoff_scenarios
+
+  const data = scenarios.map(s => ({
+    move:    Number(s.move_pct),
+    expand:  Number((s.iv_expand_20 ?? 0).toFixed(2)),
+    flat:    Number((s.iv_flat     ?? 0).toFixed(2)),
+    crush25: Number((s.iv_crush_25 ?? 0).toFixed(2)),
+    crush45: Number((s.iv_crush_45 ?? 0).toFixed(2)),
+  }))
+
+  const allVals = data.flatMap(d => [d.expand, d.flat, d.crush25, d.crush45]).filter(v => isFinite(v))
+  const minV = Math.min(...allVals)
+  const maxV = Math.max(...allVals)
+  const pad  = Math.max((maxV - minV) * 0.14, 0.01)
+
+  const breakevens = payoff.breakeven_moves_pct || []
+
+  // ── Titles and labels ──
+  const titleMap = {
+    atm_straddle:  'Long ATM Straddle · P&L at 1-Day Post-Event',
+    otm_strangle:  'Long OTM Strangle · P&L at 1-Day Post-Event',
+    call_calendar: 'Call Calendar Spread · P&L at Near-Leg Expiry',
+    put_calendar:  'Put Calendar Spread · P&L at Near-Leg Expiry',
+  }
+  const chartTitle = titleMap[structure] || 'Structure P&L Diagram'
+
+  const xAxisLabel = isCalendar
+    ? 'Underlying Move at Near-Leg Expiry'
+    : 'Underlying Move 1-Day Post-Earnings'
+
+  // ── Entry metadata strip ──
+  const debitStr = payoff.entry_debit_per_contract != null
+    ? `$${Number(payoff.entry_debit_per_contract).toFixed(2)}/contract`
+    : payoff.entry_debit != null
+      ? `$${Number(payoff.entry_debit).toFixed(3)}/share`
+      : 'n/a'
+
+  let metaStr = `Entry Debit ${debitStr}`
+  if (isStraddle && payoff.strike != null) {
+    metaStr += ` · K=${Number(payoff.strike).toFixed(2)} (ATM)`
+  } else if (isStrangle && payoff.strike_call != null) {
+    metaStr += ` · Call K=${Number(payoff.strike_call).toFixed(2)} / Put K=${Number(payoff.strike_put).toFixed(2)}`
+    if (payoff.wing_pct != null) metaStr += ` · ±${Number(payoff.wing_pct).toFixed(1)}% wings`
+  } else if (isCalendar) {
+    metaStr += ` · (near ${payoff.t_near_days}d / back ${payoff.t_back_days}d)`
+  }
+
+  return (
+    <div className="vol-chart-wrapper">
+      <div className="vol-chart-label">{chartTitle} · $/contract (100 shares) · {metaStr}</div>
+      {breakevens.length > 0 && (
+        <div className="breakeven-note">
+          IV-flat breakevens:&nbsp;
+          {breakevens.map((b, i) => (
+            <span key={i}>{b > 0 ? '+' : ''}{Number(b).toFixed(1)}%{i < breakevens.length - 1 ? ', ' : ''}</span>
+          ))}
+        </div>
+      )}
+      <ResponsiveContainer width="100%" height={220}>
+        <LineChart data={data} margin={{ top: 8, right: 24, bottom: 20, left: 8 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+          <XAxis
+            dataKey="move"
+            type="number"
+            domain={['dataMin', 'dataMax']}
+            tickFormatter={v => `${v > 0 ? '+' : ''}${v}%`}
+            tick={{ fill: '#8b949e', fontSize: 10 }}
+            label={{ value: xAxisLabel, position: 'insideBottom', offset: -8, fill: '#8b949e', fontSize: 10 }}
+          />
+          <YAxis
+            domain={[minV - pad, maxV + pad]}
+            tickFormatter={v => `$${v.toFixed(2)}`}
+            tick={{ fill: '#8b949e', fontSize: 10 }}
+            width={58}
+          />
+          <Tooltip
+            formatter={(v, name) => {
+              const labels = { expand: 'IV +20%', flat: 'IV Flat', crush25: 'IV −25%', crush45: 'IV −45%' }
+              return [`$${Number(v).toFixed(2)}`, labels[name] || name]
+            }}
+            labelFormatter={l => `Move: ${Number(l) > 0 ? '+' : ''}${Number(l)}%`}
+            contentStyle={{ background: '#161b22', border: '1px solid #30363d', borderRadius: 6, fontSize: 11 }}
+            itemStyle={{ color: '#e6edf3' }}
+            labelStyle={{ color: '#8b949e' }}
+          />
+          <ReferenceLine y={0} stroke="rgba(139,148,158,0.4)" strokeWidth={1} />
+          {breakevens.map((b, i) => (
+            <ReferenceLine
+              key={i}
+              x={Number(b)}
+              stroke="rgba(240,160,32,0.55)"
+              strokeDasharray="4 3"
+              label={{ value: 'BE', position: 'top', fill: '#f0a020', fontSize: 9 }}
+            />
+          ))}
+          <Line type="monotone" dataKey="expand"  stroke="#22c55e" strokeWidth={1.5} dot={false} />
+          <Line type="monotone" dataKey="flat"    stroke="#58a6ff" strokeWidth={2}   dot={false} />
+          <Line type="monotone" dataKey="crush25" stroke="#f0a020" strokeWidth={1.5} dot={false} />
+          <Line type="monotone" dataKey="crush45" stroke="#ef4444" strokeWidth={1.5} dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+      <div style={{ display: 'flex', gap: 14, marginTop: 4, fontSize: 11, color: '#8b949e', flexWrap: 'wrap' }}>
+        <span style={{ color: '#22c55e' }}>━ IV +20%</span>
+        <span style={{ color: '#58a6ff' }}>━ IV Flat</span>
+        <span style={{ color: '#f0a020' }}>━ IV −25%</span>
+        <span style={{ color: '#ef4444' }}>━ IV −45%</span>
+        <span style={{ color: 'rgba(240,160,32,0.6)' }}>╌ BE</span>
+        {(isStraddle || isStrangle) && (
+          <span style={{ color: '#8b949e', marginLeft: 4 }}>· MTM 1-day post-event</span>
+        )}
+      </div>
+      {(payoff.is_theoretical || payoff.calendar_is_theoretical) && (
+        <div style={{ marginTop: 6, fontSize: 10, color: '#6e7681' }}>
+          {isCalendar
+            ? '⚠ Theoretical — priced from interpolated IV30/IV45. Verify debit with live chain.'
+            : '⚠ Theoretical — BSM-priced at ATM IV. IV scenarios are symbol-calibrated estimates.'}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Calendar spread P&L diagram (kept for legacy analysis panel) ──────────────
 function CalendarSpreadChart({ calPayoff }) {
   if (!calPayoff?.payoff_scenarios?.length) return null
 
@@ -549,7 +575,7 @@ function AlertBanner({ config, result }) {
     <div className="alert-banner">
       <span className="alert-icon">🔔</span>
       <span className="alert-text">
-        Alert: {result.symbol || ''} meets thresholds — {result.recommendation} · {conf.toFixed(1)}% conf · Edge {edge.toFixed(2)}%
+        Alert: {result.symbol || ''} meets thresholds — {result.recommendation} · score {conf.toFixed(1)} · Edge {edge.toFixed(2)}%
       </span>
     </div>
   )
@@ -569,7 +595,7 @@ function AlertConfigPanel({ config, setConfig }) {
           />
         </label>
         <label className="oos-field">
-          <span>Min Confidence %</span>
+          <span>Min Setup Score</span>
           <input
             type="number" min="0" max="100" step="1"
             value={config.min_confidence}
@@ -621,12 +647,31 @@ export default function App() {
   const [oosElapsedSec, setOosElapsedSec] = useState(0)
   // Polling interval ref — cleared when job completes, errors, or user cancels.
   const oosIntervalRef = useRef(null)
+  const [warehouse, setWarehouse] = useState({
+    available: false,
+    symbols: [],
+    symbol: 'SPY',
+    tradeDate: '2025-01-02',
+    minDte: '20',
+    maxDte: '90',
+    callPut: 'C',
+    limit: '25',
+    coverage: null,
+    rows: [],
+    loadingSymbols: false,
+    loadingRows: false,
+    error: '',
+  })
 
   useEffect(() => {
     if (!oosLoading) { setOosElapsedSec(0); return }
     const t = setInterval(() => setOosElapsedSec(p => p + 1), 1000)
     return () => clearInterval(t)
   }, [oosLoading])
+
+  useEffect(() => {
+    loadWarehouseSymbols()
+  }, [])
 
   const normalizedSymbol = useMemo(() => symbol.trim().toUpperCase(), [symbol])
 
@@ -721,6 +766,65 @@ export default function App() {
     return runForSymbol(null)
   }
 
+  async function loadWarehouseSymbols() {
+    setWarehouse(p => ({ ...p, loadingSymbols: true, error: '' }))
+    try {
+      const res = await fetch(`${API_BASE}/api/historical/options/symbols`)
+      if (!res.ok) {
+        const b = await res.json().catch(() => ({}))
+        throw new Error(b.detail || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      setWarehouse(p => ({
+        ...p,
+        available: Boolean(data.available),
+        symbols: data.symbols || [],
+        loadingSymbols: false,
+        error: '',
+      }))
+    } catch (err) {
+      setWarehouse(p => ({ ...p, loadingSymbols: false, error: String(err.message || err) }))
+    }
+  }
+
+  async function runWarehouseQuery() {
+    const sym = warehouse.symbol.trim().toUpperCase()
+    if (!sym || !warehouse.tradeDate) return
+    setWarehouse(p => ({ ...p, loadingRows: true, error: '', rows: [] }))
+    try {
+      const coverageRes = await fetch(`${API_BASE}/api/historical/options/${encodeURIComponent(sym)}/coverage`)
+      if (!coverageRes.ok) {
+        const b = await coverageRes.json().catch(() => ({}))
+        throw new Error(b.detail || `Coverage HTTP ${coverageRes.status}`)
+      }
+      const coverageData = await coverageRes.json()
+
+      const params = new URLSearchParams()
+      params.set('trade_date', warehouse.tradeDate)
+      if (warehouse.minDte) params.set('min_dte', warehouse.minDte)
+      if (warehouse.maxDte) params.set('max_dte', warehouse.maxDte)
+      if (warehouse.callPut) params.set('call_put', warehouse.callPut)
+      if (warehouse.limit) params.set('limit', warehouse.limit)
+
+      const chainRes = await fetch(`${API_BASE}/api/historical/options/${encodeURIComponent(sym)}/chain?${params.toString()}`)
+      if (!chainRes.ok) {
+        const b = await chainRes.json().catch(() => ({}))
+        throw new Error(b.detail || `Chain HTTP ${chainRes.status}`)
+      }
+      const chainData = await chainRes.json()
+      setWarehouse(p => ({
+        ...p,
+        symbol: sym,
+        loadingRows: false,
+        coverage: coverageData.coverage || [],
+        rows: chainData.rows || [],
+        error: '',
+      }))
+    } catch (err) {
+      setWarehouse(p => ({ ...p, loadingRows: false, error: String(err.message || err) }))
+    }
+  }
+
   async function runOos() {
     // Stop any existing poll before starting a new job.
     if (oosIntervalRef.current) {
@@ -778,6 +882,9 @@ export default function App() {
   }
 
   const m = result?.metrics || {}
+  const selectorOutput = result?.selector_output || null
+  const structureScorecards = result?.structure_scorecards || []
+  const volSnapshot = result?.vol_snapshot || null
 
   return (
     <div className="page-shell">
@@ -788,13 +895,18 @@ export default function App() {
         {/* ── Header ── */}
         <header className="panel-header">
           <div>
-            <h1>IV Crush Edge Terminal</h1>
-            <p>Institutional IV crush research. Single-ticker. No scanner noise.</p>
+            <h1>Earnings Volatility Research</h1>
+            <p>Pre-earnings volatility setup quality analysis · Forward screener plus single-ticker drill-down</p>
           </div>
           <div className="header-badges">
-            <div className="status-chip">Production Research</div>
+            <a className="docs-link" href={`${API_BASE}/product-docs/architecture.md`} target="_blank" rel="noreferrer">
+              Learn how this works
+            </a>
+            <div className="status-chip">Research Tool · Not Financial Advice</div>
           </div>
         </header>
+
+        <ScreenerConsole apiBase={API_BASE} onAnalyzeSymbol={runForSymbol} />
 
         {/* ── Edge Analysis ── */}
         <section className="analysis-block">
@@ -839,35 +951,16 @@ export default function App() {
           {error && <div className="error-banner">{error}</div>}
           <AlertBanner config={alertConfig} result={result} />
 
-          {result && noTradeBlocked && (
-            <div className="no-trade-banner">
-              <div className="no-trade-title">NO TRADE — Hard Gate Fail</div>
-              <ul>
-                {hardGateReasons.map((r, i) => <li key={i}>{r}</li>)}
-              </ul>
-            </div>
-          )}
-
           {result && (
             <>
-              {/* Recommendation strip */}
-              <div className="rec-strip">
-                <div className="rec-left">
-                  <span className={`rec-badge rec-${recommendationValue.toLowerCase().replace(' ', '-')}`}>
-                    {recommendationValue}
-                  </span>
-                  <span className="rec-confidence">{confidenceValue} confidence</span>
+              <div className="selector-topbar">
+                <div className="selector-topbar-left">
                   {m.earnings_release_time && releaseTimeBadge(m.earnings_release_time)}
                   <VolRegimeBadge regime={m.vol_regime} pct={m.rv_percentile_rank} />
                   <TickerTierBadge tier={m.ticker_tier} mult={m.ticker_tier_mult} />
                   <MoveRiskBadge level={m.move_risk_level} ratio={m.move_risk_ratio} sampleSize={m.move_risk_sample_size} />
                 </div>
-                <div className="rec-right">
-                  <span className="rec-detail">Setup {Number(result.setup_score).toFixed(3)}</span>
-                  <span className="rec-detail">Composite {fmtNum(m.composite_score, 3)}</span>
-                  <span className={`rec-detail edge-quality-${(m.edge_quality || '').toLowerCase().replace(/\s+/g, '-')}`}>
-                    {m.edge_quality || 'n/a'}
-                  </span>
+                <div className="selector-topbar-right">
                   <button
                     className="export-btn"
                     title="Export full analysis as JSON"
@@ -882,8 +975,8 @@ export default function App() {
                       } else {
                         addToWatchlist({
                           symbol: normalizedSymbol,
-                          recommendation: recommendationValue,
-                          confidence_pct: Number(result.confidence_pct),
+                          recommendation: selectorOutput?.recommendation || recommendationValue,
+                          confidence_pct: Number(selectorOutput?.confidence_pct ?? result.confidence_pct),
                           setup_score: Number(result.setup_score),
                           vol_regime: m.vol_regime,
                           timestamp: new Date().toISOString(),
@@ -891,6 +984,164 @@ export default function App() {
                       }
                     }}
                   >{isInWatchlist(normalizedSymbol) ? '★' : '☆'}</button>
+                </div>
+              </div>
+
+              <SelectorDecisionCard
+                selectorOutput={selectorOutput}
+                scorecards={structureScorecards}
+                volSnapshot={volSnapshot}
+              />
+              <RegimeNarrativePanel
+                selectorOutput={selectorOutput}
+                scorecards={structureScorecards}
+                volSnapshot={volSnapshot}
+              />
+              <DecisionEvidenceStrip
+                selectorOutput={selectorOutput}
+                scorecards={structureScorecards}
+                volSnapshot={volSnapshot}
+              />
+              <div className="selector-secondary-grid selector-secondary-grid-trust">
+                <CalibrationInsightPanel
+                  apiBase={API_BASE}
+                  score={result.setup_score}
+                />
+                <EvidenceQualityPanel
+                  selectorOutput={selectorOutput}
+                  scorecards={structureScorecards}
+                  volSnapshot={volSnapshot}
+                />
+              </div>
+              <WhyStructurePanel
+                selectorOutput={selectorOutput}
+                scorecards={structureScorecards}
+                volSnapshot={volSnapshot}
+              />
+              <OutcomeRiskPanel
+                selectorOutput={selectorOutput}
+                scorecards={structureScorecards}
+                volSnapshot={volSnapshot}
+              />
+              <StructureComparisonTable
+                scorecards={structureScorecards}
+                selectorOutput={selectorOutput}
+              />
+              <div className="selector-secondary-grid selector-secondary-grid-snapshot">
+                <VolSnapshotPanel volSnapshot={volSnapshot} />
+              </div>
+
+              {m.term_structure_days?.length >= 2 && (
+                <div className="selector-panel selector-panel-vol-term">
+                  <div className="selector-panel-header">
+                    <h3>Vol Term Structure</h3>
+                    <span>Implied vol across expirations — steepness drives calendar carry; event premium shows near-term elevation.</span>
+                  </div>
+                  <TermStructureChart
+                    days={m.term_structure_days}
+                    ivs={m.term_structure_ivs}
+                    earningsDte={m.days_to_earnings}
+                  />
+                </div>
+              )}
+
+              {m.structure_payoff && (() => {
+                const sp = m.structure_payoff
+                const isCalendar = sp.structure === 'call_calendar' || sp.structure === 'put_calendar'
+                const isStrangle = sp.structure === 'otm_strangle'
+                const structureLabels = {
+                  atm_straddle:  'Long ATM Straddle',
+                  otm_strangle:  'Long OTM Strangle',
+                  call_calendar: 'Call Calendar · Short Near / Long Back+28d',
+                  put_calendar:  'Put Calendar · Short Near / Long Back+28d',
+                }
+                const panelTitle = structureLabels[sp.structure] || sp.structure
+                return (
+                  <div className="selector-panel selector-panel-structure-payoff">
+                    <div className="selector-panel-header">
+                      <h3>{panelTitle}</h3>
+                      <span>
+                        {isCalendar && m.calendar_spread_quality && (() => {
+                          const qColors = { Strong: '#22c55e', Moderate: '#58a6ff', Weak: '#f0a020', Poor: '#ef4444', unknown: '#8b949e' }
+                          return (
+                            <span style={{ fontWeight: 600, color: qColors[m.calendar_spread_quality] || '#8b949e', marginRight: 10 }}>
+                              {m.calendar_spread_quality} term structure ·&nbsp;
+                            </span>
+                          )
+                        })()}
+                        {isStrangle && sp.wing_pct != null && (
+                          <span style={{ marginRight: 10 }}>Wings ±{Number(sp.wing_pct).toFixed(1)}% (at implied move) ·&nbsp;</span>
+                        )}
+                        <span style={{ color: '#6e7681' }}>IV scenarios: symbol-calibrated where available</span>
+                      </span>
+                    </div>
+
+                    {/* Calendar-specific: breakeven coverage warning */}
+                    {isCalendar && m.calendar_be_vs_implied != null && m.calendar_be_vs_implied < 0.70 && (
+                      <div style={{
+                        background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.35)',
+                        borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: '#fca5a5',
+                      }}>
+                        ⚠ Breakevens cover only {Math.round(m.calendar_be_vs_implied * 100)}% of the implied move.
+                        The market is pricing a larger move than this structure profits from.
+                      </div>
+                    )}
+
+                    <StructurePayoffChart payoff={sp} />
+
+                    {/* Metadata footer */}
+                    {isCalendar && sp.iv_near != null && (
+                      <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: '#8b949e', flexWrap: 'wrap' }}>
+                        <span>Near IV: {(sp.iv_near * 100).toFixed(1)}%</span>
+                        <span>Back IV: {(sp.iv_back * 100).toFixed(1)}%</span>
+                        <span>Remaining: {sp.t_remaining_days}d</span>
+                        {m.calendar_be_vs_implied != null && (
+                          <span style={{ color: m.calendar_be_vs_implied < 0.70 ? '#f0a020' : '#8b949e' }}>
+                            BE covers {Math.round(m.calendar_be_vs_implied * 100)}% of implied move
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {(sp.structure === 'atm_straddle' || isStrangle) && sp.iv_entry != null && (
+                      <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: '#8b949e', flexWrap: 'wrap' }}>
+                        <span>Entry IV: {(sp.iv_entry * 100).toFixed(1)}%</span>
+                        <span>DTE: {sp.T_near_days}d</span>
+                        <span>P&L eval: 1-day post-event</span>
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
+
+              <Suspense fallback={<div className="oos-message">Loading legacy analysis…</div>}>
+              <LegacyAnalysisPanel>
+              {/* Recommendation strip */}
+              {noTradeBlocked && (
+                <div className="no-trade-banner">
+                  <div className="no-trade-title">NO TRADE — Legacy Hard Gate Fail</div>
+                  <ul>
+                    {hardGateReasons.map((r, i) => <li key={i}>{r}</li>)}
+                  </ul>
+                </div>
+              )}
+
+              <div className="rec-strip legacy-rec-strip">
+                <div className="rec-left">
+                  <span className={`rec-badge rec-${recommendationValue.toLowerCase().replace(' ', '-')}`}>
+                    {recommendationValue}
+                  </span>
+                  <span
+                    className="rec-confidence"
+                    title="Legacy setup score. Not a calibrated win rate."
+                  >{confidenceValue} setup score</span>
+                  {m.earnings_release_time && releaseTimeBadge(m.earnings_release_time)}
+                </div>
+                <div className="rec-right">
+                  <span className="rec-detail">Setup {Number(result.setup_score).toFixed(3)}</span>
+                  <span className="rec-detail">Composite {fmtNum(m.composite_score, 3)}</span>
+                  <span className={`rec-detail edge-quality-${(m.edge_quality || '').toLowerCase().replace(/\s+/g, '-')}`}>
+                    {m.edge_quality || 'n/a'}
+                  </span>
                 </div>
               </div>
 
@@ -915,20 +1166,73 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Confidence calibration breakdown */}
+              {(m.expansion_history_status || m.analysis_mode === 'iv_expansion') && (
+                <div className="metrics-group">
+                  <div className="metrics-group-label">IV Expansion Setup</div>
+                  <div className="metrics-grid">
+                    <Metric
+                      label="Expected IV Change"
+                      value={m.expansion_expected_iv_change != null ? fmtPp(m.expansion_expected_iv_change * 100, 2) : '--'}
+                      sub="avg front/back IV points"
+                      tone={tonePos(m.expansion_expected_iv_change, 0.01, 0)}
+                    />
+                    <Metric
+                      label="Modeled P&L Mid"
+                      value={fmtMoney(m.expansion_expected_pnl_mid)}
+                      sub="per 1-lot calendar"
+                      tone={tonePos(m.expansion_expected_pnl_mid, 0, 0)}
+                    />
+                    <Metric
+                      label="Modeled P&L Adj"
+                      value={fmtMoney(m.expansion_expected_pnl_adjusted)}
+                      sub="quoted entry/exit"
+                      tone={tonePos(m.expansion_expected_pnl_adjusted, 0, 0)}
+                    />
+                    <Metric
+                      label="Ranking Score"
+                      value={fmtNum(m.expansion_ranking_score, 3)}
+                      tone={tonePos(m.expansion_ranking_score, 0.65, 0.5)}
+                    />
+                    <Metric
+                      label="Entry / Exit"
+                      value={
+                        m.expansion_selected_entry_offset_days != null
+                          ? `T-${m.expansion_selected_entry_offset_days} / T-${m.expansion_exit_offset_days ?? 1}`
+                          : '--'
+                      }
+                      sub={m.expansion_structure || 'same-strike calendar'}
+                    />
+                    <Metric
+                      label="Historical Sample"
+                      value={
+                        m.expansion_historical_sample_size != null
+                          ? `${m.expansion_priceable_trades || 0}/${m.expansion_historical_sample_size}`
+                          : '--'
+                      }
+                      sub={
+                        m.expansion_missing_exit_quotes != null
+                          ? `${m.expansion_missing_exit_quotes} missing exits`
+                          : (m.expansion_history_status || 'no history')
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Score breakdown */}
               {m.confidence_pct_raw != null && (
                 <div className="metrics-group">
                   <div className="metrics-group-label">
-                    Confidence Calibration
+                    Score Breakdown
                     <span style={{ marginLeft: 10, fontWeight: 400, color: '#8b949e', fontSize: 11 }}>
-                      raw → adjusted via tier × kurtosis × crush-rate
+                      raw → adjusted via tier × kurtosis × inside-IV rate · not a win rate
                     </span>
                   </div>
                   <div className="metrics-grid">
                     <Metric
-                      label="Raw Confidence"
-                      value={`${Number(m.confidence_pct_raw).toFixed(1)}%`}
-                      sub="before calibration"
+                      label="Raw Score"
+                      value={`${Number(m.confidence_pct_raw).toFixed(1)}`}
+                      sub="before calibration multipliers"
                     />
                     <Metric
                       label="Ticker Tier"
@@ -965,7 +1269,7 @@ export default function App() {
                       tone={tonePos(m.kurtosis_conf_mult, 0.90, 0.78)}
                     />
                     <Metric
-                      label="Hist. Crush Rate"
+                      label="Hist. Inside-IV Rate"
                       value={m.hist_crush_rate != null ? `${Math.round(m.hist_crush_rate * 100)}%` : 'n/a'}
                       sub="% past moves < implied"
                       tone={
@@ -976,7 +1280,7 @@ export default function App() {
                       }
                     />
                     <Metric
-                      label="Crush Calibration"
+                      label="Vol Calibration"
                       value={m.crush_calibration_mult != null ? `${Math.round(m.crush_calibration_mult * 100)}%` : 'n/a'}
                       tone={tonePos(m.crush_calibration_mult, 0.95, 0.83)}
                     />
@@ -999,11 +1303,17 @@ export default function App() {
                   <Metric label="RV30 (YZ)" value={fmtVol(m.rv30)}
                     sub={m.rv_estimator === 'yang_zhang' ? 'Yang-Zhang · annualized' : 'close-to-close · annualized'} />
                   <Metric label="IV / RV30" value={fmtNum(m.iv_rv30, 3)}
-                    tone={tonePos(m.iv_rv30, 1.05, 1.0)} />
+                    tone={toneNeg(m.iv_rv30, 1.0, 1.25)} />
                   <Metric label="RV Forecast (HAR)" value={fmtVol(m.rv30_har_forecast)}
-                    sub={m.rv30_har_forecast != null ? 'Corsi 2009 · 1d fwd · annualized' : 'n/a (< 35d hist)'} />
+                    sub={
+                      m.rv30_har_forecast == null
+                        ? 'n/a (< 30d hist)'
+                        : m.rv_har_is_fallback
+                          ? 'RS 30d mean · fallback (< 100d hist)'
+                          : 'Corsi 2009 · 1d fwd · annualized'
+                    } />
                   <Metric label="IV / RV (fwd)" value={fmtNum(m.iv_rv_har, 3)}
-                    tone={tonePos(m.iv_rv_har, 1.05, 1.0)}
+                    tone={toneNeg(m.iv_rv_har, 1.0, 1.25)}
                     sub="vs HAR forecast" />
                   {/* FIX 6: relabel Vol Percentile to clarify it uses Rogers-Satchell, not YZ */}
                   <Metric
@@ -1045,6 +1355,33 @@ export default function App() {
 
               <div className="metrics-group">
                 <div className="metrics-group-label">Earnings Profile</div>
+                {/* Fix 8: decomposition warning in High vol regime */}
+                {m.decomp_regime_warning && (
+                  <div style={{
+                    background: 'rgba(240,160,32,0.09)', border: '1px solid rgba(240,160,32,0.30)',
+                    borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: '#f0a020',
+                  }}>
+                    ⚠ <strong>Vol Regime Warning:</strong> High realized-vol environment detected. Event-move and non-event-move
+                    decomposition may be unreliable — baseline volatility is elevated enough to corrupt
+                    the earnings-specific signal extraction. Treat implied-move anchors with additional caution.
+                  </div>
+                )}
+                {/* Fix 3: disclosure when move model uses fallback or thin sample */}
+                {(m.fallback_move_model_flag || m.low_event_count_flag) && (
+                  <div style={{
+                    background: 'rgba(88,166,255,0.07)', border: '1px solid rgba(88,166,255,0.25)',
+                    borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: '#79b8ff',
+                    display: 'flex', flexDirection: 'column', gap: 3,
+                  }}>
+                    <strong>Reduced-Evidence Signal</strong>
+                    {m.fallback_move_model_flag && (
+                      <span>· Move anchor uses a <strong>fallback model</strong> (no earnings history found). Score capped at {m.fallback_model_confidence_cap_pct ?? 55}.</span>
+                    )}
+                    {m.low_event_count_flag && !m.fallback_move_model_flag && (
+                      <span>· Fewer than 8 historical earnings events. Move estimates less reliable. Score capped at {m.low_event_count_confidence_cap_pct ?? 60}.</span>
+                    )}
+                  </div>
+                )}
                 <div className="metrics-grid">
                   <Metric
                     label="Days to Earnings"
@@ -1084,8 +1421,8 @@ export default function App() {
                   )}
                   <Metric label="Uncertainty Penalty" value={fmtPp(m.move_uncertainty_pct, 2)}
                     tone={toneNeg(m.move_uncertainty_pct, 1.0, 2.0)} />
-                  <Metric label="Sample Confidence" value={fmtNum(m.sample_confidence, 2)}
-                    sub={`${m.earnings_move_sample_size ?? 0} events · ${m.earnings_move_source || 'none'}`}
+                  <Metric label="Evidence Weight" value={fmtNum(m.sample_confidence, 2)}
+                    sub={`${m.earnings_move_sample_size ?? 0} events · ${m.earnings_move_source || 'none'} · sample-size-based`}
                     tone={tonePos(m.sample_confidence, 0.6, 0.3)} />
                 </div>
               </div>
@@ -1115,43 +1452,12 @@ export default function App() {
                 </div>
               </div>
 
-              {(m.kelly_half_pct != null || m.kelly_full_pct != null) && (
-                <div className="metrics-group">
-                  <div className="metrics-group-label">Position Sizing · Kelly Criterion (heuristic)</div>
-                  <div className="metrics-grid">
-                    <Metric
-                      label="Half-Kelly (Recommended)"
-                      value={m.kelly_half_pct != null ? `${m.kelly_half_pct}%` : 'n/a'}
-                      accent
-                      tone={tonePos(m.kelly_half_pct, 0.5, 0.1)}
-                      sub="% of portfolio to risk"
-                    />
-                    <Metric
-                      label="Full Kelly (Aggressive)"
-                      value={m.kelly_full_pct != null ? `${m.kelly_full_pct}%` : 'n/a'}
-                      tone={tonePos(m.kelly_full_pct, 1.0, 0.2)}
-                      sub="% of portfolio — use half-Kelly in practice"
-                    />
-                    {m.kelly_half_pct != null && (
-                      <Metric
-                        label="$10k Portfolio →"
-                        value={`$${(m.kelly_half_pct * 100).toFixed(0)} risk`}
-                        sub="half-Kelly dollar amount"
-                      />
-                    )}
-                    {m.kelly_half_pct != null && (
-                      <Metric
-                        label="$50k Portfolio →"
-                        value={`$${(m.kelly_half_pct * 500).toFixed(0)} risk`}
-                        sub="half-Kelly dollar amount"
-                      />
-                    )}
-                  </div>
-                  <div className="kelly-note">
-                    Kelly is a heuristic based on edge÷risk×confidence. For options, treat as max debit to risk per trade — not total notional.
-                  </div>
+              <div className="metrics-group">
+                <div className="metrics-group-label">Position Sizing</div>
+                <div className="position-sizing-note">
+                  {m.position_sizing_note || "Position sizing guidance not available yet — requires calibrated win rate and empirical edge estimate."}
                 </div>
-              )}
+              </div>
 
               {/* Calendar spread diagram (Fix 4: viability gate) */}
               {m.calendar_payoff && (
@@ -1208,6 +1514,49 @@ export default function App() {
                       )}
                     </div>
                   )}
+                  {/* Scenario source provenance — never pretend a fallback is calibrated history */}
+                  {m.calendar_payoff.calendar_scenario_source && (() => {
+                    const src = m.calendar_payoff.calendar_scenario_source
+                    const srcMeta = {
+                      historical_symbol_calibrated: {
+                        label: 'Calibrated (symbol history)',
+                        color: '#4ade80',
+                        bg: 'rgba(34,197,94,0.10)',
+                        border: 'rgba(34,197,94,0.28)',
+                        tip: 'Scenarios derived from ≥8 earnings events for this ticker — full statistical power.',
+                      },
+                      small_sample_estimate: {
+                        label: 'Small-sample estimate',
+                        color: '#fbbf24',
+                        bg: 'rgba(240,160,32,0.10)',
+                        border: 'rgba(240,160,32,0.28)',
+                        tip: 'Fewer than 8 earnings events available. Scenarios are estimates with elevated uncertainty.',
+                      },
+                      heuristic_fallback: {
+                        label: 'Heuristic fallback',
+                        color: '#f87171',
+                        bg: 'rgba(239,68,68,0.10)',
+                        border: 'rgba(239,68,68,0.28)',
+                        tip: 'No usable earnings history. Scenarios built from sector/macro heuristics — treat as illustrative only.',
+                      },
+                    }
+                    const m2 = srcMeta[src] || { label: src, color: '#8b949e', bg: 'rgba(139,148,158,0.08)', border: 'rgba(139,148,158,0.22)', tip: '' }
+                    return (
+                      <div style={{ marginTop: 7, display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontSize: 10, color: '#8b949e' }}>Scenario source:</span>
+                        <span
+                          title={m2.tip}
+                          style={{
+                            fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 4,
+                            background: m2.bg, color: m2.color, border: `1px solid ${m2.border}`,
+                            cursor: 'help',
+                          }}
+                        >
+                          {m2.label}
+                        </span>
+                      </div>
+                    )
+                  })()}
                 </div>
               )}
 
@@ -1223,10 +1572,19 @@ export default function App() {
                     : m.data_source === 'marketdata_app' ? 'MarketData.app' : 'yfinance'
                 }</span>
                 <span><strong>Updated:</strong> {formatTimestamp(result.generated_at || m.generated_at)}</span>
-                {/* FIX 3: stale data warning */}
+                {/* Stale data: IV/RV non-contemporaneous — score is capped */}
                 {(m.price_data_stale || (m.price_data_age_days != null && m.price_data_age_days > 1)) && (
-                  <span style={{ color: '#f0a020', fontWeight: 600 }}>
-                    ⚠ Stale data ({m.price_data_age_days}d old)
+                  <span style={{ color: '#f0a020', fontWeight: 600 }} title="IV/RV contemporaneity broken — price bars are older than 2 trading days. Setup score is capped to prevent overstatement.">
+                    ⚠ Stale data ({m.price_data_age_days}d old){m.stale_data_confidence_cap_pct != null ? ` · score capped at ${m.stale_data_confidence_cap_pct}` : ''}
+                  </span>
+                )}
+                {/* Score cap reason — shown when a cap is active and stale-data warning is not already covering it */}
+                {m.confidence_capped && m.confidence_cap_reason && !(m.price_data_stale || (m.price_data_age_days != null && m.price_data_age_days > 1)) && (
+                  <span
+                    style={{ color: '#f0a020', fontWeight: 600 }}
+                    title={`Setup score was capped: ${m.confidence_cap_reason}`}
+                  >
+                    ⚠ Score capped · {m.confidence_cap_reason}
                   </span>
                 )}
               </div>
@@ -1238,9 +1596,40 @@ export default function App() {
                   {(result.rationale || []).map((line, i) => <li key={i}>{line}</li>)}
                 </ul>
               </div>
+              </LegacyAnalysisPanel>
+              </Suspense>
             </>
           )}
         </section>
+
+        <Suspense fallback={<div className="oos-message">Loading historical warehouse…</div>}>
+          <HistoricalWarehousePanel
+            warehouse={warehouse}
+            setWarehouse={setWarehouse}
+            onLoadSymbols={loadWarehouseSymbols}
+            onRunQuery={runWarehouseQuery}
+          />
+        </Suspense>
+
+        <Suspense fallback={<div className="oos-message">Loading recommendation ledger…</div>}>
+          <LedgerDiagnosticsPanel apiBase={API_BASE} />
+        </Suspense>
+
+        <Suspense fallback={<div className="oos-message">Loading data-quality diagnostics…</div>}>
+          <DataQualityDiagnosticsPanel apiBase={API_BASE} />
+        </Suspense>
+
+        <Suspense fallback={<div className="oos-message">Loading provider telemetry…</div>}>
+          <ProviderTelemetryPanel apiBase={API_BASE} />
+        </Suspense>
+
+        <Suspense fallback={<div className="oos-message">Loading forward performance…</div>}>
+          <ForwardPerformancePanel apiBase={API_BASE} />
+        </Suspense>
+
+        <Suspense fallback={<div className="oos-message">Loading evidence report…</div>}>
+          <EvidenceReportPanel apiBase={API_BASE} />
+        </Suspense>
 
         {/* ── OOS Report Card ── */}
         <section className="oos-block">
@@ -1255,7 +1644,7 @@ export default function App() {
               )}
             </div>
           </div>
-          <p className="oos-help">Strategy-level walk-forward validation across the full S&amp;P 500 backfill universe — not ticker-specific. Results are the same regardless of which ticker you searched because the test measures whether the IV crush signal works as a repeatable strategy across many symbols. Typically 30–120 s.</p>
+          <p className="oos-help">Strategy-level walk-forward validation across the S&amp;P 500 backfill universe — not ticker-specific. Results reflect whether the pre-earnings volatility setup quality signal is repeatable across many symbols and time periods. Outputs are research metrics, not performance guarantees. Typically 30–120 s.</p>
 
           <div className="oos-controls">
             <label className="oos-field">
@@ -1279,13 +1668,13 @@ export default function App() {
             <label className="oos-field"><span>Min Signal</span>
               <input type="number" step="0.01" value={oosParams.min_signal_score} onChange={e => updateOosParam('min_signal_score', e.target.value)} />
             </label>
-            <label className="oos-field"><span>Min Crush Conf</span>
+            <label className="oos-field"><span>Min Evidence Conf</span>
               <input type="number" step="0.01" value={oosParams.min_crush_confidence} onChange={e => updateOosParam('min_crush_confidence', e.target.value)} />
             </label>
-            <label className="oos-field"><span>Min Crush Magn</span>
+            <label className="oos-field"><span>Min Vol Move</span>
               <input type="number" step="0.01" value={oosParams.min_crush_magnitude} onChange={e => updateOosParam('min_crush_magnitude', e.target.value)} />
             </label>
-            <label className="oos-field"><span>Min Crush Edge</span>
+            <label className="oos-field"><span>Min Edge Quality</span>
               <input type="number" step="0.01" value={oosParams.min_crush_edge} onChange={e => updateOosParam('min_crush_edge', e.target.value)} />
             </label>
             <label className="oos-field"><span>Target Entry DTE</span>
