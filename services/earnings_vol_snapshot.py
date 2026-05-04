@@ -10,6 +10,14 @@ import numpy as np
 import pandas as pd
 
 from services.option_surface_quality import diagnose_option_surface_quality
+from services.realized_vol import (
+    HAR_MIN_OBS as _HAR_MIN_OBS,
+    RS_FALLBACK_WINDOW as _RS_FALLBACK_WINDOW,
+    har_rv_forecast as _har_rv_forecast,
+    rs_daily_vol_series as _rs_daily_vol_series,
+    rs_trailing_mean_forecast as _rs_trailing_mean_forecast,
+    yang_zhang_rv30 as _yang_zhang_rv30,
+)
 
 
 @dataclass(frozen=True)
@@ -1194,55 +1202,6 @@ def _compute_move_uncertainty_pct(
     return float(np.clip(uncertainty, 0.03, 6.0))
 
 
-def _yang_zhang_rv30(
-    hist: pd.DataFrame,
-    window: int = 30,
-    excluded_sessions: Optional[set[pd.Timestamp]] = None,
-) -> float:
-    needed = ("Open", "High", "Low", "Close")
-    if not all(col in hist.columns for col in needed):
-        return np.nan
-    df = hist[list(needed)].copy().dropna()
-    if len(df) < max(window + 1, 6):
-        return np.nan
-
-    df = df.sort_index()
-    overnight = np.log(df["Open"] / df["Close"].shift(1))
-    intraday = np.log(df["Close"] / df["Open"])
-    high = np.log(df["High"] / df["Open"])
-    low = np.log(df["Low"] / df["Open"])
-
-    if excluded_sessions:
-        normalized_index = pd.Index([pd.Timestamp(ts).normalize() for ts in df.index])
-        excluded_mask = normalized_index.isin(list(excluded_sessions))
-        overnight = overnight.mask(excluded_mask)
-        intraday = intraday.mask(excluded_mask)
-        high = high.mask(excluded_mask)
-        low = low.mask(excluded_mask)
-
-    idx = overnight.index.intersection(intraday.index).intersection(high.index).intersection(low.index)
-    overnight = overnight[idx].dropna().tail(window)
-    intraday = intraday[idx].dropna().tail(window)
-    high = high[idx].dropna().tail(window)
-    low = low[idx].dropna().tail(window)
-    idx = overnight.index.intersection(intraday.index).intersection(high.index).intersection(low.index)
-    overnight = overnight[idx]
-    intraday = intraday[idx]
-    high = high[idx]
-    low = low[idx]
-    n = len(overnight)
-    if n < 5:
-        return np.nan
-
-    rs = high * (high - intraday) + low * (low - intraday)
-    k = 0.34 / (1.34 + (n + 1) / max(n - 1, 1))
-    var_o = float(((overnight - overnight.mean()) ** 2).sum() / max(n - 1, 1))
-    var_c = float(((intraday - intraday.mean()) ** 2).sum() / max(n - 1, 1))
-    var_rs = float(rs.mean())
-    yz_var = var_o + k * var_c + (1.0 - k) * var_rs
-    return float(np.sqrt(max(yz_var, 1e-10) * 252.0))
-
-
 def _event_contaminated_session_dates(
     hist: pd.DataFrame,
     earnings_events: Sequence[Mapping[str, Any]] | None,
@@ -1284,81 +1243,6 @@ def _event_contaminated_session_dates(
             drop_dates.add(index_list[contam_loc])
 
     return drop_dates
-
-
-def _rs_daily_vol_series(
-    hist: pd.DataFrame,
-    excluded_sessions: Optional[set[pd.Timestamp]] = None,
-) -> pd.Series:
-    needed = ("Open", "High", "Low", "Close")
-    if not all(col in hist.columns for col in needed):
-        return pd.Series(dtype=float)
-    df = hist[list(needed)].copy().dropna()
-    if excluded_sessions:
-        normalized_index = pd.Index([pd.Timestamp(ts).normalize() for ts in df.index])
-        df = df[~normalized_index.isin(list(excluded_sessions))]
-    high = np.log(df["High"] / df["Open"])
-    low = np.log(df["Low"] / df["Open"])
-    close = np.log(df["Close"] / df["Open"])
-    rs_var = (high * (high - close) + low * (low - close)).clip(lower=0.0)
-    return np.sqrt(rs_var * 252.0).dropna()
-
-
-# Minimum RS-daily observations required for stable HAR OLS (4-param regression).
-# Below this, the OLS has too few degrees of freedom; use the simpler RS fallback instead.
-_HAR_MIN_OBS: int = 100
-# Trailing window for the RS mean fallback used when n < _HAR_MIN_OBS.
-_RS_FALLBACK_WINDOW: int = 30
-
-
-def _har_rv_forecast(rv_daily: pd.Series, horizon: int = 1) -> Optional[float]:
-    n = len(rv_daily)
-    if n < _HAR_MIN_OBS:
-        return None
-    rv = (rv_daily.values.astype(float)) ** 2
-    y: List[float] = []
-    x: List[List[float]] = []
-    for idx in range(22, n - horizon):
-        rv_d = rv[idx]
-        rv_w = rv[max(idx - 4, 0): idx + 1].mean()
-        rv_m = rv[max(idx - 21, 0): idx + 1].mean()
-        y.append(rv[idx + horizon])
-        x.append([1.0, rv_d, rv_w, rv_m])
-    if len(y) < 10:
-        return None
-    try:
-        beta, _, _, _ = np.linalg.lstsq(np.array(x, dtype=float), np.array(y, dtype=float), rcond=None)
-    except Exception:
-        return None
-    last_rv_d = rv[-1]
-    last_rv_w = rv[-5:].mean() if n >= 5 else rv[-1]
-    last_rv_m = rv[-22:].mean() if n >= 22 else rv[-1]
-    forecast_var = float(beta[0] + beta[1] * last_rv_d + beta[2] * last_rv_w + beta[3] * last_rv_m)
-    return max(np.sqrt(max(forecast_var, 0.0)), 1e-4)
-
-
-def _rs_trailing_mean_forecast(
-    rv_daily: pd.Series,
-    window: int = _RS_FALLBACK_WINDOW,
-) -> Optional[float]:
-    """
-    Trailing-mean fallback used when n < _HAR_MIN_OBS and HAR is unavailable.
-
-    Returns the simple mean of the trailing `window` Rogers-Satchell annualised
-    vol values.  No regression; numerically stable at low sample sizes.  Serves
-    as a conservative baseline so event decomposition does not lose a non-event
-    vol estimate entirely when price history is short.
-
-    The calling site records ``null_reasons["rv_har_estimator"]`` to indicate
-    that this path was taken, so consumers can distinguish HAR from fallback.
-    """
-    if len(rv_daily) < window:
-        return None
-    trailing = rv_daily.tail(window).dropna()
-    if len(trailing) < 5:
-        return None
-    mean_val = float(trailing.mean())
-    return mean_val if np.isfinite(mean_val) and mean_val > 0 else None
 
 
 def _rv_percentile_and_regime(
