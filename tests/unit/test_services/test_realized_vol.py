@@ -20,6 +20,7 @@ import pandas as pd
 
 import services.earnings_vol_snapshot as snap_mod
 import services.realized_vol as rv_mod
+import web.api.edge_engine as ee_mod
 from services.realized_vol import (
     HAR_MIN_OBS,
     har_rv_forecast,
@@ -40,14 +41,13 @@ def _ohlc_frame(rows):
 
 
 class TestModuleWiringDriftDetection(unittest.TestCase):
-    """The snapshot module must re-export the new kernels. If the underscore
-    aliases stop pointing at the shared functions, this test fires before
-    any behavioral drift can land.
+    """Both the snapshot module and the edge-engine module must re-export the
+    shared kernels. If any underscore alias stops pointing at the shared
+    function, this test fires before any behavioral drift can land.
 
-    NOTE: web.api.edge_engine is intentionally NOT migrated in this step
-    (it kept its local YZ/RS/HAR functions to preserve byte-identical
-    behavior pending threshold reconciliation between the two paths). A
-    drift assertion for edge_engine will be added when its migration lands.
+    Threshold reconciliation between the two paths landed in P-3b (HAR
+    minimum observations = 100 on both); the edge-engine migration lands
+    in P-3c.
     """
 
     def test_snapshot_aliases_point_to_shared_kernels(self):
@@ -57,6 +57,11 @@ class TestModuleWiringDriftDetection(unittest.TestCase):
         self.assertIs(snap_mod._rs_trailing_mean_forecast, rs_trailing_mean_forecast)
         self.assertEqual(snap_mod._HAR_MIN_OBS, rv_mod.HAR_MIN_OBS)
         self.assertEqual(snap_mod._RS_FALLBACK_WINDOW, rv_mod.RS_FALLBACK_WINDOW)
+
+    def test_edge_engine_aliases_point_to_shared_kernels(self):
+        self.assertIs(ee_mod._yang_zhang_rv30, yang_zhang_rv30)
+        self.assertIs(ee_mod._rs_daily_vol_series, rs_daily_vol_series)
+        self.assertIs(ee_mod._har_rv_forecast, har_rv_forecast)
 
 
 class TestYangZhangRV30(unittest.TestCase):

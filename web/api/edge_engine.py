@@ -20,6 +20,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from services.realized_vol import (
+    har_rv_forecast as _har_rv_forecast,
+    rs_daily_vol_series as _rs_daily_vol_series,
+    yang_zhang_rv30 as _yang_zhang_rv30,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1091,135 +1096,6 @@ def _historical_earnings_move_profile(
 #   Yang-Zhang daily series into daily / weekly / monthly persistence components
 #   to produce a forward-looking RV forecast — the proper denominator for
 #   comparing against implied volatility (which is itself forward-looking).
-
-def _yang_zhang_rv30(hist: pd.DataFrame, window: int = 30) -> float:
-    """
-    Yang-Zhang (2000) OHLC realized volatility over *window* trading days.
-
-        σ²_YZ = σ²_o + k·σ²_c + (1-k)·σ²_RS
-
-    where
-      σ²_o  = sample variance of overnight log-returns  log(Open_t / Close_{t-1})
-      σ²_c  = sample variance of open-to-close returns  log(Close_t / Open_t)
-      σ²_RS = mean Rogers-Satchell per-day variance (direction-free intraday)
-      k     = 0.34 / (1.34 + (n+1)/(n-1))  — paper-optimal weight
-
-    Returns annualised volatility, or np.nan if data is insufficient.
-    """
-    needed = ("Open", "High", "Low", "Close")
-    if not all(c in hist.columns for c in needed):
-        return np.nan
-
-    df = hist[list(needed)].copy().dropna()
-    if len(df) < max(window + 1, 6):
-        return np.nan
-
-    df = df.tail(window + 1)  # extra row for overnight return denominator
-
-    o = np.log(df["Open"] / df["Close"].shift(1)).dropna()
-    c = np.log(df["Close"] / df["Open"]).dropna()
-    h = np.log(df["High"] / df["Open"]).dropna()
-    l = np.log(df["Low"] / df["Open"]).dropna()
-
-    idx = o.index.intersection(c.index).intersection(h.index).intersection(l.index)
-    o = o[idx].tail(window)
-    c = c[idx].tail(window)
-    h = h[idx].tail(window)
-    l = l[idx].tail(window)
-
-    n = len(o)
-    if n < 5:
-        return np.nan
-
-    # FIX 9: do NOT clip individual RS values — negative RS is mathematically
-    # valid (price traded below open all day) and clipping introduces upward
-    # bias in the YZ estimator. Clip only the final combined variance before sqrt.
-    rs = h * (h - c) + l * (l - c)  # Rogers-Satchell daily variance (unclipped)
-    k = 0.34 / (1.34 + (n + 1) / max(n - 1, 1))
-
-    # Paper specifies sample variance (1/(n-1)), not population variance (1/n)
-    var_o = float(((o - o.mean()) ** 2).sum() / max(n - 1, 1))
-    var_c = float(((c - c.mean()) ** 2).sum() / max(n - 1, 1))
-    var_rs = float(rs.mean())
-
-    yz_var = var_o + k * var_c + (1.0 - k) * var_rs
-    return float(np.sqrt(max(yz_var, 1e-10) * 252))
-
-
-def _rs_daily_vol_series(hist: pd.DataFrame) -> pd.Series:
-    """
-    Per-day Rogers-Satchell annualised volatility series — used as input to HAR.
-
-    RS_t = log(H_t/O_t)·log(H_t/C_t) + log(L_t/O_t)·log(L_t/C_t)
-
-    Each RS_t is an unbiased, direction-free estimate of daily variance that
-    requires no window.  Annualising: vol_t = √(252 · RS_t).
-    """
-    needed = ("Open", "High", "Low", "Close")
-    if not all(c in hist.columns for c in needed):
-        return pd.Series(dtype=float)
-
-    df = hist[list(needed)].copy().dropna()
-    h = np.log(df["High"] / df["Open"])
-    l = np.log(df["Low"] / df["Open"])
-    c = np.log(df["Close"] / df["Open"])
-
-    rs_var = (h * (h - c) + l * (l - c)).clip(lower=0.0)
-    return np.sqrt(rs_var * 252).dropna()
-
-
-def _har_rv_forecast(rv_daily: pd.Series, horizon: int = 1) -> Optional[float]:
-    """
-    Corsi (2009) Heterogeneous Autoregressive Realized Variance.
-
-        RV_{t+h} = β₀ + β_d·RV_t + β_w·RV^(w)_t + β_m·RV^(m)_t + ε
-
-    RV^(w)_t = 5-day average of daily RV ending at t  (weekly persistence)
-    RV^(m)_t = 22-day average of daily RV ending at t (monthly persistence)
-
-    Fitted by OLS on the in-sample daily series.  Returns a 1-day-ahead
-    forecast (annualised vol), floored at 1 bp.  Returns None if the series
-    is too short for a reliable monthly component (< 100 observations).
-
-    Note: Input is annualised vol series from _rs_daily_vol_series(); we square
-    to variance for HAR fitting (Corsi operates on RV, not σ) and convert the
-    forecast back to vol via sqrt.  This avoids Jensen's-inequality bias that
-    arises from regressing directly on σ.
-    """
-    n = len(rv_daily)
-    if n < 100:
-        return None
-
-    # Convert vol → variance (Corsi 2009 operates on realised variance)
-    rv = (rv_daily.values.astype(float)) ** 2
-    y: List[float] = []
-    X: List[List[float]] = []
-
-    for i in range(22, n - horizon):
-        rv_d = rv[i]
-        rv_w = rv[max(i - 4, 0): i + 1].mean()
-        rv_m = rv[max(i - 21, 0): i + 1].mean()
-        y.append(rv[i + horizon])
-        X.append([1.0, rv_d, rv_w, rv_m])
-
-    if len(y) < 10:
-        return None
-
-    try:
-        beta, _, _, _ = np.linalg.lstsq(
-            np.array(X, dtype=float), np.array(y, dtype=float), rcond=None
-        )
-    except Exception as exc:
-        logger.debug("HAR-RV OLS fitting failed: %s", exc)
-        return None
-
-    last_rv_d = rv[-1]
-    last_rv_w = rv[-5:].mean() if n >= 5 else rv[-1]
-    last_rv_m = rv[-22:].mean() if n >= 22 else rv[-1]
-
-    forecast_var = float(beta[0] + beta[1] * last_rv_d + beta[2] * last_rv_w + beta[3] * last_rv_m)
-    # Variance → vol; clamp negative variance to zero before sqrt, floor at 1 bp
-    return max(np.sqrt(max(forecast_var, 0.0)), 1e-4)
 
 
 def _bsm_greeks(
