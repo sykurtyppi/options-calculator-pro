@@ -1643,20 +1643,13 @@ def analyze_single_ticker(
     setup_score = float(np.clip(0.88 * setup_base + 0.12 * concavity_component, 0.0, 1.0))
 
     implied_move_total_pct = _safe_float(implied_move_pct, np.nan)
-    rv_for_event = _safe_float(rv_har_forecast, rv30)
-    non_event_move_pct = np.nan
-    event_implied_move_pct = implied_move_total_pct
-    if (
-        np.isfinite(implied_move_total_pct)
-        and near_term_dte is not None
-        and np.isfinite(rv_for_event)
-        and rv_for_event > 0
-    ):
-        non_event_days = max(int(near_term_dte) - 1, 0)
-        non_event_move_pct = float(rv_for_event * np.sqrt(non_event_days / 252.0) * 100.0)
-        event_implied_move_pct = float(
-            np.sqrt(max(implied_move_total_pct * implied_move_total_pct - non_event_move_pct * non_event_move_pct, 0.0))
-        )
+    # P-5a: read the canonical event-vol decomposition from the VolSnapshot
+    # produced by services.earnings_vol_snapshot.build_vol_snapshot.  The
+    # local recomputation that previously lived here used the same
+    # dimensionally-incoherent quadrature subtraction and is now obsolete;
+    # eliminating it keeps the decomposition in a single source of truth.
+    event_implied_move_pct = _safe_float(snapshot_inputs.get("event_implied_move_pct"), np.nan)
+    non_event_move_pct = _safe_float(snapshot_inputs.get("non_event_move_pct"), np.nan)
 
     raw_gross_edge_pct = (
         float(event_implied_move_pct - move_anchor_pct_val)

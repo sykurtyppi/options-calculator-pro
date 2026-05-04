@@ -129,6 +129,7 @@ def _make_snapshot(*, historical_move_source: str = "earnings_history", **overri
         near_back_iv_ratio=0.897,
         term_structure_slope=0.0010,
         near_term_implied_move_pct=5.5,
+        near_term_implied_sigma_pct=5.5 * 1.2533141373155001,  # MAD × √(π/2), P-5a
         non_event_move_pct_har=1.1,
         event_implied_move_pct=5.3,
         event_move_share_of_total=0.96,

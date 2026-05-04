@@ -263,6 +263,7 @@ def _stub_snapshot() -> VolSnapshot:
         near_back_iv_ratio=0.8571,
         term_structure_slope=0.0018,
         near_term_implied_move_pct=6.0,
+        near_term_implied_sigma_pct=6.0 * 1.2533141373155001,  # MAD × √(π/2), P-5a
         non_event_move_pct_har=1.2,
         event_implied_move_pct=5.88,
         event_move_share_of_total=0.98,
