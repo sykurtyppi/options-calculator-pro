@@ -9,6 +9,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from services.event_vol_decomposition import decompose_event_vol
 from services.option_surface_quality import diagnose_option_surface_quality
 from services.realized_vol import (
     HAR_MIN_OBS as _HAR_MIN_OBS,
@@ -316,56 +317,18 @@ def build_vol_snapshot(
         null_reasons["near_term_implied_move_pct"] = "missing_atm_call_put_pair"
 
     # ── Event-vol decomposition (P-5a, variance-additive on calendar time) ──
-    #
-    # `near_term_implied_move_pct` is the legacy ATM straddle premium proxy
-    # (call_mid + put_mid)/S × 100 — the mean-absolute-deviation (MAD) of
-    # S_T/S_0 under risk-neutral lognormal (Brenner-Subrahmanyam 1988).
-    # It is NOT a 1σ standard deviation, so it cannot be directly compared
-    # to σ-form realized vol via quadrature subtraction.
-    #
-    # Convert to a 1σ-form percent move over [0, T] using the closed-form
-    # identity:
-    #     (call+put)/S = σ·√(2·T_years/π)
-    #   ⇒ σ·√T_years   = (call+put)/S · √(π/2)
-    #   ⇒ near_term_implied_sigma_pct = near_term_implied_move_pct · √(π/2)
-    #
-    # The conversion folds out T cleanly — the new field is dimensionally
-    # 1σ-equivalent regardless of dte.
-    #
-    # Then perform a calendar-time variance decomposition (assume the event
-    # consumes one calendar day of total variance; both σ_implied and σ_HAR
-    # are quoted as annualised vols on calendar time per industry convention):
-    #     σ_imp²·T = σ_HAR²·(T-1d) + σ_event²·1d
-    #   ⇒ event_move²_pct = sigma²_pct − non_event_move²_pct
-    #   where both terms are 1σ-form on calendar time.
-    near_term_implied_sigma_pct: Optional[float] = None
-    non_event_move_pct_har: Optional[float] = None
-    event_implied_move_pct: Optional[float] = None
-    event_move_share_of_total: Optional[float] = None
-    if term.near_term_implied_move_pct is not None:
-        near_term_implied_sigma_pct = float(
-            term.near_term_implied_move_pct * math.sqrt(math.pi / 2.0)
-        )
-    if (
-        near_term_implied_sigma_pct is not None
-        and term.near_term_dte is not None
-        and rv_har_forecast is not None
-        and rv_har_forecast > 0
-    ):
-        non_event_T_years = max(int(term.near_term_dte) - 1, 0) / 365.0
-        non_event_move_pct_har = float(
-            rv_har_forecast * math.sqrt(non_event_T_years) * 100.0
-        )
-        event_variance_pct_sq = max(
-            (near_term_implied_sigma_pct ** 2) - (non_event_move_pct_har ** 2),
-            0.0,
-        )
-        event_implied_move_pct = float(math.sqrt(event_variance_pct_sq))
-        if near_term_implied_sigma_pct > 0:
-            event_move_share_of_total = float(
-                event_implied_move_pct / near_term_implied_sigma_pct
-            )
-    else:
+    # Single source of truth: services.event_vol_decomposition.decompose_event_vol.
+    # See that module for the full math derivation.
+    _decomp = decompose_event_vol(
+        near_term_implied_move_pct=term.near_term_implied_move_pct,
+        near_term_dte=term.near_term_dte,
+        rv_annual_calendar=rv_har_forecast,
+    )
+    near_term_implied_sigma_pct = _decomp.near_term_implied_sigma_pct
+    non_event_move_pct_har = _decomp.non_event_move_pct
+    event_implied_move_pct = _decomp.event_implied_move_pct
+    event_move_share_of_total = _decomp.event_move_share_of_total
+    if event_implied_move_pct is None:
         if term.near_term_implied_move_pct is None:
             null_reasons["near_term_implied_sigma_pct"] = "near_term_implied_move_unavailable"
             null_reasons["event_implied_move_pct"] = "near_term_implied_move_unavailable"

@@ -36,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from services.event_vol_decomposition import decompose_event_vol
 from utils.logger import setup_logger
 from web.api.edge_engine import (
     MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_EXPANSION,
@@ -788,14 +789,22 @@ def build_signal_snapshot(
     iv_rv = float(iv30 / rv30) if rv30 > 0 else np.nan
     iv_rv_har = float(iv30 / rv_har) if rv_har is not None and rv_har > 0 else np.nan
 
-    non_event_move_pct = np.nan
-    event_implied_move_pct = near_term_implied_move_pct if near_term_implied_move_pct is not None else np.nan
-    if near_term_implied_move_pct is not None and near_term_dte is not None and rv_har is not None and rv_har > 0:
-        non_event_days = max(int(near_term_dte) - 1, 0)
-        non_event_move_pct = float(rv_har * math.sqrt(non_event_days / 252.0) * 100.0)
-        event_implied_move_pct = float(
-            math.sqrt(max(near_term_implied_move_pct * near_term_implied_move_pct - non_event_move_pct * non_event_move_pct, 0.0))
-        )
+    # P-5a single source of truth for the event-vol decomposition.  Production
+    # uses HAR with an RS-trailing-mean fallback for short histories; this
+    # script's HAR pipeline often returns None on per-event 60–90-day windows,
+    # so we fall back to Yang-Zhang annualised σ (rv30) when HAR is missing.
+    # That mirrors the snapshot module's HAR→trailing-mean cascade in spirit.
+    _rv_for_decomp = (
+        rv_har if (rv_har is not None and rv_har > 0)
+        else (rv30 if (rv30 is not None and np.isfinite(rv30) and rv30 > 0) else None)
+    )
+    _decomp = decompose_event_vol(
+        near_term_implied_move_pct=near_term_implied_move_pct,
+        near_term_dte=near_term_dte,
+        rv_annual_calendar=_rv_for_decomp,
+    )
+    non_event_move_pct = _decomp.non_event_move_pct if _decomp.non_event_move_pct is not None else np.nan
+    event_implied_move_pct = _decomp.event_implied_move_pct if _decomp.event_implied_move_pct is not None else np.nan
 
     prior_events = [
         {"event_date": pd.Timestamp(row["event_date"]), "release_timing": row["release_timing"]}
