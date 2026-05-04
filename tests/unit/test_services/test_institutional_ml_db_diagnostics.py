@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from services.execution_cost_model import ExecutionCostModel
-from services.institutional_ml_db import InstitutionalMLDatabase, SnapshotReplayPair
+from services.institutional_ml_db import BacktestTrade, InstitutionalMLDatabase, SnapshotReplayPair
 
 
 class TestInstitutionalDiagnostics(unittest.TestCase):
@@ -709,6 +709,108 @@ class TestInstitutionalDiagnostics(unittest.TestCase):
                 cutoff_profiles["AAPL"]["expected_front_iv_crush_pct"],
                 all_profiles["AAPL"]["expected_front_iv_crush_pct"],
             )
+
+    def test_backtest_trade_schema_migration_adds_structure_column(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = f"{tmp_dir}/inst_schema_migration.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE backtest_trades (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        trade_date TEXT NOT NULL,
+                        hold_days INTEGER NOT NULL,
+                        setup_score REAL NOT NULL,
+                        debit_per_contract REAL NOT NULL,
+                        transaction_cost_per_contract REAL NOT NULL,
+                        gross_return_pct REAL NOT NULL,
+                        net_return_pct REAL NOT NULL,
+                        pnl_per_contract REAL NOT NULL,
+                        underlying_return REAL NOT NULL,
+                        expected_move REAL NOT NULL,
+                        move_ratio REAL NOT NULL,
+                        execution_profile TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO backtest_trades (
+                        session_id, symbol, trade_date, hold_days, setup_score,
+                        debit_per_contract, transaction_cost_per_contract,
+                        gross_return_pct, net_return_pct, pnl_per_contract,
+                        underlying_return, expected_move, move_ratio, execution_profile
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy_session",
+                        "AAPL",
+                        "2024-01-10",
+                        5,
+                        0.6,
+                        2.5,
+                        0.1,
+                        0.08,
+                        0.05,
+                        12.0,
+                        0.01,
+                        0.03,
+                        0.9,
+                        "institutional",
+                    ),
+                )
+                conn.commit()
+
+            InstitutionalMLDatabase(db_path=db_path)
+
+            with sqlite3.connect(db_path) as conn:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(backtest_trades)").fetchall()}
+                self.assertIn("structure", columns)
+                structure = conn.execute(
+                    "SELECT structure FROM backtest_trades WHERE session_id = ?",
+                    ("legacy_session",),
+                ).fetchone()[0]
+                self.assertEqual(structure, "call_calendar")
+
+    def test_store_backtest_trades_writes_explicit_structure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = f"{tmp_dir}/inst_backtest_structure.db"
+            db = InstitutionalMLDatabase(db_path=db_path)
+            trade = BacktestTrade(
+                session_id="session_structure_test",
+                symbol="AAPL",
+                structure="otm_strangle",
+                trade_date=datetime(2024, 1, 2),
+                event_date=datetime(2024, 1, 10),
+                days_to_earnings=8,
+                contracts=1,
+                hold_days=5,
+                setup_score=0.65,
+                debit_per_contract=2.5,
+                transaction_cost_per_contract=0.12,
+                gross_return_pct=0.10,
+                net_return_pct=0.07,
+                pnl_per_contract=15.0,
+                underlying_return=0.02,
+                expected_move=0.03,
+                move_ratio=0.9,
+                predicted_front_iv_crush_pct=-0.12,
+                crush_confidence=0.0,
+                crush_edge_score=0.0,
+                crush_profile_sample_size=0.0,
+                execution_profile="institutional",
+            )
+            db._store_backtest_trades("session_structure_test", [trade])
+
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT structure FROM backtest_trades WHERE session_id = ?",
+                    ("session_structure_test",),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(row[0], "otm_strangle")
 
 
 if __name__ == "__main__":

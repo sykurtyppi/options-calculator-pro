@@ -23,6 +23,9 @@ import numpy as np
 import pandas as pd
 import requests
 
+from services.provider_telemetry import classify_error, record_provider_telemetry
+from services.option_surface_quality import diagnose_option_surface_quality
+
 logger = logging.getLogger(__name__)
 
 _MARKETDATA_BASE_URL = "https://api.marketdata.app/v1"
@@ -213,10 +216,38 @@ class MarketDataClient:
             return pd.DataFrame()
 
         if data.get("s") != "ok":
+            record_provider_telemetry(
+                provider_name="marketdata_app",
+                endpoint_type="options_chain_quality",
+                symbol=symbol,
+                success=False,
+                error_category="empty_response",
+                response_quality_note=f"status={data.get('s')}",
+            )
             logger.debug("MDApp chain no data for %s: s=%s", symbol, data.get("s"))
             return pd.DataFrame()
 
-        return self._chain_response_to_df(data)
+        frame = self._chain_response_to_df(data)
+        if not frame.empty:
+            underlying_price = None
+            if "underlyingPrice" in frame.columns:
+                values = pd.to_numeric(frame["underlyingPrice"], errors="coerce").dropna()
+                if not values.empty:
+                    underlying_price = float(values.iloc[0])
+            frame.attrs["surface_quality"] = diagnose_option_surface_quality(
+                frame,
+                underlying_price=underlying_price,
+            ).to_dict()
+        if frame.empty:
+            record_provider_telemetry(
+                provider_name="marketdata_app",
+                endpoint_type="options_chain_quality",
+                symbol=symbol,
+                success=False,
+                error_category="empty_response",
+                response_quality_note="chain payload converted to empty frame",
+            )
+        return frame
 
     # ------------------------------------------------------------------
     # Earnings
@@ -264,6 +295,14 @@ class MarketDataClient:
             return pd.DataFrame()
 
         if data.get("s") not in ("ok",):
+            record_provider_telemetry(
+                provider_name="marketdata_app",
+                endpoint_type="earnings_quality",
+                symbol=symbol,
+                success=False,
+                error_category="empty_response",
+                response_quality_note=f"status={data.get('s')}",
+            )
             return pd.DataFrame()
 
         n = max(
@@ -271,6 +310,14 @@ class MarketDataClient:
             len(data.get("reportDate", [])),
         )
         if n == 0:
+            record_provider_telemetry(
+                provider_name="marketdata_app",
+                endpoint_type="earnings_quality",
+                symbol=symbol,
+                success=False,
+                error_category="empty_response",
+                response_quality_note="earnings payload had zero rows",
+            )
             return pd.DataFrame()
 
         def _col(key: str, n: int) -> list:
@@ -318,6 +365,15 @@ class MarketDataClient:
         df.sort_values("report_date", ascending=False, inplace=True, na_position="last")
         df.reset_index(drop=True, inplace=True)
 
+        # pandas sort_values converts datetime.date objects to pd.Timestamp internally;
+        # re-normalize both date columns back to datetime.date so callers get consistent types.
+        import datetime as _dt
+        for _dc in ("event_date", "report_date"):
+            if _dc in df.columns:
+                df[_dc] = df[_dc].apply(
+                    lambda x: x.date() if isinstance(x, pd.Timestamp) else x
+                )
+
         return df
 
     # ------------------------------------------------------------------
@@ -339,6 +395,14 @@ class MarketDataClient:
             return None
 
         if data.get("s") != "ok":
+            record_provider_telemetry(
+                provider_name="marketdata_app",
+                endpoint_type="quote_quality",
+                symbol=symbol,
+                success=False,
+                error_category="empty_response",
+                response_quality_note=f"status={data.get('s')}",
+            )
             return None
 
         last_list = data.get("last", [])
@@ -347,6 +411,14 @@ class MarketDataClient:
                 return float(last_list[0])
             except (TypeError, ValueError):
                 pass
+        record_provider_telemetry(
+            provider_name="marketdata_app",
+            endpoint_type="quote_quality",
+            symbol=symbol,
+            success=False,
+            error_category="empty_response",
+            response_quality_note="quote payload missing parseable last price",
+        )
         return None
 
     # ------------------------------------------------------------------
@@ -368,6 +440,7 @@ class MarketDataClient:
         """
         cache_key = url + "|" + str(sorted((params or {}).items()))
         now = time.monotonic()
+        endpoint_type, symbol = _marketdata_endpoint_from_url(url)
 
         if cache_key in self._cache:
             ts, cached = self._cache[cache_key]
@@ -376,6 +449,8 @@ class MarketDataClient:
 
         max_retries = 3
         backoff = 1.5
+        start = time.perf_counter()
+        retried = False
         for attempt in range(max_retries):
             try:
                 resp = requests.get(
@@ -385,6 +460,7 @@ class MarketDataClient:
                     timeout=15,
                 )
                 if resp.status_code == 429:
+                    retried = True
                     wait = backoff * (attempt + 1)
                     logger.warning("MDApp rate-limited, waiting %.1fs (attempt %d)", wait, attempt + 1)
                     time.sleep(wait)
@@ -392,14 +468,66 @@ class MarketDataClient:
                 resp.raise_for_status()
                 data: Dict[str, Any] = resp.json()
                 self._cache[cache_key] = (now, data)
+                record_provider_telemetry(
+                    provider_name="marketdata_app",
+                    endpoint_type=endpoint_type,
+                    symbol=symbol,
+                    success=True,
+                    latency_ms=(time.perf_counter() - start) * 1000.0,
+                    response_quality_note="retried_after_rate_limit" if retried else None,
+                )
                 return data
             except requests.exceptions.Timeout:
                 logger.warning("MDApp request timeout (attempt %d): %s", attempt + 1, url)
                 if attempt == max_retries - 1:
+                    record_provider_telemetry(
+                        provider_name="marketdata_app",
+                        endpoint_type=endpoint_type,
+                        symbol=symbol,
+                        success=False,
+                        error_category="timeout",
+                        latency_ms=(time.perf_counter() - start) * 1000.0,
+                    )
                     raise MarketDataError(f"MDApp timeout after {max_retries} attempts: {url}")
             except requests.exceptions.HTTPError as exc:
+                record_provider_telemetry(
+                    provider_name="marketdata_app",
+                    endpoint_type=endpoint_type,
+                    symbol=symbol,
+                    success=False,
+                    error_category=classify_error(str(exc)),
+                    latency_ms=(time.perf_counter() - start) * 1000.0,
+                )
                 raise MarketDataError(f"MDApp HTTP error: {exc}") from exc
+            except requests.exceptions.RequestException as exc:
+                record_provider_telemetry(
+                    provider_name="marketdata_app",
+                    endpoint_type=endpoint_type,
+                    symbol=symbol,
+                    success=False,
+                    error_category=classify_error(str(exc)),
+                    latency_ms=(time.perf_counter() - start) * 1000.0,
+                )
+                raise MarketDataError(f"MDApp request error: {exc}") from exc
+            except Exception as exc:
+                record_provider_telemetry(
+                    provider_name="marketdata_app",
+                    endpoint_type=endpoint_type,
+                    symbol=symbol,
+                    success=False,
+                    error_category=classify_error(str(exc)),
+                    latency_ms=(time.perf_counter() - start) * 1000.0,
+                )
+                raise
 
+        record_provider_telemetry(
+            provider_name="marketdata_app",
+            endpoint_type=endpoint_type,
+            symbol=symbol,
+            success=False,
+            error_category="rate_limited" if retried else "unknown_error",
+            latency_ms=(time.perf_counter() - start) * 1000.0,
+        )
         raise MarketDataError(f"MDApp max retries exceeded: {url}")
 
     @staticmethod
@@ -489,3 +617,20 @@ def _parse_marketdata_date(value: Any) -> Any:
 
     parsed = pd.to_datetime(value, utc=True, errors="coerce")
     return parsed.date() if not pd.isna(parsed) else pd.NaT
+
+
+def _marketdata_endpoint_from_url(url: str) -> Tuple[str, Optional[str]]:
+    parts = [part for part in str(url).split("/") if part]
+    if "chain" in parts:
+        idx = parts.index("chain")
+        return "options_chain", parts[idx + 1].upper() if idx + 1 < len(parts) else None
+    if "earnings" in parts:
+        idx = parts.index("earnings")
+        return "earnings", parts[idx + 1].upper() if idx + 1 < len(parts) else None
+    if "quotes" in parts:
+        idx = parts.index("quotes")
+        return "quote", parts[idx + 1].upper() if idx + 1 < len(parts) else None
+    if "expirations" in parts:
+        idx = parts.index("expirations")
+        return "options_expirations", parts[idx + 1].upper() if idx + 1 < len(parts) else None
+    return "unknown", None

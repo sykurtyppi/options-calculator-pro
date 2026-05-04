@@ -249,6 +249,7 @@ class BacktestTrade:
     crush_edge_score: float
     crush_profile_sample_size: float
     execution_profile: str
+    structure: str = "call_calendar"
 
 
 @dataclass(frozen=True)
@@ -584,6 +585,7 @@ class InstitutionalMLDatabase:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         session_id TEXT NOT NULL,
                         symbol TEXT NOT NULL,
+                        structure TEXT NOT NULL DEFAULT 'call_calendar',
                         trade_date TEXT NOT NULL,
                         event_date TEXT NOT NULL,
                         days_to_earnings INTEGER NOT NULL,
@@ -612,6 +614,10 @@ class InstitutionalMLDatabase:
                 if "contracts" not in backtest_trade_columns:
                     cursor.execute(
                         "ALTER TABLE backtest_trades ADD COLUMN contracts INTEGER NOT NULL DEFAULT 1"
+                    )
+                if "structure" not in backtest_trade_columns:
+                    cursor.execute(
+                        "ALTER TABLE backtest_trades ADD COLUMN structure TEXT NOT NULL DEFAULT 'call_calendar'"
                     )
                 if "event_date" not in backtest_trade_columns:
                     cursor.execute(
@@ -2215,11 +2221,17 @@ class InstitutionalMLDatabase:
 
                                     # MDApp historical chain data may omit IV/Greeks depending on plan.
                                     # Fallback: derive implied volatility from option price + BSM inversion.
+                                    # Fetch the risk-free rate once per replay batch
+                                    # via the shared services.pricing_rates source of
+                                    # truth. Imported lazily to keep institutional_ml_db
+                                    # importable in environments without yfinance.
+                                    from services.pricing_rates import get_pricing_risk_free_rate
+                                    _replay_rfr, _ = get_pricing_risk_free_rate()
                                     grp["derived_iv"] = grp.apply(
                                         lambda row: self._resolve_row_implied_volatility(
                                             row=row,
                                             underlying_price=snapshot_underlying,
-                                            risk_free_rate=0.03,
+                                            risk_free_rate=_replay_rfr,
                                             snapshot_date=snap_date,
                                         ),
                                         axis=1,
@@ -2447,7 +2459,8 @@ class InstitutionalMLDatabase:
         self,
         row: "pd.Series",
         underlying_price: float,
-        risk_free_rate: float = 0.03,
+        *,
+        risk_free_rate: float,
         snapshot_date: Optional[date] = None,
     ) -> float:
         iv = pd.to_numeric(pd.Series([row.get("impliedVolatility")]), errors="coerce").iloc[0]
@@ -2620,7 +2633,7 @@ class InstitutionalMLDatabase:
         long_expiry: str,
         front_iv: float,
         back_iv: float,
-        risk_free_rate: float = 0.03,
+        risk_free_rate: float,
     ) -> float:
         """Approximate calendar spread market value from snapshot IVs using BSM."""
         as_of = pd.Timestamp(as_of_date).date()
@@ -2674,6 +2687,11 @@ class InstitutionalMLDatabase:
         volume_ratio: Optional[float] = None,
     ) -> Optional[BacktestTrade]:
         """Replay a calendar trade from stored pre/post earnings snapshots."""
+        # Single rate read for both pre and post pricing — keeps entry/exit
+        # priced under the same regime even if the cache TTL flips between
+        # the two calls.
+        from services.pricing_rates import get_pricing_risk_free_rate
+        _trade_rfr, _ = get_pricing_risk_free_rate()
         entry_value = self._calendar_spread_market_value_from_snapshot(
             underlying_price=snapshot_pair.pre_underlying_price,
             strike=snapshot_pair.atm_strike,
@@ -2682,6 +2700,7 @@ class InstitutionalMLDatabase:
             long_expiry=snapshot_pair.long_expiry,
             front_iv=snapshot_pair.pre_front_iv,
             back_iv=snapshot_pair.pre_back_iv,
+            risk_free_rate=_trade_rfr,
         )
         exit_value = self._calendar_spread_market_value_from_snapshot(
             underlying_price=snapshot_pair.post_underlying_price,
@@ -2691,6 +2710,7 @@ class InstitutionalMLDatabase:
             long_expiry=snapshot_pair.long_expiry,
             front_iv=snapshot_pair.post_front_iv,
             back_iv=snapshot_pair.post_back_iv,
+            risk_free_rate=_trade_rfr,
         )
         if not np.isfinite(entry_value) or not np.isfinite(exit_value) or entry_value <= 0:
             return None
@@ -2737,6 +2757,7 @@ class InstitutionalMLDatabase:
         return BacktestTrade(
             session_id=session_id,
             symbol=snapshot_pair.symbol,
+            structure="call_calendar",
             trade_date=snapshot_pair.pre_capture_date,
             event_date=snapshot_pair.event_date,
             days_to_earnings=max(0, (snapshot_pair.event_date.date() - snapshot_pair.pre_capture_date.date()).days),
@@ -3020,7 +3041,7 @@ class InstitutionalMLDatabase:
         unqualified_events = int(((grouped['pre_count'] == 0) & (grouped['post_count'] == 0)).sum())
 
         if total_events > 0:
-            pairable_event_pct = float(pairable_events / total_events) * 100.0
+            pairable_event_pct = float(pairable_events / total_events)
         else:
             pairable_event_pct = 0.0
 
@@ -3310,6 +3331,7 @@ class InstitutionalMLDatabase:
         return BacktestTrade(
             session_id=session_id,
             symbol=symbol,
+            structure="call_calendar",
             trade_date=trade_date,
             event_date=event_date,
             days_to_earnings=days_to_earnings,
@@ -3382,15 +3404,16 @@ class InstitutionalMLDatabase:
                 cursor.execute("DELETE FROM backtest_trades WHERE session_id = ?", (session_id,))
                 cursor.executemany("""
                     INSERT INTO backtest_trades
-                    (session_id, symbol, trade_date, event_date, days_to_earnings, contracts, hold_days, setup_score, debit_per_contract,
+                    (session_id, symbol, structure, trade_date, event_date, days_to_earnings, contracts, hold_days, setup_score, debit_per_contract,
                      transaction_cost_per_contract, gross_return_pct, net_return_pct, pnl_per_contract,
                      underlying_return, expected_move, move_ratio, predicted_front_iv_crush_pct,
                      crush_confidence, crush_edge_score, crush_profile_sample_size, execution_profile)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     (
                         trade.session_id,
                         trade.symbol,
+                        trade.structure,
                         trade.trade_date.strftime('%Y-%m-%d'),
                         trade.event_date.strftime('%Y-%m-%d'),
                         trade.days_to_earnings,
@@ -5078,7 +5101,7 @@ class InstitutionalMLDatabase:
             from sklearn.calibration import CalibratedClassifierCV
             from sklearn.model_selection import StratifiedKFold, cross_val_score
             from sklearn.preprocessing import StandardScaler
-            from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
+            from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss, precision_score, recall_score
             import joblib
         except ImportError as exc:
             self.logger.error("scikit-learn not installed: %s", exc)
@@ -5133,6 +5156,16 @@ class InstitutionalMLDatabase:
         except Exception:
             auc = float("nan")
 
+        # Precision and recall at the default 0.5 decision threshold
+        _PRED_THRESHOLD = 0.50
+        y_pred_thresh = (probs >= _PRED_THRESHOLD).astype(int)
+        try:
+            precision_at_thresh = float(precision_score(y, y_pred_thresh, zero_division=0))
+            recall_at_thresh = float(recall_score(y, y_pred_thresh, zero_division=0))
+        except Exception:
+            precision_at_thresh = float("nan")
+            recall_at_thresh = float("nan")
+
         # Save models and metadata
         model_dir = os.path.expanduser("~/.options_calculator_pro/models")
         os.makedirs(model_dir, exist_ok=True)
@@ -5157,6 +5190,9 @@ class InstitutionalMLDatabase:
             "cv_accuracy_mean": float(cv_acc.mean()),
             "insample_auc": auc,
             "insample_brier": brier,
+            "pred_threshold": _PRED_THRESHOLD,
+            "precision_at_threshold": precision_at_thresh if np.isfinite(precision_at_thresh) else None,
+            "recall_at_threshold": recall_at_thresh if np.isfinite(recall_at_thresh) else None,
         }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
@@ -5174,6 +5210,9 @@ class InstitutionalMLDatabase:
             "cv_accuracy": round(float(cv_acc.mean()), 3),
             "insample_auc": round(auc, 3) if np.isfinite(auc) else None,
             "insample_brier": round(brier, 4),
+            "pred_threshold": _PRED_THRESHOLD,
+            "precision_at_threshold": round(precision_at_thresh, 3) if np.isfinite(precision_at_thresh) else None,
+            "recall_at_threshold": round(recall_at_thresh, 3) if np.isfinite(recall_at_thresh) else None,
             "model_paths": {
                 "classifier": clf_path,
                 "scaler": scaler_path,
