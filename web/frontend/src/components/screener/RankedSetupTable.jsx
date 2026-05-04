@@ -1,0 +1,150 @@
+import React from 'react'
+
+const NA = '—'
+
+function fmt(value, digits = 2, suffix = '') {
+  if (value == null || value === '') return NA
+  const num = Number(value)
+  if (!Number.isFinite(num)) return NA
+  return `${num.toFixed(digits)}${suffix}`
+}
+
+function scoreBar(score) {
+  if (score == null) return null
+  const pct = Math.round(Math.min(Math.max(Number(score), 0), 1) * 100)
+  const color = pct >= 60 ? '#2ea043' : pct >= 35 ? '#d29922' : '#da3633'
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <div
+        style={{
+          width: 48,
+          height: 6,
+          background: '#21262d',
+          borderRadius: 3,
+          overflow: 'hidden',
+        }}
+      >
+        <div style={{ width: `${pct}%`, height: '100%', background: color, borderRadius: 3 }} />
+      </div>
+      <span style={{ color, fontVariantNumeric: 'tabular-nums' }}>{(Number(score)).toFixed(2)}</span>
+    </div>
+  )
+}
+
+function releaseBadge(timing) {
+  const style = {
+    fontSize: '0.7rem',
+    padding: '1px 5px',
+    borderRadius: 3,
+    fontWeight: 600,
+    letterSpacing: '0.03em',
+    background: timing === 'BMO' ? '#1c3a5e' : timing === 'AMC' ? '#2d2a1e' : '#21262d',
+    color: timing === 'BMO' ? '#79c0ff' : timing === 'AMC' ? '#e3b341' : '#8b949e',
+  }
+  return <span style={style}>{timing || '?'}</span>
+}
+
+const COLS = [
+  { key: 'rank', label: '#', width: 32, align: 'right' },
+  { key: 'symbol', label: 'Symbol', width: 70 },
+  { key: 'earnings_date', label: 'Earnings', width: 90 },
+  { key: 'dte', label: 'DTE', width: 44, align: 'right' },
+  { key: 'release_timing', label: 'Rel', width: 48, align: 'center' },
+  { key: 'iv_rv_ratio', label: 'IV/RV', width: 60, align: 'right' },
+  { key: 'atm_iv', label: 'ATM IV', width: 66, align: 'right' },
+  { key: 'ts_ratio', label: 'TS', width: 56, align: 'right' },
+  { key: 'median_earnings_move_pct', label: 'Med Move', width: 76, align: 'right' },
+  { key: 'sample_size', label: 'N', width: 36, align: 'right' },
+  { key: 'ranking_score', label: 'Setup Score', width: 130 },
+]
+
+export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
+  if (!rows || rows.length === 0) {
+    return (
+      <div style={{ padding: '16px 0', color: '#8b949e', fontSize: '0.85rem', textAlign: 'center' }}>
+        No setups in entry window
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+        <thead>
+          <tr>
+            {COLS.map((col) => (
+              <th
+                key={col.key}
+                style={{
+                  padding: '5px 8px',
+                  textAlign: col.align || 'left',
+                  color: '#8b949e',
+                  fontWeight: 500,
+                  borderBottom: '1px solid #21262d',
+                  whiteSpace: 'nowrap',
+                  minWidth: col.width,
+                }}
+              >
+                {col.label}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            const isSelected = row.symbol === selectedSymbol
+            const isError = row.status === 'error'
+            const isNoEvent = row.status === 'no_earnings'
+            return (
+              <tr
+                key={`${row.symbol}-${row.earnings_date}`}
+                onClick={() => !isError && !isNoEvent && onSelect && onSelect(row)}
+                style={{
+                  cursor: isError || isNoEvent ? 'default' : 'pointer',
+                  background: isSelected ? '#1c3a5e22' : 'transparent',
+                  opacity: isError || isNoEvent ? 0.45 : 1,
+                }}
+              >
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#8b949e' }}>{row.rank}</td>
+                <td style={{ padding: '5px 8px', fontWeight: isSelected ? 600 : 400, color: '#e6edf3' }}>
+                  {row.symbol}
+                </td>
+                <td style={{ padding: '5px 8px', color: '#c9d1d9', whiteSpace: 'nowrap' }}>
+                  {row.earnings_date || NA}
+                </td>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#c9d1d9' }}>
+                  {row.dte != null ? row.dte : NA}
+                </td>
+                <td style={{ padding: '5px 8px', textAlign: 'center' }}>
+                  {releaseBadge(row.release_timing)}
+                </td>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.iv_rv_ratio < 1.0 ? '#2ea043' : '#c9d1d9' }}>
+                  {fmt(row.iv_rv_ratio)}
+                </td>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#c9d1d9' }}>
+                  {fmt(row.atm_iv, 1, '%')}
+                </td>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.ts_ratio < 1.0 ? '#2ea043' : '#c9d1d9' }}>
+                  {fmt(row.ts_ratio)}
+                </td>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#c9d1d9' }}>
+                  {fmt(row.median_earnings_move_pct, 1, '%')}
+                </td>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#8b949e' }}>
+                  {row.sample_size ?? NA}
+                </td>
+                <td style={{ padding: '5px 8px' }}>
+                  {isError
+                    ? <span style={{ color: '#da3633', fontSize: '0.75rem' }}>{row.error_note || 'error'}</span>
+                    : isNoEvent
+                    ? <span style={{ color: '#8b949e', fontSize: '0.75rem' }}>no event in window</span>
+                    : scoreBar(row.ranking_score)}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
