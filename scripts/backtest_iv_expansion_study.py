@@ -38,7 +38,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from utils.logger import setup_logger
 from web.api.edge_engine import (
-    MIN_IV_RV_FOR_EXPANSION,
     MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_EXPANSION,
     MIN_RV_PERCENTILE_FOR_EXPANSION,
     MIN_TS_SLOPE_FOR_EXPANSION,
@@ -51,6 +50,20 @@ from web.api.edge_engine import (
     _rv_percentile_and_regime,
     _yang_zhang_rv30,
 )
+
+# Legacy expansion floor on IV/RV. The production constant
+# MIN_IV_RV_FOR_EXPANSION was removed from web.api.edge_engine because it
+# encoded the wrong direction — low IV/RV is favourable (cheap implied vol)
+# for long-vol entry, not unfavourable. Removal is enforced by
+# tests/unit/test_fixes/test_four_fixes.py::test_min_iv_rv_for_expansion_constant_removed.
+# The production gate now uses IV_RV_CROWDING_WARNING_THRESHOLD = 1.60 as a
+# soft ceiling instead.
+#
+# This script retains the legacy floor purely for replay continuity. Default
+# 0.0 makes the gate a no-op (iv_rv < 0.0 is never True for valid input) and
+# anchors the linear score component at zero. Operators replaying against an
+# older scoreboard with a non-zero floor must override via --signal-min-iv-rv.
+MIN_IV_RV_FOR_EXPANSION: float = 0.0
 
 
 DEFAULT_DB_PATH = Path.home() / ".options_calculator_pro" / "institutional_ml.db"
