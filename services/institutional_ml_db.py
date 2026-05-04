@@ -2215,11 +2215,17 @@ class InstitutionalMLDatabase:
 
                                     # MDApp historical chain data may omit IV/Greeks depending on plan.
                                     # Fallback: derive implied volatility from option price + BSM inversion.
+                                    # Fetch the risk-free rate once per replay batch
+                                    # via the shared services.pricing_rates source of
+                                    # truth. Imported lazily to keep institutional_ml_db
+                                    # importable in environments without yfinance.
+                                    from services.pricing_rates import get_pricing_risk_free_rate
+                                    _replay_rfr, _ = get_pricing_risk_free_rate()
                                     grp["derived_iv"] = grp.apply(
                                         lambda row: self._resolve_row_implied_volatility(
                                             row=row,
                                             underlying_price=snapshot_underlying,
-                                            risk_free_rate=0.03,
+                                            risk_free_rate=_replay_rfr,
                                             snapshot_date=snap_date,
                                         ),
                                         axis=1,
@@ -2447,7 +2453,8 @@ class InstitutionalMLDatabase:
         self,
         row: "pd.Series",
         underlying_price: float,
-        risk_free_rate: float = 0.03,
+        *,
+        risk_free_rate: float,
         snapshot_date: Optional[date] = None,
     ) -> float:
         iv = pd.to_numeric(pd.Series([row.get("impliedVolatility")]), errors="coerce").iloc[0]
@@ -2620,7 +2627,7 @@ class InstitutionalMLDatabase:
         long_expiry: str,
         front_iv: float,
         back_iv: float,
-        risk_free_rate: float = 0.03,
+        risk_free_rate: float,
     ) -> float:
         """Approximate calendar spread market value from snapshot IVs using BSM."""
         as_of = pd.Timestamp(as_of_date).date()
@@ -2674,6 +2681,11 @@ class InstitutionalMLDatabase:
         volume_ratio: Optional[float] = None,
     ) -> Optional[BacktestTrade]:
         """Replay a calendar trade from stored pre/post earnings snapshots."""
+        # Single rate read for both pre and post pricing — keeps entry/exit
+        # priced under the same regime even if the cache TTL flips between
+        # the two calls.
+        from services.pricing_rates import get_pricing_risk_free_rate
+        _trade_rfr, _ = get_pricing_risk_free_rate()
         entry_value = self._calendar_spread_market_value_from_snapshot(
             underlying_price=snapshot_pair.pre_underlying_price,
             strike=snapshot_pair.atm_strike,
@@ -2682,6 +2694,7 @@ class InstitutionalMLDatabase:
             long_expiry=snapshot_pair.long_expiry,
             front_iv=snapshot_pair.pre_front_iv,
             back_iv=snapshot_pair.pre_back_iv,
+            risk_free_rate=_trade_rfr,
         )
         exit_value = self._calendar_spread_market_value_from_snapshot(
             underlying_price=snapshot_pair.post_underlying_price,
@@ -2691,6 +2704,7 @@ class InstitutionalMLDatabase:
             long_expiry=snapshot_pair.long_expiry,
             front_iv=snapshot_pair.post_front_iv,
             back_iv=snapshot_pair.post_back_iv,
+            risk_free_rate=_trade_rfr,
         )
         if not np.isfinite(entry_value) or not np.isfinite(exit_value) or entry_value <= 0:
             return None

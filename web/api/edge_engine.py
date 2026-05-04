@@ -20,6 +20,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from services.pricing_rates import (
+    _rf_rate_cache,
+    _rf_rate_lock,
+    get_pricing_risk_free_rate as _get_pricing_risk_free_rate,
+)
 from services.realized_vol import (
     har_rv_forecast as _har_rv_forecast,
     rs_daily_vol_series as _rs_daily_vol_series,
@@ -36,8 +41,6 @@ _crush_clf = None
 _crush_scaler = None
 _crush_model_loaded: bool = False
 _ml_model_lock = threading.Lock()
-_rf_rate_lock = threading.Lock()
-_rf_rate_cache: Dict[str, Any] = {"ts": 0.0, "rate": None, "source": None}
 
 
 def _try_load_crush_model() -> None:
@@ -149,50 +152,6 @@ def _safe_float(value: Any, default: float = np.nan) -> float:
         return parsed
     except (TypeError, ValueError):
         return float(default)
-
-
-def _get_pricing_risk_free_rate(cache_ttl_seconds: float = 43_200.0) -> Tuple[float, str]:
-    """
-    Resolve the pricing risk-free rate for BSM-style calculations.
-
-    Preference order:
-      1. Explicit env override `OPTIONS_PRICING_RISK_FREE_RATE`
-      2. Latest available 13-week T-bill yield via yfinance `^IRX`
-      3. Conservative static fallback near the current short-rate regime
-    """
-    now = time.time()
-    with _rf_rate_lock:
-        cached_rate = _safe_float(_rf_rate_cache.get("rate"), np.nan)
-        if (
-            np.isfinite(cached_rate)
-            and cached_rate > 0
-            and (now - float(_rf_rate_cache.get("ts") or 0.0)) < cache_ttl_seconds
-        ):
-            return float(cached_rate), str(_rf_rate_cache.get("source") or "cache")
-
-    env_raw = os.getenv("OPTIONS_PRICING_RISK_FREE_RATE", "").strip()
-    env_rate = _safe_float(env_raw, np.nan)
-    if np.isfinite(env_rate) and 0.0 < env_rate < 0.25:
-        with _rf_rate_lock:
-            _rf_rate_cache.update({"ts": now, "rate": float(env_rate), "source": "env"})
-        return float(env_rate), "env"
-
-    try:
-        irx_hist = yf.Ticker("^IRX").history(period="7d", auto_adjust=False)
-        irx_close = pd.to_numeric(irx_hist.get("Close"), errors="coerce").dropna()
-        if not irx_close.empty:
-            irx_rate = float(irx_close.iloc[-1]) / 100.0
-            if np.isfinite(irx_rate) and 0.0 < irx_rate < 0.25:
-                with _rf_rate_lock:
-                    _rf_rate_cache.update({"ts": now, "rate": irx_rate, "source": "yfinance_^IRX"})
-                return irx_rate, "yfinance_^IRX"
-    except Exception as exc:
-        logger.debug("Risk-free rate fetch via ^IRX failed: %s", exc)
-
-    fallback_rate = 0.0450
-    with _rf_rate_lock:
-        _rf_rate_cache.update({"ts": now, "rate": fallback_rate, "source": "fallback_static"})
-    return fallback_rate, "fallback_static"
 
 
 def _classify_move_risk(
