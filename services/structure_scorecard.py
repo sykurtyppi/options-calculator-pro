@@ -117,7 +117,12 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
 
     move_ratio_score = _score_high_good(snapshot.historical_vs_implied_move_ratio, 0.85, 1.75)
     tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, 0.95, 2.10)
-    moderate_event_score = _score_peak(snapshot.event_implied_move_pct, lower=3.0, center=6.0, upper=9.5)
+    # P-5b: peak bounds anchored on the post-P-5a real-corpus distribution
+    # (747 distinct events, 2024-01-01 → 2025-06-30). Using p10/p50/p90 from
+    # the canonical /tmp/p5_post_iv_expansion_v2 trade log:
+    #   event_implied_move_pct: p10=3.31, p50=5.70, p90=10.44
+    # calibration_basis="post_p5a_real_corpus_747_events_2024_2025"
+    moderate_event_score = _score_peak(snapshot.event_implied_move_pct, lower=3.31, center=5.70, upper=10.44)
     anchor_score = _score_high_good(snapshot.historical_move_anchor_pct, 3.0, 9.0)
     _using_daily_fallback = (
         getattr(snapshot, "historical_move_source", "earnings_history") == "daily_fallback"
@@ -139,9 +144,14 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     timing = _coalesce_unit(snapshot.timing_score)
     execution = _coalesce_unit(snapshot.execution_score)
     quality = _coalesce_unit(snapshot.data_quality_score)
+    # P-5b: event_move_share band anchored on post-P-5a real corpus (747
+    # events). Using p25/p90 of event_move_share_of_total = (0.78, 0.94).
+    # Pre-P-5b bounds (0.70, 0.98) sat at p17/p95 — too low and too high for
+    # the post-P-5a 1σ-form distribution.
+    # calibration_basis="post_p5a_real_corpus_747_events_2024_2025"
     crowding_intensity = _clamp01(
         0.55 * _score_high_good(_first_finite(snapshot.iv_rv_har, snapshot.iv_rv_yz), 1.00, 1.60)
-        + 0.25 * _score_high_good(snapshot.event_move_share_of_total, 0.70, 0.98)
+        + 0.25 * _score_high_good(snapshot.event_move_share_of_total, 0.78, 0.94)
         + 0.20 * _score_high_good(snapshot.near_back_iv_ratio, 1.00, 1.15)
     )
     concavity_intensity = _clamp01(
@@ -233,9 +243,12 @@ def score_otm_strangle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     )
     theta_penalty = 0.11 * (1.0 - timing)
     execution_penalty = _execution_penalty(snapshot, leg_spread_pct=_average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct]), structure="otm_strangle")
+    # P-5b: event_move_share band anchored on post-P-5a real corpus (747
+    # events). Using p25/p90 of event_move_share_of_total = (0.78, 0.94).
+    # calibration_basis="post_p5a_real_corpus_747_events_2024_2025"
     crowding_penalty = 0.08 * _clamp01(
         0.60 * _score_high_good(_first_finite(snapshot.iv_rv_har, snapshot.iv_rv_yz), 1.05, 1.70)
-        + 0.40 * _score_high_good(snapshot.event_move_share_of_total, 0.75, 0.98)
+        + 0.40 * _score_high_good(snapshot.event_move_share_of_total, 0.78, 0.94)
     )
     concavity_penalty = 0.05 * _clamp01(
         max(
@@ -329,9 +342,12 @@ def _score_calendar(
     else:
         move_fit = _clamp01(0.45 * cheapness + 0.35 * term_slope_score + 0.20 * moderate_anchor)
 
+    # P-5b: event_move_share band anchored on post-P-5a real corpus (747
+    # events). Using p25/p90 of event_move_share_of_total = (0.78, 0.94).
+    # calibration_basis="post_p5a_real_corpus_747_events_2024_2025"
     elevated_front_end_penalty = 0.07 * _clamp01(
         0.65 * _score_high_good(snapshot.near_back_iv_ratio, 1.00, 1.15)
-        + 0.35 * _score_high_good(snapshot.event_move_share_of_total, 0.75, 0.98)
+        + 0.35 * _score_high_good(snapshot.event_move_share_of_total, 0.78, 0.94)
     )
     tail_risk_penalty = 0.06 * _score_high_good(snapshot.tail_vs_implied_move_ratio, 1.30, 2.20)
     theta_penalty = 0.05 * (1.0 - timing)
