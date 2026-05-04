@@ -62,3 +62,6 @@ web/frontend/dist/
 
 # Validation report artefacts (P-5 baseline captures, real corpus, etc.)
 reports/
+
+# Stray .tmp files (mirrors origin/main's pre-existing ignore; PM-1 conflict resolution)
+*.tmp
