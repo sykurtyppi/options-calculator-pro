@@ -1,22 +1,26 @@
 from __future__ import annotations
 
+import csv
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import io
+import logging
 import math
 import os
 from pathlib import Path
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 import sys
 import sqlite3
 
 _OOS_VALIDATION_TIMEOUT_SECONDS: float = 300.0  # 5 min hard wall-clock limit per call
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -42,6 +46,23 @@ _SHARE_PASSWORD = os.getenv("SHARE_PASSWORD", "")
 _SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-in-env")
 _SESSION_COOKIE = "ops_session"
 _SESSION_MAX_AGE = 7 * 24 * 3600  # 1 week
+_HOSTED_MODE = os.getenv("OPTIONS_CALCULATOR_HOSTED_MODE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_PROTECT_API_DOCS = (
+    os.getenv("OPTIONS_CALCULATOR_PROTECT_API_DOCS", "").strip().lower() in {"1", "true", "yes", "on"}
+    or _HOSTED_MODE
+)
+_SECURE_SESSION_COOKIE = (
+    os.getenv("OPTIONS_CALCULATOR_SECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
+    or _HOSTED_MODE
+)
+_MAX_OOS_RUNNING_JOBS = max(1, int(os.getenv("OPTIONS_CALCULATOR_MAX_OOS_RUNNING_JOBS", "1")))
+_MAX_ML_RUNNING_JOBS = max(1, int(os.getenv("OPTIONS_CALCULATOR_MAX_ML_RUNNING_JOBS", "1")))
+_MAX_RETAINED_JOBS = max(10, int(os.getenv("OPTIONS_CALCULATOR_MAX_RETAINED_JOBS", "100")))
 
 # Paths that don't require authentication
 _PUBLIC_PATHS = {"/login", "/favicon.ico", "/api/health"}
@@ -122,6 +143,40 @@ _LOGIN_HTML = """<!DOCTYPE html>
 </html>"""
 
 
+def _is_strong_session_secret(secret: str) -> bool:
+    stripped = str(secret or "").strip()
+    return bool(stripped and stripped != "change-me-in-env" and len(stripped) >= 24)
+
+
+def _validate_auth_config() -> None:
+    if _HOSTED_MODE and not _SHARE_AUTH_ENABLED:
+        raise RuntimeError("OPTIONS_CALCULATOR_HOSTED_MODE=true requires ENABLE_SHARE_AUTH=true.")
+    if not _SHARE_AUTH_ENABLED:
+        return
+    if not _SHARE_PASSWORD:
+        raise RuntimeError("ENABLE_SHARE_AUTH=true requires SHARE_PASSWORD.")
+    if not _is_strong_session_secret(_SESSION_SECRET):
+        raise RuntimeError(
+            "ENABLE_SHARE_AUTH=true requires SESSION_SECRET to be non-default and at least 24 characters."
+        )
+
+
+def _docs_path(path: str) -> bool:
+    return path.startswith(("/docs", "/openapi", "/redoc"))
+
+
+def _sanitize_exception(exc: Exception, public_message: str) -> str:
+    logger.exception("%s: %s", public_message, exc)
+    return public_message
+
+
+def _raise_public_error(status_code: int, public_message: str, exc: Exception) -> None:
+    raise HTTPException(status_code=status_code, detail=_sanitize_exception(exc, public_message))
+
+
+_validate_auth_config()
+
+
 def _session_token() -> str:
     """Derive a stable HMAC token from the session secret."""
     return hmac.new(
@@ -144,19 +199,21 @@ def _valid_session(cookie_val: str) -> bool:
 
 class _AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Let public paths and API docs through unauthenticated
+        # Let CORS preflight requests through — they carry no session cookie
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        # Let public paths through unauthenticated; API docs are public only in local mode.
         path = request.url.path
-        if path in _PUBLIC_PATHS or path.startswith(("/docs", "/openapi", "/redoc")):
+        if path in _PUBLIC_PATHS or (_docs_path(path) and not _PROTECT_API_DOCS):
             return await call_next(request)
 
         session = request.cookies.get(_SESSION_COOKIE, "")
         if not _valid_session(session):
             # API requests get a 401 (so the frontend can handle it gracefully)
-            if path.startswith("/api/"):
-                return HTMLResponse(
-                    content='{"detail":"Unauthorized — please log in at /login"}',
+            if path.startswith("/api/") or _docs_path(path):
+                return JSONResponse(
+                    content={"detail": "Unauthorized — please log in at /login"},
                     status_code=401,
-                    media_type="application/json",
                 )
             # Everything else → redirect to login
             return RedirectResponse(url="/login", status_code=302)
@@ -166,17 +223,28 @@ class _AuthMiddleware(BaseHTTPMiddleware):
 
 from scripts.institutional_backfill import InstitutionalDataCollector
 from services.market_data_client import MarketDataClient
+from services.options_feature_store import OptionsFeatureStore, OptionsFeatureStoreError
 from web.api.edge_engine import analyze_single_ticker
+from web.api.screener_engine import build_edge_screener
 from web.api.schemas import (
+    CalibrationBucket,
+    CalibrationCurveResponse,
+    EdgeScreenerResponse,
     EdgeAnalyzeRequest,
     EdgeAnalyzeResponse,
+    HistoricalOptionsCoverageResponse,
+    HistoricalOptionsResponse,
     OOSReportRequest,
     OOSReportResponse,
+    RankedScreenerResponse,
+    RankedSetupRow,
+    LearningDiagnosticsResponse,
 )
 
 # Module-level MarketDataClient singleton — shared across requests so the
 # in-process cache persists between calls (saves credits on repeated symbols).
 _mda_client: Optional[MarketDataClient] = None
+_feature_store: Optional[OptionsFeatureStore] = None
 
 
 def _get_mda_client() -> MarketDataClient:
@@ -186,10 +254,17 @@ def _get_mda_client() -> MarketDataClient:
     return _mda_client
 
 
+def _get_feature_store() -> OptionsFeatureStore:
+    global _feature_store
+    if _feature_store is None:
+        _feature_store = OptionsFeatureStore()
+    return _feature_store
+
+
 app = FastAPI(
     title="Options Calculator Pro API",
     version="0.1.0",
-    description="Single-ticker IV crush edge analysis and OOS robustness reports.",
+    description="Event-volatility structure selection, evidence diagnostics, and OOS robustness reports.",
 )
 
 origins_env = os.getenv("OPTIONS_CALCULATOR_ALLOWED_ORIGINS", "")
@@ -199,6 +274,10 @@ else:
     allowed_origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
     ]
 
 app.add_middleware(
@@ -231,6 +310,7 @@ async def login_submit(request: Request):
             _session_token(),
             httponly=True,
             samesite="lax",
+            secure=_SECURE_SESSION_COOKIE,
             max_age=_SESSION_MAX_AGE,
         )
         return response
@@ -630,9 +710,125 @@ def analyze_edge(request: EdgeAnalyzeRequest) -> EdgeAnalyzeResponse:
             setup_score=snapshot.setup_score,
             metrics=snapshot.metrics,
             rationale=snapshot.rationale,
+            selector_output=snapshot.selector_output,
+            structure_scorecards=snapshot.structure_scorecards,
+            vol_snapshot=snapshot.vol_snapshot,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Analysis failed: {exc}")
+        _raise_public_error(400, "Analysis failed. Check the ticker, data availability, and provider configuration.", exc)
+
+
+@app.get("/api/edge/screener", response_model=EdgeScreenerResponse)
+def edge_screener(
+    expiry_mode: Literal["front_after_earnings", "next_monthly_opex"] = "front_after_earnings",
+    weeks: int = 6,
+) -> EdgeScreenerResponse:
+    try:
+        payload = build_edge_screener(
+            expiry_mode=expiry_mode,
+            weeks=weeks,
+            mda_client=_get_mda_client(),
+        )
+        return EdgeScreenerResponse(**payload)
+    except Exception as exc:
+        _raise_public_error(400, "Screener failed. Check data availability and provider configuration.", exc)
+
+
+@app.get("/api/historical/options/symbols")
+def historical_option_symbols() -> Dict[str, Any]:
+    store = _get_feature_store()
+    return {
+        "generated_at": datetime.now(timezone.utc),
+        "data_root": str(store.data_root),
+        "feature_root": str(store.feature_root),
+        "available": store.is_available(),
+        "symbols": store.list_symbols(),
+    }
+
+
+@app.get("/api/historical/options/coverage", response_model=HistoricalOptionsCoverageResponse)
+def historical_options_coverage() -> HistoricalOptionsCoverageResponse:
+    try:
+        coverage = _get_feature_store().coverage()
+        return HistoricalOptionsCoverageResponse(
+            generated_at=datetime.now(timezone.utc),
+            coverage=_json_safe(coverage),
+        )
+    except OptionsFeatureStoreError as exc:
+        raise HTTPException(status_code=404, detail="Historical options feature store is unavailable.")
+    except Exception as exc:
+        _raise_public_error(400, "Historical coverage query failed.", exc)
+
+
+@app.get("/api/historical/options/{symbol}/coverage", response_model=HistoricalOptionsCoverageResponse)
+def historical_options_symbol_coverage(symbol: str) -> HistoricalOptionsCoverageResponse:
+    try:
+        coverage = _get_feature_store().coverage(symbol=symbol)
+        return HistoricalOptionsCoverageResponse(
+            generated_at=datetime.now(timezone.utc),
+            coverage=_json_safe(coverage),
+        )
+    except OptionsFeatureStoreError as exc:
+        raise HTTPException(status_code=404, detail="Historical options feature store is unavailable for this symbol.")
+    except ValueError as exc:
+        _raise_public_error(400, "Invalid historical options coverage request.", exc)
+    except Exception as exc:
+        _raise_public_error(400, "Historical symbol coverage query failed.", exc)
+
+
+@app.get("/api/historical/options/{symbol}/chain", response_model=HistoricalOptionsResponse)
+def historical_options_chain(
+    symbol: str,
+    trade_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    expiry: Optional[str] = None,
+    min_dte: Optional[int] = None,
+    max_dte: Optional[int] = None,
+    call_put: Optional[str] = None,
+    min_abs_delta: Optional[float] = None,
+    max_abs_delta: Optional[float] = None,
+    limit: int = 1_000,
+) -> HistoricalOptionsResponse:
+    filters = {
+        "trade_date": trade_date,
+        "start_date": start_date,
+        "end_date": end_date,
+        "expiry": expiry,
+        "min_dte": min_dte,
+        "max_dte": max_dte,
+        "call_put": call_put,
+        "min_abs_delta": min_abs_delta,
+        "max_abs_delta": max_abs_delta,
+        "limit": limit,
+    }
+    try:
+        rows = _get_feature_store().query_chain_records(
+            symbol,
+            trade_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
+            expiry=expiry,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            call_put=call_put,
+            min_abs_delta=min_abs_delta,
+            max_abs_delta=max_abs_delta,
+            limit=limit,
+        )
+        return HistoricalOptionsResponse(
+            generated_at=datetime.now(timezone.utc),
+            symbol=symbol.upper(),
+            filters=_json_safe(filters),
+            row_count=len(rows),
+            rows=_json_safe(rows),
+        )
+    except OptionsFeatureStoreError as exc:
+        raise HTTPException(status_code=404, detail="Historical options feature store is unavailable for this symbol.")
+    except ValueError as exc:
+        _raise_public_error(400, "Invalid historical options chain request.", exc)
+    except Exception as exc:
+        _raise_public_error(400, "Historical option query failed.", exc)
 
 
 def _execute_oos_logic(request: OOSReportRequest) -> Dict[str, Any]:
@@ -865,7 +1061,7 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"OOS report generation failed: {exc}")
+        _raise_public_error(500, "OOS report generation failed.", exc)
 
 
 # ── Async OOS job store ───────────────────────────────────────────────────────
@@ -874,16 +1070,69 @@ def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
 # ARQ) when moving to multi-process / multi-worker.
 
 _oos_jobs: Dict[str, Dict[str, Any]] = {}
+_oos_jobs_lock = threading.Lock()
+
+# Fix 2: TTL for completed/errored jobs.  Pending/running jobs are never evicted.
+# Two hours is long enough for a user to poll the result; short enough that a
+# server handling many sessions doesn't accumulate unbounded state.
+_OOS_JOB_TTL_SECONDS: float = 7200.0
+
+
+def _purge_stale_oos_jobs() -> None:
+    """Evict completed or errored OOS jobs older than TTL.
+
+    Called on every new submit so cleanup is lazy (no background thread needed).
+    Access is lock-protected because submit, poll, and worker threads can all
+    touch the in-process job store.
+    """
+    with _oos_jobs_lock:
+        _purge_jobs_locked(_oos_jobs, ttl_seconds=_OOS_JOB_TTL_SECONDS)
+
+
+def _purge_jobs_locked(jobs: Dict[str, Dict[str, Any]], *, ttl_seconds: float) -> None:
+    now = datetime.now(timezone.utc)
+    to_delete: List[str] = []
+    for jid, job in jobs.items():
+        if job.get("status") not in {"complete", "error"}:
+            continue
+        try:
+            age = (now - datetime.fromisoformat(job["started_at"])).total_seconds()
+            if age > ttl_seconds:
+                to_delete.append(jid)
+        except Exception:
+            to_delete.append(jid)
+    if len(jobs) - len(to_delete) > _MAX_RETAINED_JOBS:
+        completed = [
+            (jid, job.get("started_at", ""))
+            for jid, job in jobs.items()
+            if job.get("status") in {"complete", "error"} and jid not in to_delete
+        ]
+        completed.sort(key=lambda item: item[1])
+        overflow = (len(jobs) - len(to_delete)) - _MAX_RETAINED_JOBS
+        to_delete.extend(jid for jid, _ in completed[:max(0, overflow)])
+    for jid in to_delete:
+        jobs.pop(jid, None)
+
+
+def _active_job_count_locked(jobs: Dict[str, Dict[str, Any]]) -> int:
+    return sum(1 for job in jobs.values() if job.get("status") in {"pending", "running"})
 
 
 def _oos_job_worker(job_id: str, request: OOSReportRequest) -> None:
     """Background thread target — runs OOS logic and writes result to _oos_jobs."""
-    _oos_jobs[job_id]["status"] = "running"
+    with _oos_jobs_lock:
+        if job_id in _oos_jobs:
+            _oos_jobs[job_id]["status"] = "running"
     try:
         data = _execute_oos_logic(request)
-        _oos_jobs[job_id].update({"status": "complete", "data": data, "error": None})
+        with _oos_jobs_lock:
+            if job_id in _oos_jobs:
+                _oos_jobs[job_id].update({"status": "complete", "data": data, "error": None})
     except Exception as exc:
-        _oos_jobs[job_id].update({"status": "error", "data": None, "error": str(exc)})
+        logger.exception("OOS background job failed: %s", exc)
+        with _oos_jobs_lock:
+            if job_id in _oos_jobs:
+                _oos_jobs[job_id].update({"status": "error", "data": None, "error": "OOS job failed."})
 
 
 @app.post("/api/oos/submit")
@@ -892,12 +1141,19 @@ def submit_oos_job(request: OOSReportRequest) -> Dict[str, str]:
     Poll GET /api/oos/status/{job_id} every 2–3 s for completion.
     """
     job_id = str(uuid.uuid4())
-    _oos_jobs[job_id] = {
-        "status": "pending",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "data": None,
-        "error": None,
-    }
+    with _oos_jobs_lock:
+        _purge_jobs_locked(_oos_jobs, ttl_seconds=_OOS_JOB_TTL_SECONDS)
+        if _active_job_count_locked(_oos_jobs) >= _MAX_OOS_RUNNING_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail="OOS job capacity reached. Wait for the current job to finish before submitting another.",
+            )
+        _oos_jobs[job_id] = {
+            "status": "pending",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "data": None,
+            "error": None,
+        }
     t = threading.Thread(target=_oos_job_worker, args=(job_id, request), daemon=True)
     t.start()
     return {"job_id": job_id, "status": "pending"}
@@ -906,7 +1162,8 @@ def submit_oos_job(request: OOSReportRequest) -> Dict[str, str]:
 @app.get("/api/oos/status/{job_id}")
 def get_oos_job_status(job_id: str) -> Dict[str, Any]:
     """Poll job status. Returns status, elapsed_sec, and (when complete) data."""
-    job = _oos_jobs.get(job_id)
+    with _oos_jobs_lock:
+        job = dict(_oos_jobs.get(job_id) or {})
     if not job:
         raise HTTPException(status_code=404, detail=f"OOS job {job_id!r} not found")
     elapsed_sec: Optional[int] = None
@@ -927,11 +1184,14 @@ def get_oos_job_status(job_id: str) -> Dict[str, Any]:
 # ── ML training job store ─────────────────────────────────────────────────────
 
 _ml_train_jobs: Dict[str, Dict[str, Any]] = {}
+_ml_train_jobs_lock = threading.Lock()
 
 
 def _ml_train_worker(job_id: str) -> None:
-    """Background thread: calibrates labels, trains the crush classifier, reloads it."""
-    _ml_train_jobs[job_id]["status"] = "running"
+    """Background thread: calibrates labels, trains the legacy post-event-vol classifier, reloads it."""
+    with _ml_train_jobs_lock:
+        if job_id in _ml_train_jobs:
+            _ml_train_jobs[job_id]["status"] = "running"
     try:
         collector = InstitutionalDataCollector()
         # Always calibrate labels first — this pairs any new pre/post snapshots from
@@ -941,33 +1201,70 @@ def _ml_train_worker(job_id: str) -> None:
         # Reload the model in the edge engine so subsequent analyses pick it up
         from web.api.edge_engine import reload_crush_model
         reload_crush_model()
-        _ml_train_jobs[job_id].update({"status": "complete", "data": result, "error": None})
+        with _ml_train_jobs_lock:
+            if job_id in _ml_train_jobs:
+                _ml_train_jobs[job_id].update({"status": "complete", "data": result, "error": None})
     except Exception as exc:
-        _ml_train_jobs[job_id].update({"status": "error", "data": None, "error": str(exc)})
+        logger.exception("ML training background job failed: %s", exc)
+        with _ml_train_jobs_lock:
+            if job_id in _ml_train_jobs:
+                _ml_train_jobs[job_id].update({"status": "error", "data": None, "error": "ML training job failed."})
 
 
 @app.post("/api/ml/train")
 def submit_ml_train_job() -> Dict[str, str]:
-    """Train the ML IV crush classifier in the background.
+    """Train the legacy post-event volatility classifier in the background.
     Returns job_id — poll GET /api/ml/train-status/{job_id} for completion.
     Training requires earnings_iv_decay_labels rows (run backfill first).
     """
     job_id = str(uuid.uuid4())
-    _ml_train_jobs[job_id] = {
-        "status": "pending",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "data": None,
-        "error": None,
-    }
+    with _ml_train_jobs_lock:
+        _purge_jobs_locked(_ml_train_jobs, ttl_seconds=_OOS_JOB_TTL_SECONDS)
+        if _active_job_count_locked(_ml_train_jobs) >= _MAX_ML_RUNNING_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail="ML training capacity reached. Wait for the current job to finish before submitting another.",
+            )
+        _ml_train_jobs[job_id] = {
+            "status": "pending",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "data": None,
+            "error": None,
+        }
     t = threading.Thread(target=_ml_train_worker, args=(job_id,), daemon=True)
     t.start()
     return {"job_id": job_id, "status": "pending"}
 
 
+@app.get("/api/ml/status")
+def get_ml_model_status() -> Dict[str, Any]:
+    """Return the last-trained ML model metadata (from persisted crush_model_meta.json).
+
+    Fields: trained_at, n_events, crush_rate, cv_auc, cv_auc_std, cv_accuracy,
+            precision_at_threshold, recall_at_threshold, insample_auc, insample_brier,
+            features, label, algorithm.
+    Returns 404 if no model has been trained yet.
+    """
+    import json as _json
+    meta_path = os.path.expanduser("~/.options_calculator_pro/models/crush_model_meta.json")
+    if not os.path.exists(meta_path):
+        raise HTTPException(
+            status_code=404,
+            detail="No trained model found. POST /api/ml/train to train first.",
+        )
+    try:
+        with open(meta_path) as f:
+            meta = _json.load(f)
+        return {"status": "ok", "model_metadata": meta}
+    except Exception as exc:
+        _raise_public_error(500, "Failed to read model metadata.", exc)
+
+
 @app.get("/api/ml/train-status/{job_id}")
 def get_ml_train_status(job_id: str) -> Dict[str, Any]:
     """Poll ML training job. Returns status, elapsed_sec, metrics when complete."""
-    job = _ml_train_jobs.get(job_id)
+    with _ml_train_jobs_lock:
+        job = dict(_ml_train_jobs.get(job_id) or {})
     if not job:
         raise HTTPException(status_code=404, detail=f"ML training job {job_id!r} not found")
     elapsed_sec: Optional[int] = None
@@ -985,7 +1282,417 @@ def get_ml_train_status(job_id: str) -> Dict[str, Any]:
     }
 
 
+# ── Ranked screener endpoint ─────────────────────────────────────────────────
+
+@app.get("/api/screener/ranked", response_model=RankedScreenerResponse)
+def ranked_screener(
+    dte_min: int = 3,
+    dte_max: int = 10,
+    min_sample_size: int = 4,
+    release_filter: str = "all",
+    weeks: int = 4,
+    symbols: Optional[str] = None,
+) -> RankedScreenerResponse:
+    """
+    Rank upcoming earnings candidates by pre-earnings long-vega setup quality.
+
+    Query params
+    ------------
+    dte_min / dte_max  : DTE window for entry (default 3–10)
+    min_sample_size    : Minimum earnings history required (default 4)
+    release_filter     : ``all``, ``bmo``, or ``amc``
+    weeks              : Look-ahead window in weeks (default 4)
+    symbols            : Comma-separated override universe (default: DEFAULT_UNIVERSE)
+    """
+    from services.screener_service import build_ranked_screener, DEFAULT_UNIVERSE
+    from datetime import date as _date
+
+    today = _date.today()
+    universe = (
+        [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        if symbols
+        else DEFAULT_UNIVERSE
+    )
+
+    try:
+        payload = build_ranked_screener(
+            symbols=universe,
+            dte_min=dte_min,
+            dte_max=dte_max,
+            min_sample_size=min_sample_size,
+            release_filter=release_filter,
+            weeks=weeks,
+            today=today,
+        )
+    except Exception as exc:
+        _raise_public_error(400, "Ranked screener failed. Check data availability and request parameters.", exc)
+
+    rows = [RankedSetupRow(**r) for r in payload["rows"]]
+    return RankedScreenerResponse(
+        generated_at=datetime.now(timezone.utc),
+        as_of_date=payload["as_of_date"],
+        universe_size=payload["universe_size"],
+        rows_returned=payload["rows_returned"],
+        in_entry_window=payload["in_entry_window"],
+        ranking_weights=payload["ranking_weights"],
+        strategy_note=payload["strategy_note"],
+        rows=rows,
+    )
+
+
+# ── Calibration endpoint ──────────────────────────────────────────────────────
+
+@app.get("/api/calibration/curve", response_model=CalibrationCurveResponse)
+def calibration_curve() -> CalibrationCurveResponse:
+    """
+    Return the setup_score → expected IV expansion calibration curve.
+
+    Phases are intentionally conservative:
+    - ``bootstrap_prior``: research prior only, not empirical.
+    - ``observational``: raw bucket observations where available, no fitted curve.
+    - ``fitted_moderate`` / ``fitted_high``: isotonic fit with moderate/high sample depth.
+    """
+    from services.calibration_service import get_calibration
+
+    cal = get_calibration()
+    diag = cal.diagnostics()
+    buckets_raw = cal.get_curve_summary()
+    buckets = [CalibrationBucket(**b) for b in buckets_raw]
+    return CalibrationCurveResponse(
+        generated_at=datetime.now(timezone.utc),
+        phase=diag["phase"],
+        n_observations=diag["n_observations"],
+        min_for_observational=diag["min_for_observational"],
+        min_for_fit=diag["min_for_fit"],
+        min_for_high_fit=diag["min_for_high_fit"],
+        buckets=buckets,
+    )
+
+
+@app.get("/api/diagnostics/learning", response_model=LearningDiagnosticsResponse)
+def learning_diagnostics() -> LearningDiagnosticsResponse:
+    from services.learning_diagnostics import build_learning_diagnostics
+
+    return LearningDiagnosticsResponse(**build_learning_diagnostics())
+
+
+@app.get("/api/diagnostics/data-quality")
+def data_quality_diagnostics() -> Dict[str, Any]:
+    from services.data_quality_diagnostics import build_data_quality_diagnostics
+
+    try:
+        return build_data_quality_diagnostics()
+    except Exception as exc:
+        _raise_public_error(500, "Data-quality diagnostics failed.", exc)
+
+
+@app.get("/api/diagnostics/provider-telemetry")
+def provider_telemetry_diagnostics(
+    limit: int = 100,
+    offset: int = 0,
+    provider: Optional[str] = None,
+    endpoint_type: Optional[str] = None,
+    symbol: Optional[str] = None,
+    success: Optional[bool] = None,
+    failures_only: bool = False,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+) -> Dict[str, Any]:
+    from services.provider_telemetry import build_provider_telemetry_diagnostics
+
+    try:
+        return build_provider_telemetry_diagnostics(
+            limit=limit,
+            offset=offset,
+            provider=provider,
+            endpoint_type=endpoint_type,
+            symbol=symbol,
+            success=success,
+            failures_only=failures_only,
+            since=since,
+            until=until,
+        )
+    except Exception as exc:
+        _raise_public_error(500, "Provider telemetry diagnostics failed.", exc)
+
+
+@app.get("/api/diagnostics/forward-performance")
+def forward_performance_diagnostics(limit: int = 10_000, recent_limit: int = 25) -> Dict[str, Any]:
+    from services.forward_performance_diagnostics import build_forward_performance_diagnostics
+
+    try:
+        return build_forward_performance_diagnostics(max_rows=limit, recent_limit=recent_limit)
+    except Exception as exc:
+        _raise_public_error(500, "Forward-performance diagnostics failed.", exc)
+
+
+@app.get("/api/diagnostics/evidence-report")
+def evidence_report_diagnostics(limit: int = 10_000, recent_limit: int = 25) -> Dict[str, Any]:
+    from services.evidence_report import build_evidence_report
+
+    try:
+        return build_evidence_report(max_rows=limit, recent_limit=recent_limit)
+    except Exception as exc:
+        _raise_public_error(500, "Evidence report diagnostics failed.", exc)
+
+
+# ── Recommendation ledger diagnostics ─────────────────────────────────────────
+
+def _ledger_row_summary(row: Dict[str, Any], outcome: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "recommendation_id": row.get("recommendation_id"),
+        "created_at": row.get("created_at"),
+        "symbol": row.get("symbol"),
+        "as_of_date": row.get("as_of_date"),
+        "earnings_date": row.get("earnings_date"),
+        "recommendation": row.get("recommendation"),
+        "selected_structure": row.get("selected_structure"),
+        "no_trade_reason": row.get("no_trade_reason"),
+        "data_quality_score": row.get("data_quality_score"),
+        "earnings_source": row.get("earnings_source"),
+        "earnings_source_confidence": row.get("earnings_source_confidence"),
+        "earnings_source_stale": bool(row.get("earnings_source_stale")),
+        "quote_source": row.get("quote_source"),
+        "quote_quality": row.get("quote_quality"),
+        "outcome_status": outcome.get("status") if outcome else None,
+        "trade_id": outcome.get("trade_id") if outcome else None,
+        "realized_return_pct": outcome.get("realized_return_pct") if outcome else None,
+        "realized_expansion_pct": outcome.get("realized_expansion_pct") if outcome else None,
+    }
+
+
+def _ledger_with_outcome(row: Dict[str, Any]) -> Dict[str, Any]:
+    from services.outcome_recorder import get_outcome_store
+
+    try:
+        outcome = get_outcome_store().find_by_recommendation_id(str(row.get("recommendation_id")))
+    except Exception as exc:
+        logger.warning("Ledger outcome linkage lookup failed: %s", exc)
+        outcome = None
+    return _ledger_row_summary(row, outcome)
+
+
+def _ledger_page_payload(*, rows: List[Dict[str, Any]], total: int, limit: int, offset: int) -> Dict[str, Any]:
+    safe_limit = max(1, min(int(limit or 50), 500))
+    safe_offset = max(0, int(offset or 0))
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(rows),
+        "total": int(total),
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "has_more": safe_offset + len(rows) < int(total),
+        "rows": [_ledger_with_outcome(row) for row in rows],
+    }
+
+
+def _csv_download(filename: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> Response:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({field: row.get(field) for field in fieldnames})
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+_LEDGER_EXPORT_FIELDS = [
+    "recommendation_id",
+    "created_at",
+    "symbol",
+    "as_of_date",
+    "earnings_date",
+    "recommendation",
+    "selected_structure",
+    "no_trade_reason",
+    "data_quality_score",
+    "earnings_source",
+    "earnings_source_confidence",
+    "earnings_source_stale",
+    "quote_source",
+    "quote_quality",
+    "outcome_status",
+    "trade_id",
+    "realized_return_pct",
+    "realized_expansion_pct",
+]
+
+
+@app.get("/api/diagnostics/recommendations/summary")
+def recommendation_ledger_summary() -> Dict[str, Any]:
+    from services.recommendation_ledger import get_recommendation_ledger
+
+    try:
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "summary": get_recommendation_ledger().summarize(),
+        }
+    except Exception as exc:
+        _raise_public_error(500, "Recommendation ledger summary failed.", exc)
+
+
+@app.get("/api/diagnostics/recommendations/symbol/{symbol}")
+def recommendation_ledger_search_by_symbol(symbol: str, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
+    from services.recommendation_ledger import get_recommendation_ledger
+
+    try:
+        ledger = get_recommendation_ledger()
+        rows = ledger.list_recent(limit=limit, offset=offset, symbol=symbol)
+        payload = _ledger_page_payload(rows=rows, total=ledger.count(symbol=symbol), limit=limit, offset=offset)
+        payload["symbol"] = symbol.upper()
+        return payload
+    except Exception as exc:
+        _raise_public_error(500, "Recommendation ledger symbol search failed.", exc)
+
+
+@app.get("/api/diagnostics/recommendations/export")
+def recommendation_ledger_export(
+    format: Literal["json", "csv"] = "json",
+    limit: int = 500,
+    offset: int = 0,
+    symbol: Optional[str] = None,
+) -> Any:
+    from services.recommendation_ledger import get_recommendation_ledger
+
+    try:
+        ledger = get_recommendation_ledger()
+        rows = [_ledger_with_outcome(row) for row in ledger.list_recent(limit=limit, offset=offset, symbol=symbol)]
+        if format == "csv":
+            return _csv_download("recommendation_ledger.csv", rows, _LEDGER_EXPORT_FIELDS)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "export_type": "recommendations",
+            "count": len(rows),
+            "total": ledger.count(symbol=symbol),
+            "limit": max(1, min(int(limit or 500), 500)),
+            "offset": max(0, int(offset or 0)),
+            "symbol": symbol.upper() if symbol else None,
+            "rows": rows,
+        }
+    except Exception as exc:
+        _raise_public_error(500, "Recommendation ledger export failed.", exc)
+
+
+@app.get("/api/diagnostics/recommendations/linkage/export")
+def recommendation_ledger_linkage_export(
+    format: Literal["json", "csv"] = "json",
+    limit: int = 500,
+    offset: int = 0,
+    symbol: Optional[str] = None,
+) -> Any:
+    from services.outcome_recorder import get_outcome_store
+    from services.recommendation_ledger import get_recommendation_ledger
+
+    try:
+        ledger = get_recommendation_ledger()
+        outcome_store = get_outcome_store()
+        linkages = []
+        for row in ledger.list_recent(limit=limit, offset=offset, symbol=symbol):
+            outcome = outcome_store.find_by_recommendation_id(str(row.get("recommendation_id")))
+            summary = _ledger_row_summary(row, outcome)
+            linkages.append(
+                {
+                    **summary,
+                    "has_linked_outcome": outcome is not None,
+                    "paper_trade_status": outcome.get("status") if outcome else None,
+                    "paper_trade_source_type": outcome.get("source_type") if outcome else None,
+                }
+            )
+        if format == "csv":
+            return _csv_download(
+                "recommendation_linkage_ledger.csv",
+                linkages,
+                [*_LEDGER_EXPORT_FIELDS, "has_linked_outcome", "paper_trade_status", "paper_trade_source_type"],
+            )
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "export_type": "recommendation_linkages",
+            "count": len(linkages),
+            "total": ledger.count(symbol=symbol),
+            "limit": max(1, min(int(limit or 500), 500)),
+            "offset": max(0, int(offset or 0)),
+            "symbol": symbol.upper() if symbol else None,
+            "rows": linkages,
+        }
+    except Exception as exc:
+        _raise_public_error(500, "Recommendation linkage export failed.", exc)
+
+
+@app.get("/api/diagnostics/recommendations")
+def recommendation_ledger_recent(limit: int = 50, offset: int = 0, symbol: Optional[str] = None) -> Dict[str, Any]:
+    from services.recommendation_ledger import get_recommendation_ledger
+
+    try:
+        ledger = get_recommendation_ledger()
+        rows = ledger.list_recent(limit=limit, offset=offset, symbol=symbol)
+        return _ledger_page_payload(rows=rows, total=ledger.count(symbol=symbol), limit=limit, offset=offset)
+    except Exception as exc:
+        _raise_public_error(500, "Recommendation ledger query failed.", exc)
+
+
+@app.get("/api/diagnostics/recommendations/{recommendation_id}/linkage")
+def recommendation_ledger_linkage(recommendation_id: str) -> Dict[str, Any]:
+    from services.outcome_recorder import get_outcome_store
+    from services.recommendation_ledger import get_recommendation_ledger
+
+    try:
+        row = get_recommendation_ledger().get(recommendation_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Recommendation not found.")
+        outcome = get_outcome_store().find_by_recommendation_id(recommendation_id)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "recommendation_id": recommendation_id,
+            "recommendation": _ledger_row_summary(row, outcome),
+            "paper_trade": outcome,
+            "has_linked_outcome": outcome is not None,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_public_error(500, "Recommendation linkage query failed.", exc)
+
+
+@app.get("/api/diagnostics/recommendations/{recommendation_id}")
+def recommendation_ledger_detail(recommendation_id: str) -> Dict[str, Any]:
+    from services.recommendation_ledger import get_recommendation_ledger
+
+    try:
+        row = get_recommendation_ledger().get(recommendation_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Recommendation not found.")
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "recommendation": _ledger_row_summary(row),
+            "vol_snapshot": row.get("vol_snapshot_json") or {},
+            "structure_scorecards": row.get("structure_scorecards_json") or [],
+            "selector_output": row.get("selector_output_json") or {},
+            "selector_explanation": row.get("explanation_json") or {},
+            "quote_provenance": {
+                "quote_timestamp": row.get("quote_timestamp"),
+                "quote_source": row.get("quote_source"),
+                "quote_quality": row.get("quote_quality"),
+                "bid_ask_mid": row.get("bid_ask_mid_json") or {},
+                "providers": row.get("provider_names_json") or {},
+            },
+            "metadata": row.get("metadata_json") or {},
+            "schema_version": row.get("schema_version"),
+            "engine_version": row.get("engine_version"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_public_error(500, "Recommendation ledger detail failed.", exc)
+
+
 # ── Serve the built React frontend (must be LAST — catches all remaining paths) ─
+_PRODUCT_DOCS = project_root / "docs"
+if _PRODUCT_DOCS.exists():
+    app.mount("/product-docs", StaticFiles(directory=str(_PRODUCT_DOCS), html=False), name="product-docs")
+
 _FRONTEND_DIST = project_root / "web" / "frontend" / "dist"
 if _FRONTEND_DIST.exists():
     app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
