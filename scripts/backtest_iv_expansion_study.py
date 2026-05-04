@@ -188,6 +188,7 @@ class TradeRecord:
     signal_non_event_move_pct: Optional[float]
     signal_implied_move_pct: Optional[float]
     signal_move_anchor_pct: Optional[float]
+    signal_historical_p90_move_pct: Optional[float]
     signal_move_risk_level: Optional[str]
     signal_move_risk_ratio: Optional[float]
     signal_smile_curvature: Optional[float]
@@ -892,6 +893,7 @@ def build_signal_snapshot(
             "event_implied_move_pct": float(event_implied_move_pct) if np.isfinite(event_implied_move_pct) else None,
             "non_event_move_pct": float(non_event_move_pct) if np.isfinite(non_event_move_pct) else None,
             "move_anchor_pct": float(move_anchor) if move_anchor is not None else None,
+            "historical_p90_move_pct": float(move_profile.get("p90_move_pct")) if move_profile.get("p90_move_pct") is not None else None,
             "move_uncertainty_pct": float(move_uncertainty) if move_uncertainty is not None else None,
             "move_risk_level": move_risk_level,
             "move_risk_ratio": float(move_risk_ratio) if move_risk_ratio is not None else None,
@@ -1184,6 +1186,7 @@ def trade_to_record(
         signal_non_event_move_pct=signal_snapshot.get("non_event_move_pct"),
         signal_implied_move_pct=signal_snapshot.get("implied_move_pct"),
         signal_move_anchor_pct=signal_snapshot.get("move_anchor_pct"),
+        signal_historical_p90_move_pct=signal_snapshot.get("historical_p90_move_pct"),
         signal_move_risk_level=signal_snapshot.get("move_risk_level"),
         signal_move_risk_ratio=signal_snapshot.get("move_risk_ratio"),
         signal_smile_curvature=signal_snapshot.get("smile_curvature"),
@@ -1679,6 +1682,7 @@ def run_study(config: StudyConfig, logger: logging.Logger) -> Dict[str, Any]:
                                 signal_non_event_move_pct=None,
                                 signal_implied_move_pct=None,
                                 signal_move_anchor_pct=None,
+                                signal_historical_p90_move_pct=None,
                                 signal_move_risk_level=None,
                                 signal_move_risk_ratio=None,
                                 signal_smile_curvature=None,
