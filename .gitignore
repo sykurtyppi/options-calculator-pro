@@ -35,3 +35,27 @@ npm-debug.log*
 # Ignore those external repos if you keep them in the folder
 SuperClaude/
 SuperClaude_Framework/
+
+# Claude Code per-project state
+.claude/
+
+# Local runtime data — mirror of $HOME/.options_calculator_pro/, not source
+.options_calculator_pro/
+
+# pytest auto-isolation directories (HOME redirect set by conftest.py + pytest cache)
+.pytest_home/
+.pytest_cache/
+
+# Additional virtualenvs the team uses (current rule covers .venv/ only)
+.venv_arm64/
+.venv313/
+.venv-replay180/
+
+# macOS-style local cache appearing under the project root
+Library/
+
+# Local scratch — backtest CSVs, log files, PID files, throwaway DBs
+tmp/
+
+# Vite build output (no per-folder .gitignore exists under web/frontend/)
+web/frontend/dist/
