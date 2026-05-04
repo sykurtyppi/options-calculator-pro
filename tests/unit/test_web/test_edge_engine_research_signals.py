@@ -185,6 +185,49 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         self.assertEqual(level, "unknown")
         self.assertIsNone(ratio)
 
+    def test_max_near_term_spread_threshold_matches_scorecard_eligibility(self):
+        """Edge-engine hard gate must mirror scorecard eligibility threshold.
+
+        Drift between MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE and
+        ABSOLUTE_SPREAD_THRESHOLD_PCT produces the contradictory state where the
+        selector returns NO_TRADE on ineligibility while the edge-engine gate
+        does not fire (or vice versa).
+        """
+        from services.structure_scorecard import ABSOLUTE_SPREAD_THRESHOLD_PCT
+        self.assertEqual(
+            edge_engine.MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE,
+            ABSOLUTE_SPREAD_THRESHOLD_PCT,
+            msg=(
+                "Edge-engine spread hard gate must equal scorecard eligibility "
+                "threshold; otherwise setups in the gap produce contradictory "
+                "selector vs gate output."
+            ),
+        )
+
+    def test_max_near_term_spread_pct_for_trade_is_twelve(self):
+        """Pin the absolute value at 12.0 (De Silva 2025 calibration)."""
+        self.assertAlmostEqual(
+            edge_engine.MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE, 12.0, places=6
+        )
+
+    def test_spread_thirteen_pct_triggers_hard_gate_condition(self):
+        """A 13% near-term spread must satisfy the hard-gate trigger condition.
+
+        The gate at the analyze_single_ticker path fires when
+            spread_val > MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE.
+        13.0 > 12.0 must hold (previously 13.0 > 18.0 was False, leaving the
+        scorecard ineligibility unaccompanied by a hard gate trigger).
+        """
+        self.assertGreater(13.0, edge_engine.MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE)
+
+    def test_spread_twelve_pct_does_not_trigger_hard_gate(self):
+        """At exactly 12.0% the gate must not fire (condition is strictly greater).
+
+        Mirrors test_spread_exactly_twelve_is_eligible in test_hardening_pass.py
+        so the edge-engine gate and the scorecard agree on the boundary.
+        """
+        self.assertFalse(12.0 > edge_engine.MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE)
+
 
 if __name__ == "__main__":
     unittest.main()

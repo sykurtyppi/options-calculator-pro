@@ -103,7 +103,13 @@ MIN_EARNINGS_EVENTS_FOR_FULL_SIGNAL = 8
 HARD_NO_TRADE_CONFIDENCE_CAP_PCT = 55.0
 TS_SLOPE_TARGET = -0.004
 TS_SLOPE_BAND = 0.025
-MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE = 18.0
+# Mirrors services/structure_scorecard.ABSOLUTE_SPREAD_THRESHOLD_PCT (12.0).
+# De Silva, Smith & So (2025, Review of Finance): at 12% spread, round-trip cost
+# ≈ 24% of option value, at or above the ceiling of typical pre-earnings IV
+# expansion. Keeping this aligned with the scorecard threshold prevents the
+# contradictory state where the selector returns NO_TRADE on ineligibility
+# while the edge-engine hard gate does not fire.
+MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE = 12.0
 MIN_SHORT_LEG_DTE = 2
 MIN_NEAR_BACK_IV_RATIO_FOR_EVENT = 1.02
 MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_TRADE = 400.0
