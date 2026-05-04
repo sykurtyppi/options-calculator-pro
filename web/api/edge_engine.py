@@ -1179,7 +1179,7 @@ def _har_rv_forecast(rv_daily: pd.Series, horizon: int = 1) -> Optional[float]:
 
     Fitted by OLS on the in-sample daily series.  Returns a 1-day-ahead
     forecast (annualised vol), floored at 1 bp.  Returns None if the series
-    is too short for a reliable monthly component (< 35 observations).
+    is too short for a reliable monthly component (< 100 observations).
 
     Note: Input is annualised vol series from _rs_daily_vol_series(); we square
     to variance for HAR fitting (Corsi operates on RV, not σ) and convert the
@@ -1187,7 +1187,7 @@ def _har_rv_forecast(rv_daily: pd.Series, horizon: int = 1) -> Optional[float]:
     arises from regressing directly on σ.
     """
     n = len(rv_daily)
-    if n < 35:
+    if n < 100:
         return None
 
     # Convert vol → variance (Corsi 2009 operates on realised variance)
