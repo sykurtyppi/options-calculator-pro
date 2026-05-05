@@ -115,8 +115,13 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     if leg_spread_pct is not None and leg_spread_pct > ABSOLUTE_SPREAD_THRESHOLD_PCT:
         flags.append("structure_spread_exceeds_absolute_threshold")
 
-    move_ratio_score = _score_high_good(snapshot.historical_vs_implied_move_ratio, 0.85, 1.75)
-    tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, 0.95, 2.10)
+    # P-5c: ratio bounds anchored on the post-P-5c real-corpus distribution
+    # (724 distinct events, 2024-01-01 → 2025-06-30). Using p10/p90 of:
+    #   historical_vs_implied_move_ratio: p10=0.12, p90=1.29
+    #   tail_vs_implied_move_ratio:       p10=0.24, p90=1.83
+    # calibration_basis="post_p5c_real_corpus_724_events_2024_2025_h1"
+    move_ratio_score = _score_high_good(snapshot.historical_vs_implied_move_ratio, 0.12, 1.29)
+    tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, 0.24, 1.83)
     # P-5b: peak bounds anchored on the post-P-5a real-corpus distribution
     # (747 distinct events, 2024-01-01 → 2025-06-30). Using p10/p50/p90 from
     # the canonical /tmp/p5_post_iv_expansion_v2 trade log:
@@ -216,7 +221,14 @@ def score_otm_strangle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     if snapshot.near_term_spread_pct is not None and snapshot.near_term_spread_pct > ABSOLUTE_SPREAD_THRESHOLD_PCT:
         flags.append("structure_spread_exceeds_absolute_threshold")
 
-    tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, 1.05, 2.25)
+    # P-5c: tail ratio bound for OTM strangle uses (p25, p90) of the
+    # post-P-5c real-corpus distribution (724 events, 2024-01-01 → 2025-06-30):
+    #   tail_vs_implied_move_ratio: p25=0.43, p90=1.83
+    # Tighter lower bound than calendar (which uses p10) preserves the
+    # prior relative ordering — this structure was always less permissive
+    # on tail support.
+    # calibration_basis="post_p5c_real_corpus_724_events_2024_2025_h1"
+    tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, 0.43, 1.83)
     event_risk = _coalesce_unit(snapshot.event_risk_score)
     move_anchor = _score_high_good(snapshot.historical_move_anchor_pct, 4.0, 10.0)
     execution = _coalesce_unit(snapshot.execution_score)
@@ -349,7 +361,14 @@ def _score_calendar(
         0.65 * _score_high_good(snapshot.near_back_iv_ratio, 1.00, 1.15)
         + 0.35 * _score_high_good(snapshot.event_move_share_of_total, 0.78, 0.94)
     )
-    tail_risk_penalty = 0.06 * _score_high_good(snapshot.tail_vs_implied_move_ratio, 1.30, 2.20)
+    # P-5c: tail-risk penalty uses (p75, p95) of the post-P-5c real-corpus
+    # distribution (724 events, 2024-01-01 → 2025-06-30):
+    #   tail_vs_implied_move_ratio: p75=1.34, p95=2.16
+    # Penalty engages only when tail ratio sits in the upper quartile of
+    # the empirical distribution — preserves the prior intent that this
+    # term fires for unusually fat historical tails.
+    # calibration_basis="post_p5c_real_corpus_724_events_2024_2025_h1"
+    tail_risk_penalty = 0.06 * _score_high_good(snapshot.tail_vs_implied_move_ratio, 1.34, 2.16)
     theta_penalty = 0.05 * (1.0 - timing)
     execution_penalty = _execution_penalty(snapshot, leg_spread_pct=leg_spread_pct, structure=structure)
     crowding_penalty = elevated_front_end_penalty
