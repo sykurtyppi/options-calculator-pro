@@ -36,7 +36,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from services.earnings_vol_snapshot import _event_contaminated_session_dates
 from services.event_vol_decomposition import decompose_event_vol
+from services.realized_vol import rs_trailing_mean_forecast as _rs_trailing_mean_forecast
 from utils.logger import setup_logger
 from web.api.edge_engine import (
     MIN_NEAR_TERM_LIQUIDITY_PROXY_FOR_EXPANSION,
@@ -48,6 +50,7 @@ from web.api.edge_engine import (
     _historical_earnings_move_profile,
     _har_rv_forecast,
     _normalize_release_timing,
+    _rs_daily_vol_series,
     _rv_percentile_and_regime,
     _yang_zhang_rv30,
 )
@@ -712,7 +715,19 @@ def build_signal_snapshot(
     ).set_index("trade_date")
     close = hist_idx["Close"]
     current_price = float(close.iloc[-1])
-    rv30 = _yang_zhang_rv30(hist_idx, window=30)
+
+    # Build the session-exclusion set once: past earnings days bias the
+    # non-event RV baseline upward, which biases event_implied_move_pct
+    # downward and hist/tail ratios upward. Production
+    # (services.earnings_vol_snapshot) excludes these sessions before
+    # YZ/HAR; mirror that here so the decomposition denominator matches.
+    prior_events = [
+        {"event_date": pd.Timestamp(row["event_date"]), "release_timing": row["release_timing"]}
+        for _, row in event.get("prior_symbol_events").iterrows()
+    ] if "prior_symbol_events" in event else []
+    excluded_sessions = _event_contaminated_session_dates(hist_idx, prior_events) or None
+
+    rv30 = _yang_zhang_rv30(hist_idx, window=30, excluded_sessions=excluded_sessions)
     if not np.isfinite(rv30) or rv30 <= 0:
         rv30 = float(close.pct_change().dropna().tail(30).std(ddof=1) * math.sqrt(252))
         rv_estimator = "close_to_close"
@@ -720,15 +735,14 @@ def build_signal_snapshot(
         rv_estimator = "yang_zhang"
     rv30 = max(rv30, 1e-6)
 
-    rs_proxy = pd.DataFrame(
-        {
-            "Open": hist_idx["Open"],
-            "High": hist_idx["High"],
-            "Low": hist_idx["Low"],
-            "Close": hist_idx["Close"],
-        }
-    )
-    rv_har = _har_rv_forecast(rs_proxy)
+    # Production parity: feed har_rv_forecast a Series of daily RS
+    # annualised vols (excluded_sessions removed), not the raw OHLC frame
+    # the prior code mistakenly passed. Fall back to the trailing-mean RS
+    # estimator when n < HAR_MIN_OBS, matching the snapshot pipeline.
+    rs_daily = _rs_daily_vol_series(hist_idx, excluded_sessions=excluded_sessions)
+    rv_har = _har_rv_forecast(rs_daily)
+    if rv_har is None or not np.isfinite(rv_har) or rv_har <= 0:
+        rv_har = _rs_trailing_mean_forecast(rs_daily)
     rv_pct, vol_regime = _rv_percentile_and_regime(hist_idx.reset_index(), rv30)
     rv_pct_val = float(rv_pct) if rv_pct is not None and np.isfinite(rv_pct) else np.nan
 
@@ -807,10 +821,6 @@ def build_signal_snapshot(
     non_event_move_pct = _decomp.non_event_move_pct if _decomp.non_event_move_pct is not None else np.nan
     event_implied_move_pct = _decomp.event_implied_move_pct if _decomp.event_implied_move_pct is not None else np.nan
 
-    prior_events = [
-        {"event_date": pd.Timestamp(row["event_date"]), "release_timing": row["release_timing"]}
-        for _, row in event.get("prior_symbol_events").iterrows()
-    ] if "prior_symbol_events" in event else []
     move_profile = _historical_earnings_move_profile(close=close, earnings_events=prior_events)
     move_anchor = _compute_move_anchor(
         median_move_pct=float(move_profile.get("median_move_pct")) if move_profile.get("median_move_pct") is not None else np.nan,
