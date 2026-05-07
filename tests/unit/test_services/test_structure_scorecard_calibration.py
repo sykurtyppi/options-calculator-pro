@@ -9,22 +9,22 @@ forces an explicit decision.
 
 Corpus reference
 ----------------
-calibration_basis = "post_p5c_real_corpus_724_events_2024_2025_h1"
-- 724 deduped (symbol, event_date) events
+calibration_basis = "post_p5c_v2_real_corpus_743_events_2024_2025_h1"
+- 743 deduped (symbol, event_date) events
 - window: 2024-01-01 → 2025-06-30
-- denominator: event_implied_move_pct (post-P-5a 1σ form)
+- denominator: event_implied_move_pct (post-P-5a 1σ form, earnings-excluded σ_HAR)
 
-Empirical percentiles (run dir: reports/p5c_real_corpus/iv_expansion_study_20260505T000202Z/):
+Empirical percentiles (run dir: reports/p5c_real_corpus_v2/iv_expansion_study_20260505T010758Z/):
     historical_vs_implied_move_ratio:
-        p10=0.124, p25=0.227, p50=0.572, p75=0.948, p90=1.289, p95=1.515
+        p10=0.123, p25=0.227, p50=0.521, p75=0.874, p90=1.143, p95=1.291
     tail_vs_implied_move_ratio:
-        p10=0.237, p25=0.431, p50=0.880, p75=1.343, p90=1.833, p95=2.158
+        p10=0.239, p25=0.418, p50=0.829, p75=1.218, p90=1.534, p95=1.797
 
 Thresholds chosen per scoring site (rounded to 2 decimals):
-    score_atm_straddle / hist           (p10, p90)  = (0.12, 1.29)
-    score_atm_straddle / tail           (p10, p90)  = (0.24, 1.83)
-    score_otm_strangle / tail           (p25, p90)  = (0.43, 1.83)
-    score_put_calendar / tail penalty   (p75, p95)  = (1.34, 2.16)
+    score_atm_straddle / hist           (p10, p90)  = (0.12, 1.14)
+    score_atm_straddle / tail           (p10, p90)  = (0.24, 1.53)
+    score_otm_strangle / tail           (p25, p90)  = (0.42, 1.53)
+    score_put_calendar / tail penalty   (p75, p95)  = (1.22, 1.80)
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ import math
 from services.structure_scorecard import _score_high_good
 
 
-CALIBRATION_BASIS = "post_p5c_real_corpus_724_events_2024_2025_h1"
+CALIBRATION_BASIS = "post_p5c_v2_real_corpus_743_events_2024_2025_h1"
 
 
 # Each row pins one threshold tuple. The *_basis fields name the corpus
@@ -43,30 +43,30 @@ P5C_THRESHOLDS = [
     {
         "name": "atm_straddle.historical_vs_implied_move_ratio",
         "lower": 0.12,
-        "upper": 1.29,
-        "lower_basis": ("p10", 0.124),
-        "upper_basis": ("p90", 1.289),
+        "upper": 1.14,
+        "lower_basis": ("p10", 0.123),
+        "upper_basis": ("p90", 1.143),
     },
     {
         "name": "atm_straddle.tail_vs_implied_move_ratio",
         "lower": 0.24,
-        "upper": 1.83,
-        "lower_basis": ("p10", 0.237),
-        "upper_basis": ("p90", 1.833),
+        "upper": 1.53,
+        "lower_basis": ("p10", 0.239),
+        "upper_basis": ("p90", 1.534),
     },
     {
         "name": "otm_strangle.tail_vs_implied_move_ratio",
-        "lower": 0.43,
-        "upper": 1.83,
-        "lower_basis": ("p25", 0.431),
-        "upper_basis": ("p90", 1.833),
+        "lower": 0.42,
+        "upper": 1.53,
+        "lower_basis": ("p25", 0.418),
+        "upper_basis": ("p90", 1.534),
     },
     {
         "name": "put_calendar.tail_risk_penalty",
-        "lower": 1.34,
-        "upper": 2.16,
-        "lower_basis": ("p75", 1.343),
-        "upper_basis": ("p95", 2.158),
+        "lower": 1.22,
+        "upper": 1.80,
+        "lower_basis": ("p75", 1.218),
+        "upper_basis": ("p95", 1.797),
     },
 ]
 
