@@ -92,7 +92,7 @@ def _neutral_priors() -> dict[str, WalkForwardPrior]:
 
 
 class TestStructureScorecards(unittest.TestCase):
-    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda: _neutral_priors())
+    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_structure_differentiation_by_regime(self, _mock_priors):
         straddle_snapshot = _base_snapshot(
             historical_vs_implied_move_ratio=1.72,
@@ -149,7 +149,7 @@ class TestStructureScorecards(unittest.TestCase):
             "otm_strangle",
         )
 
-    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda: _neutral_priors())
+    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_poor_spreads_make_all_structures_ineligible(self, _mock_priors):
         snapshot = _base_snapshot(
             near_term_spread_pct=25.0,
@@ -163,7 +163,7 @@ class TestStructureScorecards(unittest.TestCase):
         self.assertTrue(all(card.composite_structure_score == 0.0 for card in cards))
         self.assertTrue(all("spread_exceeds_absolute_threshold" in card.eligibility_flags for card in cards))
 
-    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda: _neutral_priors())
+    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_increasing_spread_worsens_execution_penalty(self, _mock_priors):
         tight = _base_snapshot(near_term_spread_pct=2.0, atm_call_spread_pct=2.0, atm_put_spread_pct=2.1, execution_score=0.90)
         wide = _base_snapshot(near_term_spread_pct=10.0, atm_call_spread_pct=9.8, atm_put_spread_pct=10.2, execution_score=0.55)
@@ -174,7 +174,7 @@ class TestStructureScorecards(unittest.TestCase):
         self.assertGreater(wide_card.execution_penalty, tight_card.execution_penalty)
         self.assertLess(wide_card.composite_structure_score, tight_card.composite_structure_score)
 
-    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda: _neutral_priors())
+    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_increasing_iv_rv_worsens_straddle_score(self, _mock_priors):
         cheap = _base_snapshot(iv_rv_yz=0.90, iv_rv_har=0.92, cheapness_score=0.84)
         expensive = _base_snapshot(iv_rv_yz=1.55, iv_rv_har=1.58, cheapness_score=0.18)
@@ -185,7 +185,7 @@ class TestStructureScorecards(unittest.TestCase):
         self.assertGreater(expensive_card.crowding_penalty, cheap_card.crowding_penalty)
         self.assertLess(expensive_card.composite_structure_score, cheap_card.composite_structure_score)
 
-    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda: _neutral_priors())
+    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_concavity_penalizes_straddle(self, _mock_priors):
         flat = _base_snapshot(smile_curvature=0.12, smile_concavity_flag=False)
         concave = _base_snapshot(smile_curvature=0.78, smile_concavity_flag=True)
@@ -196,7 +196,7 @@ class TestStructureScorecards(unittest.TestCase):
         self.assertGreater(concave_card.concavity_penalty, flat_card.concavity_penalty)
         self.assertLess(concave_card.composite_structure_score, flat_card.composite_structure_score)
 
-    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda: _neutral_priors())
+    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_poor_liquidity_penalizes_all_structures(self, _mock_priors):
         liquid = _base_snapshot(near_term_liquidity_proxy=4200.0, atm_total_open_interest=3200.0, atm_total_volume=1600.0, execution_score=0.88)
         illiquid = _base_snapshot(near_term_liquidity_proxy=180.0, atm_total_open_interest=120.0, atm_total_volume=60.0, execution_score=0.30)
@@ -208,7 +208,7 @@ class TestStructureScorecards(unittest.TestCase):
             self.assertGreater(illiquid_cards[structure].execution_penalty, liquid_cards[structure].execution_penalty)
             self.assertLess(illiquid_cards[structure].composite_structure_score, liquid_cards[structure].composite_structure_score)
 
-    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda: _neutral_priors())
+    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_scorecards_are_deterministic_for_same_snapshot(self, _mock_priors):
         snapshot = _base_snapshot()
         first = [card.to_dict() for card in build_structure_scorecards(snapshot)]
@@ -237,7 +237,7 @@ class TestWalkForwardPriorCache(unittest.TestCase):
             marker.write_text("{}")
             counter = {"calls": 0}
 
-            def _signature():
+            def _signature(as_of_date=None):
                 return ((str(marker), marker.stat().st_mtime),)
 
             def _calendar(structure: str) -> WalkForwardPrior:
