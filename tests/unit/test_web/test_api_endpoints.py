@@ -376,7 +376,8 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertNotIn("secret-token", response.text)
 
     def test_edge_screener_endpoint_returns_rows(self):
-        with patch.object(app_module, "build_edge_screener", return_value=_stub_screener_payload()):
+        with patch.object(app_module, "build_edge_screener", return_value=_stub_screener_payload()), \
+             patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()):
             response = self.client.get("/api/edge/screener")
 
         self.assertEqual(response.status_code, 200)
@@ -391,7 +392,9 @@ class TestApiEndpoints(unittest.TestCase):
             app_module,
             "build_edge_screener",
             return_value=_stub_screener_payload(expiry_mode="next_monthly_opex"),
-        ) as mock_build:
+        ) as mock_build, patch.object(
+            app_module, "_get_mda_client", return_value=_make_mock_mda_client()
+        ):
             response = self.client.get("/api/edge/screener?expiry_mode=next_monthly_opex&weeks=8")
 
         self.assertEqual(response.status_code, 200)
