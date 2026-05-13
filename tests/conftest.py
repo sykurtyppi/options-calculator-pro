@@ -2,10 +2,32 @@
 Shared pytest fixtures for Options Calculator Pro tests.
 """
 import datetime
+import sys
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+
+
+# ── Singleton reset: web.api.app._mda_client ──────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _reset_web_app_mda_singleton():
+    """Reset the _mda_client module-level singleton in web.api.app after each test.
+
+    _get_mda_client() caches a MarketDataClient in a module-level global.
+    The gate check (assert_allowed(MARKETDATA)) only fires when the singleton
+    is None. If a test with enable_external_io(MARKETDATA) were to initialize
+    the singleton, every subsequent test that does not patch _get_mda_client
+    directly would receive the live client without a gate check.
+
+    This fixture is a no-op for tests that never import web.api.app (the
+    sys.modules.get guard avoids triggering load_dotenv on import).
+    """
+    yield
+    web_app = sys.modules.get("web.api.app")
+    if web_app is not None:
+        web_app._mda_client = None
 
 
 # ── Sample DataFrames ──────────────────────────────────────────────────────────

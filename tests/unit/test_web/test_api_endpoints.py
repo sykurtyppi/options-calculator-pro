@@ -364,7 +364,8 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertIn("Secure", set_cookie)
 
     def test_edge_analyze_error_is_sanitized(self):
-        with patch.object(app_module, "analyze_single_ticker", side_effect=RuntimeError("secret-token=/tmp/key")):
+        with patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()), \
+             patch.object(app_module, "analyze_single_ticker", side_effect=RuntimeError("secret-token=/tmp/key")):
             response = self.client.post("/api/edge/analyze", json={"symbol": "AAPL"})
 
         self.assertEqual(response.status_code, 400)
