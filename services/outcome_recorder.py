@@ -765,6 +765,7 @@ def finalize_trade_and_update_learning(
             realized_expansion_pct,
             observation_id=trade_id,
             source_type=_source_type,
+            observation_date=exit_date or date.today(),
         )
         n_after = cal._n()
         cal_phase = cal._phase()
@@ -790,6 +791,8 @@ def finalize_trade_and_update_learning(
             realized_return_pct=realized_return_pct,
             realized_expansion_pct=realized_expansion_pct,
             source_type=_source_type,
+            observation_date=exit_date or date.today(),
+            observation_id=trade_id,
         )
         diag = ps.diagnostics()
         struct_entry = diag["structures"].get(structure, {})

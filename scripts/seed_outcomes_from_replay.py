@@ -269,11 +269,13 @@ def seed_from_trades(
         store.mark_finalized(trade_id)
 
         # ── Update calibration ────────────────────────────────────────────
+        obs_date = earnings_date or entry_date
         if cal.update(
             setup_score,
             realized_expansion_pct,
             observation_id=trade_id,
             source_type="replay",
+            observation_date=obs_date,
         ):
             cal_updates += 1
 
@@ -283,6 +285,8 @@ def seed_from_trades(
             realized_return_pct=realized_return_pct,
             realized_expansion_pct=realized_expansion_pct,
             source_type="replay",
+            observation_date=obs_date,
+            observation_id=trade_id,
         )
 
         inserted += 1
