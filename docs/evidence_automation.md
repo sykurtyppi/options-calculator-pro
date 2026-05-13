@@ -5,7 +5,7 @@ The daily automation entrypoint is:
 
 ```bash
 cd /Users/tristanalejandro/Downloads/options_calculator_pro
-./.venv_arm64/bin/python scripts/run_evidence_cycle.py
+./.venv311/bin/python scripts/run_evidence_cycle.py
 ```
 
 What it does:
@@ -20,7 +20,7 @@ What it does:
 Safe dry run:
 
 ```bash
-./.venv_arm64/bin/python scripts/run_evidence_cycle.py --dry-run
+./.venv311/bin/python scripts/run_evidence_cycle.py --dry-run
 ```
 
 Recommended collection window:
@@ -128,13 +128,13 @@ change decisions.
 Manual health check:
 
 ```bash
-./.venv_arm64/bin/python scripts/watch_daily_evidence_cycle.py
+./.venv311/bin/python scripts/watch_daily_evidence_cycle.py
 ```
 
 Dry-run alert flow:
 
 ```bash
-./.venv_arm64/bin/python scripts/watch_daily_evidence_cycle.py --dry-run-alert --force-alert
+./.venv311/bin/python scripts/watch_daily_evidence_cycle.py --dry-run-alert --force-alert
 ```
 
 iMessage alerts use the local macOS Messages app if this `.env` value is
@@ -163,7 +163,7 @@ Run this any time:
 
 ```bash
 cd /Users/tristanalejandro/Downloads/options_calculator_pro
-./.venv_arm64/bin/python scripts/check_evidence_health.py
+./.venv311/bin/python scripts/check_evidence_health.py
 ```
 
 The health check returns:
@@ -190,8 +190,8 @@ and does not change strategy state.
 Useful flags:
 
 ```bash
-./.venv_arm64/bin/python scripts/check_evidence_health.py --no-completion-log-required
-./.venv_arm64/bin/python scripts/check_evidence_health.py --date 2026-04-27
+./.venv311/bin/python scripts/check_evidence_health.py --no-completion-log-required
+./.venv311/bin/python scripts/check_evidence_health.py --date 2026-04-27
 ```
 
 ## Troubleshooting
@@ -199,7 +199,7 @@ Useful flags:
 If the daily report is missing:
 
 ```bash
-./.venv_arm64/bin/python scripts/run_evidence_cycle.py
+./.venv311/bin/python scripts/run_evidence_cycle.py
 tail -n 80 ~/.options_calculator_pro/logs/daily_evidence_cycle_launchd.log
 ```
 
@@ -213,8 +213,8 @@ scripts/automation/install_launchd_jobs.sh
 If provider telemetry is stale, check credentials and network first, then run:
 
 ```bash
-./.venv_arm64/bin/python scripts/run_evidence_cycle.py --dry-run
-./.venv_arm64/bin/python scripts/check_evidence_health.py
+./.venv311/bin/python scripts/run_evidence_cycle.py --dry-run
+./.venv311/bin/python scripts/check_evidence_health.py
 ```
 
 If SQLite health fails, do not delete databases casually. Back them up first,

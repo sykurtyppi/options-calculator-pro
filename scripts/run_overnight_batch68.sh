@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="/Users/tristanalejandro/Desktop/options_calculator_pro/.venv_arm64/bin/python"
+PYTHON_BIN="/Users/tristanalejandro/Desktop/options_calculator_pro/.venv311/bin/python"
 PROJECT_ROOT="/Users/tristanalejandro/Downloads/options_calculator_pro"
 DATA_ROOT="/Volumes/T9/market_data"
 RUN_LABEL="top250_batch9_overnight_2023_2026"

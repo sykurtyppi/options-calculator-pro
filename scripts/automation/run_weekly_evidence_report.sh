@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PYTHON_BIN="${PROJECT_ROOT}/.venv_arm64/bin/python"
+PYTHON_BIN="${PROJECT_ROOT}/.venv311/bin/python"
 LOG_DIR="${HOME}/.options_calculator_pro/logs"
 LOG_FILE="${LOG_DIR}/weekly_evidence_report_launchd.log"
 STATE_DIR="${HOME}/.options_calculator_pro/state"
