@@ -2,11 +2,47 @@
 Shared pytest fixtures for Options Calculator Pro tests.
 """
 import datetime
+import os
 import sys
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+
+
+# ── .env leak defence: clear dangerous env vars before each test ──────────────
+
+_ENV_VARS_LEAKED_BY_DOTENV = [
+    "WATCHDOG_IMESSAGE_TO",
+]
+
+
+@pytest.fixture(autouse=True)
+def _clear_dotenv_leaked_vars():
+    """Remove env vars that load_dotenv() leaks from .env into os.environ.
+
+    web/api/app.py calls load_dotenv(project_root / ".env") at module-import
+    time. Once any test imports the web module the .env values persist in
+    os.environ for the rest of the session, regardless of monkeypatch scopes.
+
+    Defense-in-depth until #13 (move load_dotenv out of import time) lands.
+    This fixture shadows that leak for every test by removing the specific
+    vars that have been shown to cause harm:
+
+    - WATCHDOG_IMESSAGE_TO  (#11): IMessageConfig.from_env() reads this as a
+      fallback when imessage_config=None, causing maybe_send_watchdog_alert to
+      reach the iMessage send path instead of returning "imessage_not_configured"
+
+    Tests that legitimately need one of these vars should set it explicitly via
+    monkeypatch.setenv() — that will take effect after this fixture's setup.
+    """
+    saved = {k: os.environ.pop(k, None) for k in _ENV_VARS_LEAKED_BY_DOTENV}
+    yield
+    for k, v in saved.items():
+        if v is not None:
+            os.environ[k] = v
+        else:
+            os.environ.pop(k, None)
 
 
 # ── Singleton reset: web.api.app._mda_client ──────────────────────────────────
