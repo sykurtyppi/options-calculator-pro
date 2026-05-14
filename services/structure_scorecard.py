@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import date
 from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -92,12 +93,30 @@ REPORTS_ROOT = REPO_ROOT / "exports" / "reports"
 ABSOLUTE_SPREAD_THRESHOLD_PCT = 12.0
 CONSERVATIVE_EXECUTION_SCENARIO = "cross_25"
 _PRIORS_CACHE_LOCK = threading.Lock()
-_PRIORS_CACHE_DATA: Optional[Dict[str, WalkForwardPrior]] = None
-_PRIORS_CACHE_SIGNATURE: Optional[tuple[tuple[str, Optional[float]], ...]] = None
+# Bounded dict keyed on the full signature tuple (includes file mtimes + as_of_date).
+# Each distinct as_of_date value gets its own slot, so backtest loops don't thrash
+# the production (no-filter) entry.  FIFO eviction after _PRIORS_CACHE_MAX slots.
+_PRIORS_CACHE: Dict[tuple, Dict[str, WalkForwardPrior]] = {}
+_PRIORS_CACHE_MAX: int = 32
 
 
-def build_structure_scorecards(snapshot: VolSnapshot) -> List[StructureScorecard]:
-    priors = _load_walk_forward_priors()
+def build_structure_scorecards(
+    snapshot: VolSnapshot,
+    as_of_date: Optional[date] = None,
+) -> List[StructureScorecard]:
+    """
+    Build scorecards for all four supported structures.
+
+    Parameters
+    ----------
+    snapshot : VolSnapshot
+    as_of_date : date, optional
+        If provided, the walk-forward priors are filtered to observations
+        recorded on or before this date.  Use snapshot.as_of_date from the
+        backtest evaluation loop (#18).  None preserves current production
+        behavior (all observations included, O(1) aggregate cache).
+    """
+    priors = _load_walk_forward_priors(as_of_date=as_of_date)
     return [
         score_atm_straddle(snapshot, prior=priors["atm_straddle"]),
         score_otm_strangle(snapshot, prior=priors["otm_strangle"]),
@@ -787,7 +806,9 @@ def _load_strangle_prior_from_reports() -> WalkForwardPrior:
     )
 
 
-def _walk_forward_prior_signature() -> tuple[tuple[str, Optional[float]], ...]:
+def _walk_forward_prior_signature(
+    as_of_date: Optional[date] = None,
+) -> tuple[tuple[str, Optional[float]], ...]:
     tracked_paths: list[Path] = []
     calendar_path = _latest_report_file("iv_expansion_study_*/iv_expansion_simulated_scoreboard.csv")
     if calendar_path is not None:
@@ -813,15 +834,30 @@ def _walk_forward_prior_signature() -> tuple[tuple[str, Optional[float]], ...]:
         except OSError:
             mtime = None
         signature.append((str(path), mtime))
-    return tuple(signature)
+    # Include as_of_date in the cache key so as-of calls don't collide with
+    # the production (no-filter) cache or with each other (#18).
+    as_of_key: tuple[str, Optional[float]] = (
+        "as_of_date", float(as_of_date.toordinal()) if as_of_date is not None else None
+    )
+    return tuple(signature) + (as_of_key,)
 
 
-def _load_walk_forward_priors() -> Dict[str, WalkForwardPrior]:
-    global _PRIORS_CACHE_DATA, _PRIORS_CACHE_SIGNATURE
-    signature = _walk_forward_prior_signature()
+def _load_walk_forward_priors(
+    as_of_date: Optional[date] = None,
+) -> Dict[str, WalkForwardPrior]:
+    """Load walk-forward priors from reports and the persistent store.
+
+    Parameters
+    ----------
+    as_of_date : date, optional
+        If provided, the persistent-store overlay is filtered to observations
+        recorded on or before this date (#18).  None preserves current
+        production behavior (unfiltered, uses the O(1) aggregate cache).
+    """
+    signature = _walk_forward_prior_signature(as_of_date=as_of_date)
     with _PRIORS_CACHE_LOCK:
-        if _PRIORS_CACHE_DATA is not None and signature == _PRIORS_CACHE_SIGNATURE:
-            return _PRIORS_CACHE_DATA
+        if signature in _PRIORS_CACHE:
+            return _PRIORS_CACHE[signature]
 
     base: Dict[str, WalkForwardPrior] = {
         "call_calendar": _load_calendar_prior_from_reports("call_calendar"),
@@ -837,7 +873,7 @@ def _load_walk_forward_priors() -> Dict[str, WalkForwardPrior]:
     try:
         from services.structure_prior_store import load_all_structure_priors
 
-        for structure, d in load_all_structure_priors().items():
+        for structure, d in load_all_structure_priors(as_of_date=as_of_date).items():
             if structure in base:
                 base[structure] = WalkForwardPrior(
                     structure=d["structure"],
@@ -853,16 +889,15 @@ def _load_walk_forward_priors() -> Dict[str, WalkForwardPrior]:
             "_load_walk_forward_priors: persistent store overlay failed (%s)", exc
         )
     with _PRIORS_CACHE_LOCK:
-        _PRIORS_CACHE_DATA = base
-        _PRIORS_CACHE_SIGNATURE = signature
-        return _PRIORS_CACHE_DATA
+        if len(_PRIORS_CACHE) >= _PRIORS_CACHE_MAX:
+            _PRIORS_CACHE.pop(next(iter(_PRIORS_CACHE)))
+        _PRIORS_CACHE[signature] = base
+        return base
 
 
 def _clear_walk_forward_priors_cache() -> None:
-    global _PRIORS_CACHE_DATA, _PRIORS_CACHE_SIGNATURE
     with _PRIORS_CACHE_LOCK:
-        _PRIORS_CACHE_DATA = None
-        _PRIORS_CACHE_SIGNATURE = None
+        _PRIORS_CACHE.clear()
 
 
 def reload_walk_forward_priors() -> None:
@@ -875,4 +910,4 @@ def reload_walk_forward_priors() -> None:
     _clear_walk_forward_priors_cache()
 
 
-_load_walk_forward_priors.cache_clear = _clear_walk_forward_priors_cache  # type: ignore[attr-defined]
+_load_walk_forward_priors.cache_clear = _clear_walk_forward_priors_cache  # type: ignore[attr-defined]  # noqa: E501

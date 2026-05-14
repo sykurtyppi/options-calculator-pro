@@ -9,6 +9,21 @@ Storage
 -------
 ~/.options_calculator_pro/priors/structure_priors.json
 
+Schema versions
+---------------
+v1 (legacy): aggregate-only.  Each structure entry stores only running sums
+  and counts; individual observations are not retained.
+
+v2 (current): per-observation list.  Each observation carries an
+  observation_date field enabling as_of_date filtering for walk-forward
+  backtesting (issue #18).  Aggregate cache fields are still maintained
+  alongside the observations list so the no-filter read path stays O(1).
+
+Migration on load: a v1 entry is upgraded by synthesizing one aggregate
+  placeholder observation dated at the entry's last_updated timestamp.
+  This preserves the no-filter read path exactly and makes the timestamp
+  visible for future as_of filtering (Phase 1.2+).
+
 Design choices
 --------------
 Win rate uses Laplace-1 smoothing for N < LAPLACE_SMOOTHING_THRESHOLD (10).
@@ -47,9 +62,10 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from datetime import datetime, timezone
+import uuid
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +90,8 @@ MIN_OBS_FOR_OVERRIDE = 5
 # Win rate: apply Laplace-1 smoothing for N < this threshold.
 # For N >= this, use raw win rate.
 LAPLACE_SMOOTHING_THRESHOLD = 10
+
+_SCHEMA_VERSION = 2
 
 
 # ── Rank score (replicated from structure_scorecard to avoid circular import) ──
@@ -106,6 +124,88 @@ def _compute_rank_score(
     return max(0.0, min(1.0, 0.45 * return_score + 0.30 * win_score + 0.25 * history_score))
 
 
+# ── Aggregate helpers ──────────────────────────────────────────────────────────
+
+
+def _recompute_aggregates(observations: List[Dict]) -> Dict[str, Any]:
+    """Recompute all aggregate fields from a filtered observations list."""
+    n = len(observations)
+    if n == 0:
+        return {
+            "observation_count": 0,
+            "positive_count": 0,
+            "sum_return_pct": 0.0,
+            "sum_expansion_pct": 0.0,
+            "win_rate": 0.50,
+            "avg_return_pct": 0.0,
+            "avg_realized_expansion_pct": 0.0,
+            "rank_score": 0.50,
+            "source_types": {},
+        }
+
+    wins = sum(1 for o in observations if float(o.get("realized_return_pct", 0.0)) > 0.0)
+    sum_ret = sum(float(o.get("realized_return_pct", 0.0)) for o in observations)
+    sum_exp = sum(float(o.get("realized_expansion_pct", 0.0)) for o in observations)
+
+    if n < LAPLACE_SMOOTHING_THRESHOLD:
+        win_rate = (wins + 1) / (n + 2)
+    else:
+        win_rate = wins / n
+
+    avg_return = sum_ret / n
+    avg_expansion = sum_exp / n
+    rank = _compute_rank_score(win_rate=win_rate, avg_return_pct=avg_return, history_count=n)
+
+    src_counts: Dict[str, int] = {}
+    for o in observations:
+        src = o.get("source_type", "paper")
+        src_counts[src] = src_counts.get(src, 0) + 1
+
+    return {
+        "observation_count": n,
+        "positive_count": wins,
+        "sum_return_pct": float(sum_ret),
+        "sum_expansion_pct": float(sum_exp),
+        "win_rate": float(win_rate),
+        "avg_return_pct": float(avg_return),
+        "avg_realized_expansion_pct": float(avg_expansion),
+        "rank_score": float(rank),
+        "source_types": src_counts,
+    }
+
+
+def _migrate_v1_entry(structure: str, entry: Dict) -> Dict:
+    """Upgrade a schema_version=1 entry to v2 by synthesizing a placeholder observation.
+
+    The aggregate cache fields are preserved exactly.  A single placeholder
+    observation is added dated at the entry's last_updated timestamp so that
+    as_of_date queries on or after that date see the historical data.
+
+    On-disk promotion to v2 is intentionally lazy: the file stays at v1 until
+    something explicitly calls save().  _load() migrates in memory only — do not
+    change this to write back eagerly on load.
+    """
+    last_updated = entry.get("last_updated")
+    if last_updated:
+        obs_date_str = str(last_updated)[:10]
+    else:
+        obs_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    placeholder: Dict[str, Any] = {
+        "observation_id": "v1_aggregate_migration",
+        "observation_date": obs_date_str,
+        "source_type": next(iter(entry.get("source_types", {})), "paper"),
+        "realized_return_pct": float(entry.get("avg_return_pct", 0.0)),
+        "realized_expansion_pct": float(entry.get("avg_realized_expansion_pct", 0.0)),
+        "_migrated": True,
+    }
+
+    upgraded = dict(entry)
+    upgraded["observations"] = [placeholder]
+    upgraded["schema_version"] = _SCHEMA_VERSION
+    return upgraded
+
+
 # ── StructurePriorStore ────────────────────────────────────────────────────────
 
 
@@ -130,7 +230,16 @@ class StructurePriorStore:
         try:
             if self._path.exists():
                 raw = json.loads(self._path.read_text())
-                self._data = raw.get("structures", {})
+                structures = raw.get("structures", {})
+                # Migrate any v1 entries to v2
+                migrated = {}
+                for s, entry in structures.items():
+                    if entry.get("schema_version", 1) < _SCHEMA_VERSION:
+                        entry = _migrate_v1_entry(s, entry)
+                    if "observations" not in entry:
+                        entry["observations"] = []
+                    migrated[s] = entry
+                self._data = migrated
                 n = sum(
                     e.get("observation_count", 0) for e in self._data.values()
                 )
@@ -156,7 +265,7 @@ class StructurePriorStore:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "schema_version": 1,
+                "schema_version": _SCHEMA_VERSION,
                 "structures": self._data,
             }
             self._path.write_text(json.dumps(payload, indent=2))
@@ -172,6 +281,8 @@ class StructurePriorStore:
         realized_return_pct: float,
         realized_expansion_pct: float,
         source_type: str = "paper",
+        observation_date: Optional[date] = None,
+        observation_id: Optional[str] = None,
     ) -> None:
         """
         Record one finalized outcome observation for *structure*.
@@ -187,6 +298,12 @@ class StructurePriorStore:
             Gross option value change, in %.
         source_type : str
             "replay", "paper", or "live".  Tracked for provenance auditing.
+        observation_date : date, optional
+            The date to associate with this observation.  Used for as_of_date
+            filtering in walk-forward backtesting (#18).  Defaults to today.
+        observation_id : str, optional
+            Stable deduplication key.  When provided, duplicate calls with the
+            same id are silently ignored.
         """
         if structure not in SUPPORTED_STRUCTURES:
             logger.warning(
@@ -195,11 +312,16 @@ class StructurePriorStore:
             )
             return
 
+        obs_date_str = (observation_date or date.today()).isoformat()
+        obs_id = str(observation_id) if observation_id is not None else str(uuid.uuid4())
+
         with _WRITE_LOCK:
             entry = self._data.get(
                 structure,
                 {
                     "structure": structure,
+                    "schema_version": _SCHEMA_VERSION,
+                    "observations": [],
                     "observation_count": 0,
                     "positive_count": 0,
                     "sum_return_pct": 0.0,
@@ -213,14 +335,32 @@ class StructurePriorStore:
                 },
             )
 
+            # Deduplication: skip if observation_id already recorded
+            existing_ids = {o.get("observation_id") for o in entry.get("observations", [])}
+            if obs_id in existing_ids:
+                logger.debug(
+                    "structure_prior_store: skipped duplicate observation_id=%s for %s",
+                    obs_id, structure,
+                )
+                return
+
+            # Append to per-observation list
+            observation: Dict[str, Any] = {
+                "observation_id": obs_id,
+                "observation_date": obs_date_str,
+                "source_type": source_type,
+                "realized_return_pct": float(realized_return_pct),
+                "realized_expansion_pct": float(realized_expansion_pct),
+            }
+            observations = list(entry.get("observations", []))
+            observations.append(observation)
+
+            # Update aggregate cache (O(1) — do not recompute from full list)
             n = entry["observation_count"] + 1
             wins = entry["positive_count"] + (1 if float(realized_return_pct) > 0.0 else 0)
             sum_ret = entry["sum_return_pct"] + float(realized_return_pct)
             sum_exp = entry["sum_expansion_pct"] + float(realized_expansion_pct)
 
-            # Win rate: Laplace-1 smoothing for small samples.
-            # For N < LAPLACE_SMOOTHING_THRESHOLD: (wins + 1) / (N + 2)
-            # For N >= LAPLACE_SMOOTHING_THRESHOLD: raw win rate
             if n < LAPLACE_SMOOTHING_THRESHOLD:
                 win_rate = (wins + 1) / (n + 2)
             else:
@@ -239,6 +379,8 @@ class StructurePriorStore:
 
             entry.update(
                 {
+                    "schema_version": _SCHEMA_VERSION,
+                    "observations": observations,
                     "observation_count": n,
                     "positive_count": wins,
                     "sum_return_pct": float(sum_ret),
@@ -264,15 +406,24 @@ class StructurePriorStore:
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
-    def get_prior_dict(self, structure: str) -> Optional[Dict[str, Any]]:
+    def get_prior_dict(
+        self,
+        structure: str,
+        as_of_date: Optional[date] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Return a dict with WalkForwardPrior-compatible keys, or None.
 
+        Parameters
+        ----------
+        structure : str
+        as_of_date : date, optional
+            If provided, only observations with observation_date <= as_of_date
+            are counted.  If None, uses the aggregate cache (O(1), no filtering).
+
         Returns None when:
           - no observations have been recorded for this structure, OR
-          - observation_count < MIN_OBS_FOR_OVERRIDE (5)
-
-        In both cases, the caller should fall back to the report-based prior.
+          - observation_count (possibly filtered) < MIN_OBS_FOR_OVERRIDE (5)
 
         Dict keys: structure, history_count, win_rate, avg_return_pct,
                    rank_score, source
@@ -280,20 +431,56 @@ class StructurePriorStore:
         entry = self._data.get(structure)
         if entry is None:
             return None
-        n = entry.get("observation_count", 0)
+
+        if as_of_date is None:
+            # Fast path: use the denormalized aggregate cache
+            n = entry.get("observation_count", 0)
+            if n < MIN_OBS_FOR_OVERRIDE:
+                return None
+            last = (entry.get("last_updated") or "unknown")[:10]
+            return {
+                "structure": structure,
+                "history_count": n,
+                "win_rate": float(entry["win_rate"]),
+                "avg_return_pct": float(entry["avg_return_pct"]),
+                "rank_score": float(entry["rank_score"]),
+                "source": f"persistent_store:{last}",
+            }
+
+        # Filtered path: iterate observations, filter by date, recompute
+        as_of_str = as_of_date.isoformat()
+        filtered = [
+            o for o in entry.get("observations", [])
+            if o.get("observation_date", "") <= as_of_str
+            and not o.get("_migrated", False)  # exclude v1 migration placeholder from filtered path
+        ]
+        # Also include non-migrated if all observations are from migration, fallback to all
+        if not filtered:
+            # Try including migrated entries (legacy data has no real dates)
+            migrated_filtered = [
+                o for o in entry.get("observations", [])
+                if o.get("observation_date", "") <= as_of_str
+            ]
+            filtered = migrated_filtered
+
+        agg = _recompute_aggregates(filtered)
+        n = agg["observation_count"]
         if n < MIN_OBS_FOR_OVERRIDE:
             return None
-        last = (entry.get("last_updated") or "unknown")[:10]
+
         return {
             "structure": structure,
             "history_count": n,
-            "win_rate": float(entry["win_rate"]),
-            "avg_return_pct": float(entry["avg_return_pct"]),
-            "rank_score": float(entry["rank_score"]),
-            "source": f"persistent_store:{last}",
+            "win_rate": agg["win_rate"],
+            "avg_return_pct": agg["avg_return_pct"],
+            "rank_score": agg["rank_score"],
+            "source": f"persistent_store:as_of:{as_of_str}",
         }
 
-    def get_all_prior_dicts(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_prior_dicts(
+        self,
+        as_of_date: Optional[date] = None,
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Return dicts for all structures meeting MIN_OBS_FOR_OVERRIDE.
 
@@ -301,7 +488,7 @@ class StructurePriorStore:
         """
         result = {}
         for s in SUPPORTED_STRUCTURES:
-            d = self.get_prior_dict(s)
+            d = self.get_prior_dict(s, as_of_date=as_of_date)
             if d is not None:
                 result[s] = d
         return result
@@ -359,11 +546,18 @@ def get_structure_prior_store(
 
 def load_all_structure_priors(
     store_path: Optional[Path] = None,
+    as_of_date: Optional[date] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Module-level convenience used by structure_scorecard._load_walk_forward_priors().
 
     Returns a dict of structure → prior_dict for structures that have
     >= MIN_OBS_FOR_OVERRIDE observations.  Empty dict if none qualify.
+
+    Parameters
+    ----------
+    as_of_date : date, optional
+        If provided, only observations on or before this date are counted.
+        Pass snapshot.as_of_date from the backtest evaluation loop.
     """
-    return get_structure_prior_store(store_path).get_all_prior_dicts()
+    return get_structure_prior_store(store_path).get_all_prior_dicts(as_of_date=as_of_date)

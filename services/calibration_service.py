@@ -39,6 +39,7 @@ import math
 import pathlib
 import threading
 from collections import Counter
+from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -188,8 +189,9 @@ class IVExpansionCalibration:
         self._scores: List[float] = []
         self._expansions: List[float] = []
         self._sources: List[str] = []
+        self._timestamps: List[str] = []  # ISO date strings, parallel to _scores (#18)
         self._observation_ids: Set[str] = set()
-        # Cached isotonic curve (rebuilt lazily after each update)
+        # Cached isotonic curve (rebuilt lazily after each update, no-filter path only)
         self._fitted_xs: List[float] = []
         self._fitted_ys: List[float] = []
         self._curve_dirty = True
@@ -205,6 +207,7 @@ class IVExpansionCalibration:
                 scores = raw.get("scores", [])
                 expansions = raw.get("expansions", [])
                 sources = raw.get("sources", [])
+                timestamps = raw.get("timestamps", [])
                 observation_ids = raw.get("observation_ids", [])
                 if len(scores) == len(expansions):
                     self._scores = [float(s) for s in scores]
@@ -213,6 +216,17 @@ class IVExpansionCalibration:
                         self._sources = [self._normalize_source_type(src) for src in sources]
                     else:
                         self._sources = ["paper"] * len(self._scores)
+                    # Migration: if no timestamps stored, synthesize from file mtime
+                    if len(timestamps) == len(scores):
+                        self._timestamps = [str(t) for t in timestamps]
+                    else:
+                        try:
+                            fallback_date = pathlib.Path(self._path).stat().st_mtime
+                            import datetime as _dt
+                            fallback_str = _dt.datetime.fromtimestamp(fallback_date).strftime("%Y-%m-%d")
+                        except Exception:
+                            fallback_str = "1970-01-01"
+                        self._timestamps = [fallback_str] * len(self._scores)
                     self._observation_ids = {
                         str(obs_id)
                         for obs_id in observation_ids
@@ -237,9 +251,11 @@ class IVExpansionCalibration:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
+                "schema_version": 2,
                 "scores": self._scores,
                 "expansions": self._expansions,
                 "sources": self._sources,
+                "timestamps": self._timestamps,
                 "observation_ids": sorted(self._observation_ids),
                 "n": len(self._scores),
             }
@@ -284,6 +300,95 @@ class IVExpansionCalibration:
             hi = 1.0
         return lo, hi
 
+    # ── as_of_date filtered path ─────────────────────────────────────────────
+
+    def _apply_as_of(self, setup_score: float, as_of_date: date) -> Dict[str, Any]:
+        """apply() with as_of_date filtering.  Does not touch the production cache."""
+        as_of_str = as_of_date.isoformat()
+        mask = [t <= as_of_str for t in self._timestamps]
+        filtered_scores = [s for s, m in zip(self._scores, mask) if m]
+        filtered_expansions = [e for e, m in zip(self._expansions, mask) if m]
+
+        n = len(filtered_scores)
+        score = float(np.clip(setup_score, 0.0, 1.0))
+
+        # Determine phase from filtered count
+        if n >= _MIN_OBS_FOR_HIGH_FIT:
+            phase = "fitted_high"
+        elif n >= _MIN_OBS_FOR_FIT:
+            phase = "fitted_moderate"
+        elif n >= _MIN_OBS_FOR_OBSERVATIONAL:
+            phase = "observational"
+        else:
+            phase = "bootstrap_prior"
+
+        if phase == "bootstrap_prior":
+            est = _bootstrap_estimate(score)
+            width = max(2.0, est * 0.35)
+            return {
+                "expected_expansion_pct": round(est, 2),
+                "low_pct": round(max(0.0, est - width), 2),
+                "high_pct": round(est + width, 2),
+                "n_observations": n,
+                "prior_only": True,
+                "phase": phase,
+                "score_input": round(score, 4),
+                "note": (
+                    f"Research prior only ({n}/{_MIN_OBS_FOR_OBSERVATIONAL} observations "
+                    f"as of {as_of_str}). Use for ordering only."
+                ),
+            }
+
+        if phase == "observational":
+            lo, hi = self._bucket_bounds(score)
+            local_obs = [
+                e for s, e in zip(filtered_scores, filtered_expansions)
+                if lo <= s < hi or (hi >= 1.0 and lo <= s <= hi)
+            ]
+            est = float(np.mean(local_obs)) if len(local_obs) >= 3 else _bootstrap_estimate(score)
+            if len(local_obs) >= 3:
+                std = float(np.std(local_obs, ddof=1)) if len(local_obs) > 1 else max(1.0, abs(est) * 0.20)
+                prior_only = False
+            else:
+                std = max(2.0, abs(est) * 0.35)
+                prior_only = True
+            margin = max(std, 1.0)
+            return {
+                "expected_expansion_pct": round(est, 2),
+                "low_pct": round(max(0.0, est - margin), 2),
+                "high_pct": round(est + margin, 2),
+                "n_observations": n,
+                "n_local": len(local_obs),
+                "prior_only": prior_only,
+                "phase": phase,
+                "score_input": round(score, 4),
+                "note": f"Observational (as_of={as_of_str}, total N={n}).",
+            }
+
+        # fitted phase — compute isotonic curve on filtered subset in-place (no cache impact)
+        fitted_xs, fitted_ys = _isotonic_fit(filtered_scores, filtered_expansions)
+        est = _interp(score, fitted_xs, fitted_ys)
+
+        lo_band = max(0.0, score - 0.10)
+        hi_band = min(1.0, score + 0.10)
+        local_obs = [
+            e for s, e in zip(filtered_scores, filtered_expansions)
+            if lo_band <= s <= hi_band
+        ]
+        margin = float(np.std(local_obs, ddof=1)) if len(local_obs) >= 3 else est * 0.30
+
+        return {
+            "expected_expansion_pct": round(est, 2),
+            "low_pct": round(max(0.0, est - margin), 2),
+            "high_pct": round(est + margin, 2),
+            "n_observations": n,
+            "n_local": len(local_obs),
+            "prior_only": False,
+            "phase": phase,
+            "score_input": round(score, 4),
+            "note": f"Fitted (as_of={as_of_str}, total N={n}, local N={len(local_obs)}).",
+        }
+
     # ── Public API ───────────────────────────────────────────────────────────
 
     def _normalize_source_type(self, source_type: Optional[str]) -> str:
@@ -297,6 +402,7 @@ class IVExpansionCalibration:
         *,
         observation_id: Optional[str] = None,
         source_type: str = "paper",
+        observation_date: Optional[date] = None,
     ) -> bool:
         """
         Record a new (score, expansion) observation and invalidate the curve cache.
@@ -312,9 +418,13 @@ class IVExpansionCalibration:
             Stable deduplication key. When provided, duplicate calls are ignored.
         source_type : str, default "paper"
             Observation provenance. Accepted values are replay, synthetic, paper, live.
+        observation_date : date, optional
+            The date to associate with this observation for as_of_date filtering
+            in walk-forward backtesting (#18).  Defaults to today.
         """
         normalized_source = self._normalize_source_type(source_type)
         normalized_id = str(observation_id) if observation_id not in (None, "") else None
+        obs_date_str = (observation_date or date.today()).isoformat()
         with self._lock:
             if normalized_id is not None and normalized_id in self._observation_ids:
                 logger.debug(
@@ -324,6 +434,7 @@ class IVExpansionCalibration:
             self._scores.append(float(setup_score))
             self._expansions.append(float(observed_expansion_pct))
             self._sources.append(normalized_source)
+            self._timestamps.append(obs_date_str)
             if normalized_id is not None:
                 self._observation_ids.add(normalized_id)
             self._curve_dirty = True
@@ -338,9 +449,22 @@ class IVExpansionCalibration:
         )
         return True
 
-    def apply(self, setup_score: float) -> Dict[str, Any]:
+    def apply(
+        self,
+        setup_score: float,
+        as_of_date: Optional[date] = None,
+    ) -> Dict[str, Any]:
         """
         Return calibration estimate for *setup_score*.
+
+        Parameters
+        ----------
+        setup_score : float
+        as_of_date : date, optional
+            If provided, only observations with observation_date <= as_of_date
+            are used to build the calibration curve.  The production cache
+            (no as_of_date) is not touched.  Pass snapshot.as_of_date from
+            the backtest evaluation loop.  (#18)
 
         Response dict keys
         ------------------
@@ -362,6 +486,9 @@ class IVExpansionCalibration:
         score_input : float
             Echo of the input score for traceability.
         """
+        if as_of_date is not None:
+            return self._apply_as_of(setup_score, as_of_date)
+
         if self._curve_dirty:
             self._rebuild_curve()
 
