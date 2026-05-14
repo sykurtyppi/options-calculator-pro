@@ -180,6 +180,10 @@ def _migrate_v1_entry(structure: str, entry: Dict) -> Dict:
     The aggregate cache fields are preserved exactly.  A single placeholder
     observation is added dated at the entry's last_updated timestamp so that
     as_of_date queries on or after that date see the historical data.
+
+    On-disk promotion to v2 is intentionally lazy: the file stays at v1 until
+    something explicitly calls save().  _load() migrates in memory only — do not
+    change this to write back eagerly on load.
     """
     last_updated = entry.get("last_updated")
     if last_updated:
