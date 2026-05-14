@@ -738,11 +738,30 @@ def finalize_trade_and_update_learning(
     setup_score = float(row["setup_score"])
     _source_type = source_type or row.get("source_type", "paper")
 
+    # ── Resolve exit date — never fall back to date.today() ───────────────────
+    # Parameter is the override; row's stored exit_date is the fallback (set by
+    # a prior update_exit call).  Raise if neither is available — timestamping
+    # an observation with the recording day corrupts as_of_date filtering (#18).
+    _row_exit_str: Optional[str] = row.get("exit_date")
+    _row_exit_date: Optional[date] = None
+    if _row_exit_str:
+        try:
+            _row_exit_date = date.fromisoformat(str(_row_exit_str)[:10])
+        except ValueError:
+            pass
+    resolved_exit_date: Optional[date] = exit_date or _row_exit_date
+    if resolved_exit_date is None:
+        raise ValueError(
+            f"finalize_trade_and_update_learning: trade_id={trade_id!r} — "
+            "exit_date must be provided (parameter) or already stored in the row; "
+            "date.today() is not a valid fallback for observation timestamps"
+        )
+
     # ── 2. Update exit fields ─────────────────────────────────────────────────
     if exit_date is not None or exit_mid is not None:
         s.update_exit(
             trade_id=trade_id,
-            exit_date=exit_date or date.today(),
+            exit_date=resolved_exit_date,
             exit_mid=exit_mid,
             realized_return_pct=realized_return_pct,
             realized_pnl=realized_pnl,
@@ -765,7 +784,7 @@ def finalize_trade_and_update_learning(
             realized_expansion_pct,
             observation_id=trade_id,
             source_type=_source_type,
-            observation_date=exit_date or date.today(),
+            observation_date=resolved_exit_date,
         )
         n_after = cal._n()
         cal_phase = cal._phase()
@@ -791,7 +810,7 @@ def finalize_trade_and_update_learning(
             realized_return_pct=realized_return_pct,
             realized_expansion_pct=realized_expansion_pct,
             source_type=_source_type,
-            observation_date=exit_date or date.today(),
+            observation_date=resolved_exit_date,
             observation_id=trade_id,
         )
         diag = ps.diagnostics()
