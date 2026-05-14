@@ -8,6 +8,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from services import external_io_gate
+
 
 DEFAULT_HOME = Path.home() / ".options_calculator_pro"
 DEFAULT_REPORT_DIR = DEFAULT_HOME / "reports" / "evidence"
@@ -178,6 +180,7 @@ def send_imessage(
     config: IMessageConfig,
     timeout_seconds: float = 10.0,
 ) -> dict[str, Any]:
+    external_io_gate.assert_allowed(external_io_gate.Category.IMESSAGE)
     script = """
 on run argv
   set targetAddress to item 1 of argv

@@ -38,6 +38,7 @@ from services.execution_scenarios import (
     build_execution_scenarios,
     compare_execution_scenarios,
 )
+from services import external_io_gate
 from services.market_data_client import MarketDataClient
 from services.option_surface_quality import diagnose_option_surface_quality
 from services.outcome_recorder import (
@@ -160,6 +161,8 @@ def _fetch_quote_for_forward_loop(
 def _get_marketdata_client(candidate: Any = None) -> Optional[MarketDataClient]:
     if candidate is not None and hasattr(candidate, "is_available"):
         return candidate if bool(candidate.is_available()) else None
+    if not external_io_gate.is_allowed(external_io_gate.Category.MARKETDATA):
+        return None
     try:
         resolved = MarketDataClient()
     except Exception:

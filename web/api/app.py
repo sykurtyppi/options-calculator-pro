@@ -222,6 +222,7 @@ class _AuthMiddleware(BaseHTTPMiddleware):
 
 
 from scripts.institutional_backfill import InstitutionalDataCollector
+from services import external_io_gate
 from services.market_data_client import MarketDataClient
 from services.options_feature_store import OptionsFeatureStore, OptionsFeatureStoreError
 from web.api.edge_engine import analyze_single_ticker
@@ -250,6 +251,7 @@ _feature_store: Optional[OptionsFeatureStore] = None
 def _get_mda_client() -> MarketDataClient:
     global _mda_client
     if _mda_client is None:
+        external_io_gate.assert_allowed(external_io_gate.Category.MARKETDATA)
         _mda_client = MarketDataClient()
     return _mda_client
 

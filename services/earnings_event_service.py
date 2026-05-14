@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from services import external_io_gate
 from services.market_data_client import MarketDataClient
 from services.provider_telemetry import classify_error, record_provider_telemetry
 
@@ -648,6 +649,7 @@ class EarningsEventService:
         return candidates
 
     def _fetch_alpha_vantage_calendar(self, *, horizon: str) -> list[dict[str, Any]]:
+        external_io_gate.assert_allowed(external_io_gate.Category.EARNINGS_ALPHA_VANTAGE)
         start = time.perf_counter()
         try:
             response = self._session.get(
@@ -727,6 +729,7 @@ class EarningsEventService:
         return self._fetch_sec_json(_SEC_COMPANY_TICKERS_URL)
 
     def _fetch_sec_json(self, url: str) -> Any:
+        external_io_gate.assert_allowed(external_io_gate.Category.EARNINGS_SEC_EDGAR)
         endpoint_type = "sec_company_tickers" if "company_tickers" in url else "sec_submissions"
         start = time.perf_counter()
         try:
@@ -768,6 +771,7 @@ class EarningsEventService:
         url: str,
         params: dict[str, Any],
     ) -> Any:
+        external_io_gate.assert_allowed(external_io_gate.Category.EARNINGS_FMP)
         start = time.perf_counter()
         try:
             response = self._session.get(url, params=params, timeout=20.0)
