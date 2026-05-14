@@ -93,8 +93,11 @@ REPORTS_ROOT = REPO_ROOT / "exports" / "reports"
 ABSOLUTE_SPREAD_THRESHOLD_PCT = 12.0
 CONSERVATIVE_EXECUTION_SCENARIO = "cross_25"
 _PRIORS_CACHE_LOCK = threading.Lock()
-_PRIORS_CACHE_DATA: Optional[Dict[str, WalkForwardPrior]] = None
-_PRIORS_CACHE_SIGNATURE: Optional[tuple[tuple[str, Optional[float]], ...]] = None
+# Bounded dict keyed on the full signature tuple (includes file mtimes + as_of_date).
+# Each distinct as_of_date value gets its own slot, so backtest loops don't thrash
+# the production (no-filter) entry.  FIFO eviction after _PRIORS_CACHE_MAX slots.
+_PRIORS_CACHE: Dict[tuple, Dict[str, WalkForwardPrior]] = {}
+_PRIORS_CACHE_MAX: int = 32
 
 
 def build_structure_scorecards(
@@ -851,11 +854,10 @@ def _load_walk_forward_priors(
         recorded on or before this date (#18).  None preserves current
         production behavior (unfiltered, uses the O(1) aggregate cache).
     """
-    global _PRIORS_CACHE_DATA, _PRIORS_CACHE_SIGNATURE
     signature = _walk_forward_prior_signature(as_of_date=as_of_date)
     with _PRIORS_CACHE_LOCK:
-        if _PRIORS_CACHE_DATA is not None and signature == _PRIORS_CACHE_SIGNATURE:
-            return _PRIORS_CACHE_DATA
+        if signature in _PRIORS_CACHE:
+            return _PRIORS_CACHE[signature]
 
     base: Dict[str, WalkForwardPrior] = {
         "call_calendar": _load_calendar_prior_from_reports("call_calendar"),
@@ -887,16 +889,15 @@ def _load_walk_forward_priors(
             "_load_walk_forward_priors: persistent store overlay failed (%s)", exc
         )
     with _PRIORS_CACHE_LOCK:
-        _PRIORS_CACHE_DATA = base
-        _PRIORS_CACHE_SIGNATURE = signature
-        return _PRIORS_CACHE_DATA
+        if len(_PRIORS_CACHE) >= _PRIORS_CACHE_MAX:
+            _PRIORS_CACHE.pop(next(iter(_PRIORS_CACHE)))
+        _PRIORS_CACHE[signature] = base
+        return base
 
 
 def _clear_walk_forward_priors_cache() -> None:
-    global _PRIORS_CACHE_DATA, _PRIORS_CACHE_SIGNATURE
     with _PRIORS_CACHE_LOCK:
-        _PRIORS_CACHE_DATA = None
-        _PRIORS_CACHE_SIGNATURE = None
+        _PRIORS_CACHE.clear()
 
 
 def reload_walk_forward_priors() -> None:
