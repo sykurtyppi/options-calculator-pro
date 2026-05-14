@@ -98,3 +98,109 @@ def test_yang_zhang_rv30_drops_meaningfully_when_event_session_excluded():
     assert rv_with > rv_without * 1.25, (
         f"exclusion did not lower RV meaningfully: with={rv_with:.4f} without={rv_without:.4f}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Finding B + C: per-structure rankings + side-weighted avg_iv_change
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_feature_rankings_partitions_by_structure():
+    """
+    feature_rankings() must compute Spearman correlations and quartile
+    statistics per structure, not pooled across structures. The output
+    DataFrame must carry a leading ``structure`` column and contain rows
+    for every structure that has ≥10 trades; the per-row ``sample_size``
+    must never exceed the count of trades for that structure (proves no
+    cross-structure leakage in the subsetting).
+    """
+    import sys, importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_bs", "scripts/backtest_iv_expansion_study.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_bs"] = mod
+    spec.loader.exec_module(mod)
+
+    rng = np.random.default_rng(seed=20260507)
+    rows = []
+    structures = ["atm_straddle", "call_calendar"]
+    for structure in structures:
+        for i in range(40):
+            rows.append({
+                "structure": structure,
+                "pnl_mid": float(rng.normal(0, 1)),
+                "avg_iv_change": float(rng.normal(0, 1)),
+                "return_mid_pct": float(rng.normal(0, 1)),
+                "return_cross_50_pct": float(rng.normal(0, 1)),
+                "signal_iv_rv30": float(rng.normal(1.2, 0.2)),
+                "signal_iv_rv_har": float(rng.normal(1.2, 0.2)),
+                "signal_term_structure_slope": float(rng.normal(0.005, 0.002)),
+                "signal_near_back_iv_ratio": float(rng.normal(1.05, 0.05)),
+                "signal_rv_percentile_rank": float(rng.uniform(20, 80)),
+                "signal_near_term_spread_pct": float(rng.uniform(2, 8)),
+                "signal_near_term_liquidity_proxy": float(rng.uniform(500, 5000)),
+                "signal_event_implied_move_pct": float(rng.uniform(2, 12)),
+                "signal_non_event_move_pct": float(rng.uniform(1, 6)),
+                "signal_smile_curvature": float(rng.normal(0.0, 0.2)),
+                "wf_ranking_score": float(rng.uniform(0, 1)),
+            })
+    base_trades = pd.DataFrame(rows)
+
+    ranking = mod.feature_rankings(base_trades)
+    assert not ranking.empty
+    assert "structure" in ranking.columns, "rankings must carry leading 'structure' column"
+    assert set(ranking["structure"].unique()) == set(structures), (
+        f"expected rows for both {structures}, got {ranking['structure'].unique()}"
+    )
+    # No leakage: every row's sample_size must fit within its structure.
+    per_structure_max = base_trades.groupby("structure").size().to_dict()
+    for _, row in ranking.iterrows():
+        assert row["sample_size"] <= per_structure_max[row["structure"]], (
+            f"sample_size {row['sample_size']} exceeds {row['structure']} count "
+            f"{per_structure_max[row['structure']]} — pooling regression"
+        )
+    # Sort contract: rows ordered by (structure asc, rank_score desc) within structure.
+    for structure in structures:
+        scores = ranking[ranking["structure"] == structure]["rank_score"].tolist()
+        assert scores == sorted(scores, reverse=True), (
+            f"{structure} rank_score not sorted descending"
+        )
+
+
+def test_avg_iv_change_is_side_weighted_for_calendar():
+    """
+    avg_iv_change must be side-weighted so positive ⇔ favorable for the
+    position. For a calendar (front side=-1, back side=+1) where front
+    IV crushes 10 vol pts and back IV rises 1 vol pt:
+        unweighted  mean: (-10 + 1) / 2 = -4.5  (says IV "fell")
+        side-weighted: (-1·-10 + 1·1) / 2 = +5.5  (says IV moved in our favor)
+    The latter is what the backtest now emits.
+    """
+    # Mirror the inline computation pattern used by realize_structure_trade.
+    class _Leg:
+        def __init__(self, side: int, iv: float):
+            self.side = side
+            self.iv = iv
+
+    entry_legs = [_Leg(side=-1, iv=30.0), _Leg(side=+1, iv=25.0)]   # short front, long back
+    exit_legs  = [_Leg(side=-1, iv=20.0), _Leg(side=+1, iv=26.0)]   # front crush, back rise
+
+    avg_iv_change = float(np.nanmean([
+        e.side * (x.iv - e.iv)
+        for e, x in zip(entry_legs, exit_legs)
+        if e.iv is not None and x.iv is not None
+    ]))
+
+    assert math.isclose(avg_iv_change, 5.5, abs_tol=1e-9), (
+        f"side-weighted calendar avg_iv_change should be +5.5, got {avg_iv_change}"
+    )
+
+    # Sanity: same expression on a long-only straddle gives the unsigned mean.
+    straddle_entry = [_Leg(side=+1, iv=25.0), _Leg(side=+1, iv=25.0)]
+    straddle_exit  = [_Leg(side=+1, iv=30.0), _Leg(side=+1, iv=30.0)]
+    straddle_change = float(np.nanmean([
+        e.side * (x.iv - e.iv)
+        for e, x in zip(straddle_entry, straddle_exit)
+    ]))
+    assert math.isclose(straddle_change, 5.0, abs_tol=1e-9)

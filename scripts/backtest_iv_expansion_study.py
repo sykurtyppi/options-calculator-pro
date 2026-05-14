@@ -967,8 +967,14 @@ def realize_structure_trade(
     debit_capital = max(entry_value_mid, 0.0)
     if debit_capital <= 0:
         return None, "negative_or_zero_debit"
+    # Side-weight so positive ⇔ "in the position's favor" regardless of
+    # leg direction. For a long leg (side=+1), favorable IV change is
+    # exit_iv > entry_iv. For a short leg (side=-1), favorable is the
+    # opposite — IV crush profits the short. Without side-weighting,
+    # calendar avg_iv_change confuses front-crush (favorable) and
+    # back-rise (also favorable) by averaging them as opposite signs.
     avg_iv_change = float(np.nanmean([
-        (exit_leg.iv - entry_leg.iv)
+        entry_leg.side * (exit_leg.iv - entry_leg.iv)
         for entry_leg, exit_leg in zip(entry_legs, exit_legs)
         if entry_leg.iv is not None and exit_leg.iv is not None
     ])) if any(entry_leg.iv is not None and exit_leg.iv is not None for entry_leg, exit_leg in zip(entry_legs, exit_legs)) else None
@@ -1397,34 +1403,42 @@ def feature_rankings(base_trades: pd.DataFrame) -> pd.DataFrame:
         "wf_ranking_score": "wf_ranking_score",
     }
     rows: List[Dict[str, Any]] = []
-    for label, col in features.items():
-        subset = realized[[col, "avg_iv_change", "return_mid_pct", "return_cross_50_pct"]].dropna()
-        if len(subset) < 10:
-            continue
-        iv_corr = subset[col].corr(subset["avg_iv_change"], method="spearman")
-        mid_corr = subset[col].corr(subset["return_mid_pct"], method="spearman")
-        adj_corr = subset[col].corr(subset["return_cross_50_pct"], method="spearman")
-        top_cut = subset[col].quantile(0.75)
-        bot_cut = subset[col].quantile(0.25)
-        top = subset[subset[col] >= top_cut]
-        bot = subset[subset[col] <= bot_cut]
-        rows.append(
-            {
-                "feature": label,
-                "sample_size": int(len(subset)),
-                "spearman_iv_change": float(iv_corr) if iv_corr is not None else np.nan,
-                "spearman_mid_return": float(mid_corr) if mid_corr is not None else np.nan,
-                "spearman_adj_return_50pct": float(adj_corr) if adj_corr is not None else np.nan,
-                "top_quartile_avg_iv_change": float(top["avg_iv_change"].mean()) if not top.empty else np.nan,
-                "bottom_quartile_avg_iv_change": float(bot["avg_iv_change"].mean()) if not bot.empty else np.nan,
-                "top_quartile_adj_return_50pct": float(top["return_cross_50_pct"].mean()) if not top.empty else np.nan,
-                "bottom_quartile_adj_return_50pct": float(bot["return_cross_50_pct"].mean()) if not bot.empty else np.nan,
-            }
-        )
+    # Partition by structure: long-vol structures (atm_straddle,
+    # otm_strangle) profit from IV expansion, while calendars profit from
+    # front IV crush relative to back. Pooling these in one Spearman
+    # correlation averages opposing direction conventions and biases all
+    # reported correlations toward zero. Per-structure correlations
+    # preserve the within-structure signal→PnL relationship.
+    for structure_name, structure_df in realized.groupby("structure"):
+        for label, col in features.items():
+            subset = structure_df[[col, "avg_iv_change", "return_mid_pct", "return_cross_50_pct"]].dropna()
+            if len(subset) < 10:
+                continue
+            iv_corr = subset[col].corr(subset["avg_iv_change"], method="spearman")
+            mid_corr = subset[col].corr(subset["return_mid_pct"], method="spearman")
+            adj_corr = subset[col].corr(subset["return_cross_50_pct"], method="spearman")
+            top_cut = subset[col].quantile(0.75)
+            bot_cut = subset[col].quantile(0.25)
+            top = subset[subset[col] >= top_cut]
+            bot = subset[subset[col] <= bot_cut]
+            rows.append(
+                {
+                    "structure": structure_name,
+                    "feature": label,
+                    "sample_size": int(len(subset)),
+                    "spearman_iv_change": float(iv_corr) if iv_corr is not None else np.nan,
+                    "spearman_mid_return": float(mid_corr) if mid_corr is not None else np.nan,
+                    "spearman_adj_return_50pct": float(adj_corr) if adj_corr is not None else np.nan,
+                    "top_quartile_avg_iv_change": float(top["avg_iv_change"].mean()) if not top.empty else np.nan,
+                    "bottom_quartile_avg_iv_change": float(bot["avg_iv_change"].mean()) if not bot.empty else np.nan,
+                    "top_quartile_adj_return_50pct": float(top["return_cross_50_pct"].mean()) if not top.empty else np.nan,
+                    "bottom_quartile_adj_return_50pct": float(bot["return_cross_50_pct"].mean()) if not bot.empty else np.nan,
+                }
+            )
     ranking = pd.DataFrame(rows)
     if not ranking.empty:
         ranking["rank_score"] = ranking["spearman_iv_change"].abs().fillna(0.0) + ranking["spearman_adj_return_50pct"].abs().fillna(0.0)
-        ranking = ranking.sort_values("rank_score", ascending=False).reset_index(drop=True)
+        ranking = ranking.sort_values(["structure", "rank_score"], ascending=[True, False]).reset_index(drop=True)
     return ranking
 
 
@@ -1577,11 +1591,18 @@ def build_memo(
         ],
     )
 
-    rankings_md = markdown_table(
-        rankings,
-        list(rankings.columns),
-        limit=10,
-    )
+    # Per-structure sub-tables so each structure's top features stay
+    # visible rather than the global top-N collapsing onto whichever
+    # structure has the strongest correlations.
+    if rankings.empty:
+        rankings_md = "(no structures with sufficient sample)"
+    else:
+        rankings_md_parts: List[str] = []
+        for structure_name, group in rankings.groupby("structure", sort=True):
+            rankings_md_parts.append(f"### {structure_name}\n")
+            rankings_md_parts.append(markdown_table(group, list(group.columns), limit=5))
+            rankings_md_parts.append("")
+        rankings_md = "\n".join(rankings_md_parts)
 
     memo = f"""# IV Expansion Candidate Historical Study
 
