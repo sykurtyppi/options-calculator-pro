@@ -18,10 +18,9 @@ Legacy desktop UI (PySide/Tk) and scanner stack were removed from this repositor
 ## Run Backend
 ```bash
 cd /path/to/options_calculator_pro
-[ -d .venv ] || python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r web/api/requirements-web.txt -c web/api/constraints-web.txt
+[ -d .venv311 ] || uv venv .venv311 --python 3.11
+source .venv311/bin/activate
+uv pip install -r requirements.lock
 python -m uvicorn web.api.app:app --reload --host 0.0.0.0 --port 8000
 ```
 

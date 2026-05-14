@@ -47,6 +47,7 @@ SuperClaude_Framework/
 .pytest_cache/
 
 # Additional virtualenvs the team uses (current rule covers .venv/ only)
+.venv311/
 .venv_arm64/
 .venv313/
 .venv-replay180/

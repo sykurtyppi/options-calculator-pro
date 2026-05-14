@@ -5,7 +5,7 @@ Local launchd jobs (macOS) that run the daily and weekly evidence cycles for thi
 ## Contents
 
 - `*.plist` — launchd job templates with `__HOME__` and `__PROJECT_ROOT__` placeholders. Rendered at install time; not loaded directly.
-- `run_*.sh` — wrappers invoked by launchd. Each self-locates the repo root from `${BASH_SOURCE[0]}` and uses `${PROJECT_ROOT}/.venv_arm64/bin/python`.
+- `run_*.sh` — wrappers invoked by launchd. Each self-locates the repo root from `${BASH_SOURCE[0]}` and uses `${PROJECT_ROOT}/.venv311/bin/python`.
 - `install_launchd_jobs.sh` / `uninstall_launchd_jobs.sh` — install/remove the jobs.
 
 ## Install
@@ -44,7 +44,7 @@ All jobs use `RunAtLoad=false`; they fire only on the calendar schedule, never o
 ## Requirements
 
 - macOS (uses `launchctl` and `~/Library/LaunchAgents`).
-- A `.venv_arm64` virtualenv at the project root (`${PROJECT_ROOT}/.venv_arm64/bin/python`) with the project's Python dependencies installed.
+- A `.venv311` virtualenv at the project root (`${PROJECT_ROOT}/.venv311/bin/python`) with the project's Python dependencies installed.
 - `~/.options_calculator_pro/{logs,state}` are auto-created by the wrappers on first run.
 
 ## Logs and state
