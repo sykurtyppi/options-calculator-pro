@@ -465,7 +465,16 @@ def _option_dates(con: duckdb.DuckDBPyConnection, options_root: Path, symbol: st
     rows = con.execute(
         f"SELECT DISTINCT trade_date FROM read_parquet('{source}', hive_partitioning=true) ORDER BY trade_date"
     ).fetchall()
-    return [row[0] for row in rows]
+    # The parquet schema stores trade_date as TIMESTAMP, which DuckDB returns
+    # as datetime.datetime. Coerce to datetime.date so downstream subtraction
+    # against earnings event_dates (which are date.fromisoformat outputs)
+    # produces a homogeneous timedelta operation. Without this, the comparison
+    # raises `TypeError: unsupported operand type(s) for -: 'datetime.date'
+    # and 'datetime.datetime'` and the entire earnings-fetch stage aborts.
+    return [
+        row[0].date() if hasattr(row[0], "date") else row[0]
+        for row in rows
+    ]
 
 
 def _load_ohlc(con: duckdb.DuckDBPyConnection, ohlc_root: Path, symbol: str) -> pd.DataFrame:
