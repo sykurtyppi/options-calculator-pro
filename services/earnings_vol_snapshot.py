@@ -666,8 +666,8 @@ def _normalize_option_chain(option_chain_data: Any) -> Tuple[pd.DataFrame, Optio
     if {"bid", "ask"}.issubset(df.columns):
         valid_ba = np.isfinite(df["bid"]) & np.isfinite(df["ask"]) & (df["ask"] >= df["bid"]) & (df["ask"] > 0)
         df.loc[valid_ba, "mid"] = df.loc[valid_ba, "mid"].fillna((df.loc[valid_ba, "bid"] + df.loc[valid_ba, "ask"]) / 2.0)
-    if "last_price" in df.columns:
-        df["mid"] = df["mid"].fillna(df["last_price"])
+    # Do not promote last trade into mid. Last prints can be stale and should not
+    # drive implied-move or term-structure calculations without valid bid/ask.
 
     if "spread_pct" not in df.columns:
         df["spread_pct"] = np.nan
