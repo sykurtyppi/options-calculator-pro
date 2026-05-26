@@ -9,6 +9,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import threading
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -18,7 +19,7 @@ import sqlite3
 _OOS_VALIDATION_TIMEOUT_SECONDS: float = 300.0  # 5 min hard wall-clock limit per call
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +47,8 @@ _SHARE_PASSWORD = os.getenv("SHARE_PASSWORD", "")
 _SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-in-env")
 _SESSION_COOKIE = "ops_session"
 _SESSION_MAX_AGE = 7 * 24 * 3600  # 1 week
+_MAX_SCREENER_SYMBOLS = max(1, int(os.getenv("OPTIONS_CALCULATOR_MAX_SCREENER_SYMBOLS", "100")))
+_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,15}$")
 _HOSTED_MODE = os.getenv("OPTIONS_CALCULATOR_HOSTED_MODE", "").strip().lower() in {
     "1",
     "true",
@@ -177,13 +180,15 @@ def _raise_public_error(status_code: int, public_message: str, exc: Exception) -
 _validate_auth_config()
 
 
-def _session_token() -> str:
-    """Derive a stable HMAC token from the session secret."""
-    return hmac.new(
-        _SESSION_SECRET.encode(),
-        b"ops-authenticated-v1",
-        hashlib.sha256,
-    ).hexdigest()
+def _session_signature(payload: str) -> str:
+    return hmac.new(_SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _session_token(now: Optional[datetime] = None) -> str:
+    """Issue a signed, expiring session token with a per-login nonce."""
+    issued_at = int((now or datetime.now(timezone.utc)).timestamp())
+    payload = f"v1.{issued_at}.{uuid.uuid4().hex}"
+    return f"{payload}.{_session_signature(payload)}"
 
 
 def _valid_session(cookie_val: str) -> bool:
@@ -192,9 +197,37 @@ def _valid_session(cookie_val: str) -> bool:
     if not cookie_val or not _SHARE_PASSWORD:
         return False
     try:
-        return hmac.compare_digest(cookie_val, _session_token())
+        version, issued_at_raw, nonce, signature = cookie_val.split(".", 3)
+        if version != "v1" or not nonce:
+            return False
+        issued_at = int(issued_at_raw)
+        age = int(datetime.now(timezone.utc).timestamp()) - issued_at
+        if age < 0 or age > _SESSION_MAX_AGE:
+            return False
+        payload = f"{version}.{issued_at_raw}.{nonce}"
+        return hmac.compare_digest(signature, _session_signature(payload))
     except Exception:
         return False
+
+
+def _parse_symbol_universe(symbols: Optional[str], default_universe: List[str]) -> List[str]:
+    universe = (
+        [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        if symbols
+        else list(default_universe)
+    )
+    if len(universe) > _MAX_SCREENER_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Symbol universe is limited to {_MAX_SCREENER_SYMBOLS} symbols per request.",
+        )
+    invalid = [s for s in universe if not _SYMBOL_RE.fullmatch(s)]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid symbol(s): {', '.join(invalid[:5])}",
+        )
+    return universe
 
 
 class _AuthMiddleware(BaseHTTPMiddleware):
@@ -1288,12 +1321,12 @@ def get_ml_train_status(job_id: str) -> Dict[str, Any]:
 
 @app.get("/api/screener/ranked", response_model=RankedScreenerResponse)
 def ranked_screener(
-    dte_min: int = 3,
-    dte_max: int = 10,
-    min_sample_size: int = 4,
-    release_filter: str = "all",
-    weeks: int = 4,
-    symbols: Optional[str] = None,
+    dte_min: int = Query(3, ge=0, le=60),
+    dte_max: int = Query(10, ge=1, le=120),
+    min_sample_size: int = Query(4, ge=0, le=40),
+    release_filter: str = Query("all", pattern="^(all|bmo|amc|dmh|unknown)$"),
+    weeks: int = Query(4, ge=1, le=26),
+    symbols: Optional[str] = Query(None, max_length=2000),
 ) -> RankedScreenerResponse:
     """
     Rank upcoming earnings candidates by pre-earnings long-vega setup quality.
@@ -1310,11 +1343,9 @@ def ranked_screener(
     from datetime import date as _date
 
     today = _date.today()
-    universe = (
-        [s.strip().upper() for s in symbols.split(",") if s.strip()]
-        if symbols
-        else DEFAULT_UNIVERSE
-    )
+    if dte_min > dte_max:
+        raise HTTPException(status_code=400, detail="dte_min must be less than or equal to dte_max.")
+    universe = _parse_symbol_universe(symbols, DEFAULT_UNIVERSE)
 
     try:
         payload = build_ranked_screener(
