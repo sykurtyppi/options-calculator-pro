@@ -402,23 +402,38 @@ class StructurePriorStore:
             src_counts = dict(entry.get("source_types", {}))
             src_counts[source_type] = src_counts.get(source_type, 0) + 1
 
-            entry.update(
-                {
-                    "schema_version": _SCHEMA_VERSION,
-                    "observations": observations,
-                    "observation_count": n,
-                    "positive_count": wins,
-                    "sum_return_pct": float(sum_ret),
-                    "sum_expansion_pct": float(sum_exp),
-                    "win_rate": float(win_rate),
-                    "avg_return_pct": float(avg_return),
-                    "avg_realized_expansion_pct": float(avg_expansion),
-                    "rank_score": float(rank),
-                    "source_types": src_counts,
-                    "last_updated": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            self._data[structure] = entry
+            # PR-W: build a fresh dict and atomically swap it in, rather
+            # than mutating `entry` in place. Readers of get_prior_dict
+            # acquire no lock — they call `self._data.get(structure)` and
+            # then read multiple keys sequentially. Under CPython the GIL
+            # makes individual key reads atomic, but the GIL can be
+            # released between bytecodes. If `entry` is the SAME dict that
+            # readers reference, a writer's `entry.update({...})` between
+            # two reader `.get()` calls causes the reader's sequential
+            # reads to see two different snapshots of the same dict
+            # (torn read).
+            #
+            # The fix is the standard persistent-data-structure pattern:
+            # build a NEW dict, assign it to self._data[structure]. The
+            # dict assignment is atomic (single STORE_SUBSCR bytecode),
+            # and a reader holding the OLD dict reference continues to
+            # see the OLD consistent snapshot.
+            new_entry = {
+                **entry,
+                "schema_version": _SCHEMA_VERSION,
+                "observations": observations,
+                "observation_count": n,
+                "positive_count": wins,
+                "sum_return_pct": float(sum_ret),
+                "sum_expansion_pct": float(sum_exp),
+                "win_rate": float(win_rate),
+                "avg_return_pct": float(avg_return),
+                "avg_realized_expansion_pct": float(avg_expansion),
+                "rank_score": float(rank),
+                "source_types": src_counts,
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+            }
+            self._data[structure] = new_entry
             self._save_locked()
 
         logger.debug(
@@ -472,11 +487,26 @@ class StructurePriorStore:
                 "source": f"persistent_store:{last}",
             }
 
-        # Filtered path: iterate observations, filter by date, recompute
+        # Filtered path: iterate observations, filter by date, recompute.
+        # PR-W: comparison is now date-based (was ISO string lex compare).
+        # The lex compare was only safe when every observation_date was in
+        # the bare YYYY-MM-DD form; a stray time component would lex-compare
+        # as larger than the same-day as_of_str, mis-excluding the row.
+        # Parse the first 10 chars to a date object; rows with unparseable
+        # dates are conservatively excluded (skip rather than crash).
+        def _on_or_before(observation_date_raw: Any) -> bool:
+            if not observation_date_raw:
+                return False
+            try:
+                obs_date = date.fromisoformat(str(observation_date_raw)[:10])
+            except (TypeError, ValueError):
+                return False
+            return obs_date <= as_of_date
+
         as_of_str = as_of_date.isoformat()
         filtered = [
             o for o in entry.get("observations", [])
-            if o.get("observation_date", "") <= as_of_str
+            if _on_or_before(o.get("observation_date"))
             and not o.get("_migrated", False)  # exclude v1 migration placeholder from filtered path
         ]
         # Also include non-migrated if all observations are from migration, fallback to all
@@ -484,7 +514,7 @@ class StructurePriorStore:
             # Try including migrated entries (legacy data has no real dates)
             migrated_filtered = [
                 o for o in entry.get("observations", [])
-                if o.get("observation_date", "") <= as_of_str
+                if _on_or_before(o.get("observation_date"))
             ]
             filtered = migrated_filtered
 

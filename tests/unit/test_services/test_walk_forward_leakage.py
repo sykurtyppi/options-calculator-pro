@@ -734,3 +734,76 @@ def test_check_for_leakage_is_safe_against_concurrent_writers(tmp_path):
         f"check_for_leakage / update() concurrent execution surfaced "
         f"{len(errors)} exception(s): {errors[:3]}"
     )
+
+
+# ── PR-W: reader-side race + filtered-path ISO compare ───────────────────────
+
+
+def test_update_swaps_entry_dict_so_readers_see_consistent_snapshot(tmp_path):
+    """After update() lands, the dict identity at self._data[structure]
+    must differ from any reader's earlier reference.
+
+    This locks in the immutable-swap contract — a reader who grabbed
+    `entry = self._data.get(structure)` before the write keeps reading
+    the OLD dict; the writer's update assigned a NEW dict. No torn
+    reads across the reader's sequential `.get()` calls."""
+    store = StructurePriorStore(store_path=tmp_path / "priors.json")
+
+    store.update(
+        structure="atm_straddle",
+        realized_return_pct=5.0,
+        realized_expansion_pct=8.0,
+        source_type="paper",
+        observation_date=date(2024, 6, 1),
+        observation_id="obs_1",
+    )
+    snapshot_before = store._data["atm_straddle"]
+
+    store.update(
+        structure="atm_straddle",
+        realized_return_pct=-3.0,
+        realized_expansion_pct=2.0,
+        source_type="paper",
+        observation_date=date(2024, 6, 2),
+        observation_id="obs_2",
+    )
+    snapshot_after = store._data["atm_straddle"]
+
+    # Different dict objects — pre-PR-W, both were the same object because
+    # update() mutated in place. Now update() builds a fresh dict and
+    # atomically swaps.
+    assert snapshot_before is not snapshot_after
+    # And the pre-write snapshot is undisturbed by the second update.
+    assert snapshot_before["observation_count"] == 1
+    assert snapshot_after["observation_count"] == 2
+
+
+def test_get_prior_dict_filtered_path_parses_datetime_form(tmp_path):
+    """Filtered path used to do `o.get("observation_date", "") <= as_of_str`
+    — a lex compare that mis-classified datetime-form strings. A 2024-06-01
+    same-day observation written as "2024-06-01T14:00:00" would lex-compare
+    GREATER than "2024-06-01", excluding it from the filtered window.
+
+    Plant a datetime-form observation and confirm the filtered path counts
+    it on the same as_of_date."""
+    store_path = tmp_path / "priors.json"
+    store = StructurePriorStore(store_path=store_path)
+
+    # Plant MIN_OBS_FOR_OVERRIDE observations all stamped same-day with a
+    # time component. The lex compare would exclude every one of them.
+    for i in range(MIN_OBS_FOR_OVERRIDE):
+        store._data.setdefault("atm_straddle", {"observations": []})
+        store._data["atm_straddle"].setdefault("observations", []).append({
+            "observation_id": f"datetime_form_{i}",
+            "observation_date": "2024-06-01T14:00:00",
+            "source_type": "replay",
+            "realized_return_pct": 5.0,
+            "realized_expansion_pct": 8.0,
+        })
+
+    result = store.get_prior_dict("atm_straddle", as_of_date=date(2024, 6, 1))
+    assert result is not None, (
+        "Filtered path should count same-day observations even when their "
+        "observation_date carries a time component"
+    )
+    assert result["history_count"] == MIN_OBS_FOR_OVERRIDE
