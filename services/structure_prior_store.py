@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import uuid
 from datetime import date, datetime, timezone
@@ -69,8 +70,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STORE = (
-    Path.home() / ".options_calculator_pro" / "priors" / "structure_priors.json"
+_DEFAULT_STORE = Path(
+    os.environ.get("OPTIONS_CALCULATOR_PRIORS_PATH", "")
+    or Path.home() / ".options_calculator_pro" / "priors" / "structure_priors.json"
 )
 _WRITE_LOCK = threading.Lock()
 
@@ -92,6 +94,17 @@ MIN_OBS_FOR_OVERRIDE = 5
 LAPLACE_SMOOTHING_THRESHOLD = 10
 
 _SCHEMA_VERSION = 2
+
+
+class BacktestLeakageError(RuntimeError):
+    """Raised when the persistent prior store contains future observations during a backtest.
+
+    If as_of_date is provided to build_structure_scorecards and the store holds
+    paper/live observations dated after as_of_date, those observations must not
+    influence the backtest result.  This error fires before any such influence
+    can occur.  To suppress it, remove the offending observations or use
+    source_type='replay' (replay observations are the sanctioned backtest signal).
+    """
 
 
 # ── Rank score (replicated from structure_scorecard to avoid circular import) ──
@@ -492,6 +505,41 @@ class StructurePriorStore:
             if d is not None:
                 result[s] = d
         return result
+
+    # ── Leakage sentinel ─────────────────────────────────────────────────────
+
+    def check_for_leakage(self, as_of_date: date) -> None:
+        """Raise BacktestLeakageError if the store contains future non-replay observations.
+
+        Call before using this store in a backtest context.  Replays are exempt
+        because they are the sanctioned backtest signal; paper and live
+        observations that are dated after as_of_date represent real trades that
+        have not yet happened and must not influence the backtest result.
+
+        Parameters
+        ----------
+        as_of_date : date
+            The backtest evaluation date.  Any observation with
+            observation_date > as_of_date and source_type != "replay" triggers
+            the error.
+        """
+        as_of_str = as_of_date.isoformat()
+        violations: List[str] = []
+        for structure, entry in self._data.items():
+            for obs in entry.get("observations", []):
+                obs_date_str = obs.get("observation_date", "")
+                src = obs.get("source_type", "paper")
+                if obs_date_str > as_of_str and src != "replay":
+                    violations.append(
+                        f"{structure}/{src}@{obs_date_str}"
+                    )
+        if violations:
+            raise BacktestLeakageError(
+                f"Persistent prior store contains {len(violations)} future non-replay "
+                f"observation(s) for as_of_date={as_of_str}.  "
+                f"First offenders: {', '.join(violations[:5])}.  "
+                "Remove the offending observations or use source_type='replay' to proceed."
+            )
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
 

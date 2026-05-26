@@ -10,6 +10,15 @@ This is a one-time / repeatable seeding path.  Repeated runs are idempotent:
   - calibration: stable observation IDs prevent double-counting on repeated runs
   - structure priors: duplicate rows are skipped before prior updates, so re-runs stay stable
 
+IMPORTANT — Store isolation (Phase 1.4)
+----------------------------------------
+By default this script writes to an ISOLATED temp directory under tmp/seed_run_<utc>/,
+NOT the production store.  Inspect the dry-run output and the temp results before
+promoting anything to the live store.
+
+To write to the production store you must pass --target=production explicitly.
+Omitting --target (or passing --target=tmp) is always safe.
+
 IMPORTANT — Honest limitations
 -------------------------------
 The backtest_trades table records calendar-spread backtest trades only
@@ -33,8 +42,11 @@ Usage
   # Dry run — show what would be seeded, touch nothing:
   .venv_arm64/bin/python scripts/seed_outcomes_from_replay.py --dry-run
 
-  # Seed from default DB:
+  # Seed into an isolated temp directory (default, safe):
   .venv_arm64/bin/python scripts/seed_outcomes_from_replay.py
+
+  # Seed into production stores (requires explicit flag):
+  .venv_arm64/bin/python scripts/seed_outcomes_from_replay.py --target=production
 
   # Seed from explicit DB path:
   .venv_arm64/bin/python scripts/seed_outcomes_from_replay.py --db-path tmp/institutional_ml_test.db
@@ -327,6 +339,17 @@ def seed_from_trades(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
+_PRODUCTION_OUTCOME_STORE = (
+    Path.home() / ".options_calculator_pro" / "outcomes" / "outcome_store.sqlite"
+)
+_PRODUCTION_CALIBRATION_STORE = (
+    Path.home() / ".options_calculator_pro" / "calibration" / "iv_expansion.json"
+)
+_PRODUCTION_PRIOR_STORE = (
+    Path.home() / ".options_calculator_pro" / "priors" / "structure_priors.json"
+)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Seed outcome store, calibration, and structure priors from replay backtest data.",
@@ -366,6 +389,17 @@ def main() -> int:
         action="store_true",
         help="Show what would be seeded without writing anything.",
     )
+    parser.add_argument(
+        "--target",
+        type=str,
+        default="tmp",
+        choices=["tmp", "production"],
+        help=(
+            "Where to write seeded observations.  "
+            "'tmp' (default): isolated directory under tmp/seed_run_<utc>/, safe to inspect and discard.  "
+            "'production': the live stores under ~/.options_calculator_pro/ — requires explicit opt-in."
+        ),
+    )
     args = parser.parse_args()
 
     db_path = Path(args.db_path) if args.db_path else _DEFAULT_DB
@@ -381,6 +415,26 @@ def main() -> int:
     if args.symbols:
         symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
+    # ── Resolve store paths based on --target ─────────────────────────────────
+    if args.dry_run:
+        outcome_store_path: Optional[Path] = None
+        calibration_store_path: Optional[Path] = None
+        prior_store_path: Optional[Path] = None
+        target_label = "DRY RUN (no writes)"
+    elif args.target == "production":
+        outcome_store_path = _PRODUCTION_OUTCOME_STORE
+        calibration_store_path = _PRODUCTION_CALIBRATION_STORE
+        prior_store_path = _PRODUCTION_PRIOR_STORE
+        target_label = f"PRODUCTION — {Path.home() / '.options_calculator_pro'}"
+    else:
+        utc_tag = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        tmp_root = _ROOT / "tmp" / f"seed_run_{utc_tag}"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        outcome_store_path = tmp_root / "outcome_store.sqlite"
+        calibration_store_path = tmp_root / "iv_expansion.json"
+        prior_store_path = tmp_root / "structure_priors.json"
+        target_label = f"ISOLATED TEMP — {tmp_root}"
+
     print()
     print("=" * 60)
     print("  OUTCOME SEEDING FROM REPLAY BACKTEST")
@@ -389,11 +443,14 @@ def main() -> int:
     print(f"  Session       : {args.session_id or 'all'}")
     print(f"  Symbols       : {', '.join(symbols) if symbols else 'all'}")
     print(f"  Structure     : {args.structure} (assumed for all trades)")
-    print(f"  Mode          : {'DRY RUN' if args.dry_run else 'LIVE'}")
+    print(f"  Target        : {target_label}")
     print()
 
-    if not args.dry_run:
+    if args.target == "production" and not args.dry_run:
+        print("  ⚠  Writing to PRODUCTION stores.  This modifies live learning state.")
         print("  Calibration updates are idempotent by stable replay trade ID.\n")
+    elif not args.dry_run:
+        print("  Writing to isolated temp directory.  Pass --target=production to promote.\n")
 
     # ── Fetch trades ──────────────────────────────────────────────────────────
     print("  Fetching trades from backtest_trades table …")
@@ -439,9 +496,9 @@ def main() -> int:
         trades,
         structure=args.structure,
         dry_run=args.dry_run,
-        outcome_store_path=None,
-        calibration_store_path=None,
-        prior_store_path=None,
+        outcome_store_path=outcome_store_path,
+        calibration_store_path=calibration_store_path,
+        prior_store_path=prior_store_path,
     )
 
     # ── Report ────────────────────────────────────────────────────────────────
@@ -505,6 +562,11 @@ def main() -> int:
         print()
         print("  DRY RUN complete — nothing was written.")
         print("  Re-run without --dry-run to apply seeding.")
+
+    if not args.dry_run and args.target == "tmp":
+        print()
+        print(f"  Results written to: {outcome_store_path.parent}")
+        print("  Inspect and promote to production with --target=production if satisfied.")
 
     print()
     return 0
