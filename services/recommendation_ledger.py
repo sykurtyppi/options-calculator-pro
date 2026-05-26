@@ -2,8 +2,27 @@
 
 The ledger records the exact evidence surface that produced a recommendation:
 VolSnapshot, structure scorecards, selector output, provider/quote provenance,
-and schema/version metadata. It is intentionally append-safe and local-first so
-research runs, API analyses, and forward paper trades can be audited later.
+and schema/version metadata. It is intentionally **immutable** — once a row
+lands in ``recommendations``, it is never updated. Any subsequent ``record()``
+call for the same ``recommendation_id`` writes a new row into the
+``recommendation_revisions`` table instead, so the original evidence is
+preserved and enrichment / re-runs are auditable as a separate history.
+
+This is the durable backbone of the evidence loop. If the original row could
+be silently overwritten (as it could before PR-K), then "we recommended X on
+date Y" stops being a defensible claim.
+
+Tables
+------
+``recommendations``
+    Append-only. ``INSERT OR IGNORE`` semantics — the first write per
+    ``recommendation_id`` wins forever.
+
+``recommendation_revisions``
+    Captures subsequent ``record()`` calls. Each revision stores the full new
+    payload as JSON plus a content hash; identical-content re-runs are deduped
+    via the ``UNIQUE(recommendation_id, content_hash)`` constraint, so paper
+    loops re-recording the same evidence don't pile up no-op rows.
 """
 
 from __future__ import annotations
@@ -14,17 +33,19 @@ import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Dict, Generator, List, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # Bumped: introduces recommendation_revisions
 ENGINE_VERSION = "event_vol_selector_v1"
 _DEFAULT_LEDGER = Path.home() / ".options_calculator_pro" / "recommendations" / "recommendation_ledger.sqlite"
 _WRITE_LOCK = threading.Lock()
+
+RecordStatus = Literal["inserted", "revision", "duplicate"]
 
 _TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS recommendations (
@@ -74,6 +95,24 @@ CREATE INDEX IF NOT EXISTS idx_recommendations_selected_structure
     ON recommendations (selected_structure);
 CREATE INDEX IF NOT EXISTS idx_recommendations_recommendation
     ON recommendations (recommendation);
+"""
+
+_REVISIONS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS recommendation_revisions (
+    revision_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    recommendation_id    TEXT NOT NULL,
+    revised_at           TEXT NOT NULL,
+    content_hash         TEXT NOT NULL,
+    record_json          TEXT NOT NULL,
+    UNIQUE(recommendation_id, content_hash)
+);
+"""
+
+_REVISIONS_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_revisions_recommendation_id
+    ON recommendation_revisions (recommendation_id);
+CREATE INDEX IF NOT EXISTS idx_revisions_revised_at
+    ON recommendation_revisions (revised_at);
 """
 
 _MIGRATION_COLUMNS: Dict[str, str] = {
@@ -152,6 +191,8 @@ def _open_db(path: Path) -> sqlite3.Connection:
     conn.executescript(_TABLE_DDL)
     _migrate(conn)
     conn.executescript(_INDEX_DDL)
+    conn.executescript(_REVISIONS_TABLE_DDL)
+    conn.executescript(_REVISIONS_INDEX_DDL)
     conn.commit()
     return conn
 
@@ -186,8 +227,21 @@ class RecommendationLedger:
     def path(self) -> Path:
         return self._path
 
-    def record(self, record: RecommendationRecord) -> bool:
-        sql = """
+    def record(self, record: RecommendationRecord) -> RecordStatus:
+        """Record a recommendation, preserving original evidence.
+
+        The first call with a given ``recommendation_id`` inserts into the
+        ``recommendations`` table and returns ``"inserted"``. Subsequent calls
+        for the same id never modify the original row — they go to the
+        ``recommendation_revisions`` table with the full new payload, and
+        return ``"revision"``. Calls with byte-identical content (same
+        content_hash) are skipped and return ``"duplicate"``.
+
+        This replaces the prior ``INSERT OR IGNORE … ON CONFLICT DO UPDATE``
+        behavior, which silently overwrote the original evidence on every
+        subsequent call — defeating the whole point of an audit ledger.
+        """
+        insert_sql = """
             INSERT OR IGNORE INTO recommendations (
                 recommendation_id, created_at, symbol, as_of_date, earnings_date,
                 earnings_source, earnings_source_confidence, earnings_source_stale,
@@ -203,40 +257,6 @@ class RecommendationLedger:
             ) VALUES (
                 ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
-            ON CONFLICT(recommendation_id) DO UPDATE SET
-                created_at = excluded.created_at,
-                symbol = excluded.symbol,
-                as_of_date = excluded.as_of_date,
-                earnings_date = excluded.earnings_date,
-                earnings_source = excluded.earnings_source,
-                earnings_source_confidence = excluded.earnings_source_confidence,
-                earnings_source_stale = excluded.earnings_source_stale,
-                recommendation = excluded.recommendation,
-                selected_structure = excluded.selected_structure,
-                no_trade_reason = excluded.no_trade_reason,
-                data_quality_score = excluded.data_quality_score,
-                option_source = excluded.option_source,
-                underlying_source = excluded.underlying_source,
-                provider_names_json = excluded.provider_names_json,
-                quote_timestamp = excluded.quote_timestamp,
-                quote_source = excluded.quote_source,
-                quote_quality = excluded.quote_quality,
-                bid_ask_mid_json = excluded.bid_ask_mid_json,
-                surface_quality_status = excluded.surface_quality_status,
-                surface_quality_reasons_json = excluded.surface_quality_reasons_json,
-                surface_quality_json = excluded.surface_quality_json,
-                surface_crossed_quote_count = excluded.surface_crossed_quote_count,
-                surface_zero_bid_count = excluded.surface_zero_bid_count,
-                surface_extreme_spread_count = excluded.surface_extreme_spread_count,
-                surface_sparse_atm_count = excluded.surface_sparse_atm_count,
-                surface_iv_anomaly_count = excluded.surface_iv_anomaly_count,
-                vol_snapshot_json = excluded.vol_snapshot_json,
-                structure_scorecards_json = excluded.structure_scorecards_json,
-                selector_output_json = excluded.selector_output_json,
-                explanation_json = excluded.explanation_json,
-                metadata_json = excluded.metadata_json,
-                schema_version = excluded.schema_version,
-                engine_version = excluded.engine_version
         """
         params = (
             record.recommendation_id,
@@ -274,10 +294,39 @@ class RecommendationLedger:
             int(record.schema_version),
             record.engine_version,
         )
+        content_hash = _record_content_hash(record)
+        record_json = _json(_record_to_dict(record))
+        revised_at = datetime.now(timezone.utc).isoformat()
+
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
-                cur.execute(sql, params)
-                return cur.rowcount > 0
+                cur.execute(insert_sql, params)
+                first_time = cur.rowcount > 0
+
+                # Always stamp the current content into recommendation_revisions.
+                # On first record, this writes the "version 1" row so the full
+                # history table is complete. On subsequent calls, the
+                # UNIQUE(recommendation_id, content_hash) constraint dedupes
+                # byte-identical re-records (e.g. paper-loop replays of the
+                # same evidence) into a no-op.
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO recommendation_revisions
+                        (recommendation_id, revised_at, content_hash, record_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        record.recommendation_id,
+                        revised_at,
+                        content_hash,
+                        record_json,
+                    ),
+                )
+                inserted_revision = cur.rowcount > 0
+
+                if first_time:
+                    return "inserted"
+                return "revision" if inserted_revision else "duplicate"
 
     def get(self, recommendation_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
@@ -285,6 +334,48 @@ class RecommendationLedger:
             (recommendation_id,),
         ).fetchone()
         return _row_to_dict(row) if row else None
+
+    def get_revisions(self, recommendation_id: str) -> List[Dict[str, Any]]:
+        """Return the full version history of a recommendation, oldest first.
+
+        Every successful ``record()`` call leaves a row here, including the
+        first one (the "v1" snapshot). Byte-identical re-records are deduped
+        via the ``UNIQUE(recommendation_id, content_hash)`` constraint, so
+        the list contains one entry per distinct content state, in
+        chronological order.
+
+        For "show me only the changes after the original," use
+        ``get_revisions(...)[1:]``.
+
+        Pairs cleanly with ``get(recommendation_id)``: ``get()`` returns the
+        immutable first-write payload, ``get_revisions()`` returns the full
+        history including enrichment.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT revision_id, recommendation_id, revised_at, content_hash, record_json
+            FROM recommendation_revisions
+            WHERE recommendation_id = ?
+            ORDER BY revised_at ASC, revision_id ASC
+            """,
+            (recommendation_id,),
+        ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                record_payload = json.loads(row["record_json"])
+            except (TypeError, ValueError):
+                record_payload = None
+            result.append(
+                {
+                    "revision_id": int(row["revision_id"]),
+                    "recommendation_id": str(row["recommendation_id"]),
+                    "revised_at": str(row["revised_at"]),
+                    "content_hash": str(row["content_hash"]),
+                    "record": record_payload,
+                }
+            )
+        return result
 
     def list_recent(
         self,
@@ -518,6 +609,32 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
 
 def _json(value: Any) -> str:
     return json.dumps(value if value is not None else {}, sort_keys=True, default=str)
+
+
+def _record_to_dict(record: RecommendationRecord) -> Dict[str, Any]:
+    """Serialize a RecommendationRecord into a JSON-safe dict.
+
+    Used both for the revision payload (full original re-record) and for
+    content hashing. Uses ``dataclasses.asdict`` which recursively turns
+    the dataclass into nested dict/list primitives. Non-JSON-safe leaf
+    types (e.g. ``date``) are handled by ``_json``'s ``default=str``.
+    """
+    return asdict(record)
+
+
+def _record_content_hash(record: RecommendationRecord) -> str:
+    """Stable SHA-256 of the record's logical content.
+
+    Excludes ``created_at`` (timestamp drift on re-record should not
+    register as a content change) and the literal ``recommendation_id``
+    (a hash keyed by id alone is uninformative). Includes everything
+    else, sorted for stability.
+    """
+    payload = _record_to_dict(record)
+    payload.pop("created_at", None)
+    payload.pop("recommendation_id", None)
+    serialized = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _loads(value: Any) -> Any:
