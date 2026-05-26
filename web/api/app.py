@@ -714,16 +714,25 @@ def _run_oos_with_timeout(
 ) -> Optional[Dict[str, Any]]:
     """Run run_oos_validation in a daemon thread with a hard wall-clock timeout.
 
-    Returns None on timeout (the daemon thread keeps running until it finishes
-    naturally or the process exits). Raises on uncaught exceptions from the
-    worker thread so callers can surface them normally.
+    PR-N: a cooperative cancel_event is passed into the worker. On
+    timeout we set the event so the rolling-OOS loop breaks at the next
+    split boundary, releasing the worker's pandas/duckdb memory instead
+    of orphaning the thread to keep running until the process exits.
+
+    Returns None on timeout. The thread may still be alive briefly after
+    we return — it will exit cleanly once it reaches its next
+    cancellation checkpoint (typically <60s for a typical split width).
+    Exceptions from the worker propagate normally.
     """
     result_box: List[Any] = []
     exc_box: List[BaseException] = []
+    cancel_event = threading.Event()
+    worker_kwargs = dict(kwargs)
+    worker_kwargs["cancel_event"] = cancel_event
 
     def _target() -> None:
         try:
-            result_box.append(collector.run_oos_validation(**kwargs))
+            result_box.append(collector.run_oos_validation(**worker_kwargs))
         except Exception as exc:  # noqa: BLE001
             exc_box.append(exc)
 
@@ -732,7 +741,16 @@ def _run_oos_with_timeout(
     t.join(timeout=timeout_seconds)
 
     if t.is_alive():
-        return None  # timed out
+        # Signal cancel; the worker will exit at the next split boundary.
+        # We deliberately do NOT t.join() again — we don't want the
+        # request to block past the timeout. Daemon=True ensures the
+        # thread can't keep the process alive at shutdown.
+        cancel_event.set()
+        logger.info(
+            "OOS validation timed out after %.0fs; cancellation signalled",
+            timeout_seconds,
+        )
+        return None
     if exc_box:
         raise exc_box[0]
     return result_box[0] if result_box else None
