@@ -8,7 +8,23 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from services.earnings_event_service import EarningsEventCandidate, EarningsEventService
+from services.earnings_event_service import (
+    EarningsEventCandidate,
+    EarningsEventService,
+    _redact_secret_text,
+)
+
+
+def test_provider_error_redaction_removes_query_credentials() -> None:
+    message = (
+        "500 Server Error for url: "
+        "https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&apikey=super-secret-token"
+    )
+
+    redacted = _redact_secret_text(message)
+
+    assert "super-secret-token" not in redacted
+    assert "apikey=<redacted>" in redacted
 
 
 def test_alpha_vantage_bulk_calendar_is_cached_and_reused(tmp_path) -> None:
