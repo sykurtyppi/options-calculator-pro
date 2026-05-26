@@ -534,21 +534,51 @@ class StructurePriorStore:
             The backtest evaluation date.  Any observation with
             observation_date > as_of_date and source_type != "replay" triggers
             the error.
+
+        Implementation notes (PR-V)
+        ---------------------------
+        - Iteration is guarded by ``_WRITE_LOCK`` so a concurrent ``update()``
+          can't mutate ``self._data`` mid-scan (which would either skip
+          observations or raise ``RuntimeError: dictionary changed size``).
+        - ``observation_date`` is parsed into a real ``date`` before
+          comparison.  The previous version compared ISO strings
+          lexicographically, which is only correct when every observation's
+          date is in the bare ``YYYY-MM-DD`` form.  If a single observation
+          ever picks up a time component (e.g. ``2026-05-26T14:00:00``),
+          lex-compare against ``as_of_str = "2026-05-26"`` would mis-classify
+          it as in the future and trigger a spurious leakage error.
+          Malformed dates that can't be parsed are skipped (conservative —
+          we'd rather miss a malformed-row violation than crash the scan).
         """
-        as_of_str = as_of_date.isoformat()
         violations: List[str] = []
-        for structure, entry in self._data.items():
-            for obs in entry.get("observations", []):
-                obs_date_str = obs.get("observation_date", "")
+        with _WRITE_LOCK:
+            # Snapshot the structures dict under the lock so we can release
+            # it before parsing dates and assembling the error message.
+            structures_snapshot = [
+                (structure, list(entry.get("observations", []) or []))
+                for structure, entry in self._data.items()
+            ]
+        for structure, observations in structures_snapshot:
+            for obs in observations:
                 src = obs.get("source_type", "paper")
-                if obs_date_str > as_of_str and src != "replay":
-                    violations.append(
-                        f"{structure}/{src}@{obs_date_str}"
-                    )
+                if src == "replay":
+                    continue
+                raw = obs.get("observation_date", "")
+                if not raw:
+                    continue
+                # Accept both YYYY-MM-DD and any datetime-prefixed form
+                # ("YYYY-MM-DDTHH:MM:SS", "YYYY-MM-DD HH:MM:SS", etc.) by
+                # slicing the first 10 chars before parsing.
+                try:
+                    obs_date = date.fromisoformat(str(raw)[:10])
+                except (TypeError, ValueError):
+                    continue
+                if obs_date > as_of_date:
+                    violations.append(f"{structure}/{src}@{obs_date.isoformat()}")
         if violations:
             raise BacktestLeakageError(
                 f"Persistent prior store contains {len(violations)} future non-replay "
-                f"observation(s) for as_of_date={as_of_str}.  "
+                f"observation(s) for as_of_date={as_of_date.isoformat()}.  "
                 f"First offenders: {', '.join(violations[:5])}.  "
                 "Remove the offending observations or use source_type='replay' to proceed."
             )

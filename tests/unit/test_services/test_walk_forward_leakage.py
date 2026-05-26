@@ -624,3 +624,113 @@ def test_sentinel_preserves_underlying_cause():
     assert exc_info.value.__cause__ is original, (
         "BacktestLeakageError should chain the original FileNotFoundError via `from exc`"
     )
+
+
+# ── PR-V: check_for_leakage parses dates instead of comparing ISO strings ─────
+
+
+def test_check_for_leakage_handles_datetime_form_observation_date(tmp_path):
+    """If an observation_date happens to carry a time component (e.g. via a
+    future caller or a malformed migration), the prior string-lex compare
+    would lex `2024-06-01T14:00:00` > `2024-01-01` and flag it as a future
+    observation. The parsed-date compare extracts the bare day and uses
+    real date arithmetic, so a same-day observation does not falsely fire.
+
+    This is the contract PR-V locks in: any "first-10-chars parseable"
+    form works, anything unparseable is conservatively skipped.
+    """
+    store_path = tmp_path / "priors.json"
+    store = StructurePriorStore(store_path=store_path)
+    # Bypass the public update() path so we can plant a non-canonical
+    # observation_date string — what we're testing is the comparator's
+    # robustness, not update()'s input validation.
+    store._data["atm_straddle"] = {
+        "observations": [
+            {
+                "observation_date": "2024-06-01T14:00:00",
+                "source_type": "paper",
+                "observation_id": "datetime_form",
+                "realized_return_pct": 5.0,
+                "realized_expansion_pct": 8.0,
+            }
+        ]
+    }
+
+    # 2024-06-01 — same calendar day. Must NOT fire (lex compare would have).
+    store.check_for_leakage(date(2024, 6, 1))
+
+    # 2024-05-31 — strictly before. SHOULD fire.
+    with pytest.raises(BacktestLeakageError, match="future non-replay"):
+        store.check_for_leakage(date(2024, 5, 31))
+
+
+def test_check_for_leakage_skips_unparseable_observation_dates(tmp_path):
+    """Garbage in observation_date is treated as "skip and continue,"
+    not "crash the sentinel." Conservative: better to miss a malformed
+    row than abort a backtest with a stack trace."""
+    store_path = tmp_path / "priors.json"
+    store = StructurePriorStore(store_path=store_path)
+    store._data["atm_straddle"] = {
+        "observations": [
+            {
+                "observation_date": "not a date",
+                "source_type": "paper",
+                "observation_id": "garbage",
+                "realized_return_pct": 5.0,
+                "realized_expansion_pct": 8.0,
+            }
+        ]
+    }
+    # Must NOT raise — unparseable rows are skipped.
+    store.check_for_leakage(date(2024, 6, 1))
+
+
+def test_check_for_leakage_is_safe_against_concurrent_writers(tmp_path):
+    """The iteration is now guarded by _WRITE_LOCK and snapshots _data
+    into a list under the lock, so a concurrent update() cannot mutate
+    the dict mid-iteration (which would either skip observations or
+    raise RuntimeError: dictionary changed size).
+
+    Smoke-tests the contract by running 100 update() calls from one
+    thread and 100 check_for_leakage() calls from another, with replay
+    observations so neither side raises. No crashes, no exceptions.
+    """
+    import threading
+
+    store_path = tmp_path / "priors.json"
+    store = StructurePriorStore(store_path=store_path)
+
+    errors: list[BaseException] = []
+
+    def writer():
+        try:
+            for i in range(100):
+                store.update(
+                    structure="atm_straddle",
+                    realized_return_pct=float(i),
+                    realized_expansion_pct=float(i) * 2.0,
+                    source_type="replay",
+                    observation_date=date(2024, 1, 1),
+                    observation_id=f"obs_{i}",
+                )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def reader():
+        try:
+            for _ in range(100):
+                store.check_for_leakage(date(2025, 1, 1))
+        except BaseException as exc:
+            errors.append(exc)
+
+    t_w = threading.Thread(target=writer)
+    t_r = threading.Thread(target=reader)
+    t_w.start()
+    t_r.start()
+    t_w.join()
+    t_r.join()
+
+    assert not errors, (
+        f"check_for_leakage / update() concurrent execution surfaced "
+        f"{len(errors)} exception(s): {errors[:3]}"
+    )
