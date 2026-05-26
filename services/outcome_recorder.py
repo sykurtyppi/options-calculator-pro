@@ -124,6 +124,15 @@ CREATE TABLE IF NOT EXISTS outcome_trades (
 
     -- Lifecycle
     status                          TEXT NOT NULL DEFAULT 'open',
+    -- Learning-loop bookkeeping (PR-M)
+    -- Tracks whether finalize_trade_and_update_learning successfully
+    -- propagated the outcome into calibration + structure priors.
+    -- Values: 'complete' | 'calibration_failed' | 'prior_failed' |
+    -- 'both_failed' | NULL (not attempted yet).
+    -- A non-'complete' value signals a trade whose P&L is recorded but
+    -- whose learning signal hasn't reached the priors / calibration —
+    -- candidates for retry.
+    learning_update_status          TEXT,
     created_at                      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at                      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -135,6 +144,7 @@ CREATE INDEX IF NOT EXISTS idx_outcome_structure     ON outcome_trades (structur
 CREATE INDEX IF NOT EXISTS idx_outcome_source_type   ON outcome_trades (source_type);
 CREATE INDEX IF NOT EXISTS idx_outcome_status        ON outcome_trades (status);
 CREATE INDEX IF NOT EXISTS idx_outcome_recommendation_id ON outcome_trades (recommendation_id);
+CREATE INDEX IF NOT EXISTS idx_outcome_learning_status   ON outcome_trades (learning_update_status);
 """
 
 _MIGRATION_COLUMNS: Dict[str, str] = {
@@ -161,6 +171,7 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "surface_extreme_spread_count": "INTEGER",
     "surface_sparse_atm_count": "INTEGER",
     "surface_iv_anomaly_count": "INTEGER",
+    "learning_update_status": "TEXT",
 }
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
@@ -437,6 +448,55 @@ class OutcomeStore:
             with _tx(self._conn) as cur:
                 cur.execute(sql, (trade_id,))
                 return cur.rowcount > 0
+
+    # ── Learning-loop bookkeeping ─────────────────────────────────────────────
+
+    def set_learning_update_status(self, trade_id: str, status: str) -> bool:
+        """Persist whether calibration + prior updates landed successfully.
+
+        Called by ``finalize_trade_and_update_learning`` after attempting
+        the learning-side updates. Values:
+        - ``"complete"`` — both calibration and structure prior updated
+        - ``"calibration_failed"`` — only calibration raised
+        - ``"prior_failed"`` — only structure prior raised
+        - ``"both_failed"`` — both raised
+
+        A non-``"complete"`` status flags the trade as needing retry, so a
+        future pass can re-attempt the learning propagation. The trade
+        itself is still finalized — its P&L is real — but its signal
+        hasn't reached the learning store yet.
+        """
+        sql = """
+            UPDATE outcome_trades
+            SET learning_update_status = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE trade_id = ?
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(sql, (status, trade_id))
+                return cur.rowcount > 0
+
+    def list_trades_with_failed_learning_update(self, *, limit: int = 1000) -> list[Dict[str, Any]]:
+        """Return finalized trades whose calibration/prior update did not succeed.
+
+        Excludes ``learning_update_status = 'complete'`` and rows where the
+        status is NULL (NULL means "not attempted yet" — either pre-PR-M
+        data or a trade still in progress). Use this for a retry sweep.
+        """
+        capped = max(1, min(int(limit or 1000), 10_000))
+        cur = self._conn.execute(
+            """
+            SELECT *
+            FROM outcome_trades
+            WHERE learning_update_status IS NOT NULL
+              AND learning_update_status != 'complete'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (capped,),
+        )
+        return [dict(row) for row in cur.fetchall()]
 
     # ── Read helpers ──────────────────────────────────────────────────────────
 
@@ -811,6 +871,7 @@ def finalize_trade_and_update_learning(
         )
 
     # ── 3. Update calibration ─────────────────────────────────────────────────
+    calibration_ok = False
     try:
         from services.calibration_service import get_calibration
 
@@ -829,6 +890,9 @@ def finalize_trade_and_update_learning(
             warnings.append(
                 f"calibration observation already present for trade_id={trade_id}"
             )
+        # "Already present" still counts as success — the learning state
+        # has the observation, just from a prior call.
+        calibration_ok = True
     except Exception as exc:
         logger.error("finalize: calibration update failed (%s)", exc)
         warnings.append(f"calibration update failed: {exc}")
@@ -838,6 +902,7 @@ def finalize_trade_and_update_learning(
     # ── 4. Update structure prior ─────────────────────────────────────────────
     prior_obs_count = 0
     prior_win_rate: Optional[float] = None
+    prior_ok = False
     try:
         from services.structure_prior_store import get_structure_prior_store
 
@@ -854,6 +919,7 @@ def finalize_trade_and_update_learning(
         struct_entry = diag["structures"].get(structure, {})
         prior_obs_count = struct_entry.get("observation_count", 0)
         prior_win_rate = struct_entry.get("win_rate")
+        prior_ok = True
     except Exception as exc:
         logger.error("finalize: structure prior update failed (%s)", exc)
         warnings.append(f"structure prior update failed: {exc}")
@@ -866,7 +932,23 @@ def finalize_trade_and_update_learning(
     except Exception as exc:
         warnings.append(f"scorecard cache invalidation failed: {exc}")
 
-    # ── 6. Mark finalized ─────────────────────────────────────────────────────
+    # ── 6. Record learning-update status ──────────────────────────────────────
+    # PR-M: previously, mark_finalized ran unconditionally even when
+    # calibration or prior had raised, silently leaving those trades with
+    # no learning signal and no way to find them for retry. The trade is
+    # still finalized (its P&L is real) but the learning_update_status
+    # column flags it as a retry candidate when either side failed.
+    if calibration_ok and prior_ok:
+        learning_status = "complete"
+    elif not calibration_ok and not prior_ok:
+        learning_status = "both_failed"
+    elif not calibration_ok:
+        learning_status = "calibration_failed"
+    else:
+        learning_status = "prior_failed"
+    s.set_learning_update_status(trade_id, learning_status)
+
+    # ── 7. Mark finalized ─────────────────────────────────────────────────────
     s.mark_finalized(trade_id)
 
     return {
@@ -881,6 +963,7 @@ def finalize_trade_and_update_learning(
         "prior_observation_count": prior_obs_count,
         "prior_win_rate": round(prior_win_rate, 4) if prior_win_rate is not None else None,
         "status": "finalized",
+        "learning_update_status": learning_status,
         "warnings": warnings,
     }
 
