@@ -164,6 +164,16 @@ class TestStructureScorecards(unittest.TestCase):
         self.assertTrue(all("spread_exceeds_absolute_threshold" in card.eligibility_flags for card in cards))
 
     @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
+    def test_record_only_surface_quality_makes_all_structures_ineligible(self, _mock_priors):
+        snapshot = _base_snapshot(surface_quality_status="record_only")
+
+        cards = build_structure_scorecards(snapshot)
+
+        self.assertTrue(all(not card.eligible for card in cards))
+        self.assertTrue(all(card.composite_structure_score == 0.0 for card in cards))
+        self.assertTrue(all("surface_quality_record_only" in card.eligibility_flags for card in cards))
+
+    @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_increasing_spread_worsens_execution_penalty(self, _mock_priors):
         tight = _base_snapshot(near_term_spread_pct=2.0, atm_call_spread_pct=2.0, atm_put_spread_pct=2.1, execution_score=0.90)
         wide = _base_snapshot(near_term_spread_pct=10.0, atm_call_spread_pct=9.8, atm_put_spread_pct=10.2, execution_score=0.55)
