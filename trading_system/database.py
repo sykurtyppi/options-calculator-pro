@@ -32,8 +32,15 @@ SYSTEM_DB = Path.home() / ".options_calculator_pro" / "trading_system.db"
 
 @contextmanager
 def get_conn(db_path: Path = SYSTEM_DB) -> Generator[sqlite3.Connection, None, None]:
-    """Context manager: auto-commit on success, rollback on exception."""
-    conn = sqlite3.connect(db_path, timeout=10.0)
+    """Context manager: auto-commit on success, rollback on exception.
+
+    Lock-wait is governed by `PRAGMA busy_timeout` (5000 ms) — the canonical
+    SQLite setting. The Python-level `timeout=` arg to sqlite3.connect is
+    intentionally omitted because it just delegates to busy_timeout under the
+    hood and a second value would silently override the PRAGMA, hiding the
+    real wait from a code reader.
+    """
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

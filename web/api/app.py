@@ -756,7 +756,7 @@ def analyze_edge(request: EdgeAnalyzeRequest) -> EdgeAnalyzeResponse:
 @app.get("/api/edge/screener", response_model=EdgeScreenerResponse)
 def edge_screener(
     expiry_mode: Literal["front_after_earnings", "next_monthly_opex"] = "front_after_earnings",
-    weeks: int = 6,
+    weeks: int = Query(6, ge=1, le=26),
 ) -> EdgeScreenerResponse:
     try:
         payload = build_edge_screener(

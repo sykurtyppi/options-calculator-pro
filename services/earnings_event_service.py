@@ -327,7 +327,11 @@ class EarningsEventService:
         try:
             earnings_df = mda_client.get_earnings(symbol, countback=24)
         except Exception as exc:
-            logger.debug("MarketData earnings lookup failed for %s: %s", symbol, exc)
+            logger.debug(
+                "MarketData earnings lookup failed for %s: %s",
+                symbol,
+                _redact_secret_text(exc),
+            )
             return []
         if earnings_df is None or earnings_df.empty:
             return []
