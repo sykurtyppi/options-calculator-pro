@@ -465,8 +465,26 @@ def init_logging(debug: bool = False, json_logs: bool = False) -> logging.Logger
 
 
 def get_logger(name=None):
-    """Get a logger instance - compatibility function"""
-    return setup_logger(name or __name__)
+    """Return a configured logger, initializing it lazily on first call.
+
+    The previous implementation called ``setup_logger`` unconditionally on
+    every invocation, which reset and re-created the logger's handlers
+    each time. Long-running processes that called ``get_logger("foo")``
+    repeatedly leaked RotatingFileHandler file descriptors and re-emitted
+    the initialization line on every call.
+
+    This now performs a guarded init: if the named logger already has
+    handlers attached (i.e. it's been set up before), the existing
+    instance is returned untouched. Only the first call per logger name
+    pays the setup cost. Tests or callers needing a fresh
+    re-configuration should call ``setup_logger`` directly — that path
+    remains the explicit "reset and re-configure" entry point.
+    """
+    target_name = name or __name__
+    logger = logging.getLogger(target_name)
+    if logger.handlers:
+        return logger
+    return setup_logger(target_name)
 
 
 # Export main functions
