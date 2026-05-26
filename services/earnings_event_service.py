@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -19,6 +20,13 @@ from services.market_data_client import MarketDataClient
 from services.provider_telemetry import classify_error, record_provider_telemetry
 
 logger = logging.getLogger(__name__)
+
+_SECRET_QUERY_RE = re.compile(r"([?&](?:apikey|api_key|token|key)=)([^&\s]+)", re.IGNORECASE)
+
+
+def _redact_secret_text(value: Any) -> str:
+    """Redact query-string credentials before classifying or logging provider errors."""
+    return _SECRET_QUERY_RE.sub(r"\1<redacted>", str(value))
 
 _ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 _FMP_BASE_URL = "https://financialmodelingprep.com/stable"
@@ -497,7 +505,7 @@ class EarningsEventService:
                 endpoint_type="earnings_info",
                 symbol=symbol,
                 success=False,
-                error_category=classify_error(str(exc)),
+                error_category=classify_error(_redact_secret_text(exc)),
                 latency_ms=(time.perf_counter() - start) * 1000.0,
             )
             info = {}
@@ -549,7 +557,7 @@ class EarningsEventService:
                     endpoint_type="earnings_dates",
                     symbol=symbol,
                     success=False,
-                    error_category=classify_error(str(exc)),
+                    error_category=classify_error(_redact_secret_text(exc)),
                     latency_ms=(time.perf_counter() - start) * 1000.0,
                     fallback_used=True,
                 )
@@ -678,7 +686,7 @@ class EarningsEventService:
                 provider_name="alpha_vantage",
                 endpoint_type="earnings_calendar",
                 success=False,
-                error_category=classify_error(str(exc)),
+                error_category=classify_error(_redact_secret_text(exc)),
                 latency_ms=(time.perf_counter() - start) * 1000.0,
                 response_quality_note=f"horizon={horizon}",
             )
@@ -757,7 +765,7 @@ class EarningsEventService:
                 provider_name="sec_edgar",
                 endpoint_type=endpoint_type,
                 success=False,
-                error_category=classify_error(str(exc)),
+                error_category=classify_error(_redact_secret_text(exc)),
                 latency_ms=(time.perf_counter() - start) * 1000.0,
                 response_quality_note="confirmation-only source",
             )
@@ -791,7 +799,7 @@ class EarningsEventService:
                 provider_name=provider_name,
                 endpoint_type=endpoint_type,
                 success=False,
-                error_category=classify_error(str(exc)),
+                error_category=classify_error(_redact_secret_text(exc)),
                 latency_ms=(time.perf_counter() - start) * 1000.0,
             )
             raise
@@ -811,12 +819,12 @@ class EarningsEventService:
                     self._stale_cache_keys.discard(cache_key)
                     return json.loads(cache_path.read_text())
         except Exception as exc:
-            logger.debug("Failed to read earnings cache %s: %s", cache_path, exc)
+            logger.debug("Failed to read earnings cache %s: %s", cache_path, _redact_secret_text(exc))
 
         try:
             payload = loader()
         except Exception as exc:
-            logger.debug("Failed to refresh earnings cache %s: %s", cache_key, exc)
+            logger.debug("Failed to refresh earnings cache %s: %s", cache_key, _redact_secret_text(exc))
             try:
                 if cache_path.exists():
                     self._stale_cache_keys.add(cache_key)
@@ -839,7 +847,7 @@ class EarningsEventService:
             cache_path.write_text(json.dumps(payload))
             self._stale_cache_keys.discard(cache_key)
         except Exception as exc:
-            logger.debug("Failed to persist earnings cache %s: %s", cache_path, exc)
+            logger.debug("Failed to persist earnings cache %s: %s", cache_path, _redact_secret_text(exc))
         return payload
 
 
