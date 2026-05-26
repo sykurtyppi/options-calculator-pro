@@ -858,7 +858,15 @@ class TestProvenance:
             prior_store_path=prior_path,
         )
         store = OutcomeStore(store_path=store_path)
-        tid = make_trade_id("AAPL", date(2024, 2, 10), "call_calendar")
+        # PR-L: seeding now folds earnings_date into the trade_id to prevent
+        # collisions between same-(symbol/structure/entry) trades across
+        # different earnings events. Look up with the matching 4-field form.
+        tid = make_trade_id(
+            "AAPL",
+            date(2024, 2, 10),
+            "call_calendar",
+            earnings_date=date(2024, 2, 15),
+        )
         row = store.get_trade(tid)
         assert row is not None
         assert row["source_type"] == "replay"

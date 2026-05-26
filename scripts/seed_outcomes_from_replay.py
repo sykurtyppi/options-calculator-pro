@@ -244,7 +244,7 @@ def seed_from_trades(
         assumed_cost_model = str(row.get("execution_profile", "backtest"))
         row_structure = str(row.get("structure") or structure)
 
-        trade_id = make_trade_id(symbol, entry_date, row_structure)
+        trade_id = make_trade_id(symbol, entry_date, row_structure, earnings_date=earnings_date)
 
         if dry_run:
             # Just count; don't touch any stores.
