@@ -947,3 +947,181 @@ class TestUtilities:
         a = make_snapshot_hash({"x": 1})
         b = make_snapshot_hash({"x": 2})
         assert a != b
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR-M. learning_update_status — finalization no longer hides learning failures
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _finalize_with_patched_services(
+    *,
+    store: "OutcomeStore",
+    cal_path: Path,
+    prior_path: Path,
+    trade_id: str,
+    exit_date: date,
+    realized_return_pct: float,
+    realized_expansion_pct: float,
+    cal_update_side_effect=None,
+    prior_update_side_effect=None,
+):
+    """Helper: run finalize_trade_and_update_learning with optional injected
+    failures into the calibration or structure prior side. Returns the
+    result dict. Mirrors the singleton-swap pattern used elsewhere in this file.
+    """
+    import services.outcome_recorder as _or
+    import services.calibration_service as _cs
+    import services.structure_prior_store as _ps
+    import services.structure_scorecard as _sc
+    from unittest.mock import patch
+
+    orig_store = _or._store
+    orig_cal = _cs._calibration
+    orig_prior = _ps._store
+
+    cal = IVExpansionCalibration(store_path=cal_path)
+    prior = StructurePriorStore(store_path=prior_path)
+    _or._store = store
+    _cs._calibration = cal
+    _ps._store = prior
+
+    contexts = []
+    if cal_update_side_effect is not None:
+        contexts.append(patch.object(cal, "update", side_effect=cal_update_side_effect))
+    if prior_update_side_effect is not None:
+        contexts.append(patch.object(prior, "update", side_effect=prior_update_side_effect))
+
+    try:
+        with _stack_contexts(contexts):
+            return finalize_trade_and_update_learning(
+                trade_id=trade_id,
+                exit_date=exit_date,
+                realized_return_pct=realized_return_pct,
+                realized_expansion_pct=realized_expansion_pct,
+            )
+    finally:
+        _or._store = orig_store
+        _cs._calibration = orig_cal
+        _ps._store = orig_prior
+        _sc._load_walk_forward_priors.cache_clear()
+
+
+def _stack_contexts(contexts):
+    """contextlib.ExitStack equivalent for a list of context managers."""
+    import contextlib
+
+    stack = contextlib.ExitStack()
+    for ctx in contexts:
+        stack.enter_context(ctx)
+    return stack
+
+
+class TestLearningUpdateStatus:
+    def test_successful_finalize_marks_learning_complete(
+        self, store_path: Path, cal_path: Path, prior_path: Path
+    ) -> None:
+        store = OutcomeStore(store_path=store_path)
+        tid = _insert_minimal(store, source_type="paper")
+        result = _finalize_with_patched_services(
+            store=store,
+            cal_path=cal_path,
+            prior_path=prior_path,
+            trade_id=tid,
+            exit_date=date(2025, 1, 20),
+            realized_return_pct=5.0,
+            realized_expansion_pct=7.0,
+        )
+        assert result["learning_update_status"] == "complete"
+        row = store.get_trade(tid)
+        assert row["status"] == "finalized"
+        assert row["learning_update_status"] == "complete"
+
+    def test_calibration_failure_marks_calibration_failed(
+        self, store_path: Path, cal_path: Path, prior_path: Path
+    ) -> None:
+        """Previously: calibration raised → caught, then mark_finalized ran
+        anyway, leaving the trade silently incomplete. Now: the failure is
+        recorded so a retry sweep can find it."""
+        store = OutcomeStore(store_path=store_path)
+        tid = _insert_minimal(store, source_type="paper")
+        result = _finalize_with_patched_services(
+            store=store,
+            cal_path=cal_path,
+            prior_path=prior_path,
+            trade_id=tid,
+            exit_date=date(2025, 1, 20),
+            realized_return_pct=5.0,
+            realized_expansion_pct=7.0,
+            cal_update_side_effect=RuntimeError("simulated calibration outage"),
+        )
+        assert result["learning_update_status"] == "calibration_failed"
+        # Trade is still finalized — its P&L is real.
+        row = store.get_trade(tid)
+        assert row["status"] == "finalized"
+        assert row["learning_update_status"] == "calibration_failed"
+
+    def test_prior_failure_marks_prior_failed(
+        self, store_path: Path, cal_path: Path, prior_path: Path
+    ) -> None:
+        store = OutcomeStore(store_path=store_path)
+        tid = _insert_minimal(store, source_type="paper")
+        result = _finalize_with_patched_services(
+            store=store,
+            cal_path=cal_path,
+            prior_path=prior_path,
+            trade_id=tid,
+            exit_date=date(2025, 1, 20),
+            realized_return_pct=5.0,
+            realized_expansion_pct=7.0,
+            prior_update_side_effect=RuntimeError("simulated prior outage"),
+        )
+        assert result["learning_update_status"] == "prior_failed"
+        assert store.get_trade(tid)["learning_update_status"] == "prior_failed"
+
+    def test_both_failures_mark_both_failed(
+        self, store_path: Path, cal_path: Path, prior_path: Path
+    ) -> None:
+        store = OutcomeStore(store_path=store_path)
+        tid = _insert_minimal(store, source_type="paper")
+        result = _finalize_with_patched_services(
+            store=store,
+            cal_path=cal_path,
+            prior_path=prior_path,
+            trade_id=tid,
+            exit_date=date(2025, 1, 20),
+            realized_return_pct=5.0,
+            realized_expansion_pct=7.0,
+            cal_update_side_effect=RuntimeError("cal down"),
+            prior_update_side_effect=RuntimeError("prior down"),
+        )
+        assert result["learning_update_status"] == "both_failed"
+        assert store.get_trade(tid)["learning_update_status"] == "both_failed"
+
+    def test_list_failed_returns_only_non_complete(
+        self, store_path: Path, cal_path: Path, prior_path: Path
+    ) -> None:
+        """A retry sweep should be able to find exactly the trades that
+        need re-attempted learning propagation."""
+        store = OutcomeStore(store_path=store_path)
+        good_tid = _insert_minimal(store, symbol="AAPL", source_type="paper")
+        cal_fail_tid = _insert_minimal(store, symbol="MSFT", source_type="paper")
+
+        # Successful finalize.
+        _finalize_with_patched_services(
+            store=store, cal_path=cal_path, prior_path=prior_path,
+            trade_id=good_tid, exit_date=date(2025, 1, 20),
+            realized_return_pct=4.0, realized_expansion_pct=6.0,
+        )
+        # Failed finalize.
+        _finalize_with_patched_services(
+            store=store, cal_path=cal_path, prior_path=prior_path,
+            trade_id=cal_fail_tid, exit_date=date(2025, 1, 21),
+            realized_return_pct=-1.0, realized_expansion_pct=-3.0,
+            cal_update_side_effect=RuntimeError("cal down"),
+        )
+
+        failed = store.list_trades_with_failed_learning_update()
+        failed_tids = {row["trade_id"] for row in failed}
+        assert cal_fail_tid in failed_tids
+        assert good_tid not in failed_tids
