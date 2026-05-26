@@ -526,6 +526,8 @@ def _base_eligibility_flags(snapshot: VolSnapshot) -> List[str]:
         flags.append("missing_earnings_date")
     if snapshot.option_source is None or snapshot.near_term_atm_iv is None:
         flags.append("missing_option_chain")
+    if getattr(snapshot, "surface_quality_status", None) == "record_only":
+        flags.append("surface_quality_record_only")
     if snapshot.near_term_dte is None or snapshot.near_term_dte < 1:
         flags.append("invalid_near_term_dte")
     if snapshot.near_term_spread_pct is not None and snapshot.near_term_spread_pct > ABSOLUTE_SPREAD_THRESHOLD_PCT:
