@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import date
+import logging
 from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -10,6 +11,8 @@ import numpy as np
 import pandas as pd
 
 from services.earnings_vol_snapshot import VolSnapshot
+
+logger = logging.getLogger(__name__)
 
 
 SUPPORTED_STRUCTURES: tuple[str, ...] = (
@@ -124,16 +127,27 @@ def build_structure_scorecards(
         observations are exempt (they are the sanctioned backtest signal).
     """
     if as_of_date is not None:
+        from services.structure_prior_store import (
+            BacktestLeakageError,
+            get_structure_prior_store,
+        )
         try:
-            from services.structure_prior_store import (
-                BacktestLeakageError,
-                get_structure_prior_store,
-            )
             get_structure_prior_store().check_for_leakage(as_of_date)
         except BacktestLeakageError:
+            # The sentinel itself — re-raise unchanged so callers can match it.
             raise
-        except Exception:
-            pass  # store unavailable — non-fatal, leakage check is best-effort
+        except Exception as exc:
+            # Phase 1.5 contract: if the store cannot be loaded or scanned we
+            # cannot guarantee no leakage, so we must NOT silently proceed.
+            # Convert into BacktestLeakageError so leakage-aware callers handle
+            # both paths uniformly; preserve the underlying cause via `from exc`.
+            logger.exception(
+                "Leakage sentinel could not run for as_of_date=%s", as_of_date
+            )
+            raise BacktestLeakageError(
+                f"Cannot verify leakage for as_of_date={as_of_date}: "
+                f"prior store unavailable ({type(exc).__name__}: {exc})"
+            ) from exc
 
     priors = _load_walk_forward_priors(as_of_date=as_of_date)
     return [
