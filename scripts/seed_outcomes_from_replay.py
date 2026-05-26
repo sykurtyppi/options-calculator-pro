@@ -67,7 +67,7 @@ import argparse
 import logging
 import sys
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -427,7 +427,10 @@ def main() -> int:
         prior_store_path = _PRODUCTION_PRIOR_STORE
         target_label = f"PRODUCTION — {Path.home() / '.options_calculator_pro'}"
     else:
-        utc_tag = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        # datetime.utcnow() is deprecated in Python 3.12+; use the
+        # timezone-aware equivalent. The 'Z' suffix in the format string
+        # documents that the timestamp is UTC.
+        utc_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         tmp_root = _ROOT / "tmp" / f"seed_run_{utc_tag}"
         tmp_root.mkdir(parents=True, exist_ok=True)
         outcome_store_path = tmp_root / "outcome_store.sqlite"
