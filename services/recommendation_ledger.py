@@ -188,6 +188,12 @@ def _open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # PR-T: consistency with trading_system/database.py. The module-level
+    # _WRITE_LOCK serializes in-process writers and WAL handles concurrent
+    # readers, but cross-process writers (a future worker pool or a manual
+    # sqlite3 CLI session against the file) would otherwise fail with
+    # OperationalError after SQLite's tiny default 5s busy timeout.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_TABLE_DDL)
     _migrate(conn)
     conn.executescript(_INDEX_DDL)

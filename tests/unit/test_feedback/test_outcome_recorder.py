@@ -1125,3 +1125,74 @@ class TestLearningUpdateStatus:
         failed_tids = {row["trade_id"] for row in failed}
         assert cal_fail_tid in failed_tids
         assert good_tid not in failed_tids
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR-T. Two-step exit pattern persists realized fields
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestTwoStepExitPersistsRealized:
+    """The Tier 2 audit (PR #38 finding) caught that the previous guard
+    in finalize_trade_and_update_learning only fired when exit_date or
+    exit_mid was passed. The documented two-step pattern (record_trade_exit
+    first, then finalize_trade_and_update_learning with the realized
+    percentages) silently skipped persisting realized_return_pct and
+    realized_expansion_pct because the guard saw both as None in step 2.
+
+    Calibration and the structure prior received the values correctly
+    (they read the function args directly), so the learning side was
+    intact — but the DB row's realized columns stayed NULL, which
+    corrupted downstream reports that aggregate by realized return.
+    """
+
+    def test_realized_fields_persist_when_only_realized_passed_to_finalize(
+        self, store_path: Path, cal_path: Path, prior_path: Path
+    ) -> None:
+        """The exact two-step pattern from record_trade_exit's docstring:
+        step 1 records exit price; step 2 commits realized percentages
+        plus learning updates. Both must land in outcome_trades."""
+        from services.outcome_recorder import record_trade_exit
+
+        store = OutcomeStore(store_path=store_path)
+        tid = _insert_minimal(store, source_type="paper")
+
+        # Step 1: exit price and date written via record_trade_exit
+        # (no realized_* values yet — they're computed later in the
+        # caller's workflow).
+        record_trade_exit(
+            trade_id=tid,
+            exit_date=date(2025, 1, 20),
+            exit_mid=5.5,
+            store=store,
+        )
+
+        # Step 2: realized_* values, NO exit_date or exit_mid in this
+        # call (per the documented pattern).
+        result = _finalize_with_patched_services(
+            store=store,
+            cal_path=cal_path,
+            prior_path=prior_path,
+            trade_id=tid,
+            exit_date=None,
+            realized_return_pct=5.0,
+            realized_expansion_pct=7.0,
+        )
+
+        assert result["learning_update_status"] == "complete"
+        row = store.get_trade(tid)
+        assert row["status"] == "finalized"
+        # The regression assertion: realized columns are populated, not NULL.
+        assert row["realized_return_pct"] == 5.0, (
+            "PR #38 regression: realized_return_pct lost in two-step pattern"
+        )
+        assert row["realized_expansion_pct"] == 7.0, (
+            "PR #38 regression: realized_expansion_pct lost in two-step pattern"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Note: _finalize_with_patched_services accepts exit_date as a kwarg; passing
+# None here exercises the row-derived fallback (which already had a stored
+# exit_date from step 1).
+# ══════════════════════════════════════════════════════════════════════════════
