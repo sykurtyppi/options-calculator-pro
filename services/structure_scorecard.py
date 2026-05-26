@@ -115,7 +115,26 @@ def build_structure_scorecards(
         recorded on or before this date.  Use snapshot.as_of_date from the
         backtest evaluation loop (#18).  None preserves current production
         behavior (all observations included, O(1) aggregate cache).
+
+    Raises
+    ------
+    BacktestLeakageError
+        If as_of_date is provided and the persistent prior store contains
+        paper or live observations dated after as_of_date.  Replay
+        observations are exempt (they are the sanctioned backtest signal).
     """
+    if as_of_date is not None:
+        try:
+            from services.structure_prior_store import (
+                BacktestLeakageError,
+                get_structure_prior_store,
+            )
+            get_structure_prior_store().check_for_leakage(as_of_date)
+        except BacktestLeakageError:
+            raise
+        except Exception:
+            pass  # store unavailable — non-fatal, leakage check is best-effort
+
     priors = _load_walk_forward_priors(as_of_date=as_of_date)
     return [
         score_atm_straddle(snapshot, prior=priors["atm_straddle"]),

@@ -17,7 +17,11 @@ from unittest.mock import patch
 import pytest
 
 from services.calibration_service import IVExpansionCalibration
-from services.structure_prior_store import StructurePriorStore, MIN_OBS_FOR_OVERRIDE
+from services.structure_prior_store import (
+    BacktestLeakageError,
+    MIN_OBS_FOR_OVERRIDE,
+    StructurePriorStore,
+)
 
 
 # ── Test 1: StructurePriorStore.get_prior_dict() accepts as_of_date ───────────
@@ -320,3 +324,130 @@ def test_build_structure_scorecards_as_of_date_uses_filtered_prior(tmp_path):
         f"historical={straddle_hist.walk_forward_rank_score:.3f}, "
         f"full={straddle_full.walk_forward_rank_score:.3f}"
     )
+
+
+# ── Phase 1.5: leakage sentinel in build_structure_scorecards ─────────────────
+
+
+def _make_sentinel_store(tmp_path, source_type: str, obs_date: date) -> StructurePriorStore:
+    """Build a store with one observation of the given source_type and date."""
+    store = StructurePriorStore(store_path=tmp_path / "priors.json")
+    store.update(
+        structure="atm_straddle",
+        realized_return_pct=5.0,
+        realized_expansion_pct=8.0,
+        source_type=source_type,
+        observation_date=obs_date,
+        observation_id=f"sentinel_{source_type}",
+    )
+    return store
+
+
+def test_leakage_sentinel_fires_for_future_paper_observation(tmp_path):
+    """check_for_leakage raises BacktestLeakageError for a paper observation
+    dated after as_of_date.  Paper trades are real and must not influence a
+    backtest set before they occurred.
+    """
+    future_obs = date(2025, 6, 1)
+    as_of = date(2024, 1, 1)
+    store = _make_sentinel_store(tmp_path, "paper", future_obs)
+    with pytest.raises(BacktestLeakageError, match="future non-replay"):
+        store.check_for_leakage(as_of)
+
+
+def test_leakage_sentinel_fires_for_future_live_observation(tmp_path):
+    """check_for_leakage raises BacktestLeakageError for a live observation
+    dated after as_of_date.
+    """
+    future_obs = date(2025, 6, 1)
+    as_of = date(2024, 1, 1)
+    store = _make_sentinel_store(tmp_path, "live", future_obs)
+    with pytest.raises(BacktestLeakageError, match="future non-replay"):
+        store.check_for_leakage(as_of)
+
+
+def test_leakage_sentinel_exempts_replay_observations(tmp_path):
+    """check_for_leakage must NOT raise for replay observations dated after
+    as_of_date.  Replays are the sanctioned backtest signal and are expected
+    to cover the full date range.
+    """
+    future_obs = date(2025, 6, 1)
+    as_of = date(2024, 1, 1)
+    store = _make_sentinel_store(tmp_path, "replay", future_obs)
+    store.check_for_leakage(as_of)  # must not raise
+
+
+def test_leakage_sentinel_integrated_in_build_structure_scorecards(tmp_path):
+    """build_structure_scorecards propagates BacktestLeakageError when called
+    with as_of_date and the store has a future paper observation.
+    """
+    import services.structure_prior_store as _sps_module
+    from services.structure_scorecard import build_structure_scorecards
+    from services.earnings_vol_snapshot import VolSnapshot
+
+    snapshot = VolSnapshot(
+        symbol="TEST",
+        as_of_date=date(2024, 1, 1),
+        earnings_date=date(2024, 1, 15),
+        release_timing="after market close",
+        days_to_earnings=14,
+        underlying_price=100.0,
+        option_source="provided",
+        underlying_source="provided",
+        price_staleness_minutes=5,
+        chain_staleness_minutes=5,
+        data_quality="high",
+        data_quality_score=0.90,
+        rv30_yang_zhang=0.20,
+        rv30_estimator="yang_zhang",
+        rv_har_forecast=0.19,
+        rv_percentile_rank=45.0,
+        vol_regime_label="Normal",
+        iv30=0.23,
+        iv45=0.26,
+        near_term_dte=4,
+        near_term_atm_iv=0.22,
+        back_term_dte=25,
+        back_term_atm_iv=0.26,
+        near_back_iv_ratio=0.86,
+        term_structure_slope=0.0024,
+        near_term_implied_move_pct=5.5,
+        near_term_implied_sigma_pct=7.0,
+        non_event_move_pct_har=1.1,
+        event_implied_move_pct=5.4,
+        event_move_share_of_total=0.87,
+        historical_event_count=8,
+        historical_median_move_pct=7.0,
+        historical_avg_last4_move_pct=7.4,
+        historical_p90_move_pct=9.8,
+        historical_move_std_pct=2.0,
+        historical_move_anchor_pct=7.2,
+        historical_move_uncertainty_pct=0.84,
+        historical_vs_implied_move_ratio=1.25,
+        tail_vs_implied_move_ratio=1.70,
+        smile_curvature=0.17,
+        smile_concavity_flag=False,
+        smile_points=7,
+        near_term_spread_pct=2.4,
+        near_term_liquidity_proxy=4000.0,
+        atm_call_spread_pct=2.3,
+        atm_put_spread_pct=2.5,
+        atm_total_open_interest=3000.0,
+        atm_total_volume=1500.0,
+        liquidity_tier="high",
+        iv_rv_yz=1.12,
+        iv_rv_har=1.18,
+        cheapness_score=0.60,
+        event_risk_score=0.72,
+        execution_score=0.84,
+        timing_score=0.76,
+        historical_move_source="earnings_history",
+        null_reasons={},
+    )
+
+    future_obs = date(2025, 6, 1)
+    store = _make_sentinel_store(tmp_path, "paper", future_obs)
+
+    with patch.object(_sps_module, "get_structure_prior_store", return_value=store):
+        with pytest.raises(BacktestLeakageError):
+            build_structure_scorecards(snapshot, as_of_date=date(2024, 1, 1))
