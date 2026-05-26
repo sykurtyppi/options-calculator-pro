@@ -30,6 +30,23 @@ the conventional chain schema:
                        call_put (str "C" or "P"), mid (float)
     optional but used: underlying_price, spread_pct, open_interest,
                        volume, iv, bid, ask
+
+Caller's responsibility — quote sanity
+--------------------------------------
+This module filters `mid > 0` but does NOT enforce bid/ask sanity (no
+crossed-market check, no spread-pct ceiling, no surface-quality gate).
+Callers MUST pass chains that have already been through their normal
+chain-normalization + surface-quality pipeline. If you feed a raw chain
+that contains crossed quotes, garbage mids, or wide-spread tail strikes,
+the picker can return a CalendarSelection for legs that are not actually
+executable. The integration adapter (commit 2 in PR-AC) is the right
+place to enforce those gates.
+
+Column-name compatibility
+-------------------------
+The required columns use the canonical names (expiry, strike, call_put,
+mid). Some providers use aliases (e.g. "expiration_date", "type"). The
+integration adapter must normalize column names before calling here.
 """
 from __future__ import annotations
 
@@ -92,6 +109,39 @@ class CalendarSelection:
     picker_back_gap_days: int
     front_dte_days: int          # actual (front_expiry - event_date).days
     back_minus_front_days: int   # actual (back_expiry - front_expiry).days
+
+    def to_metadata_dict(self) -> dict:
+        """Serialize to a JSON-safe dict for ledger / API surfaces.
+
+        Drops the raw pd.Series leg rows and extracts only stable scalar
+        fields: expiries, strike, side, mid/bid/ask, spread, OI, volume,
+        IV, plus all picker provenance. Use this rather than dataclass
+        asdict() — the latter would try to serialize pd.Series.
+        """
+        def _row(r):
+            if r is None:
+                return None
+            out = {}
+            for k in ("mid", "bid", "ask", "iv", "spread_pct",
+                      "open_interest", "volume", "delta", "dte"):
+                if k in r.index:
+                    v = r.get(k)
+                    out[k] = float(v) if v is not None and not pd.isna(v) else None
+            return out
+
+        return {
+            "side": self.side,
+            "strike": float(self.strike),
+            "front_expiry": self.front_expiry.isoformat(),
+            "back_expiry": self.back_expiry.isoformat(),
+            "front_dte_days": int(self.front_dte_days),
+            "back_minus_front_days": int(self.back_minus_front_days),
+            "picker_variant": self.picker_variant,
+            "picker_min_front_dte_days": int(self.picker_min_front_dte_days),
+            "picker_back_gap_days": int(self.picker_back_gap_days),
+            "front_leg": _row(self.front_row),
+            "back_leg": _row(self.back_row),
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -264,10 +314,26 @@ def _best_row(subset: pd.DataFrame) -> Optional[pd.Series]:
     if len(subset) == 1:
         return subset.iloc[0]
     s = subset.copy()
-    s["_liq"] = (
-        pd.to_numeric(s.get("open_interest", 0), errors="coerce").fillna(0.0)
-        + pd.to_numeric(s.get("volume", 0), errors="coerce").fillna(0.0)
+
+    # Build liquidity proxy. We can't use `s.get("col", 0)` here: when the
+    # column is absent, `.get(default)` returns the scalar default, and
+    # `pd.to_numeric(scalar).fillna(...)` raises AttributeError because
+    # the scalar has no .fillna. Use an index-aligned zero Series instead.
+    zero = pd.Series(0.0, index=s.index)
+    inf_series = pd.Series(np.inf, index=s.index)
+    oi = (
+        pd.to_numeric(s["open_interest"], errors="coerce").fillna(0.0)
+        if "open_interest" in s.columns else zero
     )
-    s["_spread"] = pd.to_numeric(s.get("spread_pct", np.inf), errors="coerce").fillna(np.inf)
+    vol = (
+        pd.to_numeric(s["volume"], errors="coerce").fillna(0.0)
+        if "volume" in s.columns else zero
+    )
+    spread = (
+        pd.to_numeric(s["spread_pct"], errors="coerce").fillna(np.inf)
+        if "spread_pct" in s.columns else inf_series
+    )
+    s["_liq"] = oi + vol
+    s["_spread"] = spread
     s = s.sort_values(["_liq", "_spread"], ascending=[False, True])
     return s.iloc[0]

@@ -438,6 +438,114 @@ class TestBestRowTieBreaking:
         assert result is not None
         assert result.front_row["open_interest"] == 5000
 
+    def test_duplicate_rows_without_optional_liquidity_columns(self):
+        """Regression for the Codex review finding: when duplicate rows exist
+        but open_interest/volume/spread_pct columns are absent, the tie-breaker
+        must not crash. Previous implementation used s.get('col', 0) which
+        returns a scalar when the column is missing, then called .fillna()
+        on it (AttributeError on scalar)."""
+        event = date(2024, 5, 1)
+        chain = pd.DataFrame([
+            # Two identical rows, no OI/volume/spread columns at all
+            {"expiry": date(2024, 5, 17), "strike": 100.0, "call_put": "C",
+             "mid": 2.0, "iv": 0.30},
+            {"expiry": date(2024, 5, 17), "strike": 100.0, "call_put": "C",
+             "mid": 2.0, "iv": 0.30},
+            {"expiry": date(2024, 6, 21), "strike": 100.0, "call_put": "C",
+             "mid": 3.0, "iv": 0.30},
+        ])
+        chain["underlying_price"] = 100.0
+        # Should NOT raise AttributeError
+        result = select_calendar_contracts(
+            chain, event_date=event, side=SIDE_CALL, picker_variant=PICKER_CANDIDATE,
+        )
+        assert result is not None
+        # First-row stable: both are equivalent, picker takes the first
+        assert result.front_expiry == date(2024, 5, 17)
+
+    def test_duplicate_rows_with_partial_optional_columns(self):
+        """Mixed case: open_interest column present, volume + spread_pct absent."""
+        event = date(2024, 5, 1)
+        chain = pd.DataFrame([
+            {"expiry": date(2024, 5, 17), "strike": 100.0, "call_put": "C",
+             "mid": 2.0, "iv": 0.30, "open_interest": 100},
+            {"expiry": date(2024, 5, 17), "strike": 100.0, "call_put": "C",
+             "mid": 2.0, "iv": 0.30, "open_interest": 9999},
+            {"expiry": date(2024, 6, 21), "strike": 100.0, "call_put": "C",
+             "mid": 3.0, "iv": 0.30, "open_interest": 500},
+        ])
+        chain["underlying_price"] = 100.0
+        result = select_calendar_contracts(
+            chain, event_date=event, side=SIDE_CALL, picker_variant=PICKER_CANDIDATE,
+        )
+        assert result is not None
+        # Should still prefer the more liquid duplicate
+        assert result.front_row["open_interest"] == 9999
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Serialization adapter (for ledger / API surfaces in commits 3-4)
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestToMetadataDict:
+    def test_returns_json_safe_scalars_only(self):
+        event = date(2024, 5, 1)
+        chain = pd.DataFrame([
+            {"expiry": date(2024, 5, 17), "strike": 100.0, "call_put": "C",
+             "mid": 2.0, "iv": 0.30, "bid": 1.95, "ask": 2.05,
+             "open_interest": 500, "volume": 50, "spread_pct": 5.0},
+            {"expiry": date(2024, 6, 21), "strike": 100.0, "call_put": "C",
+             "mid": 3.0, "iv": 0.30, "bid": 2.95, "ask": 3.05,
+             "open_interest": 800, "volume": 80, "spread_pct": 3.3},
+        ])
+        chain["underlying_price"] = 100.0
+        result = select_calendar_contracts(
+            chain, event_date=event, side=SIDE_CALL, picker_variant=PICKER_CANDIDATE,
+        )
+        assert result is not None
+        meta = result.to_metadata_dict()
+
+        # ISO-format dates, not date objects
+        assert isinstance(meta["front_expiry"], str)
+        assert meta["front_expiry"] == "2024-05-17"
+        assert meta["back_expiry"] == "2024-06-21"
+
+        # Picker provenance preserved
+        assert meta["picker_variant"] == PICKER_CANDIDATE
+        assert meta["picker_min_front_dte_days"] == CANDIDATE_FRONT_MIN_DTE_DAYS
+        assert meta["picker_back_gap_days"] == DEFAULT_BACK_GAP_DAYS
+
+        # Leg fields are simple floats
+        assert meta["front_leg"]["mid"] == 2.0
+        assert meta["front_leg"]["bid"] == 1.95
+        assert meta["front_leg"]["ask"] == 2.05
+        assert meta["back_leg"]["mid"] == 3.0
+
+        # Must be JSON-safe — no pd.Series, no numpy scalars that break json
+        import json
+        json.dumps(meta)  # would raise if not serializable
+
+    def test_handles_missing_optional_leg_fields(self):
+        event = date(2024, 5, 1)
+        chain = pd.DataFrame([
+            {"expiry": date(2024, 5, 17), "strike": 100.0, "call_put": "C",
+             "mid": 2.0, "iv": 0.30},
+            {"expiry": date(2024, 6, 21), "strike": 100.0, "call_put": "C",
+             "mid": 3.0, "iv": 0.30},
+        ])
+        chain["underlying_price"] = 100.0
+        result = select_calendar_contracts(
+            chain, event_date=event, side=SIDE_CALL, picker_variant=PICKER_CANDIDATE,
+        )
+        assert result is not None
+        meta = result.to_metadata_dict()
+        # Optional fields absent: leg dict still serializable, just shorter
+        assert meta["front_leg"]["mid"] == 2.0
+        assert "bid" not in meta["front_leg"]
+        assert "ask" not in meta["front_leg"]
+        import json
+        json.dumps(meta)
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Date coercion robustness
