@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
@@ -33,10 +33,11 @@ SYSTEM_DB = Path.home() / ".options_calculator_pro" / "trading_system.db"
 @contextmanager
 def get_conn(db_path: Path = SYSTEM_DB) -> Generator[sqlite3.Connection, None, None]:
     """Context manager: auto-commit on success, rollback on exception."""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()
@@ -248,6 +249,49 @@ DEFAULT_CONFIG = {
     "backtest_avg_cost_per_trade": "56.03",
 }
 
+_TABLE_COLUMNS = {
+    "signals": {
+        "scan_date", "symbol", "event_date", "pre_capture_date", "post_capture_date",
+        "front_expiry", "back_expiry", "nbr", "nbr_threshold", "t1_front_oi",
+        "t1_back_oi", "t1_front_spread_pct", "t1_back_spread_pct", "t1_front_iv",
+        "t1_back_iv", "passed_nbr", "passed_oi", "passed_spread", "passed_all_filters",
+        "filter_reject_reason", "passed_risk_gate", "risk_reject_reason", "traded",
+        "trade_id", "created_at",
+    },
+    "trades": {
+        "signal_id", "symbol", "sector", "event_date", "status", "n_contracts",
+        "entry_date", "entry_front_bid", "entry_front_ask", "entry_front_mid",
+        "entry_front_fill", "entry_back_bid", "entry_back_ask", "entry_back_mid",
+        "entry_back_fill", "entry_cal_mid", "entry_cal_fill", "entry_slippage_cost",
+        "entry_front_dte", "entry_nbr", "expected_exit_date", "exit_date", "exit_reason",
+        "exit_front_bid", "exit_front_ask", "exit_front_mid", "exit_front_fill",
+        "exit_back_bid", "exit_back_ask", "exit_back_mid", "exit_back_fill",
+        "exit_cal_mid", "exit_cal_fill", "exit_slippage_cost", "gross_pnl",
+        "total_transaction_cost", "net_pnl", "capital_deployed", "notes", "created_at",
+        "updated_at",
+    },
+    "risk_snapshots": {
+        "snapshot_date", "n_open_trades", "open_trade_ids", "total_capital_deployed",
+        "unrealized_pnl", "realized_pnl_mtd", "realized_pnl_ytd", "daily_net_pnl",
+        "top_symbol", "top_symbol_pct", "tech_comm_pct", "at_position_limit",
+        "at_monthly_loss_limit", "created_at",
+    },
+    "performance_log": {
+        "log_date", "realized_pnl_today", "unrealized_pnl_today", "total_pnl_today",
+        "cumulative_realized", "n_open_trades", "n_trades_closed_ytd",
+        "n_signals_evaluated", "created_at",
+    },
+}
+
+
+def _validate_columns(table: str, payload: Dict[str, Any]) -> None:
+    allowed = _TABLE_COLUMNS.get(table)
+    if allowed is None:
+        raise ValueError(f"Unknown table for column validation: {table}")
+    invalid = sorted(set(payload) - allowed)
+    if invalid:
+        raise ValueError(f"Invalid {table} columns: {', '.join(invalid)}")
+
 
 def init_db(db_path: Path = SYSTEM_DB) -> None:
     """Create schema and seed default config if not exists."""
@@ -288,6 +332,7 @@ def get_all_config(db_path: Path = SYSTEM_DB) -> Dict[str, str]:
 # ── signal helpers ─────────────────────────────────────────────────────────────
 
 def insert_signal(signal: Dict[str, Any], db_path: Path = SYSTEM_DB) -> int:
+    _validate_columns("signals", signal)
     cols = ", ".join(signal.keys())
     placeholders = ", ".join("?" * len(signal))
     with get_conn(db_path) as conn:
@@ -300,6 +345,7 @@ def insert_signal(signal: Dict[str, Any], db_path: Path = SYSTEM_DB) -> int:
 
 def update_signal(signal_id: int, updates: Dict[str, Any],
                   db_path: Path = SYSTEM_DB) -> None:
+    _validate_columns("signals", updates)
     set_clause = ", ".join(f"{k}=?" for k in updates)
     with get_conn(db_path) as conn:
         conn.execute(
@@ -311,6 +357,7 @@ def update_signal(signal_id: int, updates: Dict[str, Any],
 # ── trade helpers ──────────────────────────────────────────────────────────────
 
 def insert_trade(trade: Dict[str, Any], db_path: Path = SYSTEM_DB) -> int:
+    _validate_columns("trades", trade)
     cols = ", ".join(trade.keys())
     placeholders = ", ".join("?" * len(trade))
     with get_conn(db_path) as conn:
@@ -323,7 +370,8 @@ def insert_trade(trade: Dict[str, Any], db_path: Path = SYSTEM_DB) -> int:
 
 def update_trade(trade_id: int, updates: Dict[str, Any],
                  db_path: Path = SYSTEM_DB) -> None:
-    updates["updated_at"] = datetime.now().isoformat()
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _validate_columns("trades", updates)
     set_clause = ", ".join(f"{k}=?" for k in updates)
     with get_conn(db_path) as conn:
         conn.execute(
@@ -393,6 +441,7 @@ def upsert_daily_mark(mark: Dict[str, Any], db_path: Path = SYSTEM_DB) -> None:
 
 def upsert_risk_snapshot(snap: Dict[str, Any],
                           db_path: Path = SYSTEM_DB) -> None:
+    _validate_columns("risk_snapshots", snap)
     with get_conn(db_path) as conn:
         cols = ", ".join(snap.keys())
         placeholders = ", ".join("?" * len(snap))
@@ -404,6 +453,7 @@ def upsert_risk_snapshot(snap: Dict[str, Any],
 
 def upsert_performance_log(entry: Dict[str, Any],
                             db_path: Path = SYSTEM_DB) -> None:
+    _validate_columns("performance_log", entry)
     with get_conn(db_path) as conn:
         cols = ", ".join(entry.keys())
         placeholders = ", ".join("?" * len(entry))
