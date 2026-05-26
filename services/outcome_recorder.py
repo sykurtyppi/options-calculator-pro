@@ -855,7 +855,33 @@ def finalize_trade_and_update_learning(
         )
 
     # ── 2. Update exit fields ─────────────────────────────────────────────────
-    if exit_date is not None or exit_mid is not None:
+    # PR-T: the previous guard only checked exit_date / exit_mid. That misses
+    # the documented two-step pattern (see record_trade_exit's docstring):
+    #   1. record_trade_exit(trade_id, exit_date=d, exit_mid=m)
+    #   2. finalize_trade_and_update_learning(
+    #          trade_id,
+    #          realized_return_pct=r,
+    #          realized_expansion_pct=e,   # ← step 2 has neither exit_date
+    #                                       #    nor exit_mid, so the old guard
+    #                                       #    skipped update_exit entirely
+    #      )
+    # Calibration + prior received the values correctly (they read the
+    # function args), but the DB row's realized_* columns stayed NULL —
+    # silently corrupting downstream reports and audit queries. Expanded
+    # guard now fires when ANY exit-side field is provided.
+    exit_fields_provided = (
+        exit_date is not None
+        or exit_mid is not None
+        or realized_return_pct is not None
+        or realized_pnl is not None
+        or realized_expansion_pct is not None
+        or exit_quote_source is not None
+        or exit_quote_quality is not None
+        or exit_quote_timestamp is not None
+        or exit_bid_ask_mid is not None
+        or exit_execution_scenarios is not None
+    )
+    if exit_fields_provided:
         s.update_exit(
             trade_id=trade_id,
             exit_date=resolved_exit_date,
