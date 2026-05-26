@@ -364,10 +364,16 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertIn("Secure", set_cookie)
 
     def test_edge_analyze_error_is_sanitized(self):
+        # Guard: _get_mda_client MUST be patched here.  Without it the external-IO
+        # gate raises ExternalIOBlocked before analyze_single_ticker is ever reached,
+        # producing the same 400 + sanitized message and making the test a false
+        # positive (issue #17 / PR #15 fix).  The assert_called_once below pins this.
         with patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()), \
-             patch.object(app_module, "analyze_single_ticker", side_effect=RuntimeError("secret-token=/tmp/key")):
+             patch.object(app_module, "analyze_single_ticker",
+                          side_effect=RuntimeError("secret-token=/tmp/key")) as mock_analyze:
             response = self.client.post("/api/edge/analyze", json={"symbol": "AAPL"})
 
+        mock_analyze.assert_called_once()  # proves the gate didn't intercept first
         self.assertEqual(response.status_code, 400)
         detail = response.json()["detail"]
         self.assertEqual(
@@ -377,10 +383,12 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertNotIn("secret-token", response.text)
 
     def test_edge_screener_endpoint_returns_rows(self):
-        with patch.object(app_module, "build_edge_screener", return_value=_stub_screener_payload()), \
+        with patch.object(app_module, "build_edge_screener",
+                          return_value=_stub_screener_payload()) as mock_build, \
              patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()):
             response = self.client.get("/api/edge/screener")
 
+        mock_build.assert_called_once()  # consistent with honors_expiry_mode; guards gate-intercept regression
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["expiry_mode"], "front_after_earnings")
