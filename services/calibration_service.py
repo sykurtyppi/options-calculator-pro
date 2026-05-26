@@ -263,7 +263,19 @@ class IVExpansionCalibration:
                 "observation_ids": sorted(self._observation_ids),
                 "n": len(self._scores),
             }
-            self._path.write_text(json.dumps(payload, indent=2))
+            tmp_path = self._path.with_name(f".{self._path.name}.{os.getpid()}.tmp")
+            try:
+                with tmp_path.open("w", encoding="utf-8") as fh:
+                    json.dump(payload, fh, indent=2)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_path, self._path)
+            finally:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        logger.warning("calibration: failed to remove temp file %s", tmp_path)
         except Exception as exc:  # noqa: BLE001
             logger.error("calibration: save failed (%s)", exc)
 
