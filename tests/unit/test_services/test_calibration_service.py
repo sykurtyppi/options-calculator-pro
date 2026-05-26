@@ -263,6 +263,37 @@ class TestCalibrationPersistence:
         c = IVExpansionCalibration(store_path=store)
         assert c._n() == 0
 
+    def test_atomic_write_preserves_original_on_fsync_failure(self, tmp_path, monkeypatch):
+        # A crash mid-write must not corrupt or truncate the existing store.
+        # Previously _save_locked used Path.write_text — a partial write left
+        # the next _load to silently fall back to an empty store.
+        store_path = tmp_path / "iv_expansion.json"
+        c = IVExpansionCalibration(store_path=store_path)
+        c.update(0.5, 3.0)
+        original_bytes = store_path.read_bytes()
+
+        def boom(_fd):
+            raise OSError("simulated crash during fsync")
+
+        monkeypatch.setattr("services.calibration_service.os.fsync", boom)
+        c.update(0.9, 9.0)  # save fails internally, swallowed by outer except
+
+        assert store_path.read_bytes() == original_bytes, (
+            "atomic-write contract broken — original file modified despite fsync failure"
+        )
+        c_reloaded = IVExpansionCalibration(store_path=store_path)
+        assert c_reloaded._n() == 1, "store survived but observation count diverged"
+
+    def test_atomic_write_leaves_no_temp_files(self, tmp_path):
+        store_path = tmp_path / "iv_expansion.json"
+        c = IVExpansionCalibration(store_path=store_path)
+        c.update(0.5, 3.0)
+        c.update(0.6, 4.0)
+
+        siblings = list(store_path.parent.iterdir())
+        stray = [p for p in siblings if p.name.startswith(".") and p.name.endswith(".tmp")]
+        assert stray == [], f"stray temp files after successful writes: {stray}"
+
 
 class TestGetCurveSummary:
     def test_returns_ten_buckets(self, cal):

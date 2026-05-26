@@ -451,3 +451,69 @@ def test_leakage_sentinel_integrated_in_build_structure_scorecards(tmp_path):
     with patch.object(_sps_module, "get_structure_prior_store", return_value=store):
         with pytest.raises(BacktestLeakageError):
             build_structure_scorecards(snapshot, as_of_date=date(2024, 1, 1))
+
+
+# ── Atomic-write contract for StructurePriorStore ─────────────────────────────
+
+
+def test_structure_prior_store_atomic_write_preserves_original_on_fsync_failure(
+    tmp_path, monkeypatch
+):
+    # The persistent priors are the evidence loop's memory.  A crash mid-write
+    # previously truncated structure_priors.json; the next _load fell back to
+    # an empty store, silently destroying weeks of paper-trade observations.
+    store_path = tmp_path / "structure_priors.json"
+    store = StructurePriorStore(store_path=store_path)
+    store.update(
+        structure="atm_straddle",
+        realized_return_pct=5.0,
+        realized_expansion_pct=8.0,
+        source_type="paper",
+        observation_date=date(2024, 6, 1),
+        observation_id="orig",
+    )
+    original_bytes = store_path.read_bytes()
+
+    def boom(_fd):
+        raise OSError("simulated crash during fsync")
+
+    monkeypatch.setattr("services.structure_prior_store.os.fsync", boom)
+    store.update(
+        structure="atm_straddle",
+        realized_return_pct=-3.0,
+        realized_expansion_pct=2.0,
+        source_type="paper",
+        observation_date=date(2024, 6, 2),
+        observation_id="should_not_persist",
+    )
+
+    assert store_path.read_bytes() == original_bytes, (
+        "atomic-write contract broken — original priors file modified despite fsync failure"
+    )
+    # Re-load fresh and inspect raw structure data; get_prior_dict gates on
+    # MIN_OBS_FOR_OVERRIDE, so we read the underlying entry directly.
+    reloaded = StructurePriorStore(store_path=store_path)
+    entry = reloaded._data.get("atm_straddle", {})
+    observations = entry.get("observations", [])
+    assert len(observations) == 1, (
+        f"reloaded store should contain only the pre-crash observation, got {len(observations)}"
+    )
+    assert observations[0]["observation_id"] == "orig"
+
+
+def test_structure_prior_store_atomic_write_leaves_no_temp_files(tmp_path):
+    store_path = tmp_path / "structure_priors.json"
+    store = StructurePriorStore(store_path=store_path)
+    for i in range(3):
+        store.update(
+            structure="atm_straddle",
+            realized_return_pct=float(i),
+            realized_expansion_pct=float(i) * 2.0,
+            source_type="paper",
+            observation_date=date(2024, 1, 1 + i),
+            observation_id=f"obs_{i}",
+        )
+
+    siblings = list(store_path.parent.iterdir())
+    stray = [p for p in siblings if p.name.startswith(".") and p.name.endswith(".tmp")]
+    assert stray == [], f"stray temp files after successful writes: {stray}"
