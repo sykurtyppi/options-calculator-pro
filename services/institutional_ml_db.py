@@ -2221,18 +2221,21 @@ class InstitutionalMLDatabase:
 
                                     # MDApp historical chain data may omit IV/Greeks depending on plan.
                                     # Fallback: derive implied volatility from option price + BSM inversion.
-                                    # Fetch the risk-free rate once per replay batch
-                                    # via the shared services.pricing_rates source of
-                                    # truth. Imported lazily to keep institutional_ml_db
+                                    # Fetch the risk-free rate and per-symbol dividend yield
+                                    # once per replay batch via the shared services.* sources
+                                    # of truth. Imported lazily to keep institutional_ml_db
                                     # importable in environments without yfinance.
                                     from services.pricing_rates import get_pricing_risk_free_rate
+                                    from services.dividend_yields import get_dividend_yield
                                     _replay_rfr, _ = get_pricing_risk_free_rate()
+                                    _replay_q, _ = get_dividend_yield(symbol)
                                     grp["derived_iv"] = grp.apply(
                                         lambda row: self._resolve_row_implied_volatility(
                                             row=row,
                                             underlying_price=snapshot_underlying,
                                             risk_free_rate=_replay_rfr,
                                             snapshot_date=snap_date,
+                                            dividend_yield=_replay_q,
                                         ),
                                         axis=1,
                                     )
@@ -2348,16 +2351,28 @@ class InstitutionalMLDatabase:
         risk_free_rate: float,
         volatility: float,
         is_call: bool,
+        *,
+        dividend_yield: float = 0.0,
     ) -> float:
+        """Merton (1973) BSM extension with continuous dividend yield ``q``.
+
+        ``dividend_yield=0.0`` (default) recovers the legacy zero-dividend
+        BSM behavior, so non-paying names and untouched call sites are
+        unchanged. For dividend-paying names, pass the per-symbol q to
+        avoid biasing call IVs down / put IVs up and to preserve put-call
+        parity in calendar-spread valuation.
+        """
         if (
             not np.isfinite(underlying_price)
             or not np.isfinite(strike)
             or not np.isfinite(time_to_expiry_years)
             or not np.isfinite(volatility)
+            or not np.isfinite(dividend_yield)
             or underlying_price <= 0
             or strike <= 0
             or time_to_expiry_years <= 0
             or volatility <= 0
+            or dividend_yield < 0
         ):
             return float("nan")
 
@@ -2367,14 +2382,15 @@ class InstitutionalMLDatabase:
             return float("nan")
         d1 = (
             math.log(underlying_price / strike)
-            + (risk_free_rate + 0.5 * volatility * volatility) * time_to_expiry_years
+            + (risk_free_rate - dividend_yield + 0.5 * volatility * volatility) * time_to_expiry_years
         ) / sigma_sqrt_t
         d2 = d1 - sigma_sqrt_t
         discounted_strike = strike * math.exp(-risk_free_rate * time_to_expiry_years)
+        discounted_underlying = underlying_price * math.exp(-dividend_yield * time_to_expiry_years)
 
         if is_call:
-            return underlying_price * cls._normal_cdf(d1) - discounted_strike * cls._normal_cdf(d2)
-        return discounted_strike * cls._normal_cdf(-d2) - underlying_price * cls._normal_cdf(-d1)
+            return discounted_underlying * cls._normal_cdf(d1) - discounted_strike * cls._normal_cdf(d2)
+        return discounted_strike * cls._normal_cdf(-d2) - discounted_underlying * cls._normal_cdf(-d1)
 
     @classmethod
     def _implied_volatility_from_price(
@@ -2385,7 +2401,18 @@ class InstitutionalMLDatabase:
         time_to_expiry_years: float,
         risk_free_rate: float,
         is_call: bool,
+        *,
+        dividend_yield: float = 0.0,
     ) -> float:
+        """Bisect for IV under the dividend-aware BSM.
+
+        ``dividend_yield=0.0`` (default) gives the legacy behavior. With a
+        non-zero ``q``, the no-arbitrage bounds shift: the underlying is
+        effectively discounted by ``exp(-q·T)``, which lowers the call's
+        upper bound and floor, and raises the put's accordingly. Without
+        this adjustment, deep-ITM calls on high-yield names report ``nan``
+        because their market price would fall outside the legacy bounds.
+        """
         if (
             not np.isfinite(option_price)
             or option_price <= 0
@@ -2395,22 +2422,33 @@ class InstitutionalMLDatabase:
             or strike <= 0
             or not np.isfinite(time_to_expiry_years)
             or time_to_expiry_years <= 0
+            or not np.isfinite(dividend_yield)
+            or dividend_yield < 0
         ):
             return float("nan")
 
         discounted_strike = strike * math.exp(-risk_free_rate * time_to_expiry_years)
-        intrinsic = max(underlying_price - strike, 0.0) if is_call else max(strike - underlying_price, 0.0)
-        upper_bound = underlying_price if is_call else discounted_strike
+        discounted_underlying = underlying_price * math.exp(-dividend_yield * time_to_expiry_years)
+        # No-arbitrage bounds: C ∈ [max(S·e^(-qT) - K·e^(-rT), 0), S·e^(-qT)],
+        # P ∈ [max(K·e^(-rT) - S·e^(-qT), 0), K·e^(-rT)].
+        if is_call:
+            intrinsic = max(discounted_underlying - discounted_strike, 0.0)
+            upper_bound = discounted_underlying
+        else:
+            intrinsic = max(discounted_strike - discounted_underlying, 0.0)
+            upper_bound = discounted_strike
         if option_price <= intrinsic + 1e-8 or option_price >= upper_bound:
             return float("nan")
 
         low_vol = 1e-4
         high_vol = 5.0
         low_price = cls._black_scholes_price(
-            underlying_price, strike, time_to_expiry_years, risk_free_rate, low_vol, is_call
+            underlying_price, strike, time_to_expiry_years, risk_free_rate, low_vol, is_call,
+            dividend_yield=dividend_yield,
         )
         high_price = cls._black_scholes_price(
-            underlying_price, strike, time_to_expiry_years, risk_free_rate, high_vol, is_call
+            underlying_price, strike, time_to_expiry_years, risk_free_rate, high_vol, is_call,
+            dividend_yield=dividend_yield,
         )
         if not np.isfinite(low_price) or not np.isfinite(high_price):
             return float("nan")
@@ -2420,7 +2458,8 @@ class InstitutionalMLDatabase:
         for _ in range(80):
             mid_vol = 0.5 * (low_vol + high_vol)
             mid_price = cls._black_scholes_price(
-                underlying_price, strike, time_to_expiry_years, risk_free_rate, mid_vol, is_call
+                underlying_price, strike, time_to_expiry_years, risk_free_rate, mid_vol, is_call,
+                dividend_yield=dividend_yield,
             )
             if not np.isfinite(mid_price):
                 return float("nan")
@@ -2462,6 +2501,7 @@ class InstitutionalMLDatabase:
         *,
         risk_free_rate: float,
         snapshot_date: Optional[date] = None,
+        dividend_yield: float = 0.0,
     ) -> float:
         iv = pd.to_numeric(pd.Series([row.get("impliedVolatility")]), errors="coerce").iloc[0]
         if np.isfinite(iv) and iv > 0:
@@ -2496,6 +2536,7 @@ class InstitutionalMLDatabase:
                 time_to_expiry_years=float(dte) / 365.0,
                 risk_free_rate=float(risk_free_rate),
                 is_call=True,
+                dividend_yield=float(dividend_yield),
             )
             if np.isfinite(call_iv) and call_iv > 0:
                 return float(call_iv)
@@ -2506,6 +2547,7 @@ class InstitutionalMLDatabase:
                 time_to_expiry_years=float(dte) / 365.0,
                 risk_free_rate=float(risk_free_rate),
                 is_call=False,
+                dividend_yield=float(dividend_yield),
             )
             return float(put_iv) if np.isfinite(put_iv) and put_iv > 0 else float("nan")
 
@@ -2516,6 +2558,7 @@ class InstitutionalMLDatabase:
             time_to_expiry_years=float(dte) / 365.0,
             risk_free_rate=float(risk_free_rate),
             is_call=(side == "call"),
+            dividend_yield=float(dividend_yield),
         )
 
     def _extract_atm_iv_from_chain(self, option_chain: Any, underlying_price: float) -> Tuple[float, float]:
@@ -2634,8 +2677,15 @@ class InstitutionalMLDatabase:
         front_iv: float,
         back_iv: float,
         risk_free_rate: float,
+        dividend_yield: float = 0.0,
     ) -> float:
-        """Approximate calendar spread market value from snapshot IVs using BSM."""
+        """Approximate calendar spread market value from snapshot IVs using BSM.
+
+        ``dividend_yield=0.0`` (default) preserves the legacy zero-dividend
+        behavior for non-paying names. For dividend-paying names, pass the
+        per-symbol q so both legs are priced under the same dividend regime
+        and put-call parity is preserved across the spread.
+        """
         as_of = pd.Timestamp(as_of_date).date()
         short_exp = pd.Timestamp(short_expiry).date()
         long_exp = pd.Timestamp(long_expiry).date()
@@ -2653,6 +2703,7 @@ class InstitutionalMLDatabase:
                 risk_free_rate=risk_free_rate,
                 volatility=front_iv,
                 is_call=True,
+                dividend_yield=dividend_yield,
             )
         else:
             short_call = max(underlying_price - strike, 0.0)
@@ -2665,6 +2716,7 @@ class InstitutionalMLDatabase:
                 risk_free_rate=risk_free_rate,
                 volatility=back_iv,
                 is_call=True,
+                dividend_yield=dividend_yield,
             )
         else:
             long_call = max(underlying_price - strike, 0.0)
@@ -2687,11 +2739,14 @@ class InstitutionalMLDatabase:
         volume_ratio: Optional[float] = None,
     ) -> Optional[BacktestTrade]:
         """Replay a calendar trade from stored pre/post earnings snapshots."""
-        # Single rate read for both pre and post pricing — keeps entry/exit
-        # priced under the same regime even if the cache TTL flips between
-        # the two calls.
+        # Single rate + dividend read for both pre and post pricing — keeps
+        # entry/exit priced under the same regime even if the cache TTL flips
+        # between the two calls. Dividend yield is per-symbol; risk-free rate
+        # is market-wide.
         from services.pricing_rates import get_pricing_risk_free_rate
+        from services.dividend_yields import get_dividend_yield
         _trade_rfr, _ = get_pricing_risk_free_rate()
+        _trade_q, _ = get_dividend_yield(snapshot_pair.symbol)
         entry_value = self._calendar_spread_market_value_from_snapshot(
             underlying_price=snapshot_pair.pre_underlying_price,
             strike=snapshot_pair.atm_strike,
@@ -2701,6 +2756,7 @@ class InstitutionalMLDatabase:
             front_iv=snapshot_pair.pre_front_iv,
             back_iv=snapshot_pair.pre_back_iv,
             risk_free_rate=_trade_rfr,
+            dividend_yield=_trade_q,
         )
         exit_value = self._calendar_spread_market_value_from_snapshot(
             underlying_price=snapshot_pair.post_underlying_price,
@@ -2711,6 +2767,7 @@ class InstitutionalMLDatabase:
             front_iv=snapshot_pair.post_front_iv,
             back_iv=snapshot_pair.post_back_iv,
             risk_free_rate=_trade_rfr,
+            dividend_yield=_trade_q,
         )
         if not np.isfinite(entry_value) or not np.isfinite(exit_value) or entry_value <= 0:
             return None
