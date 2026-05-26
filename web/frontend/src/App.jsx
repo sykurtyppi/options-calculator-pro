@@ -647,6 +647,10 @@ export default function App() {
   const [oosElapsedSec, setOosElapsedSec] = useState(0)
   // Polling interval ref — cleared when job completes, errors, or user cancels.
   const oosIntervalRef = useRef(null)
+  // AbortController for the in-flight /api/edge/analyze fetch. A fresh
+  // analysis request aborts whatever was previously in-flight so a slow
+  // older response can't land last and clobber the newer result.
+  const analyzeAbortRef = useRef(null)
   const [warehouse, setWarehouse] = useState({
     available: false,
     symbols: [],
@@ -742,22 +746,42 @@ export default function App() {
     const s = (sym || normalizedSymbol).trim().toUpperCase()
     if (!s) return
     if (sym) setSymbol(sym)
+
+    // Cancel any in-flight analyze fetch so a slow older response can't
+    // land after a newer one and overwrite setResult/setError with stale
+    // data. This was a real race when the user clicked tickers rapidly.
+    if (analyzeAbortRef.current) {
+      analyzeAbortRef.current.abort()
+    }
+    const controller = new AbortController()
+    analyzeAbortRef.current = controller
+
     setError(''); setLoading(true); setResult(null)
     try {
       const res = await fetch(`${API_BASE}/api/edge/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol: s }),
+        signal: controller.signal,
       })
+      if (controller.signal.aborted) return
       if (!res.ok) {
         const b = await res.json().catch(() => ({}))
         throw new Error(b.detail || `HTTP ${res.status}`)
       }
       setResult(await res.json())
     } catch (err) {
+      // AbortError is expected when a newer request superseded this one —
+      // silently drop it; the newer call owns the UI state now.
+      if (err && err.name === 'AbortError') return
       setError(String(err.message || err))
     } finally {
-      setLoading(false)
+      // Only release loading/ref state if we're still the current
+      // in-flight call. If a newer call took over, leave its state alone.
+      if (analyzeAbortRef.current === controller) {
+        analyzeAbortRef.current = null
+        setLoading(false)
+      }
     }
   }
 
