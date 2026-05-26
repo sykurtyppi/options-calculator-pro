@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 import CalibrationInsight from './CalibrationInsight'
 import ExpiryModeToggle from './ExpiryModeToggle'
@@ -67,7 +67,13 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
   const [data, setData] = useState(null)
   const [selectedKey, setSelectedKey] = useState('')
   const [detailCache, setDetailCache] = useState({})
+  // `detailLoadingKey` is the UI-visible loading indicator (state, so the
+  // detail panel re-renders when it changes). `detailLoadingKeyRef` mirrors
+  // it but stays out of the detail-fetch useEffect's dependency array — the
+  // effect MUST NOT re-run when this changes (see the cleanup-aborts-itself
+  // bug fixed in PR-U).
   const [detailLoadingKey, setDetailLoadingKey] = useState('')
+  const detailLoadingKeyRef = useRef('')
 
   // ── Ranked setups state ───────────────────────────────────────────────────
   const [rankedFilters, setRankedFilters] = useState(DEFAULT_RANKED_FILTERS)
@@ -153,14 +159,29 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
   useEffect(() => {
     if (!selectedRow) return
     const cacheKey = `${selectedRow.symbol}-${selectedRow.expiry_mode}`
-    if (detailCache[cacheKey] || detailLoadingKey === cacheKey) return
+    // Read the loading key through the ref, NOT through the state — see the
+    // PR-U comment block below for why this matters.
+    if (detailCache[cacheKey] || detailLoadingKeyRef.current === cacheKey) return
 
-    // PR-R: AbortController replaces the prior soft `cancelled` flag. The
-    // soft flag prevented stale results from overwriting state but left
-    // the in-flight network request to complete server-side — slow if
-    // the user clicked row→row→row quickly. AbortController cancels at
-    // the transport layer so the older request is dropped immediately.
+    // PR-R: AbortController cancels the in-flight fetch at the transport
+    // layer the moment a newer row supersedes this one — so older requests
+    // can't waste bandwidth or land late and overwrite UI state.
+    //
+    // PR-U: `detailLoadingKey` used to be in this effect's dependency
+    // array AND be set inside the effect via setDetailLoadingKey(cacheKey).
+    // That combination self-triggered: the state update caused React to
+    // run THIS effect's cleanup (abort()) immediately, then re-run the
+    // effect, which early-exited via `detailLoadingKey === cacheKey`. Net
+    // result: every single click aborted its own fetch, the detail panel
+    // showed "loading…" forever, and detailCache was never populated.
+    //
+    // The fix moves the "are we already fetching this row?" check to a
+    // ref (which doesn't trigger re-renders or dep changes) and keeps the
+    // state purely for driving the UI loading indicator. The effect's
+    // deps array no longer contains anything that the effect itself
+    // mutates.
     const controller = new AbortController()
+    detailLoadingKeyRef.current = cacheKey
     setDetailLoadingKey(cacheKey)
 
     fetch(`${apiBase}/api/edge/analyze`, {
@@ -193,13 +214,16 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
         }))
       })
       .finally(() => {
-        if (!controller.signal.aborted) setDetailLoadingKey('')
+        if (!controller.signal.aborted) {
+          detailLoadingKeyRef.current = ''
+          setDetailLoadingKey('')
+        }
       })
 
     return () => {
       controller.abort()
     }
-  }, [apiBase, detailCache, detailLoadingKey, selectedRow])
+  }, [apiBase, detailCache, selectedRow])
 
   const detailState = selectedRow
     ? detailCache[`${selectedRow.symbol}-${selectedRow.expiry_mode}`] || { loading: detailLoadingKey === `${selectedRow.symbol}-${selectedRow.expiry_mode}` }
