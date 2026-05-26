@@ -26,6 +26,33 @@ Step 2 — Variance-additive event split, in calendar time.
                                − non_event_move_pct²
     where both terms are 1σ-form on calendar time.
 
+Known bias — calendar vs trading days
+    σ_HAR is annualised via realized-vol kernels using √252 (trading-day
+    basis). The calendar-day formula here scales it by √(T_calendar/365),
+    which implicitly assumes the trading-to-calendar-day ratio in the
+    window equals 252/365 ≈ 0.690. In practice that ratio drifts:
+        7 calendar days  → 5 trading days   → ratio 0.71 (slightly above)
+        21 calendar days → ~15 trading days → ratio 0.71 (slightly above)
+        across long weekends / holidays     → ratio can fall to 0.50-0.60
+    The downstream impact on event_implied_move_pct is typically <1% for
+    clean Mon-Fri windows and 2-5% across long weekends or holiday weeks.
+    Direction: calendar-day over-attributes variance to non-event diffusion
+    (when the ratio is below 252/365), which slightly understates event_move.
+
+    Worked example: 7-day setup, σ_annual = 0.20, near_term_implied_move
+    = 5.0 (MAD-form → σ_implied = 6.27%). Calendar-day decomposition
+    yields event_move = 5.72%; a 4-trading-day-diffusion variant yields
+    5.74%. Difference here ≈ 0.35% relative. Wider for windows that span
+    Memorial Day, Thanksgiving, etc.
+
+    The cleanest fix is to count actual trading days in the sub-window
+    (Mon-Fri, holiday-aware) and use T_trading/252. That fix is deferred
+    because (a) the bias magnitude is small relative to other selector
+    noise, (b) introducing a market-calendar dependency requires its own
+    design pass. Documented here so the next person investigating
+    unexpectedly-low event_implied_move values across holiday weeks has
+    the context.
+
 Inputs and outputs are scaled to PERCENT of underlying (e.g. 5.0 → 5%).
 """
 from __future__ import annotations
