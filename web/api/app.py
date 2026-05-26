@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Tuple
 import sys
@@ -66,6 +67,15 @@ _SECURE_SESSION_COOKIE = (
 _MAX_OOS_RUNNING_JOBS = max(1, int(os.getenv("OPTIONS_CALCULATOR_MAX_OOS_RUNNING_JOBS", "1")))
 _MAX_ML_RUNNING_JOBS = max(1, int(os.getenv("OPTIONS_CALCULATOR_MAX_ML_RUNNING_JOBS", "1")))
 _MAX_RETAINED_JOBS = max(10, int(os.getenv("OPTIONS_CALCULATOR_MAX_RETAINED_JOBS", "100")))
+
+# Per-IP rate limit on POST /login. Both windows are checked; either trips
+# a 429. Defaults (5/min, 30/hour) accommodate normal use while bounding
+# brute-force throughput against a weak access code by ~3 orders of
+# magnitude versus an unbounded loop.
+_LOGIN_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_LOGIN_RATE_LIMIT_PER_MIN", "5")))
+_LOGIN_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_LOGIN_RATE_LIMIT_PER_HOUR", "30")))
+_login_attempts: Dict[str, List[float]] = {}
+_login_attempts_lock = threading.Lock()
 
 # Paths that don't require authentication
 _PUBLIC_PATHS = {"/login", "/favicon.ico", "/api/health"}
@@ -210,6 +220,51 @@ def _valid_session(cookie_val: str) -> bool:
         return False
 
 
+def _client_ip(request: Request) -> str:
+    """Return the client IP for rate-limiting purposes.
+
+    Solo / single-host deployments hit this with ``request.client.host``.
+    Behind a trusted reverse proxy, X-Forwarded-For would be the right
+    source — but that requires deployment-side trust configuration, so
+    we deliberately don't honour it here to avoid spoofing.
+    """
+    return request.client.host if request.client else "unknown"
+
+
+def _check_login_rate_limit(ip: str) -> bool:
+    """Return True if this IP is under both rate limits, False otherwise.
+
+    Counts every login attempt (success or failure) — a successful login
+    doesn't reset the counter, so brute force can't hide behind an
+    eventual win. The two windows (1 min, 1 hour) trip independently;
+    either limit blocks further attempts until the window slides.
+
+    Module-state ``_login_attempts`` is bounded only by IP cardinality;
+    a memory-pressure attacker could enumerate IPs, but they'd need at
+    least one TCP connection per IP — a much larger cost than the
+    bookkeeping. For the solo-deploy threat model this is fine.
+    """
+    now = time.time()
+    cutoff_min = now - 60.0
+    cutoff_hour = now - 3600.0
+    with _login_attempts_lock:
+        attempts = _login_attempts.setdefault(ip, [])
+        attempts[:] = [t for t in attempts if t >= cutoff_hour]
+        recent_min = sum(1 for t in attempts if t >= cutoff_min)
+        if recent_min >= _LOGIN_RATE_LIMIT_PER_MIN:
+            return False
+        if len(attempts) >= _LOGIN_RATE_LIMIT_PER_HOUR:
+            return False
+        attempts.append(now)
+        return True
+
+
+def _reset_login_rate_limit() -> None:
+    """Drop all per-IP login-attempt history. Primarily for tests."""
+    with _login_attempts_lock:
+        _login_attempts.clear()
+
+
 def _parse_symbol_universe(symbols: Optional[str], default_universe: List[str]) -> List[str]:
     universe = (
         [s.strip().upper() for s in symbols.split(",") if s.strip()]
@@ -336,6 +391,18 @@ async def login_page():
 
 @app.post("/login", response_class=HTMLResponse, include_in_schema=False)
 async def login_submit(request: Request):
+    ip = _client_ip(request)
+    if not _check_login_rate_limit(ip):
+        # Don't disclose the limit values in the response — a tighter
+        # message gives an attacker less feedback.
+        return HTMLResponse(
+            _LOGIN_HTML.replace(
+                "{{ERROR}}",
+                "Too many login attempts. Wait a minute and try again.",
+            ),
+            status_code=429,
+        )
+
     form = await request.form()
     password = form.get("password", "")
     if _SHARE_AUTH_ENABLED and _SHARE_PASSWORD and hmac.compare_digest(str(password), _SHARE_PASSWORD):

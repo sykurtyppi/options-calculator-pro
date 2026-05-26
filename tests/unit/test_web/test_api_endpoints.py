@@ -301,6 +301,9 @@ class _SampleBottleneckStubCollector:
 class TestApiEndpoints(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app_module.app)
+        # The per-IP login rate limiter (PR-P) is module-level state. Reset
+        # it between tests so tests that hit /login don't poison each other.
+        app_module._reset_login_rate_limit()
 
     def test_health_endpoint(self):
         response = self.client.get("/api/health")
@@ -437,6 +440,71 @@ class TestApiEndpoints(unittest.TestCase):
                         now=datetime.now(timezone.utc) + timedelta(seconds=1000)
                     )
                     self.assertFalse(app_module._valid_session(token))
+
+    # ── PR-P: /login rate limiting ────────────────────────────────────────────
+
+    def test_login_rate_limit_blocks_after_per_minute_limit(self):
+        """A handful of attempts succeed; the next one in the same minute
+        returns 429 without ever checking the password."""
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True), \
+             patch.object(app_module, "_SHARE_PASSWORD", "secret"), \
+             patch.object(app_module, "_SESSION_SECRET", "x" * 32), \
+             patch.object(app_module, "_LOGIN_RATE_LIMIT_PER_MIN", 3), \
+             patch.object(app_module, "_LOGIN_RATE_LIMIT_PER_HOUR", 100):
+            statuses = []
+            for _ in range(4):
+                response = self.client.post(
+                    "/login", data={"password": "wrong"}, follow_redirects=False
+                )
+                statuses.append(response.status_code)
+
+        # First 3 attempts go through the password check (401 — wrong).
+        # The 4th is blocked by the rate limiter (429).
+        self.assertEqual(statuses[:3], [401, 401, 401])
+        self.assertEqual(statuses[3], 429)
+
+    def test_login_rate_limit_blocks_even_successful_attempts(self):
+        """Brute force can't hide behind an eventual win — successful logins
+        still count toward the limit."""
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True), \
+             patch.object(app_module, "_SHARE_PASSWORD", "secret"), \
+             patch.object(app_module, "_SESSION_SECRET", "x" * 32), \
+             patch.object(app_module, "_LOGIN_RATE_LIMIT_PER_MIN", 2), \
+             patch.object(app_module, "_LOGIN_RATE_LIMIT_PER_HOUR", 100):
+            r1 = self.client.post("/login", data={"password": "secret"}, follow_redirects=False)
+            r2 = self.client.post("/login", data={"password": "secret"}, follow_redirects=False)
+            r3 = self.client.post("/login", data={"password": "secret"}, follow_redirects=False)
+
+        self.assertEqual(r1.status_code, 303)  # success
+        self.assertEqual(r2.status_code, 303)  # success
+        self.assertEqual(r3.status_code, 429)  # blocked despite valid password
+
+    def test_login_rate_limit_response_does_not_leak_password(self):
+        """The 429 response must not echo the submitted password."""
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True), \
+             patch.object(app_module, "_SHARE_PASSWORD", "secret"), \
+             patch.object(app_module, "_SESSION_SECRET", "x" * 32), \
+             patch.object(app_module, "_LOGIN_RATE_LIMIT_PER_MIN", 1):
+            self.client.post("/login", data={"password": "very-confidential-pw"})
+            blocked = self.client.post(
+                "/login", data={"password": "very-confidential-pw"}, follow_redirects=False
+            )
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertNotIn("very-confidential-pw", blocked.text)
+
+    def test_login_rate_limit_helper_resets_between_tests(self):
+        """Sanity check: _reset_login_rate_limit() actually clears state.
+        Without this guard, the test suite would self-poison."""
+        app_module._reset_login_rate_limit()
+        # Reach the limit at min=1.
+        with patch.object(app_module, "_LOGIN_RATE_LIMIT_PER_MIN", 1):
+            self.assertTrue(app_module._check_login_rate_limit("203.0.113.5"))
+            self.assertFalse(app_module._check_login_rate_limit("203.0.113.5"))
+        # Reset and confirm we can attempt again.
+        app_module._reset_login_rate_limit()
+        with patch.object(app_module, "_LOGIN_RATE_LIMIT_PER_MIN", 1):
+            self.assertTrue(app_module._check_login_rate_limit("203.0.113.5"))
 
     def test_edge_analyze_error_is_sanitized(self):
         # Guard: _get_mda_client MUST be patched here.  Without it the external-IO
