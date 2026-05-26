@@ -18,6 +18,7 @@ import os
 import json
 import itertools
 import math
+import threading
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 import pandas as pd
@@ -4686,11 +4687,20 @@ class InstitutionalMLDatabase:
                                  train_days: int = 252,
                                  test_days: int = 63,
                                  step_days: int = 63,
-                                 top_n_train: int = 1) -> pd.DataFrame:
+                                 top_n_train: int = 1,
+                                 cancel_event: Optional["threading.Event"] = None) -> pd.DataFrame:
         """
         Run rolling out-of-sample validation:
         - Tune params on each train window via sweep
         - Apply best train params on subsequent test window
+
+        ``cancel_event`` (PR-N): an optional ``threading.Event`` polled at
+        the top of every rolling-window iteration. When set, the loop
+        breaks cleanly and returns whatever rows it has accumulated so
+        far (possibly an empty frame). Callers using
+        ``_run_oos_with_timeout`` in the FastAPI layer pass an Event so
+        wall-clock timeouts can release the worker thread instead of
+        orphaning it with all its pandas/duckdb memory.
         """
         try:
             train_days = max(63, int(train_days))
@@ -4718,6 +4728,14 @@ class InstitutionalMLDatabase:
             split_index = 1
 
             while split_start + timedelta(days=train_days + test_days) <= max_date:
+                # PR-N: cooperative cancellation check. Polled once per split
+                # (the natural unit of work). A cancel here stops further
+                # train/test work; rows already collected are returned.
+                if cancel_event is not None and cancel_event.is_set():
+                    self.logger.info(
+                        "OOS rolling validation cancelled at split %d", split_index
+                    )
+                    break
                 train_start = split_start
                 train_end = train_start + timedelta(days=train_days - 1)
                 test_start = train_end + timedelta(days=1)

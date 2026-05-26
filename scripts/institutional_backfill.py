@@ -23,6 +23,7 @@ import sys
 import os
 import json
 import sqlite3
+import threading
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -2332,8 +2333,16 @@ class InstitutionalDataCollector:
                          min_trades_per_split: float = 5.0,
                          output_dir: str = "exports/reports",
                          start_date: Optional[str] = None,
-                         end_date: Optional[str] = None) -> Optional[dict]:
-        """Run rolling out-of-sample validation and export results."""
+                         end_date: Optional[str] = None,
+                         cancel_event: Optional["threading.Event"] = None) -> Optional[dict]:
+        """Run rolling out-of-sample validation and export results.
+
+        ``cancel_event`` (PR-N): forwarded to ``run_rolling_oos_validation``.
+        When set during a long run, the rolling loop returns early with
+        whatever data it has so far; this entry point then returns
+        ``None`` if no rows were produced, matching the existing
+        "no usable result" contract.
+        """
         execution_profiles = [p.strip().lower() for p in execution_profiles if p.strip()]
         hold_days_grid = [max(1, int(v)) for v in hold_days_grid]
         signal_threshold_grid = [max(0.0, min(1.0, float(v))) for v in signal_threshold_grid]
@@ -2400,6 +2409,7 @@ class InstitutionalDataCollector:
             test_days=test_days,
             step_days=step_days,
             top_n_train=top_n_train,
+            cancel_event=cancel_event,
         )
         if oos_df.empty:
             self.logger.warning("⚠️ OOS validation produced no rows")
