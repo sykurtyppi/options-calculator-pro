@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import uuid
 from datetime import date, datetime, timezone
@@ -69,8 +70,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STORE = (
-    Path.home() / ".options_calculator_pro" / "priors" / "structure_priors.json"
+_DEFAULT_STORE = Path(
+    os.environ.get("OPTIONS_CALCULATOR_PRIORS_PATH", "")
+    or Path.home() / ".options_calculator_pro" / "priors" / "structure_priors.json"
 )
 _WRITE_LOCK = threading.Lock()
 

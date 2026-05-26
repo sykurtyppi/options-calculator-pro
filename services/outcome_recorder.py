@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -44,8 +45,9 @@ from typing import Any, Dict, Generator, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STORE = (
-    Path.home() / ".options_calculator_pro" / "outcomes" / "outcome_store.sqlite"
+_DEFAULT_STORE = Path(
+    os.environ.get("OPTIONS_CALCULATOR_OUTCOMES_PATH", "")
+    or Path.home() / ".options_calculator_pro" / "outcomes" / "outcome_store.sqlite"
 )
 _WRITE_LOCK = threading.Lock()
 

@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import pathlib
 import threading
 from collections import Counter
@@ -48,7 +49,10 @@ logger = logging.getLogger(__name__)
 
 # ── Persistence path ──────────────────────────────────────────────────────────
 
-_DEFAULT_STORE = pathlib.Path.home() / ".options_calculator_pro" / "calibration" / "iv_expansion.json"
+_DEFAULT_STORE = pathlib.Path(
+    os.environ.get("OPTIONS_CALCULATOR_CALIBRATION_PATH", "")
+    or pathlib.Path.home() / ".options_calculator_pro" / "calibration" / "iv_expansion.json"
+)
 
 # ── Bootstrap prior ───────────────────────────────────────────────────────────
 # Research-grounded estimates for the pre-earnings long-vega strategy.
