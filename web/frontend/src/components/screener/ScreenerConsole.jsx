@@ -155,13 +155,19 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
     const cacheKey = `${selectedRow.symbol}-${selectedRow.expiry_mode}`
     if (detailCache[cacheKey] || detailLoadingKey === cacheKey) return
 
-    let cancelled = false
+    // PR-R: AbortController replaces the prior soft `cancelled` flag. The
+    // soft flag prevented stale results from overwriting state but left
+    // the in-flight network request to complete server-side — slow if
+    // the user clicked row→row→row quickly. AbortController cancels at
+    // the transport layer so the older request is dropped immediately.
+    const controller = new AbortController()
     setDetailLoadingKey(cacheKey)
 
     fetch(`${apiBase}/api/edge/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ symbol: selectedRow.symbol }),
+      signal: controller.signal,
     })
       .then(async (response) => {
         if (!response.ok) {
@@ -171,25 +177,27 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
         return response.json()
       })
       .then((payload) => {
-        if (cancelled) return
+        if (controller.signal.aborted) return
         setDetailCache((current) => ({
           ...current,
           [cacheKey]: { loading: false, error: '', result: payload },
         }))
       })
       .catch((detailError) => {
-        if (cancelled) return
+        // AbortError fires on cleanup when a newer row takes over —
+        // expected and ignored.
+        if (controller.signal.aborted || (detailError && detailError.name === 'AbortError')) return
         setDetailCache((current) => ({
           ...current,
           [cacheKey]: { loading: false, error: String(detailError.message || detailError), result: null },
         }))
       })
       .finally(() => {
-        if (!cancelled) setDetailLoadingKey('')
+        if (!controller.signal.aborted) setDetailLoadingKey('')
       })
 
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [apiBase, detailCache, detailLoadingKey, selectedRow])
 
