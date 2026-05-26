@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -362,6 +363,33 @@ class TestApiEndpoints(unittest.TestCase):
         set_cookie = response.headers.get("set-cookie", "")
         self.assertIn("HttpOnly", set_cookie)
         self.assertIn("Secure", set_cookie)
+
+    def test_login_cookie_is_nonce_based_and_validates(self):
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                with patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+                    first = self.client.post("/login", data={"password": "secret"}, follow_redirects=False)
+                    second = self.client.post("/login", data={"password": "secret"}, follow_redirects=False)
+
+        first_cookie = first.cookies.get(app_module._SESSION_COOKIE)
+        second_cookie = second.cookies.get(app_module._SESSION_COOKIE)
+        self.assertIsNotNone(first_cookie)
+        self.assertIsNotNone(second_cookie)
+        self.assertNotEqual(first_cookie, second_cookie)
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                with patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+                    self.assertTrue(app_module._valid_session(first_cookie))
+
+    def test_expired_login_cookie_is_rejected(self):
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                with patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+                    with patch.object(app_module, "_SESSION_MAX_AGE", 10):
+                        token = app_module._session_token(
+                            now=datetime.now(timezone.utc) - timedelta(seconds=11)
+                        )
+                        self.assertFalse(app_module._valid_session(token))
 
     def test_edge_analyze_error_is_sanitized(self):
         # Guard: _get_mda_client MUST be patched here.  Without it the external-IO
@@ -876,6 +904,23 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(payload["in_entry_window"], 2)
         self.assertIn("ranking_weights", payload)
         self.assertAlmostEqual(payload["ranking_weights"]["iv_entry_score"], 0.32)
+
+    def test_ranked_screener_rejects_invalid_or_excessive_symbol_universe(self):
+        with patch("services.screener_service.build_ranked_screener") as build_mock:
+            invalid = self.client.get("/api/screener/ranked?symbols=AAPL,$BAD")
+            too_many_symbols = ",".join(f"A{i}" for i in range(app_module._MAX_SCREENER_SYMBOLS + 1))
+            excessive = self.client.get(f"/api/screener/ranked?symbols={too_many_symbols}")
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(excessive.status_code, 400)
+        build_mock.assert_not_called()
+
+    def test_ranked_screener_rejects_inverted_dte_window(self):
+        with patch("services.screener_service.build_ranked_screener") as build_mock:
+            response = self.client.get("/api/screener/ranked?dte_min=20&dte_max=10")
+
+        self.assertEqual(response.status_code, 400)
+        build_mock.assert_not_called()
 
     def test_calibration_curve_endpoint_returns_ten_buckets(self):
         """GET /api/calibration/curve should return 10 score buckets."""
