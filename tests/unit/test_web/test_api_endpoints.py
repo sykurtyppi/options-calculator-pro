@@ -391,6 +391,53 @@ class TestApiEndpoints(unittest.TestCase):
                         )
                         self.assertFalse(app_module._valid_session(token))
 
+    def test_tampered_signature_is_rejected(self):
+        # Flip a hex char in the signature segment of a valid cookie; the HMAC
+        # check must reject it. Without this, a future refactor that breaks
+        # signature verification could still pass the uniqueness + expiry tests.
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                with patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+                    token = app_module._session_token()
+                    version, issued_at, nonce, signature = token.split(".", 3)
+                    flipped = "0" if signature[0] != "0" else "1"
+                    bad = f"{version}.{issued_at}.{nonce}.{flipped}{signature[1:]}"
+                    self.assertFalse(app_module._valid_session(bad))
+
+    def test_tampered_issued_at_is_rejected(self):
+        # Re-stamp the issued_at to a different value while keeping the original
+        # signature. The signature was computed over the original payload, so it
+        # must no longer validate.
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                with patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+                    token = app_module._session_token()
+                    version, issued_at, nonce, signature = token.split(".", 3)
+                    bumped = str(int(issued_at) + 1)
+                    bad = f"{version}.{bumped}.{nonce}.{signature}"
+                    self.assertFalse(app_module._valid_session(bad))
+
+    def test_tampered_nonce_is_rejected(self):
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                with patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+                    token = app_module._session_token()
+                    version, issued_at, nonce, signature = token.split(".", 3)
+                    flipped = "0" if nonce[0] != "0" else "1"
+                    bad = f"{version}.{issued_at}.{flipped}{nonce[1:]}.{signature}"
+                    self.assertFalse(app_module._valid_session(bad))
+
+    def test_future_dated_login_cookie_is_rejected(self):
+        # A cookie stamped 1000s in the future indicates either clock skew or
+        # forgery; both should fail closed. Guards the `age < 0` branch.
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                with patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+                    token = app_module._session_token(
+                        now=datetime.now(timezone.utc) + timedelta(seconds=1000)
+                    )
+                    self.assertFalse(app_module._valid_session(token))
+
     def test_edge_analyze_error_is_sanitized(self):
         # Guard: _get_mda_client MUST be patched here.  Without it the external-IO
         # gate raises ExternalIOBlocked before analyze_single_ticker is ever reached,
@@ -440,6 +487,21 @@ class TestApiEndpoints(unittest.TestCase):
         _, kwargs = mock_build.call_args
         self.assertEqual(kwargs["expiry_mode"], "next_monthly_opex")
         self.assertEqual(kwargs["weeks"], 8)
+
+    def test_edge_screener_rejects_out_of_range_weeks(self):
+        # Without bounds, weeks=10000 fanned out to a 192-year lookahead
+        # via build_edge_screener — DoS / credit-burn vector against the
+        # MarketData client. Validation must reject before the expensive
+        # call is dispatched.
+        with patch.object(app_module, "build_edge_screener",
+                          return_value=_stub_screener_payload()) as mock_build, \
+             patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()):
+            too_many = self.client.get("/api/edge/screener?weeks=10000")
+            zero = self.client.get("/api/edge/screener?weeks=0")
+
+        self.assertEqual(too_many.status_code, 422)
+        self.assertEqual(zero.status_code, 422)
+        mock_build.assert_not_called()
 
     def test_edge_analyze_endpoint(self):
         snapshot = EdgeSnapshot(
