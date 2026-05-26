@@ -1311,7 +1311,7 @@ def run_forward_screener(
             "entry_execution_scenarios": entry_execution_scenarios,
             "recommendation_id": recommendation_id,
         }
-        trade_id = make_trade_id(symbol, as_of, structure)
+        trade_id = make_trade_id(symbol, as_of, structure, earnings_date=earnings_date)
 
         inserted = True
         if not dry_run:

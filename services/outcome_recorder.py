@@ -560,16 +560,44 @@ class OutcomeStore:
 # ── Utility functions ──────────────────────────────────────────────────────────
 
 
-def make_trade_id(symbol: str, entry_date: date, structure: str) -> str:
+def make_trade_id(
+    symbol: str,
+    entry_date: date,
+    structure: str,
+    earnings_date: Optional[date] = None,
+) -> str:
     """
-    Generate a deterministic, stable trade_id from the three identity fields.
+    Generate a deterministic, stable trade_id from the trade's identity fields.
 
     The same inputs always produce the same ID, which makes repeated calls
     to seed_outcomes_from_replay idempotent (INSERT OR IGNORE catches dupes).
 
-    Format: ``{SYMBOL}|{YYYY-MM-DD}|{structure}``
+    Format depends on whether earnings_date is provided:
+
+    - New (preferred): ``{SYMBOL}|{YYYY-MM-DD entry}|{YYYY-MM-DD earnings}|{structure}``
+    - Legacy: ``{SYMBOL}|{YYYY-MM-DD entry}|{structure}``
+
+    The new 4-field form prevents collisions between trades on the same
+    symbol/structure/entry-date around different earnings events — a real
+    case for tickers with multiple back-to-back earnings releases or for
+    re-recordings that shift entry by a day. Callers that don't pass
+    earnings_date keep the legacy 3-field format, so existing trade_ids
+    in the outcome store remain addressable by their original keys.
+
+    Backward compatibility
+    ----------------------
+    Callers that previously stored a trade with the legacy 3-field id can
+    keep retrieving it by calling ``make_trade_id(symbol, entry_date,
+    structure)`` (no earnings_date) — bit-identical to the old behavior.
+    New code passing earnings_date gets the 4-field form. Reads-by-id
+    work for both formats since the trade_id is just the primary key.
     """
-    return f"{symbol.upper()}|{_fmt_date(entry_date)}|{structure}"
+    if earnings_date is None:
+        return f"{symbol.upper()}|{_fmt_date(entry_date)}|{structure}"
+    return (
+        f"{symbol.upper()}|{_fmt_date(entry_date)}|"
+        f"{_fmt_date(earnings_date)}|{structure}"
+    )
 
 
 def make_snapshot_hash(snapshot_dict: Dict[str, Any]) -> str:
@@ -622,7 +650,10 @@ def record_trade_entry(
     Parameters
     ----------
     symbol, structure, entry_date, setup_score, source_type : required
-    **kwargs : any additional insert_entry() keyword arguments
+    **kwargs : any additional insert_entry() keyword arguments. If
+        ``earnings_date`` is present (which it almost always is), it's
+        also folded into the auto-generated trade_id to prevent collisions
+        between trades around different earnings events.
     store : OutcomeStore, optional — uses singleton if not provided
 
     Returns
@@ -630,7 +661,11 @@ def record_trade_entry(
     trade_id : str
         Stable identifier for this trade.
     """
-    trade_id = kwargs.pop("trade_id", make_trade_id(symbol, entry_date, structure))
+    earnings_date = kwargs.get("earnings_date")
+    trade_id = kwargs.pop(
+        "trade_id",
+        make_trade_id(symbol, entry_date, structure, earnings_date=earnings_date),
+    )
     s = store or get_outcome_store()
     s.insert_entry(
         trade_id=trade_id,

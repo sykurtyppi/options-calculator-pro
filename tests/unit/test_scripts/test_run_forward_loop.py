@@ -244,7 +244,9 @@ def test_run_daily_cycle_records_entries_finalizes_exits_and_skips_missing_data(
     assert ledger.count() == 4
     assert baseline_store.count() == 6
 
-    aapl_trade = store.get_trade(make_trade_id("AAPL", today, "atm_straddle"))
+    aapl_trade = store.get_trade(
+        make_trade_id("AAPL", today, "atm_straddle", earnings_date=today + timedelta(days=6))
+    )
     assert aapl_trade is not None
     aapl_notes = json.loads(str(aapl_trade["notes"]))
     assert aapl_trade["recommendation_id"]
@@ -327,7 +329,9 @@ def test_run_daily_cycle_prefers_edge_screener_discovery_when_marketdata_is_avai
     assert result["entries"]["analyzed"] == 1
     assert result["entries"]["discovery_source"] == "edge_screener"
 
-    trade = store.get_trade(make_trade_id("MSFT", today, "otm_strangle"))
+    trade = store.get_trade(
+        make_trade_id("MSFT", today, "otm_strangle", earnings_date=today + timedelta(days=6))
+    )
     assert trade is not None
     assert trade["recommendation_id"]
     assert ledger.count() == 1
@@ -630,7 +634,9 @@ def test_otm_strangle_quote_provenance_is_persisted_in_paper_entry(tmp_path: Pat
     )
 
     assert result["entries"]["entries"] == 1
-    trade = store.get_trade(make_trade_id("AAPL", today, "otm_strangle"))
+    trade = store.get_trade(
+        make_trade_id("AAPL", today, "otm_strangle", earnings_date=today + timedelta(days=5))
+    )
     assert trade is not None
     notes = json.loads(str(trade["notes"]))
     provenance = notes["entry_bid_ask_mid"]["provenance"]
