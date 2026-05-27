@@ -94,7 +94,31 @@ REPORTS_ROOT = REPO_ROOT / "exports" / "reports"
 # When round-trip cost (24%) ≥ typical IV expansion ceiling (18%): structurally unprofitable.
 # The old threshold (18%) allowed setups with 36% round-trip cost — empirically indefensible.
 ABSOLUTE_SPREAD_THRESHOLD_PCT = 12.0
-CONSERVATIVE_EXECUTION_SCENARIO = "cross_25"
+
+# Persisted backtest priors are filtered to the 25%-of-bid-ask-cross
+# execution scenario when loading. The previous name for this constant
+# was `CONSERVATIVE_EXECUTION_SCENARIO`, which was misleading on two
+# counts:
+#
+#   1. services/execution_scenarios.SCENARIO_LEVELS reserves the label
+#      "conservative" for a 50%-of-spread cross — twice as harsh as the
+#      25% level this filter actually selects. Reading the old name and
+#      then looking up execution_scenarios would have made it appear
+#      the priors were stricter than they actually are.
+#   2. The upstream backtest scripts that emit these rows
+#      (scripts/backtest_iv_expansion_study.py:98 and
+#      scripts/backtest_pre_earnings_otm_strangle.py:90) only produce
+#      "cross_25" and "cross_50" rows. There are no "conservative"
+#      rows on disk to filter to; the loader had to map "conservative"
+#      back to "cross_25" anyway. Renaming makes that explicit.
+#
+# PR #65 (planned) will refactor _evaluate_forward_quality_gate and
+# _compute_rank_score to consume per-scenario returns directly from
+# candidate_shadow_outcome blocks; at that point this single-scenario
+# filter becomes unnecessary. For PR #64 (foundations) we only fix the
+# naming so the new scenario-labeled fields downstream can use
+# "conservative" without overloading the term.
+PROMOTION_BASELINE_SCENARIO = "cross_25"
 _PRIORS_CACHE_LOCK = threading.Lock()
 # Bounded dict keyed on the full signature tuple (includes file mtimes + as_of_date).
 # Each distinct as_of_date value gets its own slot, so backtest loops don't thrash
@@ -733,7 +757,7 @@ def _load_calendar_prior_from_reports(structure: str) -> WalkForwardPrior:
         return _neutral_prior(structure, source="neutral_missing_iv_expansion_report")
 
     frame = pd.read_csv(path)
-    subset = frame[(frame["structure"] == structure) & (frame["scenario"] == CONSERVATIVE_EXECUTION_SCENARIO)].copy()
+    subset = frame[(frame["structure"] == structure) & (frame["scenario"] == PROMOTION_BASELINE_SCENARIO)].copy()
     if subset.empty:
         return _neutral_prior(structure, source=f"neutral_missing_{structure}_scenario")
 
@@ -749,7 +773,7 @@ def _load_calendar_prior_from_reports(structure: str) -> WalkForwardPrior:
         win_rate=win_rate,
         avg_return_pct=float(avg_return),
         rank_score=rank,
-        source=f"{path.parent.name}:{CONSERVATIVE_EXECUTION_SCENARIO}",
+        source=f"{path.parent.name}:{PROMOTION_BASELINE_SCENARIO}",
     )
 
 
@@ -759,9 +783,9 @@ def _load_straddle_prior_from_reports() -> WalkForwardPrior:
         return _neutral_prior("atm_straddle", source="neutral_missing_strangle_report")
 
     frame = pd.read_csv(path)
-    subset = frame[(frame["structure"] == "atm_straddle") & (frame["execution_scenario"] == CONSERVATIVE_EXECUTION_SCENARIO)].copy()
+    subset = frame[(frame["structure"] == "atm_straddle") & (frame["execution_scenario"] == PROMOTION_BASELINE_SCENARIO)].copy()
     if subset.empty:
-        return _neutral_prior("atm_straddle", source=f"neutral_missing_atm_straddle_{CONSERVATIVE_EXECUTION_SCENARIO}")
+        return _neutral_prior("atm_straddle", source=f"neutral_missing_atm_straddle_{PROMOTION_BASELINE_SCENARIO}")
 
     weights = pd.to_numeric(subset["realized_count"], errors="coerce").fillna(0.0)
     valid_weights = weights.where(weights > 0.0, 1.0)
@@ -778,7 +802,7 @@ def _load_straddle_prior_from_reports() -> WalkForwardPrior:
         win_rate=win_rate,
         avg_return_pct=float(avg_return),
         rank_score=rank,
-        source=f"{path.parent.name}:{CONSERVATIVE_EXECUTION_SCENARIO}",
+        source=f"{path.parent.name}:{PROMOTION_BASELINE_SCENARIO}",
     )
 
 
@@ -793,7 +817,7 @@ def _load_strangle_prior_from_reports() -> WalkForwardPrior:
         match = next(
             (
                 row for row in baseline_rows
-                if str(row.get("execution_scenario")) == CONSERVATIVE_EXECUTION_SCENARIO
+                if str(row.get("execution_scenario")) == PROMOTION_BASELINE_SCENARIO
             ),
             None,
         )
@@ -810,7 +834,7 @@ def _load_strangle_prior_from_reports() -> WalkForwardPrior:
                 win_rate=win_rate,
                 avg_return_pct=float(avg_return),
                 rank_score=rank,
-                source=f"{summary_path.parent.name}:baseline:{CONSERVATIVE_EXECUTION_SCENARIO}",
+                source=f"{summary_path.parent.name}:baseline:{PROMOTION_BASELINE_SCENARIO}",
             )
 
     path = _latest_report_file("pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_scoreboard.csv")
@@ -818,9 +842,9 @@ def _load_strangle_prior_from_reports() -> WalkForwardPrior:
         return _neutral_prior("otm_strangle", source="neutral_missing_strangle_report")
 
     frame = pd.read_csv(path)
-    subset = frame[(frame["structure"] == "otm_strangle_3pct") & (frame["execution_scenario"] == CONSERVATIVE_EXECUTION_SCENARIO)].copy()
+    subset = frame[(frame["structure"] == "otm_strangle_3pct") & (frame["execution_scenario"] == PROMOTION_BASELINE_SCENARIO)].copy()
     if subset.empty:
-        return _neutral_prior("otm_strangle", source=f"neutral_missing_otm_strangle_{CONSERVATIVE_EXECUTION_SCENARIO}")
+        return _neutral_prior("otm_strangle", source=f"neutral_missing_otm_strangle_{PROMOTION_BASELINE_SCENARIO}")
 
     weights = pd.to_numeric(subset["realized_count"], errors="coerce").fillna(0.0)
     valid_weights = weights.where(weights > 0.0, 1.0)
@@ -837,7 +861,7 @@ def _load_strangle_prior_from_reports() -> WalkForwardPrior:
         win_rate=win_rate,
         avg_return_pct=float(avg_return),
         rank_score=rank,
-        source=f"{path.parent.name}:{CONSERVATIVE_EXECUTION_SCENARIO}",
+        source=f"{path.parent.name}:{PROMOTION_BASELINE_SCENARIO}",
     )
 
 

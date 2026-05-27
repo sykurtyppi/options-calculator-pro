@@ -512,3 +512,277 @@ def test_lookup_exact_contract_row_returns_none_when_no_match() -> None:
         chain, expiry=pd.Timestamp("2026-06-01"), strike=200.0, call_put="C",
     )
     assert row is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR #64: execution realism foundations
+# ──────────────────────────────────────────────────────────────────────────
+#
+# These tests pin three properties of the PR #64 change:
+#
+#   1. `mid_realized_return_pct` is byte-identical to its pre-PR-#64
+#      value. The promotion gate still reads this field and we have
+#      explicitly deferred the gate refactor to PR #65; any drift here
+#      would change promotion behavior under the guise of "just adding
+#      new fields."
+#
+#   2. New labeled scenario blocks appear when bid/ask is available,
+#      and degrade gracefully to all-None when bid/ask is missing.
+#
+#   3. The naming collision between
+#      `services.execution_scenarios.SCENARIO_LEVELS` (which reserves
+#      "conservative" as a 50%-cross label) and the old
+#      `CONSERVATIVE_EXECUTION_SCENARIO` in structure_scorecard.py
+#      (which was actually "cross_25") is resolved — the new
+#      `PROMOTION_BASELINE_SCENARIO` constant uses an unambiguous
+#      name and "conservative" is preserved as a distinct scenario
+#      label.
+
+
+def test_mid_realized_return_pct_unchanged_after_pr_64() -> None:
+    """Regression: the canonical research-grade promotion-evidence
+    number must not have drifted. Use the same _happy_path_inputs
+    fixture as test_simulate_happy_path_returns_ok_with_resolved_pnl
+    — the numerically expected value is 30.0 (debit 1.0 → exit 1.3 →
+    +30%)."""
+    from services.candidate_shadow_outcome import simulate_candidate_shadow_outcome
+    entry, exit_, dp = _happy_path_inputs()
+    out = simulate_candidate_shadow_outcome(
+        entry_chain=entry, exit_chain=exit_, dual_picker=dp,
+    )
+    assert out["status"] == "ok"
+    assert out["mid_realized_return_pct"] == pytest.approx(30.0)
+    # The new labeled-returns block must agree with the scalar on
+    # the mid path — both are definitionally the same number.
+    assert out["execution_scenario_returns_pct"]["mid"] == pytest.approx(30.0)
+
+
+def test_simulate_emits_per_scenario_returns_when_bid_ask_present() -> None:
+    """Happy path emits a dict-shaped `execution_scenario_returns_pct`
+    keyed by every label in SCENARIO_LEVELS, with finite numbers for
+    scenarios the simulator can price. The toy chain uses bid =
+    mid-0.05, ask = mid+0.05 on every leg, so the 25%/50% crosses
+    produce determinable per-scenario debits/exits and finite
+    returns."""
+    from services.candidate_shadow_outcome import simulate_candidate_shadow_outcome
+    from services.execution_scenarios import SCENARIO_LEVELS
+
+    entry, exit_, dp = _happy_path_inputs()
+    out = simulate_candidate_shadow_outcome(
+        entry_chain=entry, exit_chain=exit_, dual_picker=dp,
+    )
+    assert out["status"] == "ok"
+
+    expected_labels = {name for name, _d in SCENARIO_LEVELS}
+    for block_name in (
+        "entry_scenario_values",
+        "exit_scenario_values",
+        "execution_scenario_returns_pct",
+        "execution_scenario_pnl",
+    ):
+        block = out[block_name]
+        assert isinstance(block, dict), f"{block_name} must be dict-shaped"
+        assert set(block.keys()) == expected_labels, (
+            f"{block_name} keys {set(block.keys())} != {expected_labels}"
+        )
+
+    # cross_25 and cross_50 must produce finite numbers — the toy
+    # chain has well-formed bid/ask on every leg.
+    for label in ("mid", "cross_25", "cross_50", "conservative"):
+        assert out["execution_scenario_returns_pct"][label] is not None
+        assert np.isfinite(out["execution_scenario_returns_pct"][label])
+
+    # Sanity: harsher crosses should produce a worse (lower) return
+    # than the mid path on a profitable trade. The happy-path trade
+    # is +30% on mid; cross_50 (50% spread cross on each leg in each
+    # direction) must be strictly worse.
+    assert (
+        out["execution_scenario_returns_pct"]["cross_50"]
+        < out["execution_scenario_returns_pct"]["mid"]
+    )
+
+
+def test_simulate_degrades_gracefully_when_bid_ask_missing() -> None:
+    """A chain whose rows have NaN bid/ask must still produce a
+    populated mid path (the mid is independent of bid/ask once
+    `prepare_feature_chain` has normalized the row). The per-scenario
+    non-mid blocks degrade to None for the cross labels but the dict
+    shape is preserved.
+
+    Why this matters: pre-PR-#64 historical chains and any provider
+    with sparse bid/ask coverage must continue to contribute mid-only
+    promotion-evidence rows. PR #64 must not silently shrink the
+    eligibility pool.
+    """
+    from services.candidate_shadow_outcome import simulate_candidate_shadow_outcome
+    from services.execution_scenarios import SCENARIO_LEVELS
+
+    entry, exit_, dp = _happy_path_inputs()
+
+    # Drop bid/ask columns entirely; leave mid intact. The
+    # `prepare_feature_chain` upstream filter only enforces
+    # `bid >= 0 and ask >= bid` when BOTH columns are present
+    # (`{"bid", "ask"}.issubset(df.columns)` gate). Dropping the
+    # columns is the right model for a provider whose schema simply
+    # doesn't carry bid/ask, which is the realistic missing-quote
+    # case in historical chains.
+    entry = entry.drop(columns=["bid", "ask"])
+    exit_ = exit_.drop(columns=["bid", "ask"])
+
+    out = simulate_candidate_shadow_outcome(
+        entry_chain=entry, exit_chain=exit_, dual_picker=dp,
+    )
+    # Mid path survives: the simulator gets to "ok" with the same
+    # mid_realized_return_pct as the bid/ask-populated case.
+    assert out["status"] == "ok"
+    assert out["mid_realized_return_pct"] == pytest.approx(30.0)
+    assert out["execution_scenario_returns_pct"]["mid"] == pytest.approx(30.0)
+
+    # Non-mid scenarios collapse to None.
+    expected_labels = {name for name, _d in SCENARIO_LEVELS}
+    block = out["execution_scenario_returns_pct"]
+    assert set(block.keys()) == expected_labels
+    for label in expected_labels - {"mid"}:
+        assert block[label] is None, (
+            f"scenario {label} should be None when bid/ask missing, got {block[label]}"
+        )
+
+
+def test_empty_outcome_block_has_dict_shaped_scenario_fields() -> None:
+    """`_empty_candidate_shadow_outcome` is called on every skipped
+    path (no dual_picker, malformed selection, missing chain, etc.).
+    The new scenario-block fields must be dict-shaped (with every
+    SCENARIO_LEVELS label mapped to None), NOT scalar None.
+
+    Downstream consumers in PR #65 will do
+    `outcome["execution_scenario_returns_pct"].get("conservative")`
+    on every record — including skipped ones — and that must not
+    AttributeError because the block is None."""
+    from services.candidate_shadow_provenance import _empty_candidate_shadow_outcome
+    from services.execution_scenarios import SCENARIO_LEVELS
+
+    out = _empty_candidate_shadow_outcome("skipped:no_dual_picker")
+    expected_labels = {name for name, _d in SCENARIO_LEVELS}
+
+    for block_name in (
+        "entry_scenario_values",
+        "exit_scenario_values",
+        "execution_scenario_returns_pct",
+        "execution_scenario_pnl",
+    ):
+        block = out[block_name]
+        assert isinstance(block, dict), (
+            f"{block_name} must be dict-shaped on empty outcomes (got {type(block).__name__})"
+        )
+        assert set(block.keys()) == expected_labels
+        for label in expected_labels:
+            assert block[label] is None
+
+
+def test_promotion_eligibility_unchanged_by_new_scenario_fields() -> None:
+    """PR #64 is foundations only — it must NOT change which records
+    `is_promotion_eligible` accepts. The gate still keys on
+    `mid_realized_return_pct`; the new labeled fields are evidence
+    that PR #65's gate refactor will consume.
+
+    Concretely: a record with the new fields populated remains
+    promotion-eligible IFF it would have been pre-PR-#64. A record
+    whose `mid_realized_return_pct` is finite but whose non-mid
+    scenarios are all None (the realistic case for old historical
+    chains) is still eligible.
+    """
+    from services.candidate_shadow_provenance import (
+        SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+        is_promotion_eligible,
+    )
+
+    # Record with the new fields populated → still eligible.
+    record_with_scenarios = {
+        "sample_provenance": SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+        "candidate_shadow_outcome": {
+            "status": "ok",
+            "mid_realized_return_pct": 12.5,
+            "labels": {
+                "research_mid": True,
+                "shadow_only": True,
+                "not_execution_grade": True,
+            },
+            "execution_scenario_returns_pct": {
+                "mid": 12.5, "cross_25": 8.0, "cross_50": 3.5, "conservative": 3.5,
+            },
+            "execution_scenario_pnl": {
+                "mid": 12.5, "cross_25": 8.0, "cross_50": 3.5, "conservative": 3.5,
+            },
+            "entry_scenario_values": {
+                "mid": 1.0, "cross_25": 1.05, "cross_50": 1.10, "conservative": 1.10,
+            },
+            "exit_scenario_values": {
+                "mid": 1.125, "cross_25": 1.13, "cross_50": 1.14, "conservative": 1.14,
+            },
+        },
+    }
+    assert is_promotion_eligible(record_with_scenarios) is True
+
+    # Record with non-mid scenarios all None (historical chain) →
+    # still eligible. The new fields are NOT gating criteria.
+    record_mid_only = {
+        "sample_provenance": SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+        "candidate_shadow_outcome": {
+            "status": "ok",
+            "mid_realized_return_pct": 12.5,
+            "labels": {
+                "research_mid": True,
+                "shadow_only": True,
+                "not_execution_grade": True,
+            },
+            "execution_scenario_returns_pct": {
+                "mid": 12.5, "cross_25": None, "cross_50": None, "conservative": None,
+            },
+        },
+    }
+    assert is_promotion_eligible(record_mid_only) is True
+
+
+def test_promotion_baseline_scenario_and_conservative_no_longer_collide() -> None:
+    """Regression for the PR #64 naming-collision fix.
+
+    Before PR #64:
+      - structure_scorecard.CONSERVATIVE_EXECUTION_SCENARIO = "cross_25"
+      - execution_scenarios.SCENARIO_LEVELS contained "conservative" at
+        a 50%-of-spread cross.
+    Reading the structure_scorecard name and then the
+    execution_scenarios labels would have made it appear that priors
+    were filtered to a stricter scenario than they actually were.
+
+    After PR #64:
+      - structure_scorecard.PROMOTION_BASELINE_SCENARIO = "cross_25" (renamed)
+      - "conservative" is preserved in SCENARIO_LEVELS, distinct from
+        the baseline.
+
+    This test pins both: the renamed constant exists and holds the
+    historical baseline label, and "conservative" is still a
+    SCENARIO_LEVELS member but is NOT the baseline.
+    """
+    from services.structure_scorecard import PROMOTION_BASELINE_SCENARIO
+    from services.execution_scenarios import SCENARIO_LEVELS
+
+    scenario_labels = {name for name, _d in SCENARIO_LEVELS}
+    assert "conservative" in scenario_labels, (
+        "SCENARIO_LEVELS must still expose the 'conservative' label so "
+        "downstream consumers can reference it explicitly."
+    )
+    assert PROMOTION_BASELINE_SCENARIO in scenario_labels, (
+        f"PROMOTION_BASELINE_SCENARIO={PROMOTION_BASELINE_SCENARIO!r} must "
+        f"be a valid SCENARIO_LEVELS label (got labels {scenario_labels})."
+    )
+    assert PROMOTION_BASELINE_SCENARIO != "conservative", (
+        "The historical promotion baseline is 'cross_25' — it must NOT "
+        "be aliased to the 'conservative' label, which is reserved for "
+        "the stricter 50%-of-spread cross in execution_scenarios."
+    )
+    # And it must NOT be the old misleading name.
+    import services.structure_scorecard as sc
+    assert not hasattr(sc, "CONSERVATIVE_EXECUTION_SCENARIO"), (
+        "Old `CONSERVATIVE_EXECUTION_SCENARIO` name must be fully removed "
+        "to prevent accidental reintroduction of the naming collision."
+    )

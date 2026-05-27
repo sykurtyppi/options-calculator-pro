@@ -124,6 +124,18 @@ _CANDIDATE_SHADOW_OUTCOME_FIELDS = (
     # cannot quietly relabel this as an "execution return."
     "mid_realized_return_pct",
     "iv_change_front", "iv_change_back",
+    # PR #64 (execution realism foundations): per-scenario debit /
+    # exit / realized-return blocks. Each is a dict keyed by the
+    # labels in services.execution_scenarios.SCENARIO_LEVELS — today
+    # {"mid", "cross_25", "cross_50", "conservative"}. Values are
+    # None when bid/ask coverage was insufficient to price that
+    # scenario. The mid-only `mid_realized_return_pct` above is
+    # preserved as the canonical research-grade number used by
+    # `is_promotion_eligible` until the PR #65 gate refactor.
+    "entry_scenario_values",
+    "exit_scenario_values",
+    "execution_scenario_returns_pct",
+    "execution_scenario_pnl",
 )
 
 # Labels on every candidate_shadow_outcome block — communicate that the
@@ -134,6 +146,33 @@ _CANDIDATE_SHADOW_LABELS = {
     "shadow_only": True,          # never used as a trade signal
     "not_execution_grade": True,  # do not size live positions from this
 }
+
+
+# Scenario-block field names defined in PR #64. Listed separately
+# from the scalar fields so `_empty_candidate_shadow_outcome` can
+# stamp them as dict-shaped placeholders (not None scalars) and
+# downstream consumers can always do `outcome["..."].get("cross_25")`
+# without first None-checking the block itself.
+_CANDIDATE_SHADOW_SCENARIO_BLOCK_FIELDS = frozenset({
+    "entry_scenario_values",
+    "exit_scenario_values",
+    "execution_scenario_returns_pct",
+    "execution_scenario_pnl",
+})
+
+
+def _empty_scenario_block() -> Dict[str, Optional[float]]:
+    """Return a {label: None} placeholder covering every scenario in
+    services.execution_scenarios.SCENARIO_LEVELS.
+
+    Imported lazily inside the function to avoid circular imports —
+    candidate_shadow_provenance is imported by execution_scenarios'
+    own transitive consumers. The cost (one import per failure-path
+    call) is negligible because failure paths run at most a few
+    times per minute in production.
+    """
+    from services.execution_scenarios import SCENARIO_LEVELS
+    return {name: None for name, _distance in SCENARIO_LEVELS}
 
 
 def _empty_candidate_shadow_outcome(status: str) -> Dict[str, Any]:
@@ -148,10 +187,17 @@ def _empty_candidate_shadow_outcome(status: str) -> Dict[str, Any]:
     Labels are ALWAYS present (research_mid / shadow_only /
     not_execution_grade) — they describe what kind of block this is,
     not whether it succeeded.
+
+    PR #64: scenario-block fields are stamped as
+    `{label: None}` dicts rather than scalar None, so consumers can
+    `.get("cross_25")` without first None-checking the wrapper.
     """
     out: Dict[str, Any] = {"status": status, "labels": dict(_CANDIDATE_SHADOW_LABELS)}
     for k in _CANDIDATE_SHADOW_OUTCOME_FIELDS:
-        out[k] = None
+        if k in _CANDIDATE_SHADOW_SCENARIO_BLOCK_FIELDS:
+            out[k] = _empty_scenario_block()
+        else:
+            out[k] = None
     return out
 
 
