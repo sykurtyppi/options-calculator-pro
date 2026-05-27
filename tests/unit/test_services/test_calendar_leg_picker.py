@@ -9,6 +9,7 @@ import pytest
 from services.calendar_leg_picker import (
     CANDIDATE_FRONT_MIN_DTE_DAYS,
     DEFAULT_BACK_GAP_DAYS,
+    LEG_FIELDS,
     PICKER_CANDIDATE,
     PICKER_LEGACY,
     SIDE_CALL,
@@ -525,7 +526,11 @@ class TestToMetadataDict:
         import json
         json.dumps(meta)  # would raise if not serializable
 
-    def test_handles_missing_optional_leg_fields(self):
+    def test_stable_shape_when_optional_leg_fields_missing(self):
+        """Every LEG_FIELDS key must always be present in the serialized
+        leg dict, with value None when the source row didn't carry the
+        column. Stable shape simplifies downstream consumers (ledger
+        schema, frontend types) which can rely on a fixed key set."""
         event = date(2024, 5, 1)
         chain = pd.DataFrame([
             {"expiry": date(2024, 5, 17), "strike": 100.0, "call_put": "C",
@@ -539,10 +544,18 @@ class TestToMetadataDict:
         )
         assert result is not None
         meta = result.to_metadata_dict()
-        # Optional fields absent: leg dict still serializable, just shorter
+        # Present fields keep their values
         assert meta["front_leg"]["mid"] == 2.0
-        assert "bid" not in meta["front_leg"]
-        assert "ask" not in meta["front_leg"]
+        assert meta["front_leg"]["iv"] == 0.30
+        # Absent fields are present as None — not omitted
+        assert meta["front_leg"]["bid"] is None
+        assert meta["front_leg"]["ask"] is None
+        assert meta["front_leg"]["spread_pct"] is None
+        assert meta["front_leg"]["open_interest"] is None
+        assert meta["front_leg"]["volume"] is None
+        # Stable shape — exact key set matches LEG_FIELDS
+        assert set(meta["front_leg"].keys()) == set(LEG_FIELDS)
+        assert set(meta["back_leg"].keys()) == set(LEG_FIELDS)
         import json
         json.dumps(meta)
 

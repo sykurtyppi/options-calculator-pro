@@ -16,8 +16,9 @@ Provides two picker variants for dual-path shadow comparison:
       139-event in-sample run, requiring a front >=14 days past the event
       improved put_calendar mean return from +12% to +23%. NOT yet
       out-of-sample validated. Surfaced under `experimental_contract_selection`
-      until promotion criteria are met — see docs/calendar_picker_promotion
-      (or the PR-AC commit message) for the explicit thresholds.
+      until promotion criteria are met — the explicit thresholds are
+      forthcoming in PR-AC commit 5; until then, see the PR-AC pull
+      request description.
 
 Both pickers produce a CalendarSelection that includes the picker variant
 and parameters used, so every recommendation is auditable.
@@ -84,6 +85,16 @@ _SIDE_TO_CHAIN_CODE = {SIDE_CALL: "C", SIDE_PUT: "P"}
 
 _REQUIRED_COLUMNS = ("expiry", "strike", "call_put", "mid")
 
+# Canonical leg field set returned by CalendarSelection.to_metadata_dict().
+# Every key is always present in the serialized leg dict; values are None
+# when the source chain row didn't carry the column. Exposed at module
+# level so downstream consumers (ledger schema, frontend types) can
+# import the authoritative key list rather than duplicating it.
+LEG_FIELDS = (
+    "mid", "bid", "ask", "iv", "spread_pct",
+    "open_interest", "volume", "delta", "dte",
+)
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Public data class
@@ -114,19 +125,28 @@ class CalendarSelection:
         """Serialize to a JSON-safe dict for ledger / API surfaces.
 
         Drops the raw pd.Series leg rows and extracts only stable scalar
-        fields: expiries, strike, side, mid/bid/ask, spread, OI, volume,
-        IV, plus all picker provenance. Use this rather than dataclass
-        asdict() — the latter would try to serialize pd.Series.
+        fields: expiries, strike, side, plus all picker provenance, plus
+        a leg dict with a stable canonical shape (every LEG_FIELDS key is
+        present, value is None when the underlying row didn't carry it).
+
+        Use this rather than dataclasses.asdict() — the latter would try
+        to serialize pd.Series.
         """
         def _row(r):
             if r is None:
                 return None
             out = {}
-            for k in ("mid", "bid", "ask", "iv", "spread_pct",
-                      "open_interest", "volume", "delta", "dte"):
+            for k in LEG_FIELDS:
                 if k in r.index:
                     v = r.get(k)
-                    out[k] = float(v) if v is not None and not pd.isna(v) else None
+                    out[k] = (
+                        float(v) if v is not None and not pd.isna(v) else None
+                    )
+                else:
+                    # Always present in the dict, even when the source row
+                    # didn't carry the column. Stable shape simplifies
+                    # downstream consumers (ledger, frontend diagnostics).
+                    out[k] = None
             return out
 
         return {
