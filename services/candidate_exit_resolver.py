@@ -329,35 +329,38 @@ def _resolve_one_row(
                 max_attempts=max_attempts,
             )
 
-        # 4) Re-query entry chain at as_of_date.
+        # 4) Re-query entry chain at as_of_date. Codex C4 audit caution:
+        # the entry chain SHOULD be deterministically present (it was
+        # used at recommendation time), but if the underlying store has
+        # transient I/O failures or in-flight re-processing windows,
+        # the resolver should give it the same retry budget as the
+        # exit chain rather than declaring the row permanently
+        # unrecoverable on the first miss. Treats entry-chain-miss
+        # exactly like exit-chain-miss past the lookahead window:
+        # retrying until counter reaches max_attempts, then escalating
+        # to permanently_failed:no_entry_chain_replay.
         as_of_date = row.get("as_of_date")
-        if not as_of_date:
-            return _write_terminal_with_simulator_shape(
-                ledger=ledger,
-                rec_id=rec_id,
-                symbol=symbol,
-                earnings_date=earnings_date_str,
-                exit_trade_date=exit_trade_date,
-                prior_attempts=prior_attempts,
-                resolver_status=RESOLVER_STATUS_PERMFAIL_NO_ENTRY_CHAIN_REPLAY,
-            )
-        try:
-            entry_chain = store.query_chain(symbol, trade_date=str(as_of_date))
-        except Exception as exc:
-            logger.warning(
-                "PR-AE resolver: entry chain query failed for %s on %s: %s",
-                rec_id, as_of_date, exc,
-            )
-            entry_chain = None
+        entry_chain: Optional[pd.DataFrame] = None
+        if as_of_date:
+            try:
+                entry_chain = store.query_chain(
+                    symbol, trade_date=str(as_of_date),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "PR-AE resolver: entry chain query failed for %s on %s: %s",
+                    rec_id, as_of_date, exc,
+                )
+                entry_chain = None
         if entry_chain is None or entry_chain.empty:
-            return _write_terminal_with_simulator_shape(
+            return _handle_missing_entry_chain(
                 ledger=ledger,
                 rec_id=rec_id,
                 symbol=symbol,
-                earnings_date=earnings_date_str,
+                earnings_date_str=earnings_date_str,
                 exit_trade_date=exit_trade_date,
                 prior_attempts=prior_attempts,
-                resolver_status=RESOLVER_STATUS_PERMFAIL_NO_ENTRY_CHAIN_REPLAY,
+                max_attempts=max_attempts,
             )
 
         # 5) Synthesize the minimal dual_picker the simulator needs.
@@ -612,6 +615,57 @@ def _handle_missing_exit_chain(
     )
 
 
+def _handle_missing_entry_chain(
+    *,
+    ledger: RecommendationLedger,
+    rec_id: str,
+    symbol: str,
+    earnings_date_str: Optional[str],
+    exit_trade_date: Optional[str],
+    prior_attempts: int,
+    max_attempts: int,
+) -> ResolverOutcome:
+    """Entry chain unavailable — retry-then-permfail at MAX.
+
+    Codex C4 audit P2 fix. The entry chain SHOULD be deterministically
+    present (it was used at recommendation time), but treating the
+    first miss as permanent overreacts to any transient I/O failure
+    or in-flight store reprocessing. This handler mirrors the
+    exit-chain retry semantics: write a ``retrying`` revision while
+    the counter is below ``max_attempts``, then escalate to
+    ``permanently_failed:no_entry_chain_replay`` once the budget is
+    exhausted. Same counter cadence as the exit-chain path so
+    operators see a uniform escalation timeline regardless of which
+    chain was missing.
+
+    No window-elapsed check (unlike ``_handle_missing_exit_chain``)
+    because the entry chain has no post-event window — it lives at
+    the fixed ``as_of_date`` in the past. Every miss is "past the
+    window" by definition.
+    """
+    new_attempts = prior_attempts + 1
+    if new_attempts >= max_attempts:
+        resolver_status = RESOLVER_STATUS_PERMFAIL_NO_ENTRY_CHAIN_REPLAY
+    else:
+        resolver_status = RESOLVER_STATUS_RETRYING
+    terminal_outcome = _empty_candidate_shadow_outcome(resolver_status)
+    ledger.record_resolution_and_attempt(
+        recommendation_id=rec_id,
+        candidate_shadow_outcome=terminal_outcome,
+        increment_attempts=True,
+    )
+    return ResolverOutcome(
+        recommendation_id=rec_id,
+        symbol=symbol,
+        earnings_date=earnings_date_str,
+        exit_trade_date=exit_trade_date,
+        attempt_number=new_attempts,
+        resolver_status=resolver_status,
+        simulator_status=None,
+        mid_realized_return_pct=None,
+    )
+
+
 def _write_terminal_no_simulator(
     *,
     ledger: RecommendationLedger,
@@ -627,36 +681,6 @@ def _write_terminal_no_simulator(
     provenance malformed, etc.). Uses the empty-block factory so
     the persisted shape is consistent with simulator-derived
     terminal statuses."""
-    terminal_outcome = _empty_candidate_shadow_outcome(resolver_status)
-    ledger.record_resolution_and_attempt(
-        recommendation_id=rec_id,
-        candidate_shadow_outcome=terminal_outcome,
-        increment_attempts=True,
-    )
-    return ResolverOutcome(
-        recommendation_id=rec_id,
-        symbol=symbol,
-        earnings_date=earnings_date,
-        exit_trade_date=exit_trade_date,
-        attempt_number=prior_attempts + 1,
-        resolver_status=resolver_status,
-        simulator_status=None,
-        mid_realized_return_pct=None,
-    )
-
-
-def _write_terminal_with_simulator_shape(
-    *,
-    ledger: RecommendationLedger,
-    rec_id: str,
-    symbol: str,
-    earnings_date: Optional[str],
-    exit_trade_date: Optional[str],
-    prior_attempts: int,
-    resolver_status: str,
-) -> ResolverOutcome:
-    """Terminal write when the simulator was reachable but a
-    pre-simulator dependency was missing (entry chain unrecoverable)."""
     terminal_outcome = _empty_candidate_shadow_outcome(resolver_status)
     ledger.record_resolution_and_attempt(
         recommendation_id=rec_id,

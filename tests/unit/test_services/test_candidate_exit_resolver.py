@@ -372,11 +372,13 @@ def test_resolver_picks_first_non_empty_chain_in_window(tmp_path: Path) -> None:
     assert summary.count_balance_holds
 
 
-def test_resolver_missing_entry_chain_returns_no_entry_chain_replay(tmp_path: Path) -> None:
-    """The picker_provenance names the candidate contracts, but the
-    simulator still needs the entry chain DataFrame for mid pricing.
-    If as_of_date's chain is unrecoverable from the store, the
-    resolver writes permanently_failed:no_entry_chain_replay."""
+def test_resolver_missing_entry_chain_first_miss_is_retrying(tmp_path: Path) -> None:
+    """Codex C4 audit caution: the entry chain SHOULD be present
+    (it was used at recommendation time), but the resolver mustn't
+    treat the first miss as permanent. The store could be in a
+    transient I/O failure or mid-reprocessing window. Behavior on
+    first miss: write retrying (counter +1), eligible on next tick.
+    """
     ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
     _seed_forward_record(
         ledger,
@@ -399,7 +401,42 @@ def test_resolver_missing_entry_chain_returns_no_entry_chain_replay(tmp_path: Pa
     outcomes, _ = resolve_pending_candidate_exits(
         ledger, store, now=pd.Timestamp("2026-05-30").date(),
     )
+    assert outcomes[0].resolver_status == RESOLVER_STATUS_RETRYING
+    assert outcomes[0].attempt_number == 1
+
+
+def test_resolver_missing_entry_chain_escalates_to_permfail_at_max(tmp_path: Path) -> None:
+    """At MAX_ATTEMPTS - 1, a missing entry chain on the next tick
+    escalates to permanently_failed:no_entry_chain_replay. Parallels
+    the exit-chain escalation logic, so operators see a uniform
+    escalation timeline regardless of which chain was missing."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    _seed_forward_record(
+        ledger,
+        recommendation_id="rec_entry_max",
+        earnings_date="2026-05-22",
+        as_of_date="2026-05-15",
+    )
+    # Push counter to MAX_ATTEMPTS - 1 = 5
+    for _ in range(5):
+        ledger.increment_resolver_attempts("rec_entry_max")
+
+    exit_chain = _toy_chain(
+        trade_date="2026-05-25", front_expiry="2026-05-08",
+        back_expiry="2026-05-22", strike=200.0,
+        front_mid=0.4, back_mid=1.7,
+    )
+    store = _StubFeatureStore({
+        ("AAPL", "2026-05-25"): exit_chain,
+        # No entry chain
+    })
+
+    outcomes, summary = resolve_pending_candidate_exits(
+        ledger, store, now=pd.Timestamp("2026-05-30").date(),
+    )
     assert outcomes[0].resolver_status == RESOLVER_STATUS_PERMFAIL_NO_ENTRY_CHAIN_REPLAY
+    assert outcomes[0].attempt_number == 6
+    assert summary.permanently_failed_by_reason["no_entry_chain_replay"] == 1
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -780,16 +817,17 @@ def test_resolver_one_bad_row_does_not_abort_run(tmp_path: Path) -> None:
         ledger, store, now=pd.Timestamp("2026-05-30").date(),
     )
 
-    # Two rows scanned; one resolved ok, one with the entry-chain
-    # replay terminal status. The RuntimeError is caught inside the
-    # entry-chain query and converted to no_entry_chain_replay (not
-    # simulator_error) because the catch point is the explicit
-    # try/except around store.query_chain, not the outer simulator
-    # try/except.
+    # Two rows scanned; one resolved ok, one bumped to retrying. The
+    # RuntimeError on rec_bad's entry-chain query is caught inside
+    # the explicit try/except around store.query_chain. Under the
+    # C4b update, that maps to retrying (counter +1) rather than
+    # immediate permfail — the resolver gives the store a few
+    # attempts before declaring the row permanently unrecoverable.
     assert summary.scanned == 2
     by_id = {o.recommendation_id: o for o in outcomes}
     assert by_id["rec_good"].resolver_status == RESOLVER_STATUS_OK
-    assert by_id["rec_bad"].resolver_status == RESOLVER_STATUS_PERMFAIL_NO_ENTRY_CHAIN_REPLAY
+    assert by_id["rec_bad"].resolver_status == RESOLVER_STATUS_RETRYING
+    assert by_id["rec_bad"].attempt_number == 1
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -981,3 +1019,180 @@ def test_resolver_summary_balance_holds_for_empty_run() -> None:
     assert summary.count_balance_holds
     assert summary.scanned == 0
     assert summary.permanently_failed_total == 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Codex C4 audit follow-ups (P1 and P2)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_pr_ae_c4b_end_to_end_promotion_eligibility_after_resolver(
+    tmp_path: Path,
+) -> None:
+    """Codex C4 audit P1: full path from forward-tagged row →
+    resolver ok → promotion-eligible aggregator block. The whole
+    point of PR-AE is to make this path work; everything before this
+    test is necessary but not sufficient.
+
+    Pipeline verified:
+      1. Seed a forward_post_freeze row with picker_provenance.
+      2. Run the resolver against chains that produce a clean ok.
+      3. get_with_latest_resolution(...) returns the merged view
+         with status=ok and a finite mid_realized_return_pct.
+      4. is_promotion_eligible(...) returns True on that merged
+         dict (the EXACT shape it would check at aggregation time).
+      5. The aggregator's promotion_eligible_candidate_stats.n is
+         exactly 1 when fed this merged dict.
+
+    If ANY of these links breaks, the resolver's "ok" status is
+    operationally meaningless. This test guards the whole chain.
+    """
+    from services.candidate_shadow_provenance import is_promotion_eligible
+    from web.api.edge_engine import _aggregate_experimental_candidate_evidence
+
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    _seed_forward_record(
+        ledger, recommendation_id="rec_e2e",
+        earnings_date="2026-05-22", as_of_date="2026-05-15",
+    )
+
+    entry_chain = _toy_chain(
+        trade_date="2026-05-15", front_expiry="2026-05-08",
+        back_expiry="2026-05-22", strike=200.0,
+        front_mid=1.0, back_mid=2.0,
+    )
+    exit_chain = _toy_chain(
+        trade_date="2026-05-25", front_expiry="2026-05-08",
+        back_expiry="2026-05-22", strike=200.0,
+        front_mid=0.4, back_mid=1.7,
+    )
+    store = _StubFeatureStore({
+        ("AAPL", "2026-05-15"): entry_chain,
+        ("AAPL", "2026-05-25"): exit_chain,
+    })
+
+    # Run the resolver
+    outcomes, summary = resolve_pending_candidate_exits(
+        ledger, store, now=pd.Timestamp("2026-05-27").date(),
+    )
+    assert summary.resolved_ok == 1
+
+    # Step 3: merged view surfaces the resolved candidate outcome
+    merged = ledger.get_with_latest_resolution("rec_e2e")
+    assert merged is not None
+    assert merged["candidate_shadow_outcome_json"]["status"] == "ok"
+    assert merged["candidate_shadow_outcome_json"]["mid_realized_return_pct"] == pytest.approx(30.0)
+    # sample_provenance stays at v1's tagged value
+    assert merged["sample_provenance"] == "forward_post_freeze"
+
+    # Step 4: is_promotion_eligible accepts this row.
+    # The eligibility helper checks a dict with TOP-LEVEL keys
+    # `sample_provenance` and `candidate_shadow_outcome`. The merged
+    # view exposes the parsed outcome under `candidate_shadow_outcome_json`,
+    # so we build the eligibility-shape dict from those two keys.
+    eligibility_payload = {
+        "sample_provenance": merged["sample_provenance"],
+        "candidate_shadow_outcome": merged["candidate_shadow_outcome_json"],
+    }
+    assert is_promotion_eligible(eligibility_payload) is True, (
+        "After resolver writes ok, the merged-view row MUST pass "
+        "is_promotion_eligible. If this fails, the resolver is "
+        "producing rows that look promotion-eligible by name but "
+        "fail the strict-checks helper — every link in the PR-AE "
+        "chain has to hold for forward evidence to count."
+    )
+
+    # Step 5: the aggregator counts this row in promotion_eligible_
+    # candidate_stats. The aggregator expects a list of "trade" dicts
+    # carrying symbol + event_date + sample_provenance +
+    # candidate_shadow_outcome + dual_picker. Construct the full
+    # shape so the per-event dedup keys (symbol, event_date, side_key)
+    # are populated.
+    aggregator_trade = {
+        "symbol": "AAPL",
+        "event_date": "2026-05-22",
+        "sample_provenance": merged["sample_provenance"],
+        "candidate_shadow_outcome": merged["candidate_shadow_outcome_json"],
+        "dual_picker": {
+            "shadow_status": "ok",
+            "candidate_selection": {
+                "side": "call",
+                "strike": 200.0,
+                "front_expiry": "2026-05-08",
+                "back_expiry": "2026-05-22",
+            },
+        },
+    }
+    result = _aggregate_experimental_candidate_evidence([aggregator_trade])
+    promotion_block = result["promotion_eligible_candidate_stats"]
+    assert promotion_block["n_events"] == 1, (
+        f"Aggregator's promotion_eligible_candidate_stats should "
+        f"show exactly one promotion-eligible row after the "
+        f"resolver lands an ok outcome. Got: {promotion_block}"
+    )
+    # The mid_realized_return_pct on the resolved outcome (30.0)
+    # propagates through to the aggregator's mean.
+    assert promotion_block["candidate_mid_realized_return_pct_mean"] == pytest.approx(30.0)
+
+
+def test_pr_ae_c4b_repeated_awaiting_ticks_do_not_pile_up_revisions(
+    tmp_path: Path,
+) -> None:
+    """Codex C4 audit P2: a row in awaiting_chain_data state should
+    not accumulate identical revisions over many resolver ticks. The
+    PR-K UNIQUE(recommendation_id, content_hash) constraint dedupes
+    byte-identical payloads — three consecutive awaiting ticks must
+    produce at most one new awaiting revision row, and the counter
+    must stay at 0 throughout (awaiting doesn't burn retry budget).
+    """
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    _seed_forward_record(
+        ledger, recommendation_id="rec_dup_awaiting",
+        earnings_date="2026-05-22", as_of_date="2026-05-15",
+    )
+
+    # Entry chain present; no exit chain anywhere. "Now" still inside
+    # the post-event window so every tick lands awaiting_chain_data.
+    entry_chain = _toy_chain(
+        trade_date="2026-05-15", front_expiry="2026-05-08",
+        back_expiry="2026-05-22", strike=200.0,
+        front_mid=1.0, back_mid=2.0,
+    )
+    store = _StubFeatureStore({
+        ("AAPL", "2026-05-15"): entry_chain,
+    })
+
+    # First tick — initial awaiting revision lands
+    outcomes_1, _ = resolve_pending_candidate_exits(
+        ledger, store, now=pd.Timestamp("2026-05-25").date(),
+    )
+    assert outcomes_1[0].resolver_status == RESOLVER_STATUS_AWAITING_CHAIN_DATA
+
+    revisions_after_first = len(ledger.get_revisions("rec_dup_awaiting"))
+
+    # Two more ticks — identical content → no new revisions
+    for tick_day in ("2026-05-25", "2026-05-26"):
+        outcomes, _ = resolve_pending_candidate_exits(
+            ledger, store, now=pd.Timestamp(tick_day).date(),
+        )
+        assert outcomes[0].resolver_status == RESOLVER_STATUS_AWAITING_CHAIN_DATA
+
+    revisions_after_three = len(ledger.get_revisions("rec_dup_awaiting"))
+    assert revisions_after_three == revisions_after_first, (
+        f"Repeated awaiting_chain_data ticks must dedupe via "
+        f"content_hash. Expected {revisions_after_first} revisions, "
+        f"got {revisions_after_three}. Without this dedupe, a row "
+        f"sitting in awaiting state for weeks would accumulate one "
+        f"revision per resolver tick."
+    )
+
+    # Counter never bumps for awaiting — verify on disk
+    counter = ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_dup_awaiting",),
+    ).fetchone()[0]
+    assert int(counter) == 0, (
+        "awaiting_chain_data must NEVER bump the resolver attempt "
+        "counter, regardless of how many ticks the row sits in that "
+        "state."
+    )
