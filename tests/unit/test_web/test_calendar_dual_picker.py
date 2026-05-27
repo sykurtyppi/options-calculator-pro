@@ -400,3 +400,73 @@ class TestExperimentalCandidateEvidenceAggregation:
         ]
         import json
         json.dumps(_aggregate_experimental_candidate_evidence(trades))  # must not raise
+
+    def test_event_level_outcome_buckets(self):
+        """Codex follow-up to commit 2b: event-level outcome buckets
+        (unique_events_both_succeeded, _legacy_only, _candidate_only,
+        _neither_succeeded). Distinct from trade-level versions and
+        clearer for promotion decisions."""
+        sel = {"front_expiry": "2024-05-17", "back_expiry": "2024-06-21",
+               "strike": 100.0, "front_dte_days": 16}
+        trades = [
+            # Event A: both pickers succeeded at every offset → both_succeeded
+            self._ok_trade(symbol="AAPL", event_date="2024-05-01",
+                           entry_date="2024-04-26", legacy=sel, candidate=sel, diverged=False),
+            self._ok_trade(symbol="AAPL", event_date="2024-05-01",
+                           entry_date="2024-04-29", legacy=sel, candidate=sel, diverged=False),
+            # Event B: only legacy succeeded at both offsets → legacy_only
+            self._ok_trade(symbol="AAPL", event_date="2024-08-01",
+                           entry_date="2024-07-29", legacy=sel, candidate=None, diverged=False),
+            self._ok_trade(symbol="AAPL", event_date="2024-08-01",
+                           entry_date="2024-07-30", legacy=sel, candidate=None, diverged=False),
+            # Event C: only candidate at both offsets → candidate_only
+            self._ok_trade(symbol="AAPL", event_date="2024-11-01",
+                           entry_date="2024-10-29", legacy=None, candidate=sel, diverged=False),
+            # Event D: neither at the one offset → neither_succeeded
+            self._ok_trade(symbol="AAPL", event_date="2025-02-01",
+                           entry_date="2025-01-30", legacy=None, candidate=None, diverged=False),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        ec = result["event_counts"]
+        assert ec["unique_events_both_succeeded"] == 1
+        assert ec["unique_events_legacy_only"] == 1
+        assert ec["unique_events_candidate_only"] == 1
+        assert ec["unique_events_neither_succeeded"] == 1
+        assert ec["unique_events_mixed_outcomes"] == 0
+
+    def test_event_level_buckets_handle_mixed_offsets(self):
+        """When the same event shows different outcomes across offsets
+        (e.g. candidate succeeds at offset 10 but not offset 5), the
+        event must NOT be folded into a clean bucket — it goes into
+        `unique_events_mixed_outcomes` so promotion analysis cannot
+        accidentally treat it as a clean win/loss."""
+        sel = {"front_expiry": "2024-05-17", "back_expiry": "2024-06-21",
+               "strike": 100.0, "front_dte_days": 16}
+        trades = [
+            # Same event, two offsets, different outcomes
+            self._ok_trade(symbol="AAPL", event_date="2024-05-01",
+                           entry_date="off5", legacy=sel, candidate=None, diverged=False),
+            self._ok_trade(symbol="AAPL", event_date="2024-05-01",
+                           entry_date="off10", legacy=sel, candidate=sel, diverged=False),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        ec = result["event_counts"]
+        assert ec["unique_events_mixed_outcomes"] == 1
+        # And the event must not appear in any clean bucket
+        assert ec["unique_events_both_succeeded"] == 0
+        assert ec["unique_events_legacy_only"] == 0
+        assert ec["unique_events_candidate_only"] == 0
+        assert ec["unique_events_neither_succeeded"] == 0
+
+    def test_note_points_at_narrowest_promotion_fields(self):
+        """Codex review explicitly asked for the note to point at the
+        narrowest fields (unique_events_diverged, _picker_evaluated),
+        not the broad unique_events_observed."""
+        result = _aggregate_experimental_candidate_evidence([])
+        note = result["note"]
+        assert "unique_events_diverged" in note
+        assert "unique_events_picker_evaluated" in note
+        # The broader count should be explicitly called out as NOT the
+        # right denominator
+        assert "unique_events_observed" in note  # mentioned by name
+        assert "should not be used as a denominator" in note

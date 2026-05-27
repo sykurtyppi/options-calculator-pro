@@ -917,6 +917,14 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
     unique_events_diverged: set = set()
     unique_events_picker_evaluated: set = set()  # at least one offset had shadow_status == "ok"
 
+    # Event-level outcome buckets (Codex follow-up to commit 2b). These
+    # are derived after the trade loop because a single event seen at
+    # multiple offsets can have inconsistent per-trade outcomes — we
+    # want a stable event-level classification, not "max over offsets".
+    # Rule: an event is in `unique_events_both_succeeded` iff EVERY
+    # ok-status trade for that event had both selections. Conservative.
+    per_event_trade_outcomes: Dict[Any, List[str]] = {}
+
     diverged_sample: List[Dict[str, Any]] = []
 
     for trade in trades:
@@ -944,12 +952,16 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
             unique_events_with_candidate.add(event_key)
         if legacy_present and candidate_present:
             n_both += 1
+            per_event_trade_outcomes.setdefault(event_key, []).append("both")
         elif legacy_present:
             n_legacy_only += 1
+            per_event_trade_outcomes.setdefault(event_key, []).append("legacy_only")
         elif candidate_present:
             n_candidate_only += 1
+            per_event_trade_outcomes.setdefault(event_key, []).append("candidate_only")
         else:
             n_neither += 1
+            per_event_trade_outcomes.setdefault(event_key, []).append("neither")
         if dp.get("pickers_diverged"):
             n_diverged += 1
             unique_events_diverged.add(event_key)
@@ -969,6 +981,32 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
                     }
                 )
 
+    # Event-level outcome buckets. Conservative classification: an event
+    # is in `both_succeeded` ONLY when every ok-status trade for that
+    # event had both selections. If a single offset failed on either
+    # side, the event drops to the partial-success or mixed bucket.
+    unique_events_both_succeeded: set = set()
+    unique_events_legacy_only: set = set()
+    unique_events_candidate_only: set = set()
+    unique_events_neither_succeeded: set = set()
+    unique_events_mixed_outcomes: set = set()
+    for event_key, outcomes in per_event_trade_outcomes.items():
+        unique = set(outcomes)
+        if unique == {"both"}:
+            unique_events_both_succeeded.add(event_key)
+        elif unique == {"legacy_only"}:
+            unique_events_legacy_only.add(event_key)
+        elif unique == {"candidate_only"}:
+            unique_events_candidate_only.add(event_key)
+        elif unique == {"neither"}:
+            unique_events_neither_succeeded.add(event_key)
+        else:
+            # Mixed across offsets (e.g. some offsets had both, others
+            # only legacy). Tallied separately so promotion criteria
+            # don't accidentally fold mixed events into the cleaner
+            # buckets.
+            unique_events_mixed_outcomes.add(event_key)
+
     return {
         "note": (
             "Shadow comparison of two calendar leg-picker rules. The "
@@ -979,9 +1017,14 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
             "PR-AC pull request description.\n\n"
             "IMPORTANT: trade_counts.* are inflated by entry-offset "
             "replication — the same earnings event evaluated at multiple "
-            "entry offsets produces multiple trade records. Use "
-            "event_counts.unique_events_* for promotion-criterion "
-            "thresholds (n_diverged, n_total) to avoid double-counting."
+            "entry offsets produces multiple trade records. Promotion-"
+            "criterion thresholds must reference the NARROWEST event-"
+            "level fields: `event_counts.unique_events_diverged` (the "
+            "events where the rule actually changed contract choice) "
+            "and `event_counts.unique_events_picker_evaluated` (the "
+            "events where both pickers actually ran). The broader "
+            "`unique_events_observed` includes data-availability "
+            "failures and should not be used as a denominator."
         ),
         "picker_legacy": "legacy_first_expiry",
         "picker_candidate": "candidate_min_dte",
@@ -1004,6 +1047,13 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
             "unique_events_with_legacy_selection": len(unique_events_with_legacy),
             "unique_events_with_candidate_selection": len(unique_events_with_candidate),
             "unique_events_diverged": len(unique_events_diverged),
+            # Outcome buckets (event-level, conservative per-event
+            # classification — see _per_event_trade_outcomes logic).
+            "unique_events_both_succeeded": len(unique_events_both_succeeded),
+            "unique_events_legacy_only": len(unique_events_legacy_only),
+            "unique_events_candidate_only": len(unique_events_candidate_only),
+            "unique_events_neither_succeeded": len(unique_events_neither_succeeded),
+            "unique_events_mixed_outcomes": len(unique_events_mixed_outcomes),
         },
         # Data-availability accounting (entry chain missing, helper
         # exceptions, etc.) — separated so it cannot be confused with
