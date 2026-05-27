@@ -1,5 +1,7 @@
 # Options Calculator Pro (Web Edition)
 
+[![CI](https://github.com/sykurtyppi/options-calculator-pro/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sykurtyppi/options-calculator-pro/actions/workflows/ci.yml)
+
 Selector-first event-volatility decision platform for earnings setups.
 
 > **Deploying or redeploying?** See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** —
