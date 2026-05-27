@@ -472,6 +472,123 @@ def test_picker_provenance_field_location_contract(tmp_path: Path) -> None:
     # mentions "selector_output" in some unrelated field text)
 
 
+def test_picker_provenance_end_to_end_through_edge_snapshot(tmp_path: Path) -> None:
+    """REGRESSION (Codex review of commit 4b): the field-location
+    contract test exercises `build_record_from_analysis` directly with
+    a SimpleNamespace. This test goes one layer further — constructs
+    a real EdgeSnapshot exactly the way the live engine does
+    (metrics dict carrying experimental_contract_selection), passes
+    it through `record_recommendation`, and reads the ledger to
+    confirm picker_provenance survived the full round trip. Catches
+    adapter changes outside build_record_from_analysis."""
+    from web.api.edge_engine import EdgeSnapshot
+
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    expected = _sample_experimental_contract_selection()
+
+    # Mirror the live engine's assembly: metrics dict with the
+    # experimental block as a top-level key inside metrics.
+    metrics = {
+        "data_sources": {"options_source": "marketdata_app",
+                         "price_rv_source": "yfinance"},
+        "experimental_contract_selection": expected,
+        # Other metrics fields the engine populates — included so the
+        # shape matches reality even if our test doesn't read them
+        "calendar_payoff": None,
+        "structure_payoff": None,
+    }
+    edge_snapshot = EdgeSnapshot(
+        symbol="AAPL",
+        recommendation="Candidate",
+        confidence_pct=72.0,
+        setup_score=0.72,
+        metrics=metrics,
+        rationale=["selector rationale"],
+        selector_output={
+            "recommendation": "Candidate",
+            "best_structure": "call_calendar",
+            "earnings_date": "2026-05-01",
+            "as_of": "2026-04-23",
+            "primary_thesis": "thesis",
+            "primary_risks": ["r"],
+            "why_this_structure": ["w"],
+            "why_not_others": {},
+        },
+        structure_scorecards=[
+            {"structure": "call_calendar", "eligible": True,
+             "composite_structure_score": 0.81},
+        ],
+        vol_snapshot={
+            "symbol": "AAPL",
+            "as_of_date": "2026-04-23",
+            "earnings_date": "2026-05-01",
+            "earnings_source_primary": "alpha_vantage",
+            "earnings_source_confidence": 0.82,
+            "earnings_source_stale": False,
+            "option_source": "marketdata_app",
+            "underlying_source": "yfinance",
+            "data_quality_score": 0.77,
+        },
+    )
+
+    rec_id = record_recommendation(edge_snapshot, ledger=ledger)
+    row = ledger.get(rec_id)
+    assert row is not None
+    pp = row["picker_provenance_json"]
+    # Survived the full EdgeSnapshot → build_record → ledger round trip
+    assert pp["structure"] == "call_calendar"
+    assert pp["labels"]["shadow_mode"] is True
+    assert pp["candidate_contracts"]["pickers_diverged"] is True
+    assert pp["candidate_contracts"]["candidate_selection"]["picker_variant"] == "candidate_min_dte"
+
+
+def test_picker_provenance_preserves_numeric_types_through_round_trip(tmp_path: Path) -> None:
+    """REGRESSION (Codex review of commit 4b): _json uses `default=str`
+    to never crash on dates/numpy/timestamps. That's operationally
+    correct but can hide silent type drift — a numpy.float64 written as
+    a JSON string would round-trip as a string, breaking any future
+    SQL/JSON analytics that expects a number.
+
+    Numeric fields persisted by `to_metadata_dict` (mid, bid, ask, iv,
+    strike, spread_pct) are already coerced to native Python floats
+    inside the picker module. This test confirms that contract holds
+    end-to-end: write → read → numeric fields are still numbers."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    analysis.metrics["experimental_contract_selection"] = _sample_experimental_contract_selection()
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="numeric-type-test",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    pp = ledger.get(rec_id)["picker_provenance_json"]
+
+    legacy = pp["candidate_contracts"]["legacy_selection"]
+    candidate = pp["candidate_contracts"]["candidate_selection"]
+
+    # Strikes must be float, not string
+    assert isinstance(legacy["strike"], (int, float))
+    assert isinstance(candidate["strike"], (int, float))
+    # DTE measurements must be int
+    assert isinstance(legacy["front_dte_days"], int)
+    assert isinstance(candidate["front_dte_days"], int)
+    assert isinstance(legacy["back_minus_front_days"], int)
+    # Leg quote fields must be numeric (or None when missing)
+    for side_key in ("front_leg", "back_leg"):
+        for field_key in ("mid", "bid", "ask", "iv", "spread_pct"):
+            v_legacy = legacy[side_key][field_key]
+            v_candidate = candidate[side_key][field_key]
+            assert v_legacy is None or isinstance(v_legacy, (int, float)), (
+                f"legacy.{side_key}.{field_key} drifted to non-numeric: {type(v_legacy).__name__}"
+            )
+            assert v_candidate is None or isinstance(v_candidate, (int, float)), (
+                f"candidate.{side_key}.{field_key} drifted to non-numeric: {type(v_candidate).__name__}"
+            )
+    # Booleans stay booleans
+    assert pp["candidate_contracts"]["pickers_diverged"] is True
+
+
 def test_malformed_picker_provenance_json_yields_empty_dict_on_read(tmp_path: Path) -> None:
     """Codex hygiene check: a single row with malformed
     picker_provenance_json must NOT break the whole ledger read.
