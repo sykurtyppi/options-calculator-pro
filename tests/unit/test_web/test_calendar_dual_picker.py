@@ -1467,3 +1467,320 @@ class TestPricingGradeNaming:
                                     # hazard if used in promotion stats
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# PR-AD commit 2 — aggregator with strict provenance bucketing
+# ──────────────────────────────────────────────────────────────────────────
+
+def _trade_with_provenance_and_outcome(
+    *,
+    symbol: str,
+    event_date: str,
+    entry_date: str,
+    sample_provenance: str,
+    outcome_status: str = "ok",
+    mid_realized_return_pct: Any = 5.0,
+    legacy_sel: Any = None,
+    candidate_sel: Any = None,
+    pickers_diverged: bool = False,
+    shadow_status: str = "ok",
+    labels_intact: bool = True,
+) -> Dict[str, Any]:
+    """Construct a single trade record matching the live shape produced
+    by _simulate_pre_earnings_calendar_trade. Used to exercise the
+    aggregator's provenance + eligibility logic in isolation."""
+    outcome = _empty_candidate_shadow_outcome(outcome_status)
+    if outcome_status == "ok":
+        outcome["mid_realized_return_pct"] = mid_realized_return_pct
+        outcome["side"] = "call"
+        outcome["strike"] = 100.0
+        outcome["front_expiry"] = "2024-05-17"
+        outcome["back_expiry"] = "2024-06-21"
+    if not labels_intact:
+        outcome["labels"] = {}
+    sel = {"front_expiry": "2024-05-17", "back_expiry": "2024-06-21",
+           "strike": 100.0, "front_dte_days": 16}
+    return {
+        "symbol": symbol,
+        "event_date": event_date,
+        "entry_date": entry_date,
+        "sample_provenance": sample_provenance,
+        "candidate_shadow_outcome": outcome,
+        "dual_picker": {
+            "shadow_status": shadow_status,
+            "legacy_selection": legacy_sel if legacy_sel is not None else sel,
+            "candidate_selection": candidate_sel if candidate_sel is not None else sel,
+            "pickers_diverged": pickers_diverged,
+            "candidate_min_front_dte_days": 14,
+            "experimental_note": "...",
+        },
+    }
+
+
+def _forward_eligible_trade(**overrides) -> Dict[str, Any]:
+    """A canonical forward-post-freeze trade that PASSES is_promotion_eligible.
+    Tests perturb one field at a time to verify gating."""
+    return _trade_with_provenance_and_outcome(
+        symbol=overrides.pop("symbol", "AAPL"),
+        event_date=overrides.pop("event_date", "2026-06-01"),
+        entry_date=overrides.pop("entry_date", "2026-05-29"),
+        sample_provenance=overrides.pop(
+            "sample_provenance", SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+        ),
+        **overrides,
+    )
+
+
+class TestAggregatorProvenanceBucketing:
+    """Codex hard rules for commit 2: show all records in diagnostics
+    (including unknown/replay/skipped/malformed); compute promotion
+    stats ONLY on eligible records; never mix replay and forward."""
+
+    def test_empty_input_produces_empty_promotion_stats_with_none_values(self):
+        result = _aggregate_experimental_candidate_evidence([])
+        pe = result["promotion_eligible_candidate_stats"]
+        assert pe["n_events"] == 0
+        assert pe["candidate_mid_realized_return_pct_mean"] is None
+        assert pe["candidate_mid_realized_return_pct_median"] is None
+        assert pe["candidate_mid_realized_return_pct_win_rate"] is None
+
+    def test_provenance_counts_includes_every_bucket_seen(self):
+        """Codex: 'show all records in diagnostics, including unknown,
+        replay, skipped, and malformed.'"""
+        trades = [
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date=f"2026-{m:02d}-01",
+                entry_date=f"2026-{m:02d}-01",
+                sample_provenance=prov,
+            )
+            for m, prov in enumerate([
+                SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+                SAMPLE_PROVENANCE_UNKNOWN,
+                "totally_made_up_string",
+            ], start=1)
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        counts = result["provenance_counts"]
+        assert counts[SAMPLE_PROVENANCE_HISTORICAL_REPLAY] == 2
+        assert counts[SAMPLE_PROVENANCE_FORWARD_POST_FREEZE] == 1
+        assert counts[SAMPLE_PROVENANCE_UNKNOWN] == 1
+        # Even unrecognized provenance strings appear in diagnostics
+        assert counts["totally_made_up_string"] == 1
+
+    def test_candidate_outcome_status_counts_includes_skip_reasons(self):
+        """Skipped/malformed outcomes must surface as their own counts
+        so the operator can see why candidate PnL is missing."""
+        trades = [
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2026-06-01", entry_date="2026-05-29",
+                sample_provenance=SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+                outcome_status="ok",
+            ),
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2026-09-01", entry_date="2026-08-29",
+                sample_provenance=SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+                outcome_status="skipped:missing_exit_quote",
+            ),
+            _trade_with_provenance_and_outcome(
+                symbol="MSFT", event_date="2026-07-01", entry_date="2026-06-29",
+                sample_provenance=SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+                outcome_status="skipped:no_candidate_selection",
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        counts = result["candidate_outcome_status_counts"]
+        assert counts["ok"] == 1
+        assert counts["skipped:missing_exit_quote"] == 1
+        assert counts["skipped:no_candidate_selection"] == 1
+
+
+class TestAggregatorPromotionEligibleBucket:
+    """The promotion_eligible_candidate_stats block is gated by
+    is_promotion_eligible(record). It must NEVER include historical
+    replay rows, UNKNOWN provenance, skipped outcomes, non-finite
+    returns, or label-tampered records."""
+
+    def test_historical_replay_trade_is_excluded_from_promotion(self):
+        """The single most important regression: in-sample data must
+        never enter promotion stats."""
+        trade = _trade_with_provenance_and_outcome(
+            symbol="AAPL", event_date="2024-05-01", entry_date="2024-04-29",
+            sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+            outcome_status="ok", mid_realized_return_pct=42.0,
+        )
+        result = _aggregate_experimental_candidate_evidence([trade])
+        # Diagnostics show the row exists
+        assert result["provenance_counts"][SAMPLE_PROVENANCE_HISTORICAL_REPLAY] == 1
+        assert result["candidate_outcome_status_counts"]["ok"] == 1
+        # But promotion-eligible stats are empty
+        pe = result["promotion_eligible_candidate_stats"]
+        assert pe["n_events"] == 0
+        assert pe["candidate_mid_realized_return_pct_mean"] is None
+
+    def test_forward_eligible_trade_appears_in_promotion_block(self):
+        trade = _forward_eligible_trade(mid_realized_return_pct=10.0)
+        result = _aggregate_experimental_candidate_evidence([trade])
+        pe = result["promotion_eligible_candidate_stats"]
+        assert pe["n_events"] == 1
+        assert pe["candidate_mid_realized_return_pct_mean"] == pytest.approx(10.0)
+        assert pe["candidate_mid_realized_return_pct_win_rate"] == pytest.approx(1.0)
+
+    def test_skipped_forward_trade_does_not_enter_promotion(self):
+        """A forward record with an unresolved candidate outcome is
+        diagnostic only — not promotion evidence."""
+        trade = _forward_eligible_trade(outcome_status="skipped:missing_exit_quote")
+        result = _aggregate_experimental_candidate_evidence([trade])
+        assert result["candidate_outcome_status_counts"]["skipped:missing_exit_quote"] == 1
+        assert result["promotion_eligible_candidate_stats"]["n_events"] == 0
+
+    def test_label_tampered_forward_trade_does_not_enter_promotion(self):
+        """If labels are missing/stripped, is_promotion_eligible rejects
+        the row → it can't enter promotion stats. Provenance count and
+        outcome-status count still see it."""
+        trade = _forward_eligible_trade(labels_intact=False)
+        result = _aggregate_experimental_candidate_evidence([trade])
+        assert result["provenance_counts"][SAMPLE_PROVENANCE_FORWARD_POST_FREEZE] == 1
+        assert result["promotion_eligible_candidate_stats"]["n_events"] == 0
+
+    def test_event_level_dedupe_across_entry_offsets(self):
+        """The same event seen at multiple entry offsets should count
+        ONCE in the promotion-eligible event count, not N times. PnL
+        for that event is the mean of its per-offset PnLs."""
+        trades = [
+            _forward_eligible_trade(
+                symbol="AAPL", event_date="2026-06-01",
+                entry_date=f"offset-{i}",
+                mid_realized_return_pct=10.0 + i,
+            )
+            for i in range(6)
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        pe = result["promotion_eligible_candidate_stats"]
+        # 1 unique event, regardless of 6 offsets
+        assert pe["n_events"] == 1
+        # Mean PnL is mean of 10, 11, 12, 13, 14, 15 = 12.5
+        assert pe["candidate_mid_realized_return_pct_mean"] == pytest.approx(12.5)
+
+    def test_win_rate_event_level(self):
+        # 3 events: one wins (+10), two lose (-5, -1) → win rate = 1/3
+        trades = [
+            _forward_eligible_trade(
+                symbol="AAPL", event_date="2026-06-01",
+                entry_date="2026-05-29", mid_realized_return_pct=10.0,
+            ),
+            _forward_eligible_trade(
+                symbol="AAPL", event_date="2026-09-01",
+                entry_date="2026-08-29", mid_realized_return_pct=-5.0,
+            ),
+            _forward_eligible_trade(
+                symbol="MSFT", event_date="2026-07-01",
+                entry_date="2026-06-29", mid_realized_return_pct=-1.0,
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        pe = result["promotion_eligible_candidate_stats"]
+        assert pe["n_events"] == 3
+        assert pe["candidate_mid_realized_return_pct_win_rate"] == pytest.approx(1 / 3)
+
+
+class TestAggregatorInSampleDiagnostic:
+    """The in_sample_diagnostic_candidate_stats block exists for
+    sanity-checking simulator math and is labeled exhaustively as
+    non-promotion. Tests verify the label is unambiguous."""
+
+    def test_in_sample_block_carries_explicit_provenance_label(self):
+        result = _aggregate_experimental_candidate_evidence([])
+        diag = result["in_sample_diagnostic_candidate_stats"]
+        assert diag["sample_provenance"] == SAMPLE_PROVENANCE_HISTORICAL_REPLAY
+        # Note text warns explicitly
+        assert "IN-SAMPLE" in diag["note"]
+        assert "never as out-of-sample evidence" in diag["note"]
+
+    def test_in_sample_stats_only_aggregate_historical_replay(self):
+        """A forward trade should NOT contribute to in_sample stats
+        even though its outcome is ok and its PnL is finite — its
+        provenance is wrong for this bucket."""
+        trades = [
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2024-05-01", entry_date="2024-04-29",
+                sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                mid_realized_return_pct=20.0,
+            ),
+            _forward_eligible_trade(mid_realized_return_pct=999.0),  # noise
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        diag = result["in_sample_diagnostic_candidate_stats"]
+        # Only the historical_replay row contributes
+        assert diag["n_events"] == 1
+        assert diag["candidate_mid_realized_return_pct_mean"] == pytest.approx(20.0)
+
+
+class TestAggregatorNoMixingOfProvenance:
+    """Codex hard rule: 'never mix historical replay and forward
+    evidence into one candidate performance number.'"""
+
+    def test_in_sample_and_promotion_blocks_are_separate(self):
+        """Both blocks coexist with disjoint contents — historical_replay
+        rows only in in_sample, forward rows only in promotion-eligible."""
+        trades = [
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2024-05-01", entry_date="2024-04-29",
+                sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                mid_realized_return_pct=-30.0,
+            ),
+            _forward_eligible_trade(
+                symbol="AAPL", event_date="2026-06-01",
+                entry_date="2026-05-29", mid_realized_return_pct=15.0,
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        diag = result["in_sample_diagnostic_candidate_stats"]
+        pe = result["promotion_eligible_candidate_stats"]
+        # In-sample: only the replay row
+        assert diag["n_events"] == 1
+        assert diag["candidate_mid_realized_return_pct_mean"] == pytest.approx(-30.0)
+        # Forward: only the eligible row
+        assert pe["n_events"] == 1
+        assert pe["candidate_mid_realized_return_pct_mean"] == pytest.approx(15.0)
+        # Math check: -30 and +15 never get averaged into a single
+        # "candidate performance" number. The blocks stay disjoint.
+
+    def test_aggregator_output_has_no_combined_candidate_performance_field(self):
+        """Defense: assert that no top-level key contains a single
+        candidate-performance scalar. Promotion stats live ONLY inside
+        promotion_eligible_candidate_stats."""
+        result = _aggregate_experimental_candidate_evidence([])
+        # The forbidden shapes: a top-level mean/median/win_rate
+        # that would aggregate over all provenance buckets.
+        forbidden_keys = {
+            "candidate_mean_return_pct",
+            "candidate_win_rate",
+            "candidate_realized_return_pct_mean",
+            "combined_candidate_performance",
+        }
+        assert forbidden_keys.isdisjoint(result.keys()), (
+            "aggregator must not expose a top-level scalar that could "
+            "be interpreted as a single 'candidate performance' number"
+        )
+
+    def test_field_names_carry_mid_pricing_grade(self):
+        """Codex: 'name fields with mid_ / research_mid so nobody reads
+        them as execution-grade.' The candidate stats field names must
+        embed mid_realized to make this clear."""
+        result = _aggregate_experimental_candidate_evidence([])
+        for block_name in ("in_sample_diagnostic_candidate_stats",
+                           "promotion_eligible_candidate_stats"):
+            block = result[block_name]
+            for k in block.keys():
+                if "return" in k or "win_rate" in k:
+                    # Stats fields must carry mid_realized (or be the
+                    # event-count). Win rate is the one acceptable
+                    # exception — it doesn't need a pricing qualifier.
+                    if "win_rate" not in k:
+                        assert "mid_realized" in k, (
+                            f"{block_name}.{k} is missing the mid_ "
+                            f"pricing-grade qualifier"
+                        )
+
+

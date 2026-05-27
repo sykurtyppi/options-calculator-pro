@@ -1408,6 +1408,29 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
     # Shadow-status breakdown across ALL trades (incl. non-ok)
     shadow_status_counts: Dict[str, int] = {}
 
+    # PR-AD commit 2 — provenance + candidate-outcome accounting.
+    # Codex hard rules:
+    #   - Show all records in diagnostics, including unknown / replay /
+    #     skipped / malformed.
+    #   - Compute promotion stats ONLY on records that pass
+    #     is_promotion_eligible(record).
+    #   - Never mix historical replay and forward evidence into one
+    #     "candidate performance" number.
+    provenance_counts: Dict[str, int] = {}
+    candidate_outcome_status_counts: Dict[str, int] = {}
+
+    # Per-event candidate PnL by provenance bucket. The outer key is
+    # the sample_provenance string; the inner dict maps event_key to
+    # the list of mid_realized_return_pct values seen at that event
+    # (one per ok-status candidate outcome across entry offsets).
+    candidate_pnl_by_provenance_and_event: Dict[str, Dict[Any, List[float]]] = {}
+
+    # Same shape, restricted to records that pass is_promotion_eligible.
+    # Used for the promotion_eligible_candidate_stats block. Kept
+    # separate so a downstream typo in the aggregator can't accidentally
+    # widen the filter.
+    promotion_eligible_event_pnls: Dict[Any, List[float]] = {}
+
     # Event-level (deduplicated on (symbol, event_date))
     unique_events: set = set()
     unique_events_with_legacy: set = set()
@@ -1433,6 +1456,40 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
         event_key = (trade.get("symbol"), trade.get("event_date"))
         if event_key != (None, None):
             unique_events.add(event_key)
+
+        # PR-AD commit 2 accounting — observability first, gating second.
+        prov = trade.get("sample_provenance") or "missing"
+        provenance_counts[prov] = provenance_counts.get(prov, 0) + 1
+
+        outcome = trade.get("candidate_shadow_outcome") or {}
+        outcome_status = outcome.get("status") or "missing"
+        candidate_outcome_status_counts[outcome_status] = (
+            candidate_outcome_status_counts.get(outcome_status, 0) + 1
+        )
+
+        # Collect candidate PnL by provenance for diagnostics. The
+        # in_sample_diagnostic block reads from this; the promotion
+        # block uses is_promotion_eligible() instead so the strict
+        # checks apply uniformly.
+        candidate_pnl = outcome.get("mid_realized_return_pct")
+        if (
+            outcome_status == "ok"
+            and isinstance(candidate_pnl, (int, float))
+            and not isinstance(candidate_pnl, bool)
+            and np.isfinite(candidate_pnl)
+            and event_key != (None, None)
+        ):
+            candidate_pnl_by_provenance_and_event.setdefault(prov, {}).setdefault(
+                event_key, []
+            ).append(float(candidate_pnl))
+
+        # Strict gate for promotion-eligible bucket. Routes through the
+        # single source of truth so any future change to the eligibility
+        # definition automatically tightens this aggregator too.
+        if is_promotion_eligible(trade) and event_key != (None, None):
+            promotion_eligible_event_pnls.setdefault(event_key, []).append(
+                float(outcome["mid_realized_return_pct"])
+            )
 
         # Outcome bucketing only applies when shadow logging actually ran.
         if status != "ok":
@@ -1478,6 +1535,61 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
                         "candidate_front_dte": (candidate_sel or {}).get("front_dte_days"),
                     }
                 )
+
+    # PR-AD commit 2: compute event-level candidate PnL summary stats.
+    # Reduces to per-event mean PnL first (so multiple eligible offsets
+    # of the same event don't get extra weight), then aggregates across
+    # events. Returns None on empty input rather than NaN or 0.0 — a
+    # missing stat must be visibly missing, never zero-coded.
+    def _summarize_event_level_pnls(event_pnls: Dict[Any, List[float]]) -> Dict[str, Any]:
+        if not event_pnls:
+            return {
+                "n_events": 0,
+                "candidate_mid_realized_return_pct_mean": None,
+                "candidate_mid_realized_return_pct_median": None,
+                "candidate_mid_realized_return_pct_win_rate": None,
+            }
+        per_event_mean = [
+            sum(pnls) / len(pnls) for pnls in event_pnls.values() if pnls
+        ]
+        n = len(per_event_mean)
+        if n == 0:
+            return {
+                "n_events": 0,
+                "candidate_mid_realized_return_pct_mean": None,
+                "candidate_mid_realized_return_pct_median": None,
+                "candidate_mid_realized_return_pct_win_rate": None,
+            }
+        per_event_mean_sorted = sorted(per_event_mean)
+        if n % 2 == 1:
+            median = per_event_mean_sorted[n // 2]
+        else:
+            median = 0.5 * (per_event_mean_sorted[n // 2 - 1] + per_event_mean_sorted[n // 2])
+        wins = sum(1 for v in per_event_mean if v > 0)
+        return {
+            "n_events": int(n),
+            "candidate_mid_realized_return_pct_mean": float(sum(per_event_mean) / n),
+            "candidate_mid_realized_return_pct_median": float(median),
+            "candidate_mid_realized_return_pct_win_rate": float(wins / n),
+        }
+
+    # In-sample diagnostic stats — historical replay subset ONLY.
+    # Codex hard rule: never mix replay and forward evidence into one
+    # number. We compute stats from the HISTORICAL_REPLAY bucket and
+    # label the block exhaustively so a downstream reader cannot
+    # mistake these for promotion evidence.
+    in_sample_summary = _summarize_event_level_pnls(
+        candidate_pnl_by_provenance_and_event.get(
+            SAMPLE_PROVENANCE_HISTORICAL_REPLAY, {}
+        )
+    )
+
+    # Promotion-eligible stats — gated by is_promotion_eligible(record).
+    # On the historical replay code path this is empty by construction
+    # (HISTORICAL_REPLAY is not in PROMOTION_ELIGIBLE_PROVENANCES). It
+    # becomes non-empty only when forward observations accumulate via
+    # the live API path.
+    promotion_eligible_summary = _summarize_event_level_pnls(promotion_eligible_event_pnls)
 
     # Event-level outcome buckets. Conservative classification: an event
     # is in `both_succeeded` ONLY when every ok-status trade for that
@@ -1558,6 +1670,54 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
         # picker outcomes.
         "shadow_status_counts": {
             k: int(v) for k, v in sorted(shadow_status_counts.items())
+        },
+        # PR-AD commit 2 — provenance + candidate-outcome accounting.
+        # Counts every record regardless of provenance or outcome
+        # status (Codex hard rule: "show all records in diagnostics").
+        # Empty buckets are still present with count 0 if seen.
+        "provenance_counts": {
+            k: int(v) for k, v in sorted(provenance_counts.items())
+        },
+        "candidate_outcome_status_counts": {
+            k: int(v) for k, v in sorted(candidate_outcome_status_counts.items())
+        },
+        # In-sample diagnostic candidate stats. Computed from the
+        # HISTORICAL_REPLAY provenance bucket and labeled explicitly
+        # as in-sample so a downstream reader CANNOT mistake this for
+        # validation evidence. Exists for sanity-checking simulator
+        # math (e.g., the in-sample mean should roughly match PR-AB
+        # reported numbers); it is NOT promotion evidence.
+        "in_sample_diagnostic_candidate_stats": {
+            "note": (
+                "IN-SAMPLE diagnostic only. The +14d rule was discovered "
+                "on this exact dataset (PR-AB). Use this block to verify "
+                "the candidate shadow simulator is mathematically correct "
+                "— never as out-of-sample evidence or promotion criterion "
+                "input."
+            ),
+            "sample_provenance": SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+            **in_sample_summary,
+        },
+        # Promotion-eligible candidate stats. Gated by
+        # is_promotion_eligible(record) — the SINGLE source of truth
+        # for promotion-eligibility. Empty (n_events=0) on any historical
+        # replay aggregation by construction; populated only once
+        # forward observations accumulate via the live API path.
+        # Codex hard rule: this is the ONLY block promotion criteria
+        # may reference.
+        "promotion_eligible_candidate_stats": {
+            "note": (
+                "Computed ONLY from records that pass "
+                "is_promotion_eligible(record). Required properties: "
+                "sample_provenance in PROMOTION_ELIGIBLE_PROVENANCES "
+                "(today only forward_post_freeze), candidate "
+                "outcome.status == 'ok', finite numeric "
+                "mid_realized_return_pct, and intact research_mid / "
+                "shadow_only / not_execution_grade labels. Reduces to "
+                "per-event mean PnL before cross-event aggregation so "
+                "entry-offset replication cannot inflate weights."
+            ),
+            **promotion_eligible_summary,
         },
         "diverged_sample": diverged_sample,
     }
