@@ -284,5 +284,131 @@ class TestWalkForwardPriorCache(unittest.TestCase):
                 self.assertIsNot(third, fourth)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# PR #70: Neutral prior rank consistency
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestNeutralPriorRankConsistency(unittest.TestCase):
+    """Pre-PR-#70, ``_neutral_prior()`` hardcoded ``rank_score=0.50``
+    while ``_compute_rank_score(0.50, 0.0, 0)`` returned 0.308571 —
+    same nominal inputs, different rank. A "no observations at all"
+    structure could outrank an "observed-and-genuinely-neutral"
+    structure by ~0.19, flipping selector decisions on thin-data
+    names.
+
+    PR #70 routes ``_neutral_prior``'s rank_score through
+    ``_compute_rank_score`` so the consistency property (same
+    input → same output) holds. These tests pin the property and
+    the new numerical value.
+    """
+
+    def test_neutral_prior_rank_score_matches_compute_rank_score(self):
+        """Load-bearing consistency property: a neutral prior and a
+        real prior with the same (win_rate, avg_return, history_count)
+        defaults MUST produce the same rank_score. This is the
+        invariant the old hardcoded 0.50 violated."""
+        from services.structure_scorecard import (
+            _neutral_prior,
+            _compute_rank_score,
+            _NEUTRAL_PRIOR_WIN_RATE,
+            _NEUTRAL_PRIOR_AVG_RETURN_PCT,
+            _NEUTRAL_PRIOR_HISTORY_COUNT,
+        )
+        neutral = _neutral_prior("atm_straddle", source="test_consistency")
+        observed = _compute_rank_score(
+            win_rate=_NEUTRAL_PRIOR_WIN_RATE,
+            avg_return_pct=_NEUTRAL_PRIOR_AVG_RETURN_PCT,
+            history_count=_NEUTRAL_PRIOR_HISTORY_COUNT,
+        )
+        self.assertAlmostEqual(
+            neutral.rank_score, observed, places=10,
+            msg=(
+                "Neutral prior's rank_score MUST equal "
+                "_compute_rank_score(neutral defaults). If they "
+                "diverge, the perverse-incentive bug returns."
+            ),
+        )
+
+    def test_neutral_prior_rank_score_is_approximately_0_309(self):
+        """Anchor the literal post-fix value. Catches an accidental
+        revert of the routing to a hardcoded 0.50."""
+        from services.structure_scorecard import _neutral_prior
+        neutral = _neutral_prior("atm_straddle", source="test_anchor")
+        # 0.45 * return_score(0,−10,15) + 0.30 * win_score(0.50,0.35,0.70)
+        # + 0.25 * history_score(0,5,50)
+        # = 0.45 * 0.40 + 0.30 * 0.428571 + 0.25 * 0
+        # = 0.180 + 0.128571 + 0 = 0.308571
+        self.assertAlmostEqual(neutral.rank_score, 0.308571, places=6)
+        # And specifically: NOT 0.50 (the old hardcoded value).
+        self.assertLess(
+            neutral.rank_score, 0.40,
+            "rank_score must be < 0.40 — if it's ~0.50, the "
+            "PR #70 routing fix was reverted.",
+        )
+
+    def test_neutral_prior_other_fields_unchanged(self):
+        """The fix touches ONLY rank_score. Every other field on the
+        WalkForwardPrior dataclass must remain at its pre-PR-#70
+        value so downstream consumers that inspect history_count,
+        win_rate, avg_return_pct, source, or structure are
+        unaffected."""
+        from services.structure_scorecard import _neutral_prior
+        neutral = _neutral_prior("call_calendar", source="test_other_fields")
+        self.assertEqual(neutral.structure, "call_calendar")
+        self.assertEqual(neutral.history_count, 0)
+        self.assertEqual(neutral.win_rate, 0.50)
+        self.assertEqual(neutral.avg_return_pct, 0.0)
+        self.assertEqual(neutral.source, "test_other_fields")
+
+    def test_observed_neutral_prior_ranks_identically_to_no_data(self):
+        """The actual behavior change in plain language: a structure
+        with one observation showing 50% win rate and 0% avg return
+        and 0 history (an edge case but possible) ranks IDENTICALLY
+        to a no-data structure. Pre-PR-#70 they ranked DIFFERENTLY
+        (0.50 hardcoded vs. 0.308571 computed) — a structure with
+        less information beat a structure with the same nominal
+        statistics.
+
+        This test pins the new equivalence.
+        """
+        from services.structure_scorecard import (
+            _neutral_prior, _compute_rank_score,
+        )
+        neutral_rank = _neutral_prior(
+            "otm_strangle", source="test_equivalence",
+        ).rank_score
+        observed_neutral_rank = _compute_rank_score(
+            win_rate=0.50, avg_return_pct=0.0, history_count=0,
+        )
+        self.assertEqual(neutral_rank, observed_neutral_rank)
+
+    def test_structures_with_observed_data_now_outrank_no_data(self):
+        """The directional consequence the fix is meant to produce.
+
+        A structure with even a small amount of observed positive
+        evidence (win_rate=0.55, avg_return=+2%, history=5) should
+        rank HIGHER than the no-data baseline. Pre-PR-#70 this was
+        often false — the hardcoded 0.50 was a high bar to beat
+        for thin-data structures. Now the no-data baseline sits at
+        ~0.309, so any positive evidence cleanly outranks it.
+        """
+        from services.structure_scorecard import (
+            _neutral_prior, _compute_rank_score,
+        )
+        no_data = _neutral_prior(
+            "atm_straddle", source="test_direction",
+        ).rank_score
+        thin_positive_evidence = _compute_rank_score(
+            win_rate=0.55, avg_return_pct=2.0, history_count=5,
+        )
+        self.assertGreater(thin_positive_evidence, no_data, (
+            f"A structure with thin positive evidence "
+            f"(win_rate=0.55, +2% avg return, 5 obs) must outrank "
+            f"the no-data baseline. Got "
+            f"thin={thin_positive_evidence:.4f} vs no_data={no_data:.4f}."
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()
