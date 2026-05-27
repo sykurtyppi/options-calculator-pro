@@ -244,8 +244,9 @@ def test_evidence_health_fails_on_candidate_resolver_simulator_error(tmp_path: P
         [
             {
                 "ts": "2026-04-27T12:31:00+00:00",
+                "recommendation_id": "rec_sim_err_1",
                 "resolver_status": "permanently_failed:simulator_error",
-                "failure_reason": "simulator_error",
+                "failure_reason": None,
                 "days_in_awaiting_state": None,
             }
         ],
@@ -269,9 +270,13 @@ def test_evidence_health_warns_on_candidate_resolver_stuck_awaiting(tmp_path: Pa
         [
             {
                 "ts": "2026-04-27T12:31:00+00:00",
+                "recommendation_id": "rec_stuck_1",
                 "resolver_status": "awaiting_chain_data",
                 "failure_reason": None,
                 "days_in_awaiting_state": 11,
+                # Real JSONL rows do NOT include mid_realized_return_pct
+                # on awaiting events, but a defensive test includes it
+                # to enforce the "no PnL in alerts" rule.
                 "mid_realized_return_pct": -99.0,
             }
         ],
@@ -284,8 +289,249 @@ def test_evidence_health_warns_on_candidate_resolver_stuck_awaiting(tmp_path: Pa
 
     assert status["status"] == "WARN"
     assert status["candidate_exit_resolver"]["max_days_in_awaiting_state"] == 11
+    assert status["candidate_exit_resolver"]["still_awaiting_row_count"] == 1
     assert any("awaiting chain data" in issue["message"] for issue in status["issues"])
     assert not any("-99" in issue["message"] for issue in status["issues"])
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Ops-AE C1b regression tests for the alert-stickiness fixes
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_ops_ae_c1b_simulator_error_outside_age_window_does_not_alert(
+    tmp_path: Path,
+) -> None:
+    """SEV-HIGH-1 regression: a simulator_error row with a `ts` older
+    than max_candidate_resolver_run_age_hours must NOT trigger a FAIL.
+
+    The original watchdog scanned the JSONL tail unconditionally — once
+    a single sim_error landed, the FAIL persisted for hundreds of
+    daily ticks until the row scrolled off. The fix bounds the count
+    to events within the same age window the launchd-log check uses.
+    """
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    # Sim_error from 5 days ago — well outside the 36h default window.
+    _write_candidate_resolver_jsonl(
+        cfg.candidate_resolver_jsonl,
+        [
+            {
+                "ts": "2026-04-22T12:31:00+00:00",  # 5 days before now
+                "recommendation_id": "rec_old_sim_err",
+                "resolver_status": "permanently_failed:simulator_error",
+                "failure_reason": None,
+                "days_in_awaiting_state": None,
+            }
+        ],
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    # Sim_error row exists in the JSONL but is too old to alert on.
+    # The aggregated status should be OK (no FAIL from resolver).
+    assert status["status"] == "OK"
+    assert status["candidate_exit_resolver"]["simulator_error_count"] == 0
+
+
+def test_ops_ae_c1b_simulator_error_within_age_window_still_alerts(
+    tmp_path: Path,
+) -> None:
+    """Positive companion to the age-window fix: a recent sim_error
+    still triggers FAIL. Without this, the age filter could be too
+    aggressive and silence real operational failures."""
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    # Sim_error from 6 hours ago — well within the 36h default window.
+    _write_candidate_resolver_jsonl(
+        cfg.candidate_resolver_jsonl,
+        [
+            {
+                "ts": "2026-04-27T17:00:00+00:00",  # 6h before now
+                "recommendation_id": "rec_recent_sim_err",
+                "resolver_status": "permanently_failed:simulator_error",
+                "failure_reason": None,
+                "days_in_awaiting_state": None,
+            }
+        ],
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    assert status["status"] == "FAIL"
+    assert status["candidate_exit_resolver"]["simulator_error_count"] == 1
+
+
+def test_ops_ae_c1b_simulator_error_without_ts_is_excluded(tmp_path: Path) -> None:
+    """Defensive: events with missing/unparseable `ts` are NOT counted
+    toward the simulator_error alert. They cannot be bounded by age
+    so treating them as recent would re-introduce stickiness from
+    corrupted historical data. The malformed-JSONL warning covers
+    parse failures via a separate code path."""
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    _write_candidate_resolver_jsonl(
+        cfg.candidate_resolver_jsonl,
+        [
+            {
+                # ts intentionally absent
+                "recommendation_id": "rec_no_ts",
+                "resolver_status": "permanently_failed:simulator_error",
+                "failure_reason": None,
+                "days_in_awaiting_state": None,
+            }
+        ],
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    assert status["candidate_exit_resolver"]["simulator_error_count"] == 0
+
+
+def test_ops_ae_c1b_escalated_row_does_not_trigger_stuck_awaiting_warn(
+    tmp_path: Path,
+) -> None:
+    """SEV-HIGH-2 regression: a row that spent N days awaiting and
+    THEN escalated to retrying / permanently_failed must NOT keep
+    triggering the stuck-awaiting WARN forever.
+
+    The fix groups events by recommendation_id, keeps only the
+    chronologically-latest event per id, and checks
+    days_in_awaiting_state only across rows whose latest status is
+    STILL awaiting_chain_data. The day-12 awaiting row from the
+    same rec_id no longer fires once the row escalates."""
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    _write_candidate_resolver_jsonl(
+        cfg.candidate_resolver_jsonl,
+        [
+            # Older event: this row was awaiting for 12 days.
+            {
+                "ts": "2026-04-20T12:31:00+00:00",
+                "recommendation_id": "rec_escalated",
+                "resolver_status": "awaiting_chain_data",
+                "failure_reason": None,
+                "days_in_awaiting_state": 12,
+            },
+            # Latest event: same row has now escalated to terminal.
+            # No days_in_awaiting_state on terminal rows.
+            {
+                "ts": "2026-04-27T12:31:00+00:00",
+                "recommendation_id": "rec_escalated",
+                "resolver_status": "permanently_failed:no_post_event_chain",
+                "failure_reason": "no_post_event_chain",
+                "days_in_awaiting_state": None,
+            },
+        ],
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    # The row escalated, so no stuck-awaiting WARN.
+    # (The permanently_failed:no_post_event_chain row is recorded but
+    # does not trigger a separate alert — the resolver's escalation
+    # to terminal is the intended pipeline behavior, not an
+    # operational failure.)
+    assert status["candidate_exit_resolver"]["still_awaiting_row_count"] == 0
+    assert status["candidate_exit_resolver"]["max_days_in_awaiting_state"] is None
+    assert not any(
+        issue.get("check") == "candidate_exit_resolver"
+        and "awaiting chain data" in issue.get("message", "")
+        for issue in status["issues"]
+    )
+
+
+def test_ops_ae_c1b_distinct_rows_still_counted_separately(tmp_path: Path) -> None:
+    """Positive: the grouping logic must still detect a genuinely-stuck
+    row across multiple recommendation_ids. Row A escalated; row B is
+    still awaiting at 15 days. The WARN must still fire for row B."""
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    _write_candidate_resolver_jsonl(
+        cfg.candidate_resolver_jsonl,
+        [
+            # Row A — escalated, should not contribute.
+            {
+                "ts": "2026-04-20T12:31:00+00:00",
+                "recommendation_id": "rec_a_escalated",
+                "resolver_status": "awaiting_chain_data",
+                "days_in_awaiting_state": 8,
+            },
+            {
+                "ts": "2026-04-27T12:31:00+00:00",
+                "recommendation_id": "rec_a_escalated",
+                "resolver_status": "permanently_failed:no_post_event_chain",
+                "days_in_awaiting_state": None,
+            },
+            # Row B — still awaiting at 15 days, must trigger WARN.
+            {
+                "ts": "2026-04-27T12:31:00+00:00",
+                "recommendation_id": "rec_b_still_stuck",
+                "resolver_status": "awaiting_chain_data",
+                "days_in_awaiting_state": 15,
+            },
+        ],
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    assert status["status"] == "WARN"
+    assert status["candidate_exit_resolver"]["still_awaiting_row_count"] == 1
+    assert status["candidate_exit_resolver"]["max_days_in_awaiting_state"] == 15
+    assert any("15 day" in issue["message"] for issue in status["issues"])
+
+
+def test_ops_ae_c1b_count_balance_holds_regex_rejects_false_positives(
+    tmp_path: Path,
+) -> None:
+    """SEV-MEDIUM-2 regression: the count_balance_holds parser uses a
+    bounded regex now. Substring matching could false-positive on
+    text like "see count_balance_holds: docs; this is not false alarm"
+    (contains both label and "false" but not as the actual value).
+
+    A line containing the label but with a non-true/false token after
+    the colon must NOT be classified as either true or false — it's
+    treated as "no verdict in this line" and the parser keeps looking.
+    """
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    # Custom launchd log: noise line + real verdict line.
+    cfg.candidate_resolver_launchd_log_path.write_text(
+        "===== 2026-04-27T12:30:00Z candidate exit resolver start =====\n"
+        "  Note: count_balance_holds: tracking enabled (not false alarm)\n"
+        "  count_balance_holds:    true\n"
+        "===== 2026-04-27T12:31:00Z candidate exit resolver complete =====\n",
+        encoding="utf-8",
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    # Despite the noise line containing both "count_balance_holds:"
+    # and "false" (in "false alarm"), the actual verdict is true.
+    assert status["candidate_exit_resolver"]["count_balance_holds"] is True
+    # And NO count_balance_holds:false FAIL should be emitted.
+    assert not any(
+        "count_balance_holds: false" in issue.get("message", "").lower()
+        for issue in status["issues"]
+    )
 
 
 def test_evidence_health_warns_not_fails_before_candidate_resolver_first_run(tmp_path: Path) -> None:
