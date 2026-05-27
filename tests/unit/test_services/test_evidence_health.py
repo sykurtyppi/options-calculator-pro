@@ -496,6 +496,83 @@ def test_ops_ae_c1b_distinct_rows_still_counted_separately(tmp_path: Path) -> No
     assert any("15 day" in issue["message"] for issue in status["issues"])
 
 
+def test_ops_ae_c1c_threshold_catches_missed_run_same_day_watchdog(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (Codex Ops-AE C1c P2): the resolver fires at 12:30
+    local, the daily watchdog fires at 22:15 local (~9h 45m later).
+    A missed today-12:30 run leaves yesterday's 12:30 as the latest
+    completion — about 33h 45m old at the 22:15 watchdog scan.
+
+    With the prior 36h threshold, that miss was UNDER threshold so
+    no WARN fired — the alert finally surfaced 24h later at the
+    NEXT day's watchdog (yesterday's 12:30 = 57.75h old). One
+    full day of silent miss.
+
+    With the C1c-tightened 26h threshold, the same-day watchdog
+    sees 33.75h > 26h → WARN fires same evening.
+
+    This test plants exactly that scenario: a launchd log whose
+    latest completion is ~33.75h old, and asserts the resolver
+    health reports a stale-completion WARN.
+    """
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+
+    # Yesterday 12:30 UTC completion only — today's 12:30 was missed.
+    # Now we're at today 22:15 UTC. Latest completion age = 33h 45m.
+    cfg.candidate_resolver_launchd_log_path.write_text(
+        "===== 2026-04-26T12:30:00Z candidate exit resolver start =====\n"
+        "  count_balance_holds:    true\n"
+        "===== 2026-04-26T12:30:00Z candidate exit resolver complete =====\n",
+        encoding="utf-8",
+    )
+
+    now = datetime(2026, 4, 27, 22, 15, tzinfo=timezone.utc)
+    status = build_evidence_health_status(config=cfg, now=now)
+
+    # Stale-completion WARN must be present in the issues list.
+    assert any(
+        issue["check"] == "candidate_exit_resolver"
+        and "stale" in issue["message"].lower()
+        for issue in status["issues"]
+    ), (
+        f"With default 26h threshold and a ~33.75h-old completion, "
+        f"stale-completion WARN must fire same-day at the 22:15 "
+        f"watchdog. Got issues: {status['issues']!r}"
+    )
+
+
+def test_ops_ae_c1c_threshold_allows_fresh_completion(tmp_path: Path) -> None:
+    """Positive companion: today's 12:30 completion (~9h 45m old at
+    the 22:15 watchdog scan) must NOT trigger the stale WARN. This
+    is the case the threshold tightening must preserve — false-
+    positiving on a fresh same-day run would be worse than the
+    sticky-miss bug it fixes.
+    """
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+
+    cfg.candidate_resolver_launchd_log_path.write_text(
+        "===== 2026-04-27T12:30:00Z candidate exit resolver start =====\n"
+        "  count_balance_holds:    true\n"
+        "===== 2026-04-27T12:30:00Z candidate exit resolver complete =====\n",
+        encoding="utf-8",
+    )
+
+    now = datetime(2026, 4, 27, 22, 15, tzinfo=timezone.utc)
+    status = build_evidence_health_status(config=cfg, now=now)
+
+    assert not any(
+        issue["check"] == "candidate_exit_resolver"
+        and "stale" in issue["message"].lower()
+        for issue in status["issues"]
+    ), (
+        f"A fresh ~9.75h-old completion must NOT trigger stale WARN. "
+        f"Got issues: {status['issues']!r}"
+    )
+
+
 def test_ops_ae_c1b_count_balance_holds_regex_rejects_false_positives(
     tmp_path: Path,
 ) -> None:

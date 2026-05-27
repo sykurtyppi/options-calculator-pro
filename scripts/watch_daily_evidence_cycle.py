@@ -6,6 +6,7 @@ import json
 import sys
 from datetime import date, datetime, time
 from pathlib import Path
+from typing import Any, Mapping
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -33,6 +34,54 @@ from scripts.run_forward_loop import _parse_date
 
 def _default_expected_date() -> date:
     return date.today()
+
+
+def _build_combined_watchdog_status(
+    *,
+    watchdog_status: Mapping[str, Any],
+    resolver_health: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge the daily-cycle watchdog status with the candidate exit
+    resolver health into a single payload suitable for
+    ``maybe_send_watchdog_alert``.
+
+    Ops-AE C1c (Codex P1 audit fix): resolver WARN-severity issues
+    MUST participate in the alert-dispatch decision. The prior code
+    only escalated resolver FAILs into ``combined_status['ok']``, so
+    documented alertable conditions like ``days_in_awaiting_state >
+    10`` and ``stale completion`` (both emitted as WARN by
+    evidence_health) silently failed to alert.
+
+    Contract:
+      - Resolver FAIL  → contributes to ``ok = False`` AND appears
+        in ``errors`` (for the alert message body).
+      - Resolver WARN  → contributes to ``ok = False`` AND appears
+        in ``errors`` (escalated per Ops-AE taxonomy).
+      - Daily-cycle WARN (from build_evidence_watchdog_status) →
+        stays in ``warnings`` only, observation-only (existing
+        behavior preserved).
+
+    Extracted from main() so it's directly unit-testable without
+    spawning the full CLI.
+    """
+    resolver_issues = resolver_health.get("issues", [])
+    resolver_failures = [i for i in resolver_issues if i.get("severity") == "FAIL"]
+    resolver_warnings = [i for i in resolver_issues if i.get("severity") == "WARN"]
+    resolver_alertable = resolver_failures + resolver_warnings
+
+    return {
+        **watchdog_status,
+        "ok": bool(watchdog_status.get("ok")) and not resolver_alertable,
+        "errors": (
+            list(watchdog_status.get("errors", []))
+            + [str(i.get("message")) for i in resolver_alertable]
+        ),
+        # Daily-cycle warnings remain observation-only. Resolver WARNs
+        # have been escalated to `errors` above and intentionally do
+        # NOT appear here too — avoid double-reporting.
+        "warnings": list(watchdog_status.get("warnings", [])),
+        "candidate_exit_resolver": resolver_health.get("summary", {}),
+    }
 
 
 def main() -> int:
@@ -103,21 +152,10 @@ def main() -> int:
         ),
         now=now,
     )
-    resolver_failures = [
-        issue for issue in resolver_health.get("issues", [])
-        if issue.get("severity") == "FAIL"
-    ]
-    resolver_warnings = [
-        issue for issue in resolver_health.get("issues", [])
-        if issue.get("severity") == "WARN"
-    ]
-    combined_status = {
-        **status,
-        "ok": bool(status.get("ok")) and not resolver_failures,
-        "errors": list(status.get("errors", [])) + [str(issue.get("message")) for issue in resolver_failures],
-        "warnings": list(status.get("warnings", [])) + [str(issue.get("message")) for issue in resolver_warnings],
-        "candidate_exit_resolver": resolver_health.get("summary", {}),
-    }
+    combined_status = _build_combined_watchdog_status(
+        watchdog_status=status,
+        resolver_health=resolver_health,
+    )
     alert = maybe_send_watchdog_alert(
         combined_status,
         state_path=args.state_path,

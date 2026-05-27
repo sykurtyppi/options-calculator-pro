@@ -47,7 +47,19 @@ DEFAULT_MAX_DAILY_REPORT_AGE_HOURS = 36.0
 DEFAULT_MAX_WEEKLY_REPORT_AGE_DAYS = 8
 DEFAULT_MAX_TELEMETRY_AGE_HOURS = 48.0
 DEFAULT_MAX_RUN_LOG_AGE_HOURS = 36.0
-DEFAULT_MAX_CANDIDATE_RESOLVER_RUN_AGE_HOURS = 36.0
+# Ops-AE C1c (Codex P2): tightened from 36h to 26h. The resolver fires
+# daily at 12:30 local; the daily watchdog fires at 22:15 local. With
+# the previous 36h threshold, a missed today-12:30 run was only ~33.75h
+# old when the 22:15 watchdog scanned the log, so the stale-completion
+# WARN failed to fire until the FOLLOWING day's watchdog — a full 24h
+# of silent miss. With 26h:
+#   - Today's 12:30 completion → 22:15 watchdog sees ~9.75h old → OK.
+#   - Today's 12:30 MISSED → 22:15 watchdog sees yesterday's = 33.75h
+#     old → WARN fires the same evening.
+# The (9.75h, 33.75h) gap leaves comfortable room for a slightly-late
+# completion (Mac asleep at 12:30, woke at 14:00) without false-
+# positiving.
+DEFAULT_MAX_CANDIDATE_RESOLVER_RUN_AGE_HOURS = 26.0
 DEFAULT_MAX_CANDIDATE_AWAITING_DAYS = 10
 DEFAULT_DAILY_DUE_HOUR_UTC = 21
 DEFAULT_DAILY_DUE_MINUTE_UTC = 30
