@@ -2,6 +2,8 @@
 
 Local launchd jobs (macOS) that run the daily/weekly evidence cycles and the PR-AE candidate exit resolver for this repo.
 
+For the full operational story (env-var contracts, verification, alert semantics, troubleshooting matrix) see **[../../docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md)**. This README focuses on the mechanics of the launchd jobs themselves.
+
 ## Contents
 
 - `*.plist` — launchd job templates with `__HOME__` and `__PROJECT_ROOT__` placeholders. Rendered at install time; not loaded directly.

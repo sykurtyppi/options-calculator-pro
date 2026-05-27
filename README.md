@@ -2,6 +2,12 @@
 
 Selector-first event-volatility decision platform for earnings setups.
 
+> **Deploying or redeploying?** See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** —
+> single artifact covering env-var contracts, launchd install, first-run
+> verification, alert semantics, and a troubleshooting matrix. This
+> README covers what the project IS; the runbook covers how to operate
+> it.
+
 ## Scope
 - Single-ticker event-volatility analysis and structure selection.
 - Ranked earnings screener and walk-forward OOS report card generation.
@@ -106,8 +112,12 @@ pytest -q
 - If OOS sample gates fail, the API can run one adaptive retry to improve split/trade coverage.
 - Share-code auth is optional for local use and disabled by default. Hosted mode requires
   `ENABLE_SHARE_AUTH=true`, `SHARE_PASSWORD`, and a non-default `SESSION_SECRET`.
-- Allowed browser origins default to `http://localhost:5173` and `http://127.0.0.1:5173`.
-  Override with `OPTIONS_CALCULATOR_ALLOWED_ORIGINS` as a comma-separated list.
+- Allowed browser origins default to localhost-dev ports (`http://localhost:5173`,
+  `http://127.0.0.1:5173`, and three more) **only when share-auth is off**. When
+  `ENABLE_SHARE_AUTH=true`, `OPTIONS_CALCULATOR_ALLOWED_ORIGINS` is required and
+  must NOT include `*` or `null` — the backend refuses to start otherwise.
+  See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#environment-configuration) for the
+  full contract.
 - Background OOS and legacy ML training endpoints are bounded by conservative in-process
   concurrency caps. Tune with `OPTIONS_CALCULATOR_MAX_OOS_RUNNING_JOBS`,
   `OPTIONS_CALCULATOR_MAX_ML_RUNNING_JOBS`, and `OPTIONS_CALCULATOR_MAX_RETAINED_JOBS`.
