@@ -226,3 +226,83 @@ def test_threshold_exactly_at_max_bytes_rotates(tmp_path: Path) -> None:
     _make_log(tmp_path / "demo_launchd.log", 5_000_000)
     summaries = r.rotate_launchd_logs(tmp_path, max_bytes=5_000_000, keep=7)
     assert summaries[0]["rotated"] is True
+
+
+# ── Codex follow-up P1: self-log skip ─────────────────────────────────────
+
+
+def test_self_log_over_threshold_is_skipped_by_default(tmp_path: Path) -> None:
+    """The rotator's own ``log_rotation_launchd.log`` MUST NOT be
+    rotated by default — the launchd-driven run holds an fd on it and
+    would lose its completion marker. Regression for Codex web-audit
+    follow-up P1.
+    """
+    self_log = _make_log(tmp_path / "log_rotation_launchd.log", 6_000_000)
+    original_bytes = self_log.read_bytes()
+
+    summaries = r.rotate_launchd_logs(tmp_path, max_bytes=5_000_000, keep=7)
+
+    # The self-log was filtered out before processing; no summary, no
+    # archive, original file untouched.
+    assert all(
+        Path(s["path"]).name != "log_rotation_launchd.log" for s in summaries
+    ), f"self-log appeared in summaries: {summaries}"
+    assert self_log.exists()
+    assert self_log.read_bytes() == original_bytes
+    assert list(tmp_path.glob("log_rotation_launchd.log.*.gz")) == []
+
+
+def test_all_self_log_shapes_are_skipped(tmp_path: Path) -> None:
+    """The plist's StandardOut/ErrPath siblings (stdout/stderr in both
+    legacy ``.stderr.log`` and current ``_stderr.log`` conventions)
+    must also be excluded — launchd holds fds on those too."""
+    self_logs = [
+        "log_rotation_launchd.log",
+        "log_rotation_launchd_stderr.log",
+        "log_rotation_launchd_stdout.log",
+        "log_rotation_launchd.stderr.log",
+        "log_rotation_launchd.stdout.log",
+    ]
+    for name in self_logs:
+        _make_log(tmp_path / name, 6_000_000)
+
+    summaries = r.rotate_launchd_logs(tmp_path, max_bytes=5_000_000, keep=7)
+
+    assert summaries == []
+    for name in self_logs:
+        assert (tmp_path / name).exists()
+    assert list(tmp_path.glob("log_rotation_launchd.*.gz")) == []
+
+
+def test_include_self_flag_overrides_skip(tmp_path: Path) -> None:
+    """An operator running the rotator manually (NOT from within the
+    launchd job) can pass include_self=True to clean up a self-log
+    that somehow grew. Verify the override works."""
+    self_log = _make_log(tmp_path / "log_rotation_launchd.log", 6_000_000)
+
+    summaries = r.rotate_launchd_logs(
+        tmp_path, max_bytes=5_000_000, keep=7, include_self=True
+    )
+
+    assert any(
+        Path(s["path"]).name == "log_rotation_launchd.log" and s["rotated"]
+        for s in summaries
+    )
+    assert not self_log.exists()  # was rotated
+    archives = list(tmp_path.glob("log_rotation_launchd.log.*.gz"))
+    assert len(archives) == 1
+
+
+def test_self_log_skip_does_not_affect_other_jobs(tmp_path: Path) -> None:
+    """Critical contract: skipping self-logs MUST NOT affect rotation
+    of the other launchd jobs' logs that happen to live in the same
+    directory."""
+    _make_log(tmp_path / "log_rotation_launchd.log", 6_000_000)
+    _make_log(tmp_path / "daily_evidence_cycle_launchd.log", 6_000_000)
+
+    summaries = r.rotate_launchd_logs(tmp_path, max_bytes=5_000_000, keep=7)
+
+    # The cycle log IS rotated; the self-log is NOT.
+    rotated_names = {Path(s["path"]).name for s in summaries if s["rotated"]}
+    assert "daily_evidence_cycle_launchd.log" in rotated_names
+    assert "log_rotation_launchd.log" not in rotated_names

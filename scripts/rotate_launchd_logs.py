@@ -38,6 +38,18 @@ leaves an uncompressed ``.log.<ts>`` orphan that step 1 picks up next
 run. The threshold check in step 2 makes the script idempotent on
 repeated runs with no new log writes.
 
+**Self-logs are skipped by default.** When the launchd-driven rotation
+job is running, the wrapper holds an fd on ``log_rotation_launchd.log``
+(via shell ``>>`` redirection) and launchd holds fds on the plist's
+``StandardOutPath`` / ``StandardErrorPath`` siblings. Renaming +
+unlinking any of those would land the wrapper's completion marker —
+written after Python exits — in a deleted inode. Concurrent writes
+during the gzip step could also corrupt the archive. So we skip the
+``log_rotation_launchd*`` set by default. Self-logs grow at ~hundreds
+of bytes per run; a year of unattended growth is ~70 KB. If that ever
+becomes a problem, an operator can pass ``--include-self`` when
+invoking the script manually (NOT from within the launchd job).
+
 Run daily via launchd at 03:00 local — far from the daily evidence
 cycle (~22:15 local) and resolver (~12:30 local) so no other job has
 an active handle.
@@ -71,6 +83,31 @@ _LAUNCHD_LOG_GLOBS: tuple[str, ...] = (
     "*_launchd.stderr.log",
     "*_launchd.stdout.log",
 )
+
+# Codex web-audit follow-up P1: when the rotator is itself running, the
+# shell wrapper holds a write fd on ``log_rotation_launchd.log`` via
+# ``>>`` redirection, and launchd holds fds on the plist's
+# ``StandardOutPath`` / ``StandardErrorPath`` (the two ``_stdout/stderr``
+# siblings). If the rotator renames+unlinks any of those, the wrapper's
+# completion marker — written AFTER Python exits but before the shell's
+# redirection block closes — lands in a deleted inode and is lost. Worse,
+# concurrent writes during the gzip step can corrupt the archive.
+#
+# The fix here is the simplest one that works: skip the rotator's own
+# logs by default. They're operational logs for a fast script (rotation
+# completes in seconds), each run writes a few hundred bytes, and
+# realistic growth caps at ~70 KB/year. If one ever grows large enough
+# to need rotation, an operator can either pass ``--include-self`` to
+# this script when invoking manually (NOT from the launchd job; that
+# self-rotation race is the whole bug) or use ``gzip`` + truncate on
+# the file directly.
+_SELF_LOG_BASENAMES: frozenset[str] = frozenset({
+    "log_rotation_launchd.log",
+    "log_rotation_launchd_stderr.log",
+    "log_rotation_launchd_stdout.log",
+    "log_rotation_launchd.stderr.log",
+    "log_rotation_launchd.stdout.log",
+})
 
 
 def _utc_timestamp() -> str:
@@ -210,9 +247,18 @@ def rotate_launchd_logs(
     *,
     max_bytes: int = DEFAULT_MAX_BYTES,
     keep: int = DEFAULT_KEEP,
+    include_self: bool = False,
 ) -> list[dict]:
     """Rotate every launchd log under *log_dir*. Returns a list of
-    per-file summaries (in the order files were processed)."""
+    per-file summaries (in the order files were processed).
+
+    Self-logs (the rotator's own ``log_rotation_launchd*`` files) are
+    skipped by default — the rotator's wrapper holds an fd on them
+    while it's running, and rename+unlink would lose the completion
+    marker (Codex web-audit follow-up P1). Pass ``include_self=True``
+    only when invoking the script manually from outside the launchd
+    job; the launchd-driven runs MUST leave it false.
+    """
     if not log_dir.exists():
         return []
     seen: set[Path] = set()
@@ -220,6 +266,8 @@ def rotate_launchd_logs(
     for pattern in _LAUNCHD_LOG_GLOBS:
         for p in log_dir.glob(pattern):
             if p in seen:
+                continue
+            if not include_self and p.name in _SELF_LOG_BASENAMES:
                 continue
             seen.add(p)
             targets.append(p)
@@ -260,6 +308,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print what would be rotated, but don't modify any files.",
     )
+    parser.add_argument(
+        "--include-self",
+        action="store_true",
+        help=(
+            "Override the self-log skip and rotate this script's own logs. "
+            "Safe ONLY when invoking manually from outside the launchd job; "
+            "the launchd-driven run holds fds on the self-logs and would "
+            "lose its completion marker. See rotate_launchd_logs.py "
+            "module docstring for the rationale."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.dry_run:
@@ -275,7 +334,13 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 seen.add(p)
                 size = p.stat().st_size
-                marker = "WOULD ROTATE" if size >= args.max_bytes else "ok"
+                is_self = p.name in _SELF_LOG_BASENAMES
+                if is_self and not args.include_self:
+                    marker = "skip(self)"
+                elif size >= args.max_bytes:
+                    marker = "WOULD ROTATE"
+                else:
+                    marker = "ok"
                 print(f"  [{marker}] {p.name}: {_format_size(size)}")
         return 0
 
@@ -284,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         args.log_dir,
         max_bytes=args.max_bytes,
         keep=args.keep,
+        include_self=args.include_self,
     )
     rotated = sum(1 for s in summaries if s["rotated"])
     orphans = sum(len(s["orphans_gzipped"]) for s in summaries)
