@@ -1,6 +1,6 @@
 # Automation: launchd jobs
 
-Local launchd jobs (macOS) that run the daily and weekly evidence cycles for this repo.
+Local launchd jobs (macOS) that run the daily/weekly evidence cycles and the PR-AE candidate exit resolver for this repo.
 
 ## Contents
 
@@ -35,11 +35,38 @@ launchctl list | grep optionscalculator
 
 | Job | When |
 |---|---|
+| `com.optionscalculator.candidate-exit-resolver` | Daily at 12:30 |
 | `com.optionscalculator.evidence-cycle` | Daily at 21:30 |
 | `com.optionscalculator.evidence-watchdog` | Daily at 22:15 |
 | `com.optionscalculator.weekly-evidence-report` | Mondays at 22:45 |
 
 All jobs use `RunAtLoad=false`; they fire only on the calendar schedule, never on `launchctl load`.
+
+The candidate exit resolver is scheduled at 12:30 local time so prior-day post-event chains have time to settle before the resolver scans pending forward observations. It is operational infrastructure only: it records whether candidate shadow outcomes could be resolved, and it never alerts on positive/negative PnL or candidate-vs-legacy performance.
+
+### Resolver due-window check — timezone mapping
+
+The health/watchdog scripts include a "first-run not due yet" check so a fresh install before today's 12:30 fire doesn't false-alarm at the same-day 22:15 watchdog. The check compares `now` against the resolver's expected fire time in **UTC**. The launchd plist's `StartCalendarInterval Hour=12 Minute=30` is in **local** time. The defaults in `EvidenceHealthConfig` (`resolver_due_hour_utc=12`, `resolver_due_minute_utc=30`) assume the system local timezone is UTC.
+
+If your Mac runs in a non-UTC timezone, override via the CLI flags on `scripts/check_evidence_health.py` and `scripts/watch_daily_evidence_cycle.py`:
+
+| System local timezone | `--resolver-due-hour-utc` | `--resolver-due-minute-utc` |
+|---|---|---|
+| UTC (e.g. Iceland) | 12 (default) | 30 (default) |
+| Europe/London BST (UTC+1) | 11 | 30 |
+| Europe/Berlin CEST (UTC+2) | 10 | 30 |
+| US/Eastern EST (UTC-5) | 17 | 30 |
+| US/Eastern EDT (UTC-4) | 16 | 30 |
+| US/Pacific PST (UTC-8) | 20 | 30 |
+| US/Pacific PDT (UTC-7) | 19 | 30 |
+
+The mapping changes with DST. If the values become wrong (e.g. after a DST transition), the symptom is either:
+- False alert on install day: the override is *later* than reality (the resolver fires before the configured "due window," so the watchdog thinks it's still pending when it's actually already fired and missing).
+- False non-alert on a missed run: the override is *earlier* than reality (the watchdog still thinks it's not due yet when it actually was due).
+
+Both modes are operationally noisy but never escalate to PnL/trading-signal alerts — they're pipeline-health observations only.
+
+For users who want a deterministic UTC schedule, change `Hour=12 Minute=30` in `com.optionscalculator.candidate-exit-resolver.plist` to a value that maps cleanly to UTC for your tz, reinstall via `install_launchd_jobs.sh`, and update the override flags accordingly.
 
 ## Requirements
 
@@ -51,4 +78,23 @@ All jobs use `RunAtLoad=false`; they fire only on the calendar schedule, never o
 
 - Wrapper logs: `~/.options_calculator_pro/logs/*.log`
 - Launchd stdout/stderr: same directory, suffixed `_launchd_stdout.log` / `_launchd_stderr.log`
+- Candidate resolver row telemetry: `~/.options_calculator_pro/logs/candidate_exit_resolutions.jsonl` when candidate rows are processed. A clean resolver run with zero pending rows is recorded in `candidate_exit_resolver_launchd.log`, not as a JSONL row.
 - Lock files (anti-overlap): `~/.options_calculator_pro/state/*.lock` directories — auto-removed on script exit, with stale-lock recovery via mtime.
+
+## Health checks
+
+Manual health check:
+
+```sh
+./.venv311/bin/python scripts/check_evidence_health.py
+```
+
+Resolver-specific operational failures are:
+
+- launchd wrapper log missing or stale after the first scheduled run
+- resolver wrapper failure exit code
+- `count_balance_holds: false` in the resolver stdout summary
+- any row stuck with `days_in_awaiting_state > 10`
+- any `permanently_failed:simulator_error` row
+
+These are deliberately operational alerts, not trading signals. Do not alert on `mid_realized_return_pct`, candidate-vs-legacy performance, or promotion-threshold progress.

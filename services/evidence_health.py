@@ -8,11 +8,24 @@ trading advice.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+
+# PR-AE Ops-AE C1b: precise regex for the resolver CLI's
+# `count_balance_holds: <true|false>` line. The previous substring-
+# match-based check worked against the current CLI output but would
+# false-positive on any line that happened to contain both
+# "count_balance_holds:" (in an error/help string) AND "true"/"false"
+# elsewhere. A bounded regex requires the actual value to follow the
+# label, anchored on a word boundary.
+_COUNT_BALANCE_PATTERN = re.compile(
+    r"count_balance_holds:\s*(true|false)\b", re.IGNORECASE
+)
 
 from services.automation_watchdog import (
     DEFAULT_LOG_PATH as DEFAULT_LAUNCHD_LOG_PATH,
@@ -27,14 +40,39 @@ from services.recommendation_ledger import _DEFAULT_LEDGER as DEFAULT_LEDGER_STO
 
 DEFAULT_HOME = Path.home() / ".options_calculator_pro"
 DEFAULT_STRUCTURED_RUN_LOG = DEFAULT_HOME / "logs" / "evidence_cycle_runs.jsonl"
+DEFAULT_CANDIDATE_RESOLVER_JSONL = DEFAULT_HOME / "logs" / "candidate_exit_resolutions.jsonl"
+DEFAULT_CANDIDATE_RESOLVER_LAUNCHD_LOG = DEFAULT_HOME / "logs" / "candidate_exit_resolver_launchd.log"
 DEFAULT_WEEKLY_REPORT_DIR = DEFAULT_REPORT_DIR / "weekly"
 DEFAULT_MAX_DAILY_REPORT_AGE_HOURS = 36.0
 DEFAULT_MAX_WEEKLY_REPORT_AGE_DAYS = 8
 DEFAULT_MAX_TELEMETRY_AGE_HOURS = 48.0
 DEFAULT_MAX_RUN_LOG_AGE_HOURS = 36.0
+# Ops-AE C1c (Codex P2): tightened from 36h to 26h. The resolver fires
+# daily at 12:30 local; the daily watchdog fires at 22:15 local. With
+# the previous 36h threshold, a missed today-12:30 run was only ~33.75h
+# old when the 22:15 watchdog scanned the log, so the stale-completion
+# WARN failed to fire until the FOLLOWING day's watchdog — a full 24h
+# of silent miss. With 26h:
+#   - Today's 12:30 completion → 22:15 watchdog sees ~9.75h old → OK.
+#   - Today's 12:30 MISSED → 22:15 watchdog sees yesterday's = 33.75h
+#     old → WARN fires the same evening.
+# The (9.75h, 33.75h) gap leaves comfortable room for a slightly-late
+# completion (Mac asleep at 12:30, woke at 14:00) without false-
+# positiving.
+DEFAULT_MAX_CANDIDATE_RESOLVER_RUN_AGE_HOURS = 26.0
+DEFAULT_MAX_CANDIDATE_AWAITING_DAYS = 10
 DEFAULT_DAILY_DUE_HOUR_UTC = 21
 DEFAULT_DAILY_DUE_MINUTE_UTC = 30
 DEFAULT_DAILY_DUE_GRACE_MINUTES = 60
+# Ops-AE C1d (Codex P2): resolver fire time in UTC (matches the
+# launchd plist StartCalendarInterval Hour=12, Minute=30 for users
+# whose system local tz == UTC; users in other tz must override).
+# Used to suppress false-alarms on a fresh install where the
+# launchd log doesn't exist yet because the first scheduled fire
+# hasn't happened. Grace allows for sleep/wake delays.
+DEFAULT_RESOLVER_DUE_HOUR_UTC = 12
+DEFAULT_RESOLVER_DUE_MINUTE_UTC = 30
+DEFAULT_RESOLVER_DUE_GRACE_MINUTES = 60
 
 
 @dataclass(frozen=True)
@@ -44,6 +82,8 @@ class EvidenceHealthConfig:
     weekly_report_dir: Path = DEFAULT_WEEKLY_REPORT_DIR
     structured_run_log: Path = DEFAULT_STRUCTURED_RUN_LOG
     launchd_log_path: Path = DEFAULT_LAUNCHD_LOG_PATH
+    candidate_resolver_jsonl: Path = DEFAULT_CANDIDATE_RESOLVER_JSONL
+    candidate_resolver_launchd_log_path: Path = DEFAULT_CANDIDATE_RESOLVER_LAUNCHD_LOG
     ledger_path: Path = DEFAULT_LEDGER_STORE
     outcome_store_path: Path = DEFAULT_OUTCOME_STORE
     baseline_store_path: Path = DEFAULT_BASELINE_STORE
@@ -52,10 +92,22 @@ class EvidenceHealthConfig:
     max_weekly_report_age_days: int = DEFAULT_MAX_WEEKLY_REPORT_AGE_DAYS
     max_telemetry_age_hours: float = DEFAULT_MAX_TELEMETRY_AGE_HOURS
     max_run_log_age_hours: float = DEFAULT_MAX_RUN_LOG_AGE_HOURS
+    max_candidate_resolver_run_age_hours: float = DEFAULT_MAX_CANDIDATE_RESOLVER_RUN_AGE_HOURS
+    max_candidate_awaiting_days: int = DEFAULT_MAX_CANDIDATE_AWAITING_DAYS
     require_completion_log: bool = True
     daily_due_hour_utc: int = DEFAULT_DAILY_DUE_HOUR_UTC
     daily_due_minute_utc: int = DEFAULT_DAILY_DUE_MINUTE_UTC
     daily_due_grace_minutes: int = DEFAULT_DAILY_DUE_GRACE_MINUTES
+    # Ops-AE C1d: resolver due-window check for missing-log handling.
+    # When the launchd log doesn't exist AND now is before today's
+    # resolver due time + grace, the missing-log condition is
+    # emitted as a NON-ALERTABLE WARN — the resolver hasn't had a
+    # chance to fire yet, so paging the operator would be a false
+    # alarm. After due-window elapses with no log, the alertable
+    # WARN fires per the C1c escalation.
+    resolver_due_hour_utc: int = DEFAULT_RESOLVER_DUE_HOUR_UTC
+    resolver_due_minute_utc: int = DEFAULT_RESOLVER_DUE_MINUTE_UTC
+    resolver_due_grace_minutes: int = DEFAULT_RESOLVER_DUE_GRACE_MINUTES
 
 
 def build_evidence_health_status(
@@ -78,6 +130,9 @@ def build_evidence_health_status(
 
     provider = _check_provider_telemetry(cfg, now_utc)
     issues.extend(provider["issues"])
+
+    candidate_resolver = build_candidate_exit_resolver_health(config=cfg, now=now_utc)
+    issues.extend(candidate_resolver["issues"])
 
     databases = {
         "recommendation_ledger": _check_sqlite_store("recommendation_ledger", cfg.ledger_path),
@@ -139,12 +194,123 @@ def build_evidence_health_status(
         "weekly_report": weekly_report["summary"],
         "structured_run_log": run_log["summary"],
         "provider_telemetry": provider["summary"],
+        "candidate_exit_resolver": candidate_resolver["summary"],
         "databases": {key: value["summary"] for key, value in databases.items()},
         "watchdog": watchdog,
         "issues": issues,
         "summary": _summary_text(status, issues),
     }
 
+
+
+def build_candidate_exit_resolver_health(
+    *,
+    config: EvidenceHealthConfig,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Return operational health for the PR-AE candidate exit resolver.
+
+    This check is deliberately about pipeline mechanics only: scheduled-run
+    freshness, count-balance status, stuck awaiting rows, and simulator
+    exceptions. It must not alert on PnL, win rate, or candidate-vs-legacy
+    performance.
+    """
+    now_utc = _ensure_utc(now or datetime.now(timezone.utc))
+    issues: list[dict[str, str]] = []
+
+    log_summary = _candidate_resolver_log_summary(config, now_utc)
+    issues.extend(log_summary["issues"])
+
+    jsonl = _read_jsonl_tail(config.candidate_resolver_jsonl, check_name="candidate_exit_resolver")
+    issues.extend(jsonl["issues"])
+    events = jsonl["events"]
+    latest_row_ts = _latest_event_timestamp(events)
+    latest_status = str(events[-1].get("resolver_status")) if events else None
+
+    # PR-AE Ops-AE C1b SEV-HIGH-2 fix: stuck-awaiting alert was sticky
+    # past the row's actual state. The previous code took max
+    # days_in_awaiting_state across the whole JSONL tail, so a row
+    # that spent 12 days awaiting and then escalated to retrying or
+    # permanently_failed would STILL trigger WARN forever — the
+    # day-12 row stayed in the tail.
+    #
+    # Fix: group events by recommendation_id, keep only the
+    # chronologically-latest event per id, and check
+    # days_in_awaiting_state only across rows whose latest status
+    # is STILL awaiting_chain_data. A row that already escalated
+    # no longer contributes.
+    latest_per_rec = _latest_event_per_recommendation_id(events)
+    still_awaiting_rows = [
+        event
+        for event in latest_per_rec.values()
+        if event.get("resolver_status") == "awaiting_chain_data"
+    ]
+    max_awaiting_days = _max_int_field(still_awaiting_rows, "days_in_awaiting_state")
+
+    # PR-AE Ops-AE C1b SEV-HIGH-1 fix: simulator_error alert was sticky
+    # forever — once one sim_error row landed, every subsequent
+    # health check FAILed until the row scrolled off the JSONL tail
+    # (potentially hundreds of daily ticks). The watchdog rule was
+    # "alert when a simulator exception JUST happened," not "alert
+    # forever once any has ever happened."
+    #
+    # Fix: bound the count to events whose `ts` is parseable AND
+    # within max_candidate_resolver_run_age_hours of now. Events
+    # with no/unparseable ts are deliberately excluded — the existing
+    # malformed-JSONL warning covers that case separately, and we
+    # don't want unparseable old data to trigger a permanent FAIL.
+    #
+    # PR-AE Ops-AE C1b SEV-MEDIUM-1 fix: the prior code had an
+    # `event.get("failure_reason") == "simulator_error"` OR-clause
+    # that was dead — failure_reason is only ever set to
+    # "no_post_event_chain" or "no_entry_chain_replay" by the
+    # resolver (see services/candidate_exit_resolver.py). Removed
+    # to avoid misleading future readers.
+    age_window = timedelta(hours=config.max_candidate_resolver_run_age_hours)
+    simulator_error_count = sum(
+        1
+        for event in events
+        if event.get("resolver_status") == "permanently_failed:simulator_error"
+        and _event_is_within_age_window(event, now_utc, age_window)
+    )
+
+    if max_awaiting_days is not None and max_awaiting_days > config.max_candidate_awaiting_days:
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                f"Candidate exit resolver has row(s) awaiting chain data for {max_awaiting_days} day(s).",
+                "Inspect candidate_exit_resolutions.jsonl and provider feature-store freshness; do not infer anything from PnL.",
+            )
+        )
+    if simulator_error_count > 0:
+        issues.append(
+            _issue(
+                "FAIL",
+                "candidate_exit_resolver",
+                f"Candidate exit resolver recorded {simulator_error_count} recent simulator_error row(s).",
+                "Inspect the resolver JSONL error_message fields and rerun after fixing the simulator/runtime issue.",
+            )
+        )
+
+    return {
+        "summary": {
+            "launchd_log_path": str(config.candidate_resolver_launchd_log_path),
+            "launchd_log_exists": config.candidate_resolver_launchd_log_path.exists(),
+            "latest_completion_at": log_summary["summary"].get("latest_completion_at"),
+            "latest_failure_at": log_summary["summary"].get("latest_failure_at"),
+            "jsonl_path": str(config.candidate_resolver_jsonl),
+            "jsonl_exists": config.candidate_resolver_jsonl.exists(),
+            "events_scanned": len(events),
+            "latest_row_ts": latest_row_ts.isoformat() if latest_row_ts else None,
+            "latest_status": latest_status,
+            "max_days_in_awaiting_state": max_awaiting_days,
+            "still_awaiting_row_count": len(still_awaiting_rows),
+            "simulator_error_count": simulator_error_count,
+            "count_balance_holds": log_summary["summary"].get("count_balance_holds"),
+        },
+        "issues": issues,
+    }
 
 def _check_daily_report(cfg: EvidenceHealthConfig, now: datetime) -> dict[str, Any]:
     path = cfg.report_dir / f"evidence_report_{cfg.expected_date.isoformat()}.json"
@@ -437,6 +603,274 @@ def _check_sqlite_store(name: str, path: Path) -> dict[str, Any]:
     }
 
 
+
+def _candidate_resolver_log_summary(cfg: EvidenceHealthConfig, now: datetime) -> dict[str, Any]:
+    issues: list[dict[str, str]] = []
+    path = cfg.candidate_resolver_launchd_log_path
+    lines = _read_text_tail(path)
+    latest_complete = _latest_log_marker(lines, "candidate exit resolver complete")
+    latest_failed = _latest_log_marker(lines, "candidate exit resolver failed")
+    latest_start = _latest_log_marker(lines, "candidate exit resolver start")
+    latest_start_index = _latest_line_index(lines, "candidate exit resolver start")
+    latest_run_lines = lines[latest_start_index:] if latest_start_index is not None else lines
+
+    # PR-AE Ops-AE C1b SEV-MEDIUM-2 fix: prior substring-matching code
+    # could false-positive on any line that happened to contain both
+    # "count_balance_holds:" (e.g. in an error/help string) AND
+    # "true"/"false" elsewhere. Bounded regex requires the actual
+    # value to follow the label and be word-anchored.
+    #
+    # Preserves the original "false wins" semantics: if any line in
+    # the latest run reports false, the overall verdict is false
+    # even if a later line says true (which should never happen but
+    # is the safer fail-closed direction).
+    count_balance_holds: bool | None = None
+    for line in latest_run_lines:
+        match = _COUNT_BALANCE_PATTERN.search(line)
+        if not match:
+            continue
+        line_value = match.group(1).lower() == "true"
+        if line_value is False:
+            count_balance_holds = False
+            break  # false-wins short-circuit
+        if count_balance_holds is None:
+            count_balance_holds = True
+
+    if not path.exists():
+        # Ops-AE C1d (Codex P2 audit fix): a fresh install where the
+        # resolver hasn't had a chance to fire today yet would have
+        # false-alarmed under the C1c "all resolver WARN escalates"
+        # rule. The launchd log doesn't exist because the first
+        # scheduled fire hasn't happened — not because of an
+        # operational failure.
+        #
+        # Resolution: when now is BEFORE today's resolver due
+        # window + grace, emit a NON-ALERTABLE WARN with explicit
+        # "not due yet" framing. Observable in the JSON payload for
+        # forensics; never pages the operator. After the due
+        # window passes with no log, the alertable WARN fires per
+        # the C1c rule.
+        if _is_before_resolver_due_window(cfg, now):
+            issues.append(
+                _issue(
+                    "WARN",
+                    "candidate_exit_resolver",
+                    (
+                        "Candidate exit resolver launchd log does not "
+                        "exist yet (not due yet — resolver scheduled "
+                        f"for {cfg.resolver_due_hour_utc:02d}:{cfg.resolver_due_minute_utc:02d} UTC)."
+                    ),
+                    (
+                        "No action required — the log will be created "
+                        "after today's scheduled fire. If this persists "
+                        "past the due window, the alertable WARN will fire."
+                    ),
+                    alertable=False,
+                )
+            )
+        else:
+            issues.append(
+                _issue(
+                    "WARN",
+                    "candidate_exit_resolver",
+                    f"Candidate exit resolver launchd log does not exist yet: {path}.",
+                    "Install/load com.optionscalculator.candidate-exit-resolver and verify the first scheduled run.",
+                )
+            )
+    elif latest_complete is None:
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                "Candidate exit resolver has no completion marker in the launchd log.",
+                "Check launchctl status and run scripts/resolve_candidate_exits.py manually with --no-jsonl for a smoke test.",
+            )
+        )
+    elif _age_hours(latest_complete, now) > cfg.max_candidate_resolver_run_age_hours:
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                f"Candidate exit resolver completion is stale ({_age_hours(latest_complete, now):.1f}h old).",
+                "Check whether com.optionscalculator.candidate-exit-resolver is loaded and whether the Mac was awake at 12:30.",
+            )
+        )
+
+    if latest_failed and (latest_complete is None or latest_failed >= latest_complete):
+        issues.append(
+            _issue(
+                "FAIL",
+                "candidate_exit_resolver",
+                "Latest candidate exit resolver launchd run failed.",
+                "Open candidate_exit_resolver_launchd.log, fix the resolver/runtime error, then rerun scripts/resolve_candidate_exits.py.",
+            )
+        )
+    if count_balance_holds is False:
+        issues.append(
+            _issue(
+                "FAIL",
+                "candidate_exit_resolver",
+                "Candidate exit resolver reported count_balance_holds: false.",
+                "Inspect candidate_exit_resolver_launchd.log and candidate_exit_resolutions.jsonl for an unbucketed resolver outcome.",
+            )
+        )
+    # Ops-AE C1e (Codex P2 audit fix): the resolver CLI ALWAYS prints
+    # a `count_balance_holds: true|false` line in its summary block —
+    # see scripts/resolve_candidate_exits.py:_format_summary. If the
+    # launchd log shows a complete run with no parseable verdict,
+    # something is wrong: stdout was truncated, the CLI was modified,
+    # or the wrapper redirected output incorrectly. Absence of the
+    # invariant verdict is itself an operational anomaly that should
+    # alert.
+    #
+    # Conditions for the emission: the latest run completed (we have a
+    # `complete` marker) AND no count_balance_holds line was matched
+    # in the run's stdout. We don't emit when latest_complete is None
+    # because the "no completion marker" WARN already covers that
+    # case, and emitting both would be redundant noise.
+    if latest_complete is not None and count_balance_holds is None:
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                (
+                    "Candidate exit resolver completed without a parseable "
+                    "count_balance_holds verdict in the launchd log."
+                ),
+                (
+                    "Inspect candidate_exit_resolver_launchd.log near the "
+                    "latest 'complete' marker. The resolver CLI's summary "
+                    "block should always emit 'count_balance_holds: "
+                    "true|false'. Verify the wrapper script and CLI are "
+                    "unchanged."
+                ),
+            )
+        )
+
+    return {
+        "summary": {
+            "latest_start_at": latest_start.isoformat() if latest_start else None,
+            "latest_completion_at": latest_complete.isoformat() if latest_complete else None,
+            "latest_failure_at": latest_failed.isoformat() if latest_failed else None,
+            "count_balance_holds": count_balance_holds,
+        },
+        "issues": issues,
+    }
+
+
+def _read_text_tail(path: Path, *, max_lines: int = 500) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
+    except Exception:
+        return []
+
+
+def _latest_line_index(lines: list[str], marker: str) -> int | None:
+    for idx in range(len(lines) - 1, -1, -1):
+        if marker in lines[idx]:
+            return idx
+    return None
+
+
+def _latest_log_marker(lines: list[str], marker: str) -> datetime | None:
+    idx = _latest_line_index(lines, marker)
+    if idx is None:
+        return None
+    return _parse_log_marker_datetime(lines[idx])
+
+
+def _parse_log_marker_datetime(line: str) -> datetime | None:
+    prefix = "===== "
+    if not line.startswith(prefix):
+        return None
+    rest = line[len(prefix):]
+    raw = rest.split(" ", 1)[0]
+    return _parse_datetime(raw)
+
+
+def _latest_event_timestamp(events: list[dict[str, Any]]) -> datetime | None:
+    timestamps = [_parse_datetime(event.get("ts")) for event in events]
+    parsed = [ts for ts in timestamps if ts is not None]
+    return max(parsed) if parsed else None
+
+
+def _latest_event_per_recommendation_id(
+    events: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Group resolver JSONL events by recommendation_id and keep only the
+    chronologically-latest event per id (by parsed `ts`).
+
+    PR-AE Ops-AE C1b SEV-HIGH-2 helper. Used by
+    build_candidate_exit_resolver_health to avoid sticky alerts: a
+    row's earlier `awaiting_chain_data` state must not keep firing
+    after the row has escalated to retrying / permanently_failed.
+
+    Events with missing recommendation_id are skipped (they cannot
+    be grouped). Events with missing/unparseable ts are kept only
+    as a fallback when no parseable-ts event exists for the same
+    recommendation_id — in that case the lexically-later occurrence
+    wins by virtue of being processed second. This is a defensive
+    choice for malformed data; the strict path (all events have
+    parseable ts) is unambiguous.
+    """
+    latest_per_id: dict[str, dict[str, Any]] = {}
+    latest_ts_per_id: dict[str, datetime] = {}
+    for event in events:
+        rec_id = event.get("recommendation_id")
+        if not isinstance(rec_id, str) or not rec_id:
+            continue
+        event_ts = _parse_datetime(event.get("ts"))
+        if rec_id not in latest_per_id:
+            latest_per_id[rec_id] = event
+            if event_ts is not None:
+                latest_ts_per_id[rec_id] = event_ts
+            continue
+        prior_ts = latest_ts_per_id.get(rec_id)
+        if event_ts is None:
+            # Defensive fallback: only overwrite if the prior event also
+            # lacks a parseable ts (else the parseable-ts event wins).
+            if prior_ts is None:
+                latest_per_id[rec_id] = event
+            continue
+        if prior_ts is None or event_ts > prior_ts:
+            latest_per_id[rec_id] = event
+            latest_ts_per_id[rec_id] = event_ts
+    return latest_per_id
+
+
+def _event_is_within_age_window(
+    event: dict[str, Any],
+    now: datetime,
+    window: timedelta,
+) -> bool:
+    """Return True iff *event* has a parseable `ts` field within
+    *window* of *now*.
+
+    PR-AE Ops-AE C1b SEV-HIGH-1 helper. Used to bound the
+    simulator_error alert to recent events only — events whose ts
+    is older than the window OR is missing/unparseable do NOT
+    count toward the alert. The malformed-JSONL warning surfaces
+    parse failures via a separate code path.
+    """
+    event_ts = _parse_datetime(event.get("ts"))
+    if event_ts is None:
+        return False
+    age = _ensure_utc(now) - event_ts
+    return timedelta(0) <= age <= window
+
+
+def _max_int_field(events: list[dict[str, Any]], key: str) -> int | None:
+    values: list[int] = []
+    for event in events:
+        value = event.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            values.append(value)
+    return max(values) if values else None
+
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -445,7 +879,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _read_jsonl_tail(path: Path, *, max_lines: int = 500) -> dict[str, Any]:
+def _read_jsonl_tail(path: Path, *, max_lines: int = 500, check_name: str = "structured_run_log") -> dict[str, Any]:
     issues: list[dict[str, str]] = []
     events: list[dict[str, Any]] = []
     if not path.exists():
@@ -458,8 +892,8 @@ def _read_jsonl_tail(path: Path, *, max_lines: int = 500) -> dict[str, Any]:
             "issues": [
                 _issue(
                     "WARN",
-                    "structured_run_log",
-                    f"Could not read structured run log: {type(exc).__name__}: {exc}.",
+                    check_name,
+                    f"Could not read JSONL log: {type(exc).__name__}: {exc}.",
                     "Check file permissions under ~/.options_calculator_pro/logs.",
                 )
             ],
@@ -479,8 +913,8 @@ def _read_jsonl_tail(path: Path, *, max_lines: int = 500) -> dict[str, Any]:
         issues.append(
             _issue(
                 "WARN",
-                "structured_run_log",
-                f"Structured run log contains {malformed} malformed JSONL line(s).",
+                check_name,
+                f"JSONL log contains {malformed} malformed JSONL line(s).",
                 "Rotate or inspect the log; new runs should write one JSON object per line.",
             )
         )
@@ -537,8 +971,61 @@ def _is_not_due_error(error: Any, expected_date: date) -> bool:
     return "Daily evidence cycle completion marker is missing" in text
 
 
-def _issue(severity: str, check: str, message: str, fix: str) -> dict[str, str]:
-    return {"severity": severity, "check": check, "message": message, "fix": fix}
+def _resolver_due_deadline(cfg: EvidenceHealthConfig) -> datetime:
+    """Today's resolver fire time + grace, as a UTC datetime.
+
+    Ops-AE C1d helper. Used to decide whether a missing launchd log
+    is alertable. The default config assumes the resolver fires at
+    12:30 UTC; users whose launchd plist fires at a non-UTC local
+    12:30 must override ``resolver_due_hour_utc`` /
+    ``resolver_due_minute_utc`` on EvidenceHealthConfig.
+    """
+    due = datetime(
+        cfg.expected_date.year,
+        cfg.expected_date.month,
+        cfg.expected_date.day,
+        cfg.resolver_due_hour_utc,
+        cfg.resolver_due_minute_utc,
+        tzinfo=timezone.utc,
+    )
+    return due + timedelta(minutes=cfg.resolver_due_grace_minutes)
+
+
+def _is_before_resolver_due_window(
+    cfg: EvidenceHealthConfig, now: datetime
+) -> bool:
+    """Return True iff *now* is BEFORE today's resolver fire time
+    plus the configured grace window. Used to suppress false-alarms
+    on a fresh install where the launchd log doesn't exist yet
+    because the first scheduled fire hasn't happened.
+    """
+    return _ensure_utc(now) < _resolver_due_deadline(cfg)
+
+
+def _issue(
+    severity: str,
+    check: str,
+    message: str,
+    fix: str,
+    *,
+    alertable: bool = True,
+) -> dict[str, Any]:
+    """Construct an issue dict for the aggregated health payload.
+
+    Ops-AE C1d: gained an explicit ``alertable`` flag (default True).
+    Issues marked ``alertable=False`` carry information value for the
+    operator (they still appear in the JSON output) but the
+    watchdog dispatcher MUST NOT escalate them to an alert. Used
+    for "not due yet" type conditions where the absence of a
+    resource is expected by the current point in the daily schedule.
+    """
+    return {
+        "severity": severity,
+        "check": check,
+        "message": message,
+        "fix": fix,
+        "alertable": alertable,
+    }
 
 
 def _aggregate_status(issues: Iterable[dict[str, str]]) -> str:

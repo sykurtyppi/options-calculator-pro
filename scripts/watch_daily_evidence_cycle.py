@@ -6,6 +6,7 @@ import json
 import sys
 from datetime import date, datetime, time
 from pathlib import Path
+from typing import Any, Mapping
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -18,6 +19,7 @@ try:
 except ImportError:
     pass
 
+from services.evidence_health import EvidenceHealthConfig, build_candidate_exit_resolver_health
 from services.automation_watchdog import (
     DEFAULT_LOG_PATH,
     DEFAULT_MAX_REPORT_AGE_HOURS,
@@ -34,6 +36,78 @@ def _default_expected_date() -> date:
     return date.today()
 
 
+def _build_combined_watchdog_status(
+    *,
+    watchdog_status: Mapping[str, Any],
+    resolver_health: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge the daily-cycle watchdog status with the candidate exit
+    resolver health into a single payload suitable for
+    ``maybe_send_watchdog_alert``.
+
+    Ops-AE C1c (Codex P1 audit fix): resolver WARN-severity issues
+    MUST participate in the alert-dispatch decision. The prior code
+    only escalated resolver FAILs into ``combined_status['ok']``, so
+    documented alertable conditions like ``days_in_awaiting_state >
+    10`` and ``stale completion`` (both emitted as WARN by
+    evidence_health) silently failed to alert.
+
+    Contract:
+      - Resolver FAIL          → contributes to ``ok = False`` AND
+        appears in ``errors`` (for the alert message body).
+      - Resolver WARN          → contributes to ``ok = False`` AND
+        appears in ``errors`` (escalated per Ops-AE taxonomy).
+      - Resolver ``alertable=False`` issue (Ops-AE C1d, e.g. "log
+        missing but resolver not due yet") → kept in the JSON
+        payload via the resolver block but NEVER contributes to
+        ``ok`` / ``errors`` regardless of severity. Forensics-only.
+      - Daily-cycle WARN (from build_evidence_watchdog_status) →
+        stays in ``warnings`` only, observation-only (existing
+        behavior preserved).
+
+    Extracted from main() so it's directly unit-testable without
+    spawning the full CLI.
+    """
+    resolver_issues = resolver_health.get("issues", [])
+    # Ops-AE C1d: honor the explicit `alertable` flag on issues so
+    # "not due yet" type WARNs (logged for forensics) cannot page
+    # the operator. Default to True for backward compatibility
+    # with any issue dicts produced before C1d.
+    resolver_alertable = [
+        issue
+        for issue in resolver_issues
+        if issue.get("alertable", True)
+        and issue.get("severity") in {"FAIL", "WARN"}
+    ]
+    # Resolver issues that were explicitly tagged non-alertable still
+    # belong in the JSON output's warnings list so the operator can
+    # inspect them via `scripts/check_evidence_health.py` output —
+    # they just don't trigger iMessage alerts.
+    resolver_non_alertable = [
+        issue
+        for issue in resolver_issues
+        if not issue.get("alertable", True)
+    ]
+
+    return {
+        **watchdog_status,
+        "ok": bool(watchdog_status.get("ok")) and not resolver_alertable,
+        "errors": (
+            list(watchdog_status.get("errors", []))
+            + [str(i.get("message")) for i in resolver_alertable]
+        ),
+        # Daily-cycle warnings + resolver non-alertable warnings.
+        # Resolver alertable WARNs have been escalated to `errors`
+        # above and intentionally do NOT appear here too — avoid
+        # double-reporting in the alert payload.
+        "warnings": (
+            list(watchdog_status.get("warnings", []))
+            + [str(i.get("message")) for i in resolver_non_alertable]
+        ),
+        "candidate_exit_resolver": resolver_health.get("summary", {}),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Check daily evidence-cycle health and optionally send iMessage on failure."
@@ -44,6 +118,27 @@ def main() -> int:
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--max-report-age-hours", type=float, default=DEFAULT_MAX_REPORT_AGE_HOURS)
     parser.add_argument("--no-completion-log-required", action="store_true")
+    parser.add_argument("--candidate-resolver-jsonl", type=Path, default=None)
+    parser.add_argument("--candidate-resolver-log", type=Path, default=None)
+    # Ops-AE C1e (Codex P3 audit): see scripts/check_evidence_health.py
+    # for the rationale. launchd fires at LOCAL 12:30; the resolver
+    # due-window check uses UTC. Defaults work for UTC machines only.
+    parser.add_argument(
+        "--resolver-due-hour-utc",
+        type=int,
+        default=None,
+        help=(
+            "UTC hour at which the candidate exit resolver launchd "
+            "job fires today. Defaults to 12. Override if your "
+            "system local timezone is not UTC."
+        ),
+    )
+    parser.add_argument(
+        "--resolver-due-minute-utc",
+        type=int,
+        default=None,
+        help="UTC minute portion of the resolver due time. Defaults to 30.",
+    )
     parser.add_argument("--not-due-before-hour", type=int, default=22)
     parser.add_argument("--not-due-before-minute", type=int, default=15)
     parser.add_argument("--force-alert", action="store_true", help="Send even if this failure was already alerted.")
@@ -89,19 +184,45 @@ def main() -> int:
         require_completion_log=not args.no_completion_log_required,
     )
     status = build_evidence_watchdog_status(config=config)
+    resolver_base = EvidenceHealthConfig(expected_date=expected)
+    resolver_health = build_candidate_exit_resolver_health(
+        config=EvidenceHealthConfig(
+            expected_date=expected,
+            candidate_resolver_jsonl=args.candidate_resolver_jsonl or resolver_base.candidate_resolver_jsonl,
+            candidate_resolver_launchd_log_path=args.candidate_resolver_log or resolver_base.candidate_resolver_launchd_log_path,
+            resolver_due_hour_utc=(
+                args.resolver_due_hour_utc
+                if args.resolver_due_hour_utc is not None
+                else resolver_base.resolver_due_hour_utc
+            ),
+            resolver_due_minute_utc=(
+                args.resolver_due_minute_utc
+                if args.resolver_due_minute_utc is not None
+                else resolver_base.resolver_due_minute_utc
+            ),
+            max_candidate_resolver_run_age_hours=resolver_base.max_candidate_resolver_run_age_hours,
+            max_candidate_awaiting_days=resolver_base.max_candidate_awaiting_days,
+        ),
+        now=now,
+    )
+    combined_status = _build_combined_watchdog_status(
+        watchdog_status=status,
+        resolver_health=resolver_health,
+    )
     alert = maybe_send_watchdog_alert(
-        status,
+        combined_status,
         state_path=args.state_path,
         force=args.force_alert,
         dry_run=args.dry_run_alert,
     )
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
-        "watchdog": status,
+        "watchdog": combined_status,
+        "candidate_exit_resolver": resolver_health,
         "alert": alert,
     }
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))
-    return 0 if status.get("ok") else 2
+    return 0 if combined_status.get("ok") else 2
 
 
 if __name__ == "__main__":

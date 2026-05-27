@@ -8,6 +8,7 @@ TEMPLATE_DIR="${PROJECT_ROOT}/scripts/automation"
 mkdir -p "${LAUNCH_AGENTS_DIR}" "${HOME}/.options_calculator_pro/logs"
 
 for plist in \
+  com.optionscalculator.candidate-exit-resolver.plist \
   com.optionscalculator.evidence-cycle.plist \
   com.optionscalculator.evidence-watchdog.plist \
   com.optionscalculator.weekly-evidence-report.plist
