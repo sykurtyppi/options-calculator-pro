@@ -106,8 +106,11 @@ CREATE TABLE IF NOT EXISTS recommendations (
     -- PR-AD commit 3: sample provenance for promotion-eligibility
     -- filtering. Denormalized so SQL queries can filter without
     -- parsing JSON. Values come from SAMPLE_PROVENANCE_* constants
-    -- in web/api/edge_engine.py; promotion criteria reference only
-    -- the PROMOTION_ELIGIBLE_PROVENANCES set defined there.
+    -- in services/candidate_shadow_provenance.py (canonical source
+    -- after PR-AD commit 4 extracted them out of web/api/edge_engine.py
+    -- for services -> web edge cleanup); promotion criteria
+    -- reference only the PROMOTION_ELIGIBLE_PROVENANCES set
+    -- defined in that same module.
     sample_provenance             TEXT,
     -- PR-AE commit 1: live-exit-resolver attempt counter. Process
     -- bookkeeping, NOT part of the recommendation evidence — that is
@@ -656,6 +659,40 @@ class RecommendationLedger:
           status startswith "permanently_failed:" → increment_attempts=True
 
         Raises ``KeyError`` if ``recommendation_id`` is unknown.
+
+        Revision overlay semantics (Codex C5 audit, P3 — IMPORTANT):
+        =============================================================
+        This helper rebuilds the revision payload from the IMMUTABLE
+        v1 row and overlays ONLY ``candidate_shadow_outcome``. It is
+        NOT a cumulative full-state merge across prior revisions.
+
+        Concretely: if a future enrichment path (some PR-AF, PR-AG, …)
+        writes a revision that modifies ``picker_provenance`` or
+        ``surface_quality`` or any other field, and then the resolver
+        runs against the same row, the resolver's new revision will:
+
+          - carry v1's ``picker_provenance`` / ``surface_quality`` —
+            NOT the most-recent enriched values from the intervening
+            revision.
+          - carry the resolver's new ``candidate_shadow_outcome``.
+
+        This is intentional for PR-AE: the resolver only mutates the
+        candidate outcome, and v1 already carries the right values for
+        every other field. If a future PR needs a true cumulative
+        overlay (merge latest revision's payload + this revision's
+        changes), it must:
+
+          - Read the latest revision via ``get_revisions(...)`` rather
+            than only v1 inside this transaction.
+          - Or add a new dedicated helper with merge-from-latest
+            semantics, leaving this one for "PR-AE-style outcome-only
+            overlays."
+
+        The "PR-AE-only" scope is enforced by the
+        ``test_pr_ae_c5b_revisions_are_overlay_not_cumulative_merge``
+        regression test below; any future helper that introduces true
+        cumulative semantics must add its own test under a different
+        name.
         """
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:

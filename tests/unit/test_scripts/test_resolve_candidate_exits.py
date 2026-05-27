@@ -500,6 +500,31 @@ def test_summary_reports_count_balance_status() -> None:
     assert "count_balance_holds:    true" in text
 
 
+def test_summary_skipped_ineligible_is_not_misleadingly_zero() -> None:
+    """REGRESSION (Codex C5 audit P2): the original summary printed
+    `skipped_ineligible: 0` unconditionally, which suggested the
+    resolver had measured zero ineligible rows when in fact those
+    rows are filtered out at the SQL layer and never seen by the
+    resolver. Replaced with an explicit `not_measured` indicator
+    that names the SQL prefilter as the reason."""
+    text = _format_summary(
+        ResolverRunSummary(scanned=5, resolved_ok=5),
+        now=date(2026, 5, 30),
+        run_started_at=pd.Timestamp("2026-05-30T12:00:00", tz="UTC").to_pydatetime(),
+        duration_seconds=0.0,
+    )
+    # The line must mention "not_measured" or the SQL prefilter
+    # source — never a bare 0 that pretends to be a measurement.
+    assert "skipped_ineligible:" in text
+    assert (
+        "not_measured" in text
+        or "list_pending_candidate_exit_resolutions" in text
+    ), (
+        "skipped_ineligible must be labeled as not measured (SQL "
+        "prefilter) rather than reported as a misleading 0."
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Exit-code behavior
 # ──────────────────────────────────────────────────────────────────────────

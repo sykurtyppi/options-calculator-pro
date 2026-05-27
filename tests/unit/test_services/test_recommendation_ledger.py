@@ -1545,6 +1545,150 @@ def test_pr_ae_list_pending_returns_merged_view_not_v1(tmp_path: Path) -> None:
     assert eligible[0]["candidate_shadow_outcome_json"]["status"] == "awaiting_chain_data"
 
 
+def test_pr_ae_c5b_revisions_are_overlay_not_cumulative_merge(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (Codex C5 audit P3): record_resolution_and_attempt
+    rebuilds the revision payload from the IMMUTABLE v1 row and
+    overlays ONLY candidate_shadow_outcome. It does NOT cumulatively
+    merge intermediate revisions' changes to other fields.
+
+    This is the intentional PR-AE scope. The test guards against a
+    future refactor that silently changes this to a cumulative
+    merge — which would entangle the resolver with arbitrary other
+    enrichment paths and break the "v1 is the canonical source for
+    every non-candidate field" invariant.
+
+    Scenario:
+      1. Record a forward row with picker_provenance == A.
+      2. Plant a synthetic intermediate revision that ALSO changes
+         picker_provenance to A_PRIME (simulating some future
+         enrichment path's revision).
+      3. Run the resolver write (record_resolution_and_attempt).
+      4. The new resolver revision must carry picker_provenance ==
+         A (from v1), NOT A_PRIME (from the intermediate revision).
+         This proves the overlay is from v1, not cumulative.
+
+    If a future PR adds cumulative-merge semantics, it must do so in
+    a separately-named helper and leave this contract intact for
+    PR-AE.
+    """
+    from services.recommendation_ledger import build_record_from_analysis
+
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+
+    # Step 1: record v1 with picker_provenance carrying "A" marker.
+    # _forward_record's signature is fixed for the common case; this
+    # test needs to override picker_provenance, so we go through
+    # build_record_from_analysis directly.
+    pp_a = _sample_experimental_contract_selection()
+    pp_a["candidate_contracts"]["pickers_diverged"] = True  # v1 marker
+
+    analysis = SimpleNamespace(
+        symbol="AAPL",
+        recommendation="Candidate",
+        setup_score=0.72,
+        metrics={
+            "data_sources": {"options_source": "marketdata_app",
+                             "price_rv_source": "yfinance"},
+            "experimental_contract_selection": pp_a,
+        },
+        rationale=[],
+        selector_output={
+            "recommendation": "Candidate",
+            "best_structure": "call_calendar",
+            "earnings_date": "2026-05-01",
+            "primary_thesis": "thesis",
+            "primary_risks": [],
+            "why_this_structure": [],
+            "why_not_others": {},
+        },
+        structure_scorecards=[
+            {"structure": "call_calendar", "eligible": True,
+             "composite_structure_score": 0.81},
+        ],
+        vol_snapshot={
+            "symbol": "AAPL",
+            "as_of_date": "2026-04-23",
+            "earnings_date": "2026-05-01",
+            "earnings_source_primary": "alpha_vantage",
+            "earnings_source_confidence": 0.82,
+            "earnings_source_stale": False,
+            "option_source": "marketdata_app",
+            "underlying_source": "yfinance",
+            "data_quality_score": 0.77,
+        },
+        sample_provenance="forward_post_freeze",
+        candidate_shadow_outcome={},
+    )
+    rec = build_record_from_analysis(
+        analysis,
+        recommendation_id="rec_overlay_contract",
+        quote_payload={
+            "quote_source": "yfinance",
+            "quote_timestamp": "2026-04-23T12:00:00+00:00",
+            "quote_quality": "paper_research_mid_not_execution_grade",
+            "bid_ask_mid": {"legs": {"call": {"mid": 4.1}}},
+            "surface_quality": {"status": "valid_evidence", "warning_flags": []},
+        },
+    )
+    ledger.record(rec)
+
+    # Step 2: plant an intermediate revision that changes
+    # picker_provenance to "A_PRIME" (simulating some future
+    # enrichment path that we have not yet shipped — e.g. a
+    # post-recommendation picker-provenance correction PR).
+    import json
+    pp_a_prime = _sample_experimental_contract_selection()
+    pp_a_prime["candidate_contracts"]["pickers_diverged"] = False  # A_PRIME marker
+    enriched_payload = {
+        "recommendation_id": "rec_overlay_contract",
+        "picker_provenance": pp_a_prime,
+        "candidate_shadow_outcome": {},
+        "sample_provenance": "forward_post_freeze",
+    }
+    ledger._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO recommendation_revisions
+            (recommendation_id, revised_at, content_hash, record_json)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            "rec_overlay_contract",
+            "2026-05-26T00:00:00+00:00",
+            "synthetic_intermediate_hash",
+            json.dumps(enriched_payload, sort_keys=True),
+        ),
+    )
+    ledger._conn.commit()
+
+    # Step 3: run the resolver write — overlays only the outcome.
+    ledger.record_resolution_and_attempt(
+        recommendation_id="rec_overlay_contract",
+        candidate_shadow_outcome=_sample_candidate_shadow_outcome(),
+        increment_attempts=False,
+    )
+
+    # Step 4: the LATEST revision (= the one record_resolution_and_attempt
+    # just wrote) must carry v1's picker_provenance with pickers_diverged
+    # == True, NOT the intermediate revision's pickers_diverged == False.
+    revisions = ledger.get_revisions("rec_overlay_contract")
+    latest_payload = revisions[-1]["record"]
+    assert (
+        latest_payload["picker_provenance"]["candidate_contracts"]["pickers_diverged"]
+        is True
+    ), (
+        "record_resolution_and_attempt MUST overlay onto v1's "
+        "picker_provenance (pickers_diverged=True), NOT the "
+        "intermediate revision's (pickers_diverged=False). If this "
+        "fails, the resolver has silently been changed to do a "
+        "cumulative merge — which would entangle PR-AE with every "
+        "other future enrichment path. Move the cumulative-merge "
+        "behavior into a separately-named helper and restore the "
+        "v1-overlay contract here."
+    )
+
+
 def test_pr_ae_composite_index_exists(tmp_path: Path) -> None:
     """The (sample_provenance, earnings_date) composite index must exist
     so the daily eligibility query doesn't full-scan a growing

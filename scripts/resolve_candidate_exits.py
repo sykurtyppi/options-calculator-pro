@@ -266,7 +266,14 @@ def _format_summary(
         f"(now={now.isoformat()})"
     )
     lines.append(f"  scanned:                {summary.scanned:>4d} candidate rows from ledger")
-    lines.append(f"  skipped_ineligible:     {0:>4d}  (filtered at SQL layer)")
+    # Codex C5 audit (P2): `skipped_ineligible` is filtered at the SQL
+    # layer by list_pending_candidate_exit_resolutions, so the resolver
+    # never sees those rows. Reporting a hardcoded 0 was misleading —
+    # surface the semantic explicitly instead.
+    lines.append(
+        f"  skipped_ineligible:    not_measured  (filtered at SQL layer by "
+        f"list_pending_candidate_exit_resolutions)"
+    )
     lines.append(f"  skipped_malformed:      {summary.skipped_malformed:>4d}  (picker_provenance missing/malformed)")
     lines.append(f"  resolved_ok:            {summary.resolved_ok:>4d}")
     lines.append(f"  awaiting_chain_data:    {summary.awaiting_chain_data:>4d}")
