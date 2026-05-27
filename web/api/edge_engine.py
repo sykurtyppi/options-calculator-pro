@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from services.dividend_yields import get_dividend_yield
+from services.iv_term_structure import bounded_interp
 from services.earnings_event_service import resolve_upcoming_earnings_event
 from services.earnings_vol_snapshot import build_vol_snapshot
 from services.provider_telemetry import classify_error, record_provider_telemetry
@@ -1979,8 +1980,14 @@ def _term_structure_from_mda_chain(
     days_arr = np.array(days, dtype=float)[order]
     ivs_arr = np.array(ivs, dtype=float)[order]
 
-    iv30 = float(np.interp(30.0, days_arr, ivs_arr))
-    iv45 = float(np.interp(45.0, days_arr, ivs_arr))
+    # PR #72: bounded interpolation — return np.nan (the legacy
+    # "missing" sentinel for this fallback path) when the target
+    # tenor isn't bracketed. Pre-fix used np.interp directly which
+    # silently clamped to the nearest endpoint.
+    _iv30_value, _iv30_status = bounded_interp(30.0, days_arr, ivs_arr)
+    _iv45_value, _iv45_status = bounded_interp(45.0, days_arr, ivs_arr)
+    iv30 = float(_iv30_value) if _iv30_value is not None else np.nan
+    iv45 = float(_iv45_value) if _iv45_value is not None else np.nan
     # FIX 1: slope between first real listed tenor and tenor nearest 45d.
     # np.interp(0.0, ...) clamps to shortest expiry — calling it "0-45d" is wrong.
     _ts_near_dte = float(days_arr[0])
@@ -2259,8 +2266,13 @@ def _term_structure_points_yf(
     order = np.argsort(np.array(days, dtype=float))
     days_arr = np.array(days, dtype=float)[order]
     ivs_arr = np.array(ivs, dtype=float)[order]
-    iv30 = float(np.interp(30.0, days_arr, ivs_arr))
-    iv45 = float(np.interp(45.0, days_arr, ivs_arr))
+    # PR #72: bounded interpolation (same fix as the sibling
+    # fallback above). np.nan on out-of-bracket so downstream
+    # `np.isfinite(iv30)` checks behave as before.
+    _iv30_value, _iv30_status = bounded_interp(30.0, days_arr, ivs_arr)
+    _iv45_value, _iv45_status = bounded_interp(45.0, days_arr, ivs_arr)
+    iv30 = float(_iv30_value) if _iv30_value is not None else np.nan
+    iv45 = float(_iv45_value) if _iv45_value is not None else np.nan
     # FIX 1: slope between first real listed tenor and tenor nearest 45d.
     _ts_near_dte = float(days_arr[0])
     _ts_far_idx  = int(np.argmin(np.abs(days_arr - 45.0)))
