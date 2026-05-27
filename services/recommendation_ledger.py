@@ -1208,27 +1208,54 @@ _ledger_lock = threading.Lock()
 
 
 def get_recommendation_ledger(ledger_path: Optional[Path] = None) -> RecommendationLedger:
+    """Return the module-global ledger singleton.
+
+    Semantics:
+      * ``ledger_path=None`` (argless): return whatever's installed,
+        lazy-initializing to ``_DEFAULT_LEDGER`` only if no singleton
+        exists yet. Never closes an existing handle. This preserves
+        the pre-Hardening contract — argless callers don't care what
+        path is in use, they just want the current instance.
+      * ``ledger_path`` supplied AND matches the current singleton's
+        path: return the existing instance unchanged. Two callers
+        (e.g. two FastAPI handlers) passing the same explicit path
+        get the same handle.
+      * ``ledger_path`` supplied AND differs from the current
+        singleton's path: close the previous SQLite connection, then
+        install a new instance.
+
+    Hardening P1-5 / P1-5b: closing the previous connection prevents
+    the FleetView FastAPI app and any long-running daemon from leaking
+    one SQLite WAL handle per path change. Codex's P1-5b audit caught
+    that an earlier version over-corrected by closing on every
+    supplied path, even when it matched — which invalidated handles
+    other callers were still holding. The path-aware compare here
+    resolves both: leak fixed, singleton invariant preserved.
+    """
     global _ledger
-    if _ledger is None or ledger_path is not None:
-        with _ledger_lock:
-            if _ledger is None or ledger_path is not None:
-                # Hardening P1-5: close the previous instance's SQLite
-                # connection before dropping the reference. Without this,
-                # every call that supplies ``ledger_path`` (the web layer
-                # and any test that monkey-patches _DEFAULT_LEDGER) leaks
-                # one SQLite connection plus its WAL file handle. Launchd
-                # entrypoints run once-per-invocation so production
-                # exposure is bounded, but the FastAPI app and any
-                # future daemon would accumulate handles until ulimit
-                # kicks in.
-                if _ledger is not None:
-                    try:
-                        _ledger.close()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "recommendation_ledger: failed to close previous "
-                            "instance before replacement: %s",
-                            exc,
-                        )
-                _ledger = RecommendationLedger(ledger_path or _DEFAULT_LEDGER)
+    # ── Argless path: never replace, never close. ─────────────────────
+    if ledger_path is None:
+        if _ledger is None:
+            with _ledger_lock:
+                if _ledger is None:
+                    _ledger = RecommendationLedger(_DEFAULT_LEDGER)
+        return _ledger
+    # ── Explicit path: replace only on path change. ───────────────────
+    # Fast-path read outside the lock for the no-replacement case.
+    # Re-checked inside the lock to handle the concurrent-init race.
+    if _ledger is not None and _ledger.path == ledger_path:
+        return _ledger
+    with _ledger_lock:
+        if _ledger is None or _ledger.path != ledger_path:
+            previous = _ledger
+            if previous is not None:
+                try:
+                    previous.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "recommendation_ledger: failed to close previous "
+                        "instance before replacement: %s",
+                        exc,
+                    )
+            _ledger = RecommendationLedger(ledger_path)
     return _ledger

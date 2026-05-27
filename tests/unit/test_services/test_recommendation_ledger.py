@@ -1947,10 +1947,10 @@ def test_pr_ae_atomic_helper_duplicate_outcome_still_bumps_counter(
 # ── Hardening P1-5 regression test ───────────────────────────────────────
 
 
-def test_get_recommendation_ledger_closes_previous_instance_on_replacement(
+def test_get_recommendation_ledger_closes_previous_on_different_path(
     tmp_path: Path,
 ) -> None:
-    """Hardening P1-5: replacing the module-global ledger via a new
+    """Hardening P1-5: replacing the module-global ledger via a *different*
     ``ledger_path`` must close the previous SQLite connection. Without
     this, long-running processes (the FastAPI web app, any future
     daemon) accumulate WAL handles every time the path changes — until
@@ -1984,4 +1984,62 @@ def test_get_recommendation_ledger_closes_previous_instance_on_replacement(
 
     # Cleanup so we don't bleed state into other tests.
     second.close()
+    ledger_module._ledger = None
+
+
+def test_get_recommendation_ledger_same_path_returns_same_instance(
+    tmp_path: Path,
+) -> None:
+    """Hardening P1-5b (Codex audit P1): two callers requesting the
+    *same* explicit ``ledger_path`` must receive the same singleton
+    instance — and crucially, the second call must NOT close the
+    connection the first caller is still holding.
+
+    This is the singleton-invariant regression Codex caught: an earlier
+    version of the fix closed-and-replaced on every supplied path,
+    even when it matched, which silently invalidated the first
+    caller's handle.
+    """
+    same_path = tmp_path / "shared.sqlite"
+
+    ledger_module._ledger = None
+
+    first = get_recommendation_ledger(ledger_path=same_path)
+    first_handle = first._conn  # noqa: SLF001
+
+    # Sanity: the first instance is usable.
+    assert first_handle.execute("SELECT 1").fetchone()[0] == 1
+
+    second = get_recommendation_ledger(ledger_path=same_path)
+    # Same object, same connection handle.
+    assert second is first
+    assert second._conn is first_handle  # noqa: SLF001
+
+    # The first caller's handle must still be open — this is the
+    # whole point of the singleton.
+    assert first_handle.execute("SELECT 1").fetchone()[0] == 1
+
+    # Cleanup.
+    first.close()
+    ledger_module._ledger = None
+
+
+def test_get_recommendation_ledger_no_arg_does_not_replace_when_already_initialized(
+    tmp_path: Path,
+) -> None:
+    """A bare ``get_recommendation_ledger()`` after the singleton is
+    initialized to a custom path must NOT silently swap it back to
+    the default — that would close an in-use connection.
+    Documents the contract: argless calls return whatever's currently
+    installed.
+    """
+    explicit_path = tmp_path / "explicit.sqlite"
+    ledger_module._ledger = None
+
+    first = get_recommendation_ledger(ledger_path=explicit_path)
+    second = get_recommendation_ledger()
+    # No arg → no replacement.
+    assert second is first
+
+    first.close()
     ledger_module._ledger = None
