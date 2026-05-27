@@ -478,6 +478,33 @@ def _select_pre_earnings_calendar_contracts(
     }
 
 
+_DUAL_PICKER_EXPERIMENTAL_NOTE = (
+    "candidate_selection uses an in-sample +14d-min-front-DTE rule "
+    "(PR-AB). Not out-of-sample validated. Do not execute against "
+    "candidate_selection without independent review."
+)
+
+
+def _empty_dual_picker(shadow_status: str) -> Dict[str, Any]:
+    """Canonical empty dual-picker block.
+
+    Used for every code path where the dual-picker cannot produce a
+    selection (missing entry chain, picker exception, etc.). Ensures
+    every return shape carries the SAME keys — required so downstream
+    consumers can rely on stable schema regardless of which failure
+    path produced the record.
+    """
+    from services.calendar_leg_picker import CANDIDATE_FRONT_MIN_DTE_DAYS
+    return {
+        "legacy_selection": None,
+        "candidate_selection": None,
+        "pickers_diverged": False,
+        "shadow_status": shadow_status,
+        "candidate_min_front_dte_days": int(CANDIDATE_FRONT_MIN_DTE_DAYS),
+        "experimental_note": _DUAL_PICKER_EXPERIMENTAL_NOTE,
+    }
+
+
 def _dual_picker_calendar_selection(
     chain_df: pd.DataFrame,
     event_date: pd.Timestamp,
@@ -532,17 +559,7 @@ def _dual_picker_calendar_selection(
         )
     except Exception as exc:  # defensive: shadow logging must never break sim
         logger.debug("dual-picker shadow logging failed: %s", exc)
-        return {
-            "legacy_selection": None,
-            "candidate_selection": None,
-            "pickers_diverged": False,
-            "shadow_status": f"error:{type(exc).__name__}",
-            "experimental_note": (
-                "candidate_selection uses an in-sample +14d-min-front-DTE "
-                "rule (PR-AB). Not out-of-sample validated. Do not execute "
-                "against candidate_selection without independent review."
-            ),
-        }
+        return _empty_dual_picker(f"error:{type(exc).__name__}")
 
     diverged = False
     if legacy is not None and candidate is not None:
@@ -558,11 +575,7 @@ def _dual_picker_calendar_selection(
         "pickers_diverged": bool(diverged),
         "shadow_status": "ok",
         "candidate_min_front_dte_days": int(CANDIDATE_FRONT_MIN_DTE_DAYS),
-        "experimental_note": (
-            "candidate_selection uses an in-sample +14d-min-front-DTE rule "
-            "(PR-AB). Not out-of-sample validated. Do not execute against "
-            "candidate_selection without independent review."
-        ),
+        "experimental_note": _DUAL_PICKER_EXPERIMENTAL_NOTE,
     }
 
 
@@ -601,17 +614,13 @@ def _simulate_pre_earnings_calendar_trade(
     try:
         entry_chain = store.query_chain(symbol, trade_date=base["entry_date"], call_put="C", limit=5000)
     except Exception as exc:
-        # No entry chain → no dual-picker possible. Stable shape.
+        # No entry chain → no dual-picker possible. Use the canonical
+        # empty-block factory so the shape matches every other return.
         return {
             **base,
             "status": "missing_entry_chain",
             "reason": str(exc),
-            "dual_picker": {
-                "legacy_selection": None,
-                "candidate_selection": None,
-                "pickers_diverged": False,
-                "shadow_status": "skipped:missing_entry_chain",
-            },
+            "dual_picker": _empty_dual_picker("skipped:missing_entry_chain"),
         }
 
     # Shadow-mode dual-picker logging. Computed ONCE from the entry chain,
@@ -872,42 +881,67 @@ def _summarize_pre_earnings_expansion(
 
 
 def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate the dual-picker shadow logs across a set of simulated
-    trades into a single ``experimental_candidate_evidence`` block.
+    """Aggregate dual-picker shadow logs into an evidence block.
 
     Each input trade dict is expected to carry a ``dual_picker`` field
-    populated by ``_dual_picker_calendar_selection`` (a stable-shape
-    dict). Counts are emitted regardless of trade status — i.e. trades
-    that failed for reasons unrelated to the picker (missing_exit_quote,
-    negative_debit, etc.) still contribute their dual_picker evidence.
+    populated by ``_dual_picker_calendar_selection``. The aggregation
+    distinguishes two count axes:
 
-    The summary is intentionally count-only. Promotion-ready performance
-    comparison (mean PnL under each picker) requires *also* simulating
-    the candidate path through entry+exit pricing — that is a separate
-    commit, NOT part of commit 2's shadow-logging scope."""
+      * trade_counts: per simulated trade record. The same earnings
+        event evaluated at N different entry-offsets produces N
+        records, so this is inflated by the offset cardinality.
+      * event_counts: deduplicated by (symbol, event_date). This is
+        the count that should drive any promotion criterion — independent
+        earnings events, not entry-offset replication.
+
+    Picker outcome counts (legacy_succeeded, candidate_succeeded, etc.)
+    only include trades whose ``shadow_status`` == "ok". Data-availability
+    failures (``skipped:missing_entry_chain``, ``error:*``) are tallied
+    separately under ``shadow_status_counts`` so they cannot be
+    mistaken for picker failures."""
+    # Trade-level (per offset × event)
     n_total = 0
-    n_legacy = 0
-    n_candidate = 0
-    n_both = 0
-    n_both_failed = 0
     n_legacy_only = 0
     n_candidate_only = 0
+    n_both = 0
+    n_neither = 0
     n_diverged = 0
+
+    # Shadow-status breakdown across ALL trades (incl. non-ok)
+    shadow_status_counts: Dict[str, int] = {}
+
+    # Event-level (deduplicated on (symbol, event_date))
+    unique_events: set = set()
+    unique_events_with_legacy: set = set()
+    unique_events_with_candidate: set = set()
+    unique_events_diverged: set = set()
+    unique_events_picker_evaluated: set = set()  # at least one offset had shadow_status == "ok"
+
     diverged_sample: List[Dict[str, Any]] = []
+
     for trade in trades:
         dp = trade.get("dual_picker") or {}
-        # Only count trades where shadow logging actually ran.
-        if dp.get("shadow_status") not in ("ok", "skipped:missing_entry_chain"):
+        status = dp.get("shadow_status")
+        shadow_status_counts[status or "missing"] = shadow_status_counts.get(status or "missing", 0) + 1
+
+        event_key = (trade.get("symbol"), trade.get("event_date"))
+        if event_key != (None, None):
+            unique_events.add(event_key)
+
+        # Outcome bucketing only applies when shadow logging actually ran.
+        if status != "ok":
             continue
+
         n_total += 1
+        unique_events_picker_evaluated.add(event_key)
         legacy_sel = dp.get("legacy_selection")
         candidate_sel = dp.get("candidate_selection")
         legacy_present = legacy_sel is not None
         candidate_present = candidate_sel is not None
         if legacy_present:
-            n_legacy += 1
+            unique_events_with_legacy.add(event_key)
         if candidate_present:
-            n_candidate += 1
+            unique_events_with_candidate.add(event_key)
         if legacy_present and candidate_present:
             n_both += 1
         elif legacy_present:
@@ -915,9 +949,10 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
         elif candidate_present:
             n_candidate_only += 1
         else:
-            n_both_failed += 1
+            n_neither += 1
         if dp.get("pickers_diverged"):
             n_diverged += 1
+            unique_events_diverged.add(event_key)
             if len(diverged_sample) < 5:
                 diverged_sample.append(
                     {
@@ -933,6 +968,7 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
                         "candidate_front_dte": (candidate_sel or {}).get("front_dte_days"),
                     }
                 )
+
     return {
         "note": (
             "Shadow comparison of two calendar leg-picker rules. The "
@@ -940,19 +976,40 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
             "in-sample on PR-AB's 10-symbol/139-event dataset and NOT "
             "out-of-sample validated. Do not interpret divergence counts "
             "as performance claims; promotion criteria are defined in the "
-            "PR-AC pull request description."
+            "PR-AC pull request description.\n\n"
+            "IMPORTANT: trade_counts.* are inflated by entry-offset "
+            "replication — the same earnings event evaluated at multiple "
+            "entry offsets produces multiple trade records. Use "
+            "event_counts.unique_events_* for promotion-criterion "
+            "thresholds (n_diverged, n_total) to avoid double-counting."
         ),
         "picker_legacy": "legacy_first_expiry",
         "picker_candidate": "candidate_min_dte",
+        # Per-trade-record (offset-inflated). Useful for understanding
+        # the simulation's overall picker behavior but NOT for evidence-
+        # threshold checks.
         "trade_counts": {
-            "total": int(n_total),
-            "legacy_succeeded": int(n_legacy),
-            "candidate_succeeded": int(n_candidate),
+            "total_picker_evaluated": int(n_total),
             "both_succeeded": int(n_both),
             "legacy_only": int(n_legacy_only),
             "candidate_only": int(n_candidate_only),
-            "both_failed": int(n_both_failed),
+            "neither_succeeded": int(n_neither),
             "pickers_diverged": int(n_diverged),
+        },
+        # Per-earnings-event (deduplicated). THIS is the count that
+        # promotion criteria should use.
+        "event_counts": {
+            "unique_events_observed": len(unique_events),
+            "unique_events_picker_evaluated": len(unique_events_picker_evaluated),
+            "unique_events_with_legacy_selection": len(unique_events_with_legacy),
+            "unique_events_with_candidate_selection": len(unique_events_with_candidate),
+            "unique_events_diverged": len(unique_events_diverged),
+        },
+        # Data-availability accounting (entry chain missing, helper
+        # exceptions, etc.) — separated so it cannot be confused with
+        # picker outcomes.
+        "shadow_status_counts": {
+            k: int(v) for k, v in sorted(shadow_status_counts.items())
         },
         "diverged_sample": diverged_sample,
     }
