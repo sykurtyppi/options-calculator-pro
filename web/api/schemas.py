@@ -22,6 +22,16 @@ class EdgeAnalyzeResponse(BaseModel):
 
 
 class OOSReportRequest(BaseModel):
+    """OOS / backtest report parameters.
+
+    Web-audit P2-1: every integer and float here previously had no upper
+    bound. An authenticated user POSTing absurd values (``lookback_days=
+    100_000_000``, ``max_backtest_symbols=100_000``) could pin a worker
+    thread for the full 300s wall-clock and burn DuckDB/pandas memory.
+    Bounds below are picked to cover any realistic backtest while
+    refusing pathological inputs.
+    """
+
     oos_stability_profile: Literal[
         "stability_auto",
         "evidence_balanced",
@@ -30,27 +40,29 @@ class OOSReportRequest(BaseModel):
         "alpha_focus",
     ] = "stability_auto"
 
-    lookback_days: int = 1095
-    max_backtest_symbols: int = 50
+    # ~10y of history is enough for any realistic backtest.
+    lookback_days: int = Field(1095, ge=30, le=3650)
+    # 200 symbols is well above any production universe (10–50 typical).
+    max_backtest_symbols: int = Field(50, ge=1, le=200)
     backtest_start_date: Optional[str] = "2023-01-01"
     backtest_end_date: Optional[str] = None
-    min_signal_score: float = 0.50
-    min_crush_confidence: float = 0.30
-    min_crush_magnitude: float = 0.06
-    min_crush_edge: float = 0.02
-    target_entry_dte: int = 6
-    entry_dte_band: int = 6
-    min_daily_share_volume: int = 1_000_000
-    max_abs_momentum_5d: float = 0.11
+    min_signal_score: float = Field(0.50, ge=0.0, le=1.0)
+    min_crush_confidence: float = Field(0.30, ge=0.0, le=1.0)
+    min_crush_magnitude: float = Field(0.06, ge=0.0, le=1.0)
+    min_crush_edge: float = Field(0.02, ge=0.0, le=1.0)
+    target_entry_dte: int = Field(6, ge=0, le=365)
+    entry_dte_band: int = Field(6, ge=0, le=365)
+    min_daily_share_volume: int = Field(1_000_000, ge=0, le=10_000_000_000)
+    max_abs_momentum_5d: float = Field(0.11, ge=0.0, le=10.0)
 
-    oos_train_days: int = 189
-    oos_test_days: int = 42
-    oos_step_days: int = 42
-    oos_top_n_train: int = 1
+    oos_train_days: int = Field(189, ge=7, le=3650)
+    oos_test_days: int = Field(42, ge=1, le=3650)
+    oos_step_days: int = Field(42, ge=1, le=3650)
+    oos_top_n_train: int = Field(1, ge=1, le=20)
 
-    oos_min_splits: int = 8
-    oos_min_total_test_trades: int = 80
-    oos_min_trades_per_split: float = 5.0
+    oos_min_splits: int = Field(8, ge=1, le=100)
+    oos_min_total_test_trades: int = Field(80, ge=1, le=100_000)
+    oos_min_trades_per_split: float = Field(5.0, ge=0.0, le=10_000.0)
 
 
 class OOSReportResponse(BaseModel):

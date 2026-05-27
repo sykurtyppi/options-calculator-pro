@@ -64,21 +64,65 @@ _SECURE_SESSION_COOKIE = (
     os.getenv("OPTIONS_CALCULATOR_SECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
     or _HOSTED_MODE
 )
+# Web-audit P1-3: explicit escape hatch for the plaintext-HTTP local dev case.
+# When share-auth is on, _validate_auth_config requires either Secure cookies
+# (recommended) or this opt-in flag — acknowledging the cookie-disclosure risk
+# on any HTTP sibling page.
+_ALLOW_INSECURE_SESSION_COOKIE = (
+    os.getenv("OPTIONS_CALCULATOR_ALLOW_INSECURE_SESSION_COOKIE", "")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+# Web-audit P1-1: opt-in flag for honouring X-Forwarded-For in _client_ip().
+# OFF by default (so untrusted direct requests can't spoof their IP); ON when
+# behind a trusted proxy/tunnel (Cloudflare, Tailscale Funnel, nginx) — without
+# this, /login rate-limiting collapses to a single global bucket because every
+# request comes from the proxy's loopback IP.
+_TRUST_PROXY_HEADERS = (
+    os.getenv("OPTIONS_CALCULATOR_TRUST_PROXY_HEADERS", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+    or _HOSTED_MODE  # hosted mode implies a trusted tunnel/proxy is in front
+)
 _MAX_OOS_RUNNING_JOBS = max(1, int(os.getenv("OPTIONS_CALCULATOR_MAX_OOS_RUNNING_JOBS", "1")))
 _MAX_ML_RUNNING_JOBS = max(1, int(os.getenv("OPTIONS_CALCULATOR_MAX_ML_RUNNING_JOBS", "1")))
 _MAX_RETAINED_JOBS = max(10, int(os.getenv("OPTIONS_CALCULATOR_MAX_RETAINED_JOBS", "100")))
 
-# Per-IP rate limit on POST /login. Both windows are checked; either trips
-# a 429. Defaults (5/min, 30/hour) accommodate normal use while bounding
-# brute-force throughput against a weak access code by ~3 orders of
-# magnitude versus an unbounded loop.
+# ── Per-IP rate limits ────────────────────────────────────────────────────────
+# Both windows on every limited endpoint are checked; either trips a 429.
+# Defaults are picked to bound brute-force / DoS-by-loop throughput while
+# leaving normal use unaffected.
 _LOGIN_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_LOGIN_RATE_LIMIT_PER_MIN", "5")))
 _LOGIN_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_LOGIN_RATE_LIMIT_PER_HOUR", "30")))
-_login_attempts: Dict[str, List[float]] = {}
-_login_attempts_lock = threading.Lock()
+# Web-audit P2-3: /api/ml/train and /api/oos/submit had a 1-job concurrency
+# lock but no rate limit — an auth'd user (or stolen cookie) could loop POSTs
+# to drive sustained CPU + model-file churn.
+_ML_TRAIN_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_ML_TRAIN_RATE_LIMIT_PER_MIN", "2")))
+_ML_TRAIN_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_ML_TRAIN_RATE_LIMIT_PER_HOUR", "10")))
+_OOS_SUBMIT_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_OOS_SUBMIT_RATE_LIMIT_PER_MIN", "3")))
+_OOS_SUBMIT_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_OOS_SUBMIT_RATE_LIMIT_PER_HOUR", "20")))
 
-# Paths that don't require authentication
-_PUBLIC_PATHS = {"/login", "/favicon.ico", "/api/health"}
+# (bucket_name, ip) -> list of recent attempt timestamps. Same shape used for
+# all rate-limited endpoints; keyed by bucket so /login attempts can't be
+# counted against /api/ml/train, etc.
+_rate_limit_buckets: Dict[Tuple[str, str], List[float]] = {}
+_rate_limit_lock = threading.Lock()
+
+# Web-audit P1-2: session-nonce revocation set. POST /logout records the
+# nonce here so _valid_session rejects the cookie even before its 7-day TTL
+# expires. In-memory only — server restart "forgets" revocations, but new
+# logins get fresh nonces anyway, so all that means is that a cookie which
+# was previously logged-out may become valid again until either (a) the
+# original 7-day expiry fires or (b) the user logs out again on the new
+# instance. The bigger threat — undetected cookie theft — is what this
+# defends against.
+_revoked_nonces: Dict[str, float] = {}  # nonce -> original cookie's expiry timestamp
+_revoked_nonces_lock = threading.Lock()
+
+# Paths that don't require authentication. /logout is here so users with an
+# expired or already-revoked cookie can still hit it (the handler is a no-op
+# on missing/invalid cookies; it still clears whatever's there).
+_PUBLIC_PATHS = {"/login", "/logout", "/favicon.ico", "/api/health"}
 
 _LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -172,6 +216,21 @@ def _validate_auth_config() -> None:
         raise RuntimeError(
             "ENABLE_SHARE_AUTH=true requires SESSION_SECRET to be non-default and at least 24 characters."
         )
+    # Web-audit P1-3: a session cookie without the Secure flag can be read by
+    # any plaintext-HTTP page on the same eTLD+1 (sibling subdomain misconfig,
+    # MITM on an HTTP fetch the browser issues to the same host). Force the
+    # operator to either deploy with TLS (recommended — OPTIONS_CALCULATOR_
+    # SECURE_COOKIES=true, or HOSTED_MODE=true which implies it) or opt in
+    # explicitly to the no-TLS local-dev case via OPTIONS_CALCULATOR_ALLOW_
+    # INSECURE_SESSION_COOKIE=true.
+    if not _SECURE_SESSION_COOKIE and not _ALLOW_INSECURE_SESSION_COOKIE:
+        raise RuntimeError(
+            "ENABLE_SHARE_AUTH=true requires either OPTIONS_CALCULATOR_SECURE_COOKIES=true "
+            "(or OPTIONS_CALCULATOR_HOSTED_MODE=true, which implies it) — recommended for any "
+            "TLS deployment — OR an explicit OPTIONS_CALCULATOR_ALLOW_INSECURE_SESSION_COOKIE="
+            "true escape hatch for plaintext-HTTP local dev. Without one of those, the session "
+            "cookie can be disclosed by any HTTP page on the same eTLD+1."
+        )
 
 
 def _docs_path(path: str) -> bool:
@@ -201,68 +260,167 @@ def _session_token(now: Optional[datetime] = None) -> str:
     return f"{payload}.{_session_signature(payload)}"
 
 
-def _valid_session(cookie_val: str) -> bool:
-    if not _SHARE_AUTH_ENABLED:
-        return True
-    if not cookie_val or not _SHARE_PASSWORD:
-        return False
+def _extract_session_token(cookie_val: str) -> Optional[Tuple[str, int]]:
+    """Parse and HMAC-verify *cookie_val*.
+
+    Returns ``(nonce, issued_at)`` if the cookie's signature is valid
+    AND it's within the normal session age window; otherwise ``None``.
+    Does NOT consult the revocation set — that's the caller's job in
+    :func:`_valid_session`. By keeping the verification gate separate
+    from the revocation check, ``POST /logout`` can use this helper
+    to decide whether a cookie is worth revoking *at all* (Codex
+    web-audit follow-up P1).
+
+    Without this gate, ``/logout`` accepts any syntactically shaped
+    cookie and inserts its nonce into ``_revoked_nonces`` — turning a
+    public endpoint into a memory-pressure surface. Forged cookies
+    with absurd timestamps could also blow up ``int(issued_at_raw)``
+    with ``OverflowError``; that's caught here too.
+    """
+    if not _SHARE_AUTH_ENABLED or not cookie_val or not _SHARE_PASSWORD:
+        return None
     try:
         version, issued_at_raw, nonce, signature = cookie_val.split(".", 3)
         if version != "v1" or not nonce:
-            return False
+            return None
         issued_at = int(issued_at_raw)
         age = int(datetime.now(timezone.utc).timestamp()) - issued_at
         if age < 0 or age > _SESSION_MAX_AGE:
-            return False
+            return None
         payload = f"{version}.{issued_at_raw}.{nonce}"
-        return hmac.compare_digest(signature, _session_signature(payload))
-    except Exception:
+        if not hmac.compare_digest(signature, _session_signature(payload)):
+            return None
+        return (nonce, issued_at)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _valid_session(cookie_val: str) -> bool:
+    if not _SHARE_AUTH_ENABLED:
+        return True
+    parsed = _extract_session_token(cookie_val)
+    if parsed is None:
         return False
+    nonce, _issued_at = parsed
+    # Web-audit P1-2: even a signature-valid cookie is rejected if the
+    # nonce has been revoked via POST /logout. Without this check, the
+    # only way to invalidate a leaked cookie before its 7-day TTL was
+    # to rotate SESSION_SECRET — which kicks every other session.
+    return not _is_nonce_revoked(nonce)
+
+
+def _revoke_nonce(nonce: str, expiry_ts: float) -> None:
+    """Add *nonce* to the in-memory revocation set with its original cookie
+    expiry. Subsequent calls to :func:`_valid_session` reject the cookie even
+    though the HMAC still verifies.
+
+    Opportunistically GCs any revoked nonces whose original cookies have
+    already expired — the auth path would reject them on age anyway, so
+    there's no point keeping them in memory.
+    """
+    if not nonce:
+        return
+    now = time.time()
+    with _revoked_nonces_lock:
+        # GC first so the dict can't grow unbounded under a /logout flood.
+        for n, exp in list(_revoked_nonces.items()):
+            if exp < now:
+                _revoked_nonces.pop(n, None)
+        _revoked_nonces[nonce] = expiry_ts
+
+
+def _is_nonce_revoked(nonce: str) -> bool:
+    if not nonce:
+        return False
+    with _revoked_nonces_lock:
+        return nonce in _revoked_nonces
+
+
+def _reset_revoked_nonces() -> None:
+    """Drop the revoked-nonce set. Primarily for tests."""
+    with _revoked_nonces_lock:
+        _revoked_nonces.clear()
 
 
 def _client_ip(request: Request) -> str:
     """Return the client IP for rate-limiting purposes.
 
-    Solo / single-host deployments hit this with ``request.client.host``.
-    Behind a trusted reverse proxy, X-Forwarded-For would be the right
-    source — but that requires deployment-side trust configuration, so
-    we deliberately don't honour it here to avoid spoofing.
+    Web-audit P1-1: behind a trusted reverse proxy (Cloudflare, Tailscale
+    Funnel, nginx), ``request.client.host`` collapses to the proxy's
+    loopback IP — so every login attempt counts against the same bucket,
+    making `/login` rate-limiting effectively global. When
+    ``OPTIONS_CALCULATOR_TRUST_PROXY_HEADERS=true`` (or HOSTED_MODE=true,
+    which implies it), honour the leftmost ``X-Forwarded-For`` instead.
+
+    Trust is opt-in because an untrusted direct caller can set
+    ``X-Forwarded-For`` to whatever they want and spoof their IP — only
+    safe when a real proxy is enforced in front of this process.
     """
+    if _TRUST_PROXY_HEADERS:
+        xff = request.headers.get("x-forwarded-for", "").strip()
+        if xff:
+            # XFF format is "client, proxy1, proxy2"; leftmost is the
+            # original client. Strip whitespace and reject empty entries
+            # (some buggy proxies emit ",realip").
+            first = xff.split(",", 1)[0].strip()
+            if first:
+                return first
     return request.client.host if request.client else "unknown"
 
 
-def _check_login_rate_limit(ip: str) -> bool:
-    """Return True if this IP is under both rate limits, False otherwise.
+def _check_rate_limit(bucket: str, ip: str, limit_per_min: int, limit_per_hour: int) -> bool:
+    """Generic per-IP rate limiter. Used by /login, /api/ml/train, and
+    /api/oos/submit. Both windows trip independently; either limit blocks
+    further attempts until the window slides.
 
-    Counts every login attempt (success or failure) — a successful login
-    doesn't reset the counter, so brute force can't hide behind an
-    eventual win. The two windows (1 min, 1 hour) trip independently;
-    either limit blocks further attempts until the window slides.
+    Counts every attempt regardless of success — a successful request
+    doesn't reset the counter, so brute-force / loop-DoS can't hide behind
+    an eventual win. Buckets are keyed by ``(bucket_name, ip)`` so
+    endpoints can't poison each other's quotas.
 
-    Module-state ``_login_attempts`` is bounded only by IP cardinality;
-    a memory-pressure attacker could enumerate IPs, but they'd need at
-    least one TCP connection per IP — a much larger cost than the
-    bookkeeping. For the solo-deploy threat model this is fine.
+    Memory bound: O(unique IPs × buckets); each IP enumeration costs the
+    attacker at least one TCP connection. Acceptable for the solo-deploy
+    threat model.
     """
     now = time.time()
     cutoff_min = now - 60.0
     cutoff_hour = now - 3600.0
-    with _login_attempts_lock:
-        attempts = _login_attempts.setdefault(ip, [])
+    key = (bucket, ip)
+    with _rate_limit_lock:
+        attempts = _rate_limit_buckets.setdefault(key, [])
         attempts[:] = [t for t in attempts if t >= cutoff_hour]
         recent_min = sum(1 for t in attempts if t >= cutoff_min)
-        if recent_min >= _LOGIN_RATE_LIMIT_PER_MIN:
+        if recent_min >= limit_per_min:
             return False
-        if len(attempts) >= _LOGIN_RATE_LIMIT_PER_HOUR:
+        if len(attempts) >= limit_per_hour:
             return False
         attempts.append(now)
         return True
 
 
+def _check_login_rate_limit(ip: str) -> bool:
+    """Thin wrapper retained for clarity at the call site. Delegates to
+    the generic limiter using the ``"login"`` bucket and the configured
+    /login per-minute/per-hour caps."""
+    return _check_rate_limit(
+        "login", ip, _LOGIN_RATE_LIMIT_PER_MIN, _LOGIN_RATE_LIMIT_PER_HOUR
+    )
+
+
 def _reset_login_rate_limit() -> None:
-    """Drop all per-IP login-attempt history. Primarily for tests."""
-    with _login_attempts_lock:
-        _login_attempts.clear()
+    """Drop ALL rate-limit history (every bucket, every IP). Primarily for
+    tests. Despite the name, this clears every bucket — the original
+    helper predates the multi-endpoint refactor and is kept under the
+    same name so existing tests don't break. Use ``_reset_rate_limits()``
+    in new code.
+    """
+    _reset_rate_limits()
+
+
+def _reset_rate_limits() -> None:
+    """Drop ALL rate-limit history. Primarily for tests."""
+    with _rate_limit_lock:
+        _rate_limit_buckets.clear()
 
 
 def _parse_symbol_universe(symbols: Optional[str], default_universe: List[str]) -> List[str]:
@@ -357,18 +515,69 @@ app = FastAPI(
     description="Event-volatility structure selection, evidence diagnostics, and OOS robustness reports.",
 )
 
+_LOCALHOST_DEV_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
+]
+
+
+def _compute_allowed_origins(share_auth_enabled: bool, origins_env: str) -> List[str]:
+    """Resolve the CORS ``allow_origins`` list with the safety rails from
+    Web-audit P2-2 plus the Codex audit follow-up.
+
+    The localhost-dev defaults grant credentialed CORS access to any
+    cross-port local web service. That's fine when share-auth is off
+    (the auth middleware lets everything through anyway, so there's
+    nothing privileged to exfiltrate). But when share-auth is on, any
+    malicious localhost service the operator runs in the same browser
+    can ``fetch(credentials: "include")`` against this app and read
+    session-cookie-protected data. Force operators to set
+    ``OPTIONS_CALCULATOR_ALLOWED_ORIGINS`` explicitly in that case AND
+    refuse the two values that would undo the entire gate:
+
+      * ``"*"`` — combined with ``allow_credentials=True`` this is the
+        confused-deputy footgun the gate was meant to close. Starlette
+        does fail-closed at the middleware layer when both are passed,
+        but failing here (with a clear error) catches the misconfig at
+        startup instead of producing silent 4xx CORS errors later.
+      * ``"null"`` — the literal origin string emitted by sandboxed
+        iframes, ``file://`` documents, and some redirect chains.
+        Allowing it grants implicit trust to anything that opens this
+        app inside a sandbox.
+
+    Extracted into a function so tests can exercise the contract without
+    importing the FastAPI app at startup (which would lock in whatever
+    env vars happen to be set at import time).
+    """
+    if origins_env.strip():
+        origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()]
+        if share_auth_enabled:
+            forbidden = {"*", "null"}
+            bad = sorted({o for o in origins if o in forbidden})
+            if bad:
+                raise RuntimeError(
+                    "OPTIONS_CALCULATOR_ALLOWED_ORIGINS cannot include "
+                    f"{bad!r} when ENABLE_SHARE_AUTH=true: allow_credentials=True "
+                    "is on and these values would undo the credentialed-CORS gate. "
+                    "Use an explicit list of origins (e.g., 'https://app.example.com')."
+                )
+        return origins
+    if share_auth_enabled:
+        raise RuntimeError(
+            "ENABLE_SHARE_AUTH=true requires OPTIONS_CALCULATOR_ALLOWED_ORIGINS to be "
+            "set explicitly (comma-separated list of origins). The localhost-dev "
+            "defaults would grant credentialed CORS access to any cross-port local "
+            "web service — a real risk when running multiple local services."
+        )
+    return list(_LOCALHOST_DEV_ORIGINS)
+
+
 origins_env = os.getenv("OPTIONS_CALCULATOR_ALLOWED_ORIGINS", "")
-if origins_env.strip():
-    allowed_origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()]
-else:
-    allowed_origins = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:5175",
-    ]
+allowed_origins = _compute_allowed_origins(_SHARE_AUTH_ENABLED, origins_env)
 
 app.add_middleware(
     CORSMiddleware,
@@ -421,6 +630,43 @@ async def login_submit(request: Request):
         _LOGIN_HTML.replace("{{ERROR}}", "Incorrect access code."),
         status_code=401,
     )
+
+
+@app.post("/logout", include_in_schema=False)
+async def logout(request: Request):
+    """Clear the session cookie and add its nonce to the in-memory
+    revocation set so the (still-signature-valid) cookie can't be replayed
+    even if it was captured before expiry.
+
+    Web-audit P1-2. POST-only on purpose — a GET would let an attacker
+    log the operator out via an ``<img src="…/logout">`` tag from any
+    site. Annoyance, not security breach, but easy to close.
+
+    Codex web-audit follow-up P1: only revoke a nonce after the cookie's
+    HMAC + age have been verified by :func:`_extract_session_token`.
+    Otherwise an unauthenticated attacker could POST forged cookies with
+    arbitrary nonces and timestamps to grow ``_revoked_nonces``
+    unboundedly. The ``delete_cookie`` below still runs on every call,
+    so users with malformed or expired cookies are still cleanly
+    logged out — they just don't get anything written to the revocation
+    set (there's nothing valid to revoke).
+    """
+    session = request.cookies.get(_SESSION_COOKIE, "")
+    if session:
+        parsed = _extract_session_token(session)
+        if parsed is not None:
+            nonce, issued_at = parsed
+            _revoke_nonce(nonce, float(issued_at + _SESSION_MAX_AGE))
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie(
+        _SESSION_COOKIE,
+        path="/",
+        secure=_SECURE_SESSION_COOKIE,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
 
 _OOS_STABILITY_PROFILES: Dict[str, Dict[str, Any]] = {
     "evidence_balanced": {
@@ -1169,8 +1415,28 @@ def _execute_oos_logic(request: OOSReportRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/oos/report-card", response_model=OOSReportResponse)
-def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
-    """Synchronous OOS endpoint (legacy). Prefer /api/oos/submit for long runs."""
+def run_oos_report_card(
+    request: OOSReportRequest, http_request: Request
+) -> OOSReportResponse:
+    """Synchronous OOS endpoint (legacy). Prefer /api/oos/submit for long runs.
+
+    Codex web-audit follow-up P2: shares the ``oos_submit`` rate-limit
+    bucket with the async submit endpoint — otherwise an auth'd client
+    (or stolen cookie) could bypass the new /api/oos/submit limit by
+    hammering this synchronous variant instead, burning a worker thread
+    per call for the full _OOS_VALIDATION_TIMEOUT_SECONDS wall-clock.
+    Same bucket key (`"oos_submit"`) on purpose: the user's *intent* is
+    the same (run an OOS analysis), regardless of which endpoint they
+    chose, so attempts should count against a single quota.
+    """
+    if not _check_rate_limit(
+        "oos_submit", _client_ip(http_request),
+        _OOS_SUBMIT_RATE_LIMIT_PER_MIN, _OOS_SUBMIT_RATE_LIMIT_PER_HOUR,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="OOS submission rate limit exceeded. Wait a minute and try again.",
+        )
     try:
         data = _execute_oos_logic(request)
         return OOSReportResponse(
@@ -1256,10 +1522,23 @@ def _oos_job_worker(job_id: str, request: OOSReportRequest) -> None:
 
 
 @app.post("/api/oos/submit")
-def submit_oos_job(request: OOSReportRequest) -> Dict[str, str]:
+def submit_oos_job(request: OOSReportRequest, http_request: Request) -> Dict[str, str]:
     """Submit an OOS job and return immediately with a job_id.
     Poll GET /api/oos/status/{job_id} every 2–3 s for completion.
     """
+    # Web-audit P2-3: cap how fast a single client can fire OOS jobs.
+    # The concurrency lock below already caps in-flight jobs at 1, but
+    # without a rate limit an authenticated client (or stolen cookie)
+    # could submit then poll-wait-then-resubmit in a tight loop to burn
+    # CPU continuously. Defaults: 3/min, 20/hour per IP.
+    if not _check_rate_limit(
+        "oos_submit", _client_ip(http_request),
+        _OOS_SUBMIT_RATE_LIMIT_PER_MIN, _OOS_SUBMIT_RATE_LIMIT_PER_HOUR,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="OOS submission rate limit exceeded. Wait a minute and try again.",
+        )
     job_id = str(uuid.uuid4())
     with _oos_jobs_lock:
         _purge_jobs_locked(_oos_jobs, ttl_seconds=_OOS_JOB_TTL_SECONDS)
@@ -1332,11 +1611,25 @@ def _ml_train_worker(job_id: str) -> None:
 
 
 @app.post("/api/ml/train")
-def submit_ml_train_job() -> Dict[str, str]:
+def submit_ml_train_job(http_request: Request) -> Dict[str, str]:
     """Train the legacy post-event volatility classifier in the background.
     Returns job_id — poll GET /api/ml/train-status/{job_id} for completion.
     Training requires earnings_iv_decay_labels rows (run backfill first).
     """
+    # Web-audit P2-3: same shape as the OOS rate limit — bound how fast a
+    # single client can fire trainings. A 1-job concurrency lock isn't
+    # enough on its own; without a rate limit an auth'd client could
+    # loop submit-then-wait-then-resubmit and drive sustained CPU plus
+    # ~/.options_calculator_pro/models/crush_model_meta.json churn.
+    # Defaults: 2/min, 10/hour per IP.
+    if not _check_rate_limit(
+        "ml_train", _client_ip(http_request),
+        _ML_TRAIN_RATE_LIMIT_PER_MIN, _ML_TRAIN_RATE_LIMIT_PER_HOUR,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="ML train rate limit exceeded. Wait a minute and try again.",
+        )
     job_id = str(uuid.uuid4())
     with _ml_train_jobs_lock:
         _purge_jobs_locked(_ml_train_jobs, ttl_seconds=_OOS_JOB_TTL_SECONDS)
