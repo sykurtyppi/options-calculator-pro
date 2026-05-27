@@ -2,6 +2,12 @@
 
 Selector-first event-volatility decision platform for earnings setups.
 
+> **Deploying or redeploying?** See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** —
+> single artifact covering env-var contracts, launchd install, first-run
+> verification, alert semantics, and a troubleshooting matrix. This
+> README covers what the project IS; the runbook covers how to operate
+> it.
+
 ## Scope
 - Single-ticker event-volatility analysis and structure selection.
 - Ranked earnings screener and walk-forward OOS report card generation.
