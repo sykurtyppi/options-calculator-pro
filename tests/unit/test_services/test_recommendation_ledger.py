@@ -287,3 +287,193 @@ def test_revisions_table_created_on_open(tmp_path: Path) -> None:
         ).fetchall()
     }
     assert "recommendation_revisions" in tables
+
+
+# ── PR-AC commit 4: picker_provenance round-trip ────────────────────────────
+
+
+def _sample_experimental_contract_selection() -> dict:
+    """A realistic experimental_contract_selection block shaped exactly
+    like the one produced by web.api.edge_engine in commit 3. Kept here
+    rather than imported so the ledger test stays decoupled from the
+    edge_engine module."""
+    return {
+        "structure": "call_calendar",
+        "labels": {
+            "experimental": True,
+            "shadow_mode": True,
+            "not_execution_guidance": True,
+            "out_of_sample_validated": False,
+        },
+        "note": "Experimental candidate contract selection.",
+        "status": "ok",
+        "candidate_contracts": {
+            "shadow_status": "ok",
+            "candidate_min_front_dte_days": 14,
+            "experimental_note": "...",
+            "legacy_selection": {
+                "side": "call", "strike": 100.0,
+                "front_expiry": "2026-05-03", "back_expiry": "2026-05-17",
+                "front_dte_days": 2, "back_minus_front_days": 14,
+                "picker_variant": "legacy_first_expiry",
+                "picker_min_front_dte_days": 14, "picker_back_gap_days": 14,
+                "front_leg": {"mid": 1.0, "bid": 0.95, "ask": 1.05,
+                              "iv": 0.30, "spread_pct": 10.0,
+                              "open_interest": 500, "volume": 50,
+                              "delta": None, "dte": 2},
+                "back_leg": {"mid": 2.0, "bid": 1.95, "ask": 2.05,
+                             "iv": 0.30, "spread_pct": 5.0,
+                             "open_interest": 800, "volume": 80,
+                             "delta": None, "dte": 16},
+            },
+            "candidate_selection": {
+                "side": "call", "strike": 100.0,
+                "front_expiry": "2026-05-17", "back_expiry": "2026-06-21",
+                "front_dte_days": 16, "back_minus_front_days": 35,
+                "picker_variant": "candidate_min_dte",
+                "picker_min_front_dte_days": 14, "picker_back_gap_days": 14,
+                "front_leg": {"mid": 2.0, "bid": 1.95, "ask": 2.05,
+                              "iv": 0.30, "spread_pct": 5.0,
+                              "open_interest": 800, "volume": 80,
+                              "delta": None, "dte": 16},
+                "back_leg": {"mid": 3.0, "bid": 2.95, "ask": 3.05,
+                             "iv": 0.30, "spread_pct": 3.3,
+                             "open_interest": 1200, "volume": 120,
+                             "delta": None, "dte": 51},
+            },
+            "pickers_diverged": True,
+        },
+    }
+
+
+def test_picker_provenance_persists_when_present_in_analysis(tmp_path: Path) -> None:
+    """Codex hard requirement for PR-AC commit 4: every recorded paper
+    observation that displayed experimental picker metadata MUST persist
+    picker_variant, shadow_mode, selected expiries, strike, and whether
+    legacy/candidate diverged. Without this, the live API shows
+    candidates but the system fails to accumulate auditable evidence."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    analysis.metrics["experimental_contract_selection"] = _sample_experimental_contract_selection()
+    recommendation_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="atm_straddle",
+        salt="picker-provenance-test",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=recommendation_id)
+    row = ledger.get(recommendation_id)
+    assert row is not None
+    pp = row["picker_provenance_json"]
+    # Round-trip preserves the labeled shadow surface
+    assert pp["structure"] == "call_calendar"
+    assert pp["labels"]["shadow_mode"] is True
+    assert pp["labels"]["out_of_sample_validated"] is False
+    # All the Codex-required fields are accessible
+    cc = pp["candidate_contracts"]
+    assert cc["legacy_selection"]["picker_variant"] == "legacy_first_expiry"
+    assert cc["candidate_selection"]["picker_variant"] == "candidate_min_dte"
+    assert cc["legacy_selection"]["front_expiry"] == "2026-05-03"
+    assert cc["candidate_selection"]["front_expiry"] == "2026-05-17"
+    assert cc["legacy_selection"]["strike"] == 100.0
+    assert cc["candidate_selection"]["strike"] == 100.0
+    assert cc["pickers_diverged"] is True
+    assert cc["candidate_min_front_dte_days"] == 14
+
+
+def test_picker_provenance_empty_when_absent_from_analysis(tmp_path: Path) -> None:
+    """Backward-compatible: analyses produced before PR-AC commit 3 have
+    no experimental_contract_selection field. The ledger must accept
+    those records and store an empty dict for picker_provenance — never
+    raise, never produce NULL JSON."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    # NO experimental_contract_selection key
+    recommendation_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="atm_straddle",
+        salt="no-experimental-block",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=recommendation_id)
+    row = ledger.get(recommendation_id)
+    assert row is not None
+    assert row["picker_provenance_json"] == {}
+
+
+def test_picker_provenance_handles_put_calendar_placeholder(tmp_path: Path) -> None:
+    """put_calendar gets the explicit 'put_side_not_yet_supported'
+    placeholder from commit 3. The ledger must persist that as-is,
+    including candidate_contracts=None — never silently dropping it."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    analysis.metrics["experimental_contract_selection"] = {
+        "structure": "put_calendar",
+        "labels": {"experimental": True, "shadow_mode": True,
+                   "not_execution_guidance": True,
+                   "out_of_sample_validated": False},
+        "note": "Experimental candidate contract selection.",
+        "status": "put_side_not_yet_supported",
+        "reason": "Historical backtest only queries calls.",
+        "candidate_contracts": None,
+    }
+    recommendation_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="put_calendar",
+        salt="put-placeholder-test",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=recommendation_id)
+    row = ledger.get(recommendation_id)
+    pp = row["picker_provenance_json"]
+    assert pp["structure"] == "put_calendar"
+    assert pp["status"] == "put_side_not_yet_supported"
+    assert pp["candidate_contracts"] is None
+    # The placeholder remains attributable — future analysis can
+    # filter for "put_side_not_yet_supported" to see how often the
+    # selector picked put_calendar without having put-side evidence.
+
+
+def test_picker_provenance_column_added_by_migration(tmp_path: Path) -> None:
+    """An existing ledger DB created BEFORE PR-AC commit 4 (no
+    picker_provenance_json column) must gain the column on next open,
+    not crash and not lose data."""
+    db_path = tmp_path / "ledger.sqlite"
+    # Create the old schema by hand — leave picker_provenance_json out
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """CREATE TABLE recommendations (
+            recommendation_id TEXT PRIMARY KEY,
+            created_at TEXT,
+            symbol TEXT,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            engine_version TEXT NOT NULL DEFAULT 'event_vol_selector_v1'
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO recommendations (recommendation_id, created_at, symbol) VALUES (?, ?, ?)",
+        ("legacy_row_001", "2025-01-01T00:00:00+00:00", "AAPL"),
+    )
+    conn.commit()
+    conn.close()
+
+    # Open via the ledger — migration should add the missing column
+    ledger = RecommendationLedger(ledger_path=db_path)
+    cols = {row["name"] for row in ledger._conn.execute("PRAGMA table_info(recommendations)").fetchall()}  # noqa: SLF001
+    assert "picker_provenance_json" in cols, "migration must add the new column"
+
+    # Legacy row preserved (no data loss)
+    row = ledger._conn.execute(  # noqa: SLF001
+        "SELECT recommendation_id, symbol FROM recommendations WHERE recommendation_id = ?",
+        ("legacy_row_001",),
+    ).fetchone()
+    assert row is not None
+    assert row["symbol"] == "AAPL"
+
+    # And new records can write picker_provenance_json without error
+    analysis = _analysis()
+    analysis.metrics["experimental_contract_selection"] = _sample_experimental_contract_selection()
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="post-migration-write",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    assert ledger.get(rec_id)["picker_provenance_json"]["structure"] == "call_calendar"
