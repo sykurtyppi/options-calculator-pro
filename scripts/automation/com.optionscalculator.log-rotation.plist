@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optionscalculator.log-rotation</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/scripts/automation/run_launchd_log_rotation.sh</string>
+  </array>
+  <!--
+    Daily at 03:00 LOCAL. Chosen to be well away from every other
+    launchd job in this project (daily evidence cycle ~22:15 local,
+    candidate-exit-resolver 12:30 local, watchdog 22:30 local) so no
+    other job has an active handle on the .log files we rotate.
+  -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/log_rotation_launchd_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/log_rotation_launchd_stderr.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
