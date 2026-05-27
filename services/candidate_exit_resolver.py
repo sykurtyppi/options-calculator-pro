@@ -142,6 +142,23 @@ class ResolverOutcome:
     simulator_status: Optional[str]
     mid_realized_return_pct: Optional[float]
     error_message: Optional[str] = None
+    # PR-AE C5 watch item (Codex audit): `retrying` is the same
+    # resolver_status string for two distinct underlying causes —
+    # missing exit chain past the lookahead window vs. missing entry
+    # chain. The persisted ledger payload's status remains the bare
+    # `retrying` (no semantic change to what gets stored) but the
+    # ResolverOutcome carries the sub-reason so the C5 CLI summary
+    # can break down retrying by cause. Permanent failures already
+    # encode the reason in resolver_status itself
+    # (permanently_failed:<reason>); this field mirrors that for
+    # the retrying path.
+    #
+    # Populated as one of:
+    #   "no_post_event_chain"      — exit chain missing past window
+    #   "no_entry_chain_replay"    — entry chain unrecoverable
+    # None for any other resolver_status (ok, awaiting_chain_data,
+    # skipped, simulator_error).
+    failure_reason: Optional[str] = None
 
 
 @dataclass
@@ -150,12 +167,19 @@ class ResolverRunSummary:
     asserts the balance invariant before printing the summary so
     drift between scanned and accounted-for counts is caught
     immediately.
+
+    PR-AE C5 (Codex audit watch item): both ``retrying`` and
+    ``permanently_failed`` carry sub-reason breakdowns so the
+    operational summary distinguishes "exit chain missing past
+    window" from "entry chain unrecoverable" without forcing the
+    operator to drill into individual JSONL rows.
     """
     scanned: int = 0
     resolved_ok: int = 0
     awaiting_chain_data: int = 0
     retrying: int = 0
     skipped_malformed: int = 0
+    retrying_by_reason: Dict[str, int] = field(default_factory=dict)
     permanently_failed_by_reason: Dict[str, int] = field(default_factory=dict)
 
     @property
@@ -166,14 +190,23 @@ class ResolverRunSummary:
     def count_balance_holds(self) -> bool:
         """Sum invariant: every scanned row belongs to exactly one
         outcome bucket. Returns False if the run has lost track of
-        a row — the C5 CLI uses this to fail non-zero on drift."""
-        return self.scanned == (
+        a row — the C5 CLI uses this to fail non-zero on drift.
+
+        Note: ``retrying_by_reason`` is a *breakdown* of ``retrying``
+        (sub-totals must equal the top-level retrying count); it is
+        NOT a separate bucket in the count balance.
+        """
+        retrying_breakdown_balances = (
+            sum(self.retrying_by_reason.values()) == self.retrying
+        )
+        bucket_sum_matches_scanned = self.scanned == (
             self.resolved_ok
             + self.awaiting_chain_data
             + self.retrying
             + self.skipped_malformed
             + self.permanently_failed_total
         )
+        return bucket_sum_matches_scanned and retrying_breakdown_balances
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -612,6 +645,7 @@ def _handle_missing_exit_chain(
         resolver_status=resolver_status,
         simulator_status=None,
         mid_realized_return_pct=None,
+        failure_reason="no_post_event_chain",
     )
 
 
@@ -663,6 +697,7 @@ def _handle_missing_entry_chain(
         resolver_status=resolver_status,
         simulator_status=None,
         mid_realized_return_pct=None,
+        failure_reason="no_entry_chain_replay",
     )
 
 
@@ -710,6 +745,16 @@ def _bucket_outcome(outcome: ResolverOutcome, summary: ResolverRunSummary) -> No
         summary.awaiting_chain_data += 1
     elif status == RESOLVER_STATUS_RETRYING:
         summary.retrying += 1
+        # PR-AE C5 watch item: also bucket under the specific failure
+        # reason so the CLI summary distinguishes which chain was
+        # missing. Falls back to "unknown" if the resolver returned
+        # retrying without populating failure_reason — that shouldn't
+        # happen, but the fallback keeps the breakdown's sub-totals
+        # balanced against the top-level retrying count.
+        reason = outcome.failure_reason or "unknown"
+        summary.retrying_by_reason[reason] = (
+            summary.retrying_by_reason.get(reason, 0) + 1
+        )
     elif status == RESOLVER_STATUS_PERMFAIL_NO_PICKER_PROVENANCE:
         # Malformed picker provenance is conceptually a "skipped"
         # category, not a resolver-failure category — the resolver
