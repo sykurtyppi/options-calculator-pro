@@ -81,6 +81,14 @@ CREATE TABLE IF NOT EXISTS recommendations (
     selector_output_json          TEXT NOT NULL,
     explanation_json              TEXT,
     metadata_json                 TEXT,
+    -- PR-AC commit 4: experimental_contract_selection block from the
+    -- live API response, serialized verbatim. Captures picker_variant,
+    -- shadow_mode label, front/back expiries, strike, pickers_diverged,
+    -- and the candidate_min_front_dte_days threshold. Required for any
+    -- future promotion-criterion analysis that compares forward
+    -- observations between legacy and candidate picker rules. Schema
+    -- documented in the PR-AC commit 3 response surface.
+    picker_provenance_json        TEXT,
     schema_version                INTEGER NOT NULL,
     engine_version                TEXT NOT NULL
 );
@@ -147,6 +155,8 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "selector_output_json": "TEXT",
     "explanation_json": "TEXT",
     "metadata_json": "TEXT",
+    # PR-AC commit 4 — picker provenance for forward-validation.
+    "picker_provenance_json": "TEXT",
     "schema_version": "INTEGER NOT NULL DEFAULT 1",
     "engine_version": "TEXT NOT NULL DEFAULT 'event_vol_selector_v1'",
 }
@@ -179,6 +189,12 @@ class RecommendationRecord:
     selector_output: Dict[str, Any] = field(default_factory=dict)
     explanation: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # PR-AC commit 4: experimental_contract_selection block from the
+    # live API response. Empty dict when the response did not include
+    # one (most pre-PR-AC recommendations and any structure that isn't
+    # call/put_calendar). Required for downstream promotion-criterion
+    # analysis to attribute forward observations to their picker rule.
+    picker_provenance: Dict[str, Any] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
     engine_version: str = ENGINE_VERSION
 
@@ -259,9 +275,10 @@ class RecommendationLedger:
                 surface_extreme_spread_count, surface_sparse_atm_count,
                 surface_iv_anomaly_count,
                 vol_snapshot_json, structure_scorecards_json, selector_output_json,
-                explanation_json, metadata_json, schema_version, engine_version
+                explanation_json, metadata_json, picker_provenance_json,
+                schema_version, engine_version
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
         """
         params = (
@@ -297,6 +314,7 @@ class RecommendationLedger:
             _json(record.selector_output),
             _json(record.explanation),
             _json(record.metadata),
+            _json(record.picker_provenance),
             int(record.schema_version),
             record.engine_version,
         )
@@ -545,6 +563,13 @@ def build_record_from_analysis(
         reasons = selector_output.get("primary_risks") or selector_output.get("why_this_structure") or []
         no_trade_reason = "; ".join(str(item) for item in reasons[:3]) or "selector_abstained"
 
+    # PR-AC commit 4: capture the experimental_contract_selection block
+    # if the API response carried one (commit 3 surface). Lives in metrics
+    # since the analysis payload places it alongside structure_payoff /
+    # calendar_payoff. Empty dict when absent — backward-compatible with
+    # any earlier analysis payloads.
+    picker_provenance = _as_dict(metrics.get("experimental_contract_selection") or {})
+
     return RecommendationRecord(
         recommendation_id=recommendation_id,
         created_at=created_at,
@@ -574,6 +599,7 @@ def build_record_from_analysis(
             "schema_source": "build_record_from_analysis",
             **(metadata or {}),
         },
+        picker_provenance=picker_provenance,
     )
 
 
@@ -607,6 +633,7 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "selector_output_json",
         "explanation_json",
         "metadata_json",
+        "picker_provenance_json",
     ):
         payload[key] = _loads(payload.get(key))
     payload["earnings_source_stale"] = bool(payload.get("earnings_source_stale"))
