@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 
+import { apiFetch } from '../../lib/api'
 import CalibrationInsight from './CalibrationInsight'
 import ExpiryModeToggle from './ExpiryModeToggle'
 import QualificationBadge from './QualificationBadge'
@@ -88,7 +89,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch(`${apiBase}/api/edge/screener?expiry_mode=${mode}`)
+      const response = await apiFetch(`${apiBase}/api/edge/screener?expiry_mode=${mode}`)
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
         throw new Error(body.detail || `HTTP ${response.status}`)
@@ -184,7 +185,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
     detailLoadingKeyRef.current = cacheKey
     setDetailLoadingKey(cacheKey)
 
-    fetch(`${apiBase}/api/edge/analyze`, {
+    apiFetch(`${apiBase}/api/edge/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ symbol: selectedRow.symbol }),
@@ -243,7 +244,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
         release_filter: f.releaseFilter,
         weeks: f.weeks,
       })
-      const response = await fetch(`${apiBase}/api/screener/ranked?${params}`)
+      const response = await apiFetch(`${apiBase}/api/screener/ranked?${params}`)
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
         throw new Error(body.detail || `HTTP ${response.status}`)

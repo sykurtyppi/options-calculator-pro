@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { apiFetch } from '../../lib/api'
 import { SectionTitle } from '../common/DisplayAtoms'
 import {
   buildBenchmarkComparisonRows,
@@ -21,7 +22,7 @@ export default function ForwardPerformancePanel({ apiBase }) {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch(`${apiBase}/api/diagnostics/forward-performance`)
+      const response = await apiFetch(`${apiBase}/api/diagnostics/forward-performance`)
       if (!response.ok) throw new Error(`Forward-performance diagnostics failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {

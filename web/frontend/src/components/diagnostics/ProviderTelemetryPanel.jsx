@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { apiFetch } from '../../lib/api'
 import { SectionTitle } from '../common/DisplayAtoms'
 import {
   buildProviderHealthRows,
@@ -34,7 +35,7 @@ export default function ProviderTelemetryPanel({ apiBase }) {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch(endpoint)
+      const response = await apiFetch(endpoint)
       if (!response.ok) throw new Error(`Provider telemetry failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {

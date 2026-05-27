@@ -43,7 +43,7 @@ import {
   tonePos,
 } from './lib/formatters'
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000'
+import { API_BASE, apiFetch } from './lib/api'
 const LegacyAnalysisPanel = lazy(() => import('./components/edge/LegacyAnalysisPanel'))
 const HistoricalWarehousePanel = lazy(() => import('./components/historical/HistoricalWarehousePanel'))
 const LedgerDiagnosticsPanel = lazy(() => import('./components/diagnostics/LedgerDiagnosticsPanel'))
@@ -62,6 +62,48 @@ const EvidenceReportPanel = lazy(() => import('./components/diagnostics/Evidence
 //   - alerts/{WatchlistChips, AlertBanner, AlertConfigPanel}
 //   - lib/exportJson
 
+
+
+// ── Logout button ────────────────────────────────────────────────────────────
+//
+// Frontend-audit P1-2: the backend has POST /logout (HMAC-verified nonce
+// revocation, see PR #59) but there was no UI affordance to call it.
+// Renders as a small unobtrusive link-style button in the header. On
+// click: POST /logout with credentials, then hard-reload to /login so
+// the cleared cookie state is reflected immediately.
+function LogoutButton() {
+  const [busy, setBusy] = useState(false)
+  async function handleLogout() {
+    if (busy) return
+    setBusy(true)
+    try {
+      // Errors here are non-blocking — even if the network call fails,
+      // we still navigate the user to /login. The backend's
+      // delete_cookie is the ONLY thing that clears the cookie on the
+      // browser; if that fails, the user re-logs in on their next
+      // attempt and the old session expires naturally.
+      await apiFetch(`${API_BASE}/logout`, { method: 'POST' })
+    } catch {
+      // Swallowed on purpose — see comment above.
+    } finally {
+      // Hard navigation rather than React-router push: ensures any
+      // cached fetches / module-level state from the authenticated
+      // session can't carry over.
+      window.location.assign('/login')
+    }
+  }
+  return (
+    <button
+      type="button"
+      className="logout-button"
+      onClick={handleLogout}
+      disabled={busy}
+      aria-label="Log out"
+    >
+      {busy ? 'Logging out…' : 'Log out'}
+    </button>
+  )
+}
 
 
 // ── Main App ─────────────────────────────────────────────────────────────────
@@ -194,7 +236,7 @@ export default function App() {
 
     setError(''); setLoading(true); setResult(null)
     try {
-      const res = await fetch(`${API_BASE}/api/edge/analyze`, {
+      const res = await apiFetch(`${API_BASE}/api/edge/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol: s }),
@@ -229,7 +271,7 @@ export default function App() {
   async function loadWarehouseSymbols() {
     setWarehouse(p => ({ ...p, loadingSymbols: true, error: '' }))
     try {
-      const res = await fetch(`${API_BASE}/api/historical/options/symbols`)
+      const res = await apiFetch(`${API_BASE}/api/historical/options/symbols`)
       if (!res.ok) {
         const b = await res.json().catch(() => ({}))
         throw new Error(b.detail || `HTTP ${res.status}`)
@@ -252,7 +294,7 @@ export default function App() {
     if (!sym || !warehouse.tradeDate) return
     setWarehouse(p => ({ ...p, loadingRows: true, error: '', rows: [] }))
     try {
-      const coverageRes = await fetch(`${API_BASE}/api/historical/options/${encodeURIComponent(sym)}/coverage`)
+      const coverageRes = await apiFetch(`${API_BASE}/api/historical/options/${encodeURIComponent(sym)}/coverage`)
       if (!coverageRes.ok) {
         const b = await coverageRes.json().catch(() => ({}))
         throw new Error(b.detail || `Coverage HTTP ${coverageRes.status}`)
@@ -266,7 +308,7 @@ export default function App() {
       if (warehouse.callPut) params.set('call_put', warehouse.callPut)
       if (warehouse.limit) params.set('limit', warehouse.limit)
 
-      const chainRes = await fetch(`${API_BASE}/api/historical/options/${encodeURIComponent(sym)}/chain?${params.toString()}`)
+      const chainRes = await apiFetch(`${API_BASE}/api/historical/options/${encodeURIComponent(sym)}/chain?${params.toString()}`)
       if (!chainRes.ok) {
         const b = await chainRes.json().catch(() => ({}))
         throw new Error(b.detail || `Chain HTTP ${chainRes.status}`)
@@ -296,7 +338,7 @@ export default function App() {
     let jobId = null
     try {
       // Submit — returns immediately with a job_id.
-      const submitRes = await fetch(`${API_BASE}/api/oos/submit`, {
+      const submitRes = await apiFetch(`${API_BASE}/api/oos/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildOosPayload()),
@@ -311,7 +353,7 @@ export default function App() {
       // Poll every 2 s until done, error, or user cancels.
       oosIntervalRef.current = setInterval(async () => {
         try {
-          const statusRes = await fetch(`${API_BASE}/api/oos/status/${jobId}`)
+          const statusRes = await apiFetch(`${API_BASE}/api/oos/status/${jobId}`)
           if (!statusRes.ok) return  // transient error — keep polling
           const statusData = await statusRes.json()
 
@@ -363,6 +405,7 @@ export default function App() {
               Learn how this works
             </a>
             <div className="status-chip">Research Tool · Not Financial Advice</div>
+            <LogoutButton />
           </div>
         </header>
 
