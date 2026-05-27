@@ -30,6 +30,8 @@ def main() -> int:
     parser.add_argument("--report-dir", type=Path, default=None)
     parser.add_argument("--weekly-report-dir", type=Path, default=None)
     parser.add_argument("--structured-run-log", type=Path, default=None)
+    parser.add_argument("--candidate-resolver-jsonl", type=Path, default=None)
+    parser.add_argument("--candidate-resolver-log", type=Path, default=None)
     parser.add_argument("--no-completion-log-required", action="store_true")
     args = parser.parse_args()
 
@@ -44,6 +46,8 @@ def main() -> int:
         weekly_report_dir=args.weekly_report_dir or base.weekly_report_dir,
         structured_run_log=args.structured_run_log or base.structured_run_log,
         launchd_log_path=base.launchd_log_path,
+        candidate_resolver_jsonl=args.candidate_resolver_jsonl or base.candidate_resolver_jsonl,
+        candidate_resolver_launchd_log_path=args.candidate_resolver_log or base.candidate_resolver_launchd_log_path,
         ledger_path=base.ledger_path,
         outcome_store_path=base.outcome_store_path,
         baseline_store_path=base.baseline_store_path,
@@ -52,6 +56,8 @@ def main() -> int:
         max_weekly_report_age_days=base.max_weekly_report_age_days,
         max_telemetry_age_hours=base.max_telemetry_age_hours,
         max_run_log_age_hours=base.max_run_log_age_hours,
+        max_candidate_resolver_run_age_hours=base.max_candidate_resolver_run_age_hours,
+        max_candidate_awaiting_days=base.max_candidate_awaiting_days,
         require_completion_log=not args.no_completion_log_required,
     )
     payload = build_evidence_health_status(config=config, now=datetime.now().astimezone())

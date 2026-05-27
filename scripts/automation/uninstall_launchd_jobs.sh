@@ -5,6 +5,7 @@ LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
 LEGACY_RUNTIME_DIR="${HOME}/.options_calculator_pro/automation"
 
 for plist in \
+  com.optionscalculator.candidate-exit-resolver.plist \
   com.optionscalculator.evidence-cycle.plist \
   com.optionscalculator.evidence-watchdog.plist \
   com.optionscalculator.weekly-evidence-report.plist
@@ -22,6 +23,7 @@ done
 # Legacy: pre-template installs copied wrappers into ${LEGACY_RUNTIME_DIR}.
 # Current installs don't write there; clean up only what actually exists.
 for script in \
+  run_candidate_exit_resolver.sh \
   run_daily_evidence_cycle.sh \
   run_daily_evidence_watchdog.sh \
   run_weekly_evidence_report.sh

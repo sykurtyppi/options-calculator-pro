@@ -18,6 +18,7 @@ try:
 except ImportError:
     pass
 
+from services.evidence_health import EvidenceHealthConfig, build_candidate_exit_resolver_health
 from services.automation_watchdog import (
     DEFAULT_LOG_PATH,
     DEFAULT_MAX_REPORT_AGE_HOURS,
@@ -44,6 +45,8 @@ def main() -> int:
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--max-report-age-hours", type=float, default=DEFAULT_MAX_REPORT_AGE_HOURS)
     parser.add_argument("--no-completion-log-required", action="store_true")
+    parser.add_argument("--candidate-resolver-jsonl", type=Path, default=None)
+    parser.add_argument("--candidate-resolver-log", type=Path, default=None)
     parser.add_argument("--not-due-before-hour", type=int, default=22)
     parser.add_argument("--not-due-before-minute", type=int, default=15)
     parser.add_argument("--force-alert", action="store_true", help="Send even if this failure was already alerted.")
@@ -89,19 +92,46 @@ def main() -> int:
         require_completion_log=not args.no_completion_log_required,
     )
     status = build_evidence_watchdog_status(config=config)
+    resolver_base = EvidenceHealthConfig(expected_date=expected)
+    resolver_health = build_candidate_exit_resolver_health(
+        config=EvidenceHealthConfig(
+            expected_date=expected,
+            candidate_resolver_jsonl=args.candidate_resolver_jsonl or resolver_base.candidate_resolver_jsonl,
+            candidate_resolver_launchd_log_path=args.candidate_resolver_log or resolver_base.candidate_resolver_launchd_log_path,
+            max_candidate_resolver_run_age_hours=resolver_base.max_candidate_resolver_run_age_hours,
+            max_candidate_awaiting_days=resolver_base.max_candidate_awaiting_days,
+        ),
+        now=now,
+    )
+    resolver_failures = [
+        issue for issue in resolver_health.get("issues", [])
+        if issue.get("severity") == "FAIL"
+    ]
+    resolver_warnings = [
+        issue for issue in resolver_health.get("issues", [])
+        if issue.get("severity") == "WARN"
+    ]
+    combined_status = {
+        **status,
+        "ok": bool(status.get("ok")) and not resolver_failures,
+        "errors": list(status.get("errors", [])) + [str(issue.get("message")) for issue in resolver_failures],
+        "warnings": list(status.get("warnings", [])) + [str(issue.get("message")) for issue in resolver_warnings],
+        "candidate_exit_resolver": resolver_health.get("summary", {}),
+    }
     alert = maybe_send_watchdog_alert(
-        status,
+        combined_status,
         state_path=args.state_path,
         force=args.force_alert,
         dry_run=args.dry_run_alert,
     )
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
-        "watchdog": status,
+        "watchdog": combined_status,
+        "candidate_exit_resolver": resolver_health,
         "alert": alert,
     }
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))
-    return 0 if status.get("ok") else 2
+    return 0 if combined_status.get("ok") else 2
 
 
 if __name__ == "__main__":

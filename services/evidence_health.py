@@ -27,11 +27,15 @@ from services.recommendation_ledger import _DEFAULT_LEDGER as DEFAULT_LEDGER_STO
 
 DEFAULT_HOME = Path.home() / ".options_calculator_pro"
 DEFAULT_STRUCTURED_RUN_LOG = DEFAULT_HOME / "logs" / "evidence_cycle_runs.jsonl"
+DEFAULT_CANDIDATE_RESOLVER_JSONL = DEFAULT_HOME / "logs" / "candidate_exit_resolutions.jsonl"
+DEFAULT_CANDIDATE_RESOLVER_LAUNCHD_LOG = DEFAULT_HOME / "logs" / "candidate_exit_resolver_launchd.log"
 DEFAULT_WEEKLY_REPORT_DIR = DEFAULT_REPORT_DIR / "weekly"
 DEFAULT_MAX_DAILY_REPORT_AGE_HOURS = 36.0
 DEFAULT_MAX_WEEKLY_REPORT_AGE_DAYS = 8
 DEFAULT_MAX_TELEMETRY_AGE_HOURS = 48.0
 DEFAULT_MAX_RUN_LOG_AGE_HOURS = 36.0
+DEFAULT_MAX_CANDIDATE_RESOLVER_RUN_AGE_HOURS = 36.0
+DEFAULT_MAX_CANDIDATE_AWAITING_DAYS = 10
 DEFAULT_DAILY_DUE_HOUR_UTC = 21
 DEFAULT_DAILY_DUE_MINUTE_UTC = 30
 DEFAULT_DAILY_DUE_GRACE_MINUTES = 60
@@ -44,6 +48,8 @@ class EvidenceHealthConfig:
     weekly_report_dir: Path = DEFAULT_WEEKLY_REPORT_DIR
     structured_run_log: Path = DEFAULT_STRUCTURED_RUN_LOG
     launchd_log_path: Path = DEFAULT_LAUNCHD_LOG_PATH
+    candidate_resolver_jsonl: Path = DEFAULT_CANDIDATE_RESOLVER_JSONL
+    candidate_resolver_launchd_log_path: Path = DEFAULT_CANDIDATE_RESOLVER_LAUNCHD_LOG
     ledger_path: Path = DEFAULT_LEDGER_STORE
     outcome_store_path: Path = DEFAULT_OUTCOME_STORE
     baseline_store_path: Path = DEFAULT_BASELINE_STORE
@@ -52,6 +58,8 @@ class EvidenceHealthConfig:
     max_weekly_report_age_days: int = DEFAULT_MAX_WEEKLY_REPORT_AGE_DAYS
     max_telemetry_age_hours: float = DEFAULT_MAX_TELEMETRY_AGE_HOURS
     max_run_log_age_hours: float = DEFAULT_MAX_RUN_LOG_AGE_HOURS
+    max_candidate_resolver_run_age_hours: float = DEFAULT_MAX_CANDIDATE_RESOLVER_RUN_AGE_HOURS
+    max_candidate_awaiting_days: int = DEFAULT_MAX_CANDIDATE_AWAITING_DAYS
     require_completion_log: bool = True
     daily_due_hour_utc: int = DEFAULT_DAILY_DUE_HOUR_UTC
     daily_due_minute_utc: int = DEFAULT_DAILY_DUE_MINUTE_UTC
@@ -78,6 +86,9 @@ def build_evidence_health_status(
 
     provider = _check_provider_telemetry(cfg, now_utc)
     issues.extend(provider["issues"])
+
+    candidate_resolver = build_candidate_exit_resolver_health(config=cfg, now=now_utc)
+    issues.extend(candidate_resolver["issues"])
 
     databases = {
         "recommendation_ledger": _check_sqlite_store("recommendation_ledger", cfg.ledger_path),
@@ -139,12 +150,82 @@ def build_evidence_health_status(
         "weekly_report": weekly_report["summary"],
         "structured_run_log": run_log["summary"],
         "provider_telemetry": provider["summary"],
+        "candidate_exit_resolver": candidate_resolver["summary"],
         "databases": {key: value["summary"] for key, value in databases.items()},
         "watchdog": watchdog,
         "issues": issues,
         "summary": _summary_text(status, issues),
     }
 
+
+
+def build_candidate_exit_resolver_health(
+    *,
+    config: EvidenceHealthConfig,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Return operational health for the PR-AE candidate exit resolver.
+
+    This check is deliberately about pipeline mechanics only: scheduled-run
+    freshness, count-balance status, stuck awaiting rows, and simulator
+    exceptions. It must not alert on PnL, win rate, or candidate-vs-legacy
+    performance.
+    """
+    now_utc = _ensure_utc(now or datetime.now(timezone.utc))
+    issues: list[dict[str, str]] = []
+
+    log_summary = _candidate_resolver_log_summary(config, now_utc)
+    issues.extend(log_summary["issues"])
+
+    jsonl = _read_jsonl_tail(config.candidate_resolver_jsonl, check_name="candidate_exit_resolver")
+    issues.extend(jsonl["issues"])
+    events = jsonl["events"]
+    latest_row_ts = _latest_event_timestamp(events)
+    max_awaiting_days = _max_int_field(events, "days_in_awaiting_state")
+    simulator_error_count = sum(
+        1
+        for event in events
+        if event.get("resolver_status") == "permanently_failed:simulator_error"
+        or event.get("failure_reason") == "simulator_error"
+    )
+    latest_status = str(events[-1].get("resolver_status")) if events else None
+
+    if max_awaiting_days is not None and max_awaiting_days > config.max_candidate_awaiting_days:
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                f"Candidate exit resolver has row(s) awaiting chain data for {max_awaiting_days} day(s).",
+                "Inspect candidate_exit_resolutions.jsonl and provider feature-store freshness; do not infer anything from PnL.",
+            )
+        )
+    if simulator_error_count > 0:
+        issues.append(
+            _issue(
+                "FAIL",
+                "candidate_exit_resolver",
+                f"Candidate exit resolver recorded {simulator_error_count} simulator_error row(s).",
+                "Inspect the resolver JSONL error_message fields and rerun after fixing the simulator/runtime issue.",
+            )
+        )
+
+    return {
+        "summary": {
+            "launchd_log_path": str(config.candidate_resolver_launchd_log_path),
+            "launchd_log_exists": config.candidate_resolver_launchd_log_path.exists(),
+            "latest_completion_at": log_summary["summary"].get("latest_completion_at"),
+            "latest_failure_at": log_summary["summary"].get("latest_failure_at"),
+            "jsonl_path": str(config.candidate_resolver_jsonl),
+            "jsonl_exists": config.candidate_resolver_jsonl.exists(),
+            "events_scanned": len(events),
+            "latest_row_ts": latest_row_ts.isoformat() if latest_row_ts else None,
+            "latest_status": latest_status,
+            "max_days_in_awaiting_state": max_awaiting_days,
+            "simulator_error_count": simulator_error_count,
+            "count_balance_holds": log_summary["summary"].get("count_balance_holds"),
+        },
+        "issues": issues,
+    }
 
 def _check_daily_report(cfg: EvidenceHealthConfig, now: datetime) -> dict[str, Any]:
     path = cfg.report_dir / f"evidence_report_{cfg.expected_date.isoformat()}.json"
@@ -437,6 +518,138 @@ def _check_sqlite_store(name: str, path: Path) -> dict[str, Any]:
     }
 
 
+
+def _candidate_resolver_log_summary(cfg: EvidenceHealthConfig, now: datetime) -> dict[str, Any]:
+    issues: list[dict[str, str]] = []
+    path = cfg.candidate_resolver_launchd_log_path
+    lines = _read_text_tail(path)
+    latest_complete = _latest_log_marker(lines, "candidate exit resolver complete")
+    latest_failed = _latest_log_marker(lines, "candidate exit resolver failed")
+    latest_start = _latest_log_marker(lines, "candidate exit resolver start")
+    latest_start_index = _latest_line_index(lines, "candidate exit resolver start")
+    latest_run_lines = lines[latest_start_index:] if latest_start_index is not None else lines
+    count_balance_false = any(
+        "count_balance_holds:" in line and "false" in line.lower()
+        for line in latest_run_lines
+    )
+    count_balance_true = any(
+        "count_balance_holds:" in line and "true" in line.lower()
+        for line in latest_run_lines
+    )
+    count_balance_holds: bool | None
+    if count_balance_false:
+        count_balance_holds = False
+    elif count_balance_true:
+        count_balance_holds = True
+    else:
+        count_balance_holds = None
+
+    if not path.exists():
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                f"Candidate exit resolver launchd log does not exist yet: {path}.",
+                "Install/load com.optionscalculator.candidate-exit-resolver and verify the first scheduled run.",
+            )
+        )
+    elif latest_complete is None:
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                "Candidate exit resolver has no completion marker in the launchd log.",
+                "Check launchctl status and run scripts/resolve_candidate_exits.py manually with --no-jsonl for a smoke test.",
+            )
+        )
+    elif _age_hours(latest_complete, now) > cfg.max_candidate_resolver_run_age_hours:
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                f"Candidate exit resolver completion is stale ({_age_hours(latest_complete, now):.1f}h old).",
+                "Check whether com.optionscalculator.candidate-exit-resolver is loaded and whether the Mac was awake at 12:30.",
+            )
+        )
+
+    if latest_failed and (latest_complete is None or latest_failed >= latest_complete):
+        issues.append(
+            _issue(
+                "FAIL",
+                "candidate_exit_resolver",
+                "Latest candidate exit resolver launchd run failed.",
+                "Open candidate_exit_resolver_launchd.log, fix the resolver/runtime error, then rerun scripts/resolve_candidate_exits.py.",
+            )
+        )
+    if count_balance_holds is False:
+        issues.append(
+            _issue(
+                "FAIL",
+                "candidate_exit_resolver",
+                "Candidate exit resolver reported count_balance_holds: false.",
+                "Inspect candidate_exit_resolver_launchd.log and candidate_exit_resolutions.jsonl for an unbucketed resolver outcome.",
+            )
+        )
+
+    return {
+        "summary": {
+            "latest_start_at": latest_start.isoformat() if latest_start else None,
+            "latest_completion_at": latest_complete.isoformat() if latest_complete else None,
+            "latest_failure_at": latest_failed.isoformat() if latest_failed else None,
+            "count_balance_holds": count_balance_holds,
+        },
+        "issues": issues,
+    }
+
+
+def _read_text_tail(path: Path, *, max_lines: int = 500) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
+    except Exception:
+        return []
+
+
+def _latest_line_index(lines: list[str], marker: str) -> int | None:
+    for idx in range(len(lines) - 1, -1, -1):
+        if marker in lines[idx]:
+            return idx
+    return None
+
+
+def _latest_log_marker(lines: list[str], marker: str) -> datetime | None:
+    idx = _latest_line_index(lines, marker)
+    if idx is None:
+        return None
+    return _parse_log_marker_datetime(lines[idx])
+
+
+def _parse_log_marker_datetime(line: str) -> datetime | None:
+    prefix = "===== "
+    if not line.startswith(prefix):
+        return None
+    rest = line[len(prefix):]
+    raw = rest.split(" ", 1)[0]
+    return _parse_datetime(raw)
+
+
+def _latest_event_timestamp(events: list[dict[str, Any]]) -> datetime | None:
+    timestamps = [_parse_datetime(event.get("ts")) for event in events]
+    parsed = [ts for ts in timestamps if ts is not None]
+    return max(parsed) if parsed else None
+
+
+def _max_int_field(events: list[dict[str, Any]], key: str) -> int | None:
+    values: list[int] = []
+    for event in events:
+        value = event.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            values.append(value)
+    return max(values) if values else None
+
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -445,7 +658,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _read_jsonl_tail(path: Path, *, max_lines: int = 500) -> dict[str, Any]:
+def _read_jsonl_tail(path: Path, *, max_lines: int = 500, check_name: str = "structured_run_log") -> dict[str, Any]:
     issues: list[dict[str, str]] = []
     events: list[dict[str, Any]] = []
     if not path.exists():
@@ -458,8 +671,8 @@ def _read_jsonl_tail(path: Path, *, max_lines: int = 500) -> dict[str, Any]:
             "issues": [
                 _issue(
                     "WARN",
-                    "structured_run_log",
-                    f"Could not read structured run log: {type(exc).__name__}: {exc}.",
+                    check_name,
+                    f"Could not read JSONL log: {type(exc).__name__}: {exc}.",
                     "Check file permissions under ~/.options_calculator_pro/logs.",
                 )
             ],
@@ -479,8 +692,8 @@ def _read_jsonl_tail(path: Path, *, max_lines: int = 500) -> dict[str, Any]:
         issues.append(
             _issue(
                 "WARN",
-                "structured_run_log",
-                f"Structured run log contains {malformed} malformed JSONL line(s).",
+                check_name,
+                f"JSONL log contains {malformed} malformed JSONL line(s).",
                 "Rotate or inspect the log; new runs should write one JSON object per line.",
             )
         )

@@ -50,6 +50,21 @@ def _write_completion_log(path: Path) -> None:
     path.write_text("===== 2026-04-27T22:01:00Z daily evidence cycle complete =====\n", encoding="utf-8")
 
 
+def _write_candidate_resolver_log(path: Path, *, count_balance: str = "true", marker: str = "complete") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "===== 2026-04-27T12:30:00Z candidate exit resolver start =====\n"
+        f"  count_balance_holds:    {count_balance}\n"
+        f"===== 2026-04-27T12:31:00Z candidate exit resolver {marker} =====\n",
+        encoding="utf-8",
+    )
+
+
+def _write_candidate_resolver_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
 def _write_telemetry(path: Path, *, ts: str = "2026-04-27T22:00:00+00:00") -> None:
     _init_db(
         path,
@@ -77,6 +92,8 @@ def _config(tmp_path: Path) -> EvidenceHealthConfig:
         weekly_report_dir=tmp_path / "reports" / "weekly",
         structured_run_log=tmp_path / "logs" / "evidence_cycle_runs.jsonl",
         launchd_log_path=tmp_path / "logs" / "daily_evidence_cycle_launchd.log",
+        candidate_resolver_jsonl=tmp_path / "logs" / "candidate_exit_resolutions.jsonl",
+        candidate_resolver_launchd_log_path=tmp_path / "logs" / "candidate_exit_resolver_launchd.log",
         ledger_path=tmp_path / "db" / "ledger.sqlite",
         outcome_store_path=tmp_path / "db" / "outcomes.sqlite",
         baseline_store_path=tmp_path / "db" / "baselines.sqlite",
@@ -89,6 +106,7 @@ def _seed_ok_files(cfg: EvidenceHealthConfig) -> None:
     _write_weekly_report(cfg.weekly_report_dir / "weekly_latest.json")
     _write_run_log(cfg.structured_run_log)
     _write_completion_log(cfg.launchd_log_path)
+    _write_candidate_resolver_log(cfg.candidate_resolver_launchd_log_path)
     _write_telemetry(cfg.telemetry_store_path)
     _sqlite_store(cfg.ledger_path)
     _sqlite_store(cfg.outcome_store_path)
@@ -199,3 +217,89 @@ def test_evidence_health_fails_on_sqlite_corruption_like_unreadable_store(tmp_pa
 
     assert status["status"] == "FAIL"
     assert any(issue["check"] == "outcome_store" for issue in status["issues"])
+
+
+def test_evidence_health_fails_when_candidate_resolver_count_balance_breaks(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    _write_candidate_resolver_log(cfg.candidate_resolver_launchd_log_path, count_balance="false")
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    assert status["status"] == "FAIL"
+    assert any(
+        issue["check"] == "candidate_exit_resolver" and "count_balance_holds" in issue["message"]
+        for issue in status["issues"]
+    )
+
+
+def test_evidence_health_fails_on_candidate_resolver_simulator_error(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    _write_candidate_resolver_jsonl(
+        cfg.candidate_resolver_jsonl,
+        [
+            {
+                "ts": "2026-04-27T12:31:00+00:00",
+                "resolver_status": "permanently_failed:simulator_error",
+                "failure_reason": "simulator_error",
+                "days_in_awaiting_state": None,
+            }
+        ],
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    assert status["status"] == "FAIL"
+    assert status["candidate_exit_resolver"]["simulator_error_count"] == 1
+    assert any("simulator_error" in issue["message"] for issue in status["issues"])
+
+
+def test_evidence_health_warns_on_candidate_resolver_stuck_awaiting(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    _write_candidate_resolver_jsonl(
+        cfg.candidate_resolver_jsonl,
+        [
+            {
+                "ts": "2026-04-27T12:31:00+00:00",
+                "resolver_status": "awaiting_chain_data",
+                "failure_reason": None,
+                "days_in_awaiting_state": 11,
+                "mid_realized_return_pct": -99.0,
+            }
+        ],
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    assert status["status"] == "WARN"
+    assert status["candidate_exit_resolver"]["max_days_in_awaiting_state"] == 11
+    assert any("awaiting chain data" in issue["message"] for issue in status["issues"])
+    assert not any("-99" in issue["message"] for issue in status["issues"])
+
+
+def test_evidence_health_warns_not_fails_before_candidate_resolver_first_run(tmp_path: Path) -> None:
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    cfg.candidate_resolver_launchd_log_path.unlink()
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    assert status["status"] == "WARN"
+    assert any(
+        issue["check"] == "candidate_exit_resolver" and "does not exist yet" in issue["message"]
+        for issue in status["issues"]
+    )
