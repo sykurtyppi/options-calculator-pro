@@ -4282,6 +4282,15 @@ def analyze_single_ticker(
         "current_price": current_price,
         "pricing_risk_free_rate": float(pricing_risk_free_rate),
         "pricing_risk_free_rate_source": pricing_risk_free_rate_source,
+        # PR #68 Codex follow-up: expose the resolved dividend yield
+        # alongside the risk-free rate so operators can tell whether
+        # pricing used real dividend data ("yfinance" / "env" / "cache")
+        # or fell back to the no-dividend default ("fallback_zero").
+        # Without this, a yfinance hiccup on a dividend-paying name
+        # silently degraded the pricing to the legacy no-dividend
+        # path with no visible signal.
+        "pricing_dividend_yield": float(pricing_dividend_yield),
+        "pricing_dividend_yield_source": pricing_dividend_yield_source,
         "days_to_earnings": dte,
         "earnings_release_time": earnings_release_time,
         "rv30": rv30,

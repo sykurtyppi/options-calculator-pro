@@ -176,11 +176,14 @@ def test_straddle_entry_debit_changes_with_dividend() -> None:
     """A long ATM straddle's debit = call + put. At q > 0, the
     call gets cheaper but the put gets more expensive — the net
     direction depends on which dominates at the specific (T, σ, q)
-    combination. For our fixture (T=30d, σ=0.30, q=0.04), the put
-    increase dominates, so the straddle debit RISES. We assert the
-    debit changed (not its direction) plus the magnitude is bounded
-    sensibly — at q=0.04 over 30d, the e^(−qT) factor is
-    exp(−0.04·30/365) ≈ 0.997, so the change is small but real."""
+    combination. For our fixture (T=30d, σ=0.30, q=0.04), the
+    actual numerical outcome is a small DECREASE in debit:
+    13.7079 → 13.6729. (Codex P3 follow-up fixed a prior comment
+    that claimed the debit RISES — empirically wrong on this
+    fixture.) We assert the debit changed (not its direction)
+    plus the magnitude is bounded sensibly — at q=0.04 over 30d
+    the e^(−qT) factor is exp(−0.04·30/365) ≈ 0.997, so the change
+    is small but real."""
     no_div = _straddle_payoff(S=_S, iv=_SIGMA, T_near_days=_T_DAYS, r=_R, q=0.0)
     with_div = _straddle_payoff(
         S=_S, iv=_SIGMA, T_near_days=_T_DAYS, r=_R, q=0.04,
