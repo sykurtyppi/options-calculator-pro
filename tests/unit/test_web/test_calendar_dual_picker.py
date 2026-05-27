@@ -20,6 +20,7 @@ import pytest
 
 from web.api.edge_engine import (
     _CANDIDATE_SHADOW_OUTCOME_FIELDS,
+    _CANDIDATE_SHADOW_SCENARIO_BLOCK_FIELDS,
     PROMOTION_ELIGIBLE_PROVENANCES,
     SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
     SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED,
@@ -704,9 +705,22 @@ class TestEmptyCandidateShadowOutcome:
         block = _empty_candidate_shadow_outcome("skipped:test")
         assert set(block.keys()) == set(CANDIDATE_SHADOW_KEYS)
         assert block["status"] == "skipped:test"
-        # Every non-status field is None
+        # Scalar fields are None; scenario-block fields (PR #64) are
+        # dict-shaped placeholders so consumers can `.get("cross_25")`
+        # without first None-checking the wrapper.
         for k in _CANDIDATE_SHADOW_OUTCOME_FIELDS:
-            assert block[k] is None, f"{k} should be None in empty block, got {block[k]!r}"
+            if k in _CANDIDATE_SHADOW_SCENARIO_BLOCK_FIELDS:
+                assert isinstance(block[k], dict), (
+                    f"{k} should be a dict in empty block (PR #64 stable shape), "
+                    f"got {type(block[k]).__name__}"
+                )
+                # Every value inside the dict is None on empty paths.
+                for label, value in block[k].items():
+                    assert value is None, f"{k}[{label!r}] should be None, got {value!r}"
+            else:
+                assert block[k] is None, (
+                    f"{k} should be None in empty block, got {block[k]!r}"
+                )
 
     def test_status_string_preserved(self):
         for status in ("skipped:no_dual_picker", "skipped:no_candidate_selection",
@@ -898,9 +912,23 @@ class TestCandidateShadowOutcomeShape:
                 f"key drift on {description}: extra={set(result.keys()) - set(CANDIDATE_SHADOW_KEYS)}, "
                 f"missing={set(CANDIDATE_SHADOW_KEYS) - set(result.keys())}"
             )
-            # Every non-status field must be None on skip paths
+            # On skip paths: scalar fields are None; scenario-block
+            # fields (PR #64) are dict-shaped placeholders with every
+            # SCENARIO_LEVELS label mapped to None.
             for k in _CANDIDATE_SHADOW_OUTCOME_FIELDS:
-                assert result[k] is None, f"{description}: {k} is {result[k]!r}, expected None"
+                if k in _CANDIDATE_SHADOW_SCENARIO_BLOCK_FIELDS:
+                    assert isinstance(result[k], dict), (
+                        f"{description}: {k} should be a dict on skip paths "
+                        f"(PR #64 stable shape), got {type(result[k]).__name__}"
+                    )
+                    for label, value in result[k].items():
+                        assert value is None, (
+                            f"{description}: {k}[{label!r}] should be None, got {value!r}"
+                        )
+                else:
+                    assert result[k] is None, (
+                        f"{description}: {k} is {result[k]!r}, expected None"
+                    )
 
     def test_output_is_json_safe(self):
         import json

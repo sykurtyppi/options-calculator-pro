@@ -72,6 +72,11 @@ from services.candidate_shadow_provenance import (
     _CANDIDATE_SHADOW_LABELS,
     _empty_candidate_shadow_outcome,
 )
+from services.execution_scenarios import (
+    SCENARIO_LEVELS,
+    build_execution_scenarios,
+    compare_execution_scenarios,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -159,6 +164,62 @@ def best_contract_row(frame: pd.DataFrame) -> Optional[pd.Series]:
         ascending=[False, False, False, True],
     )
     return ranked.iloc[0]
+
+
+def _empty_scenario_dict() -> Dict[str, Optional[float]]:
+    """Return a fresh {label: None} dict covering every scenario in
+    SCENARIO_LEVELS. Used as the default when bid/ask quotes are
+    incomplete and per-scenario evaluation cannot run.
+
+    Stable shape: downstream consumers (PR #65 promotion gate refactor,
+    ledger readers) get the same key set on every simulator output —
+    `None` values communicate "couldn't price this scenario," missing
+    keys would communicate "this scenario doesn't exist," and those
+    are very different. We always emit the keys.
+    """
+    return {name: None for name, _distance in SCENARIO_LEVELS}
+
+
+def _quote_payload_from_leg_rows(
+    front_row: pd.Series,
+    back_row: pd.Series,
+) -> Dict[str, Any]:
+    """Adapt the simulator's two leg row Series into the
+    ``quote_payload`` shape that :func:`build_execution_scenarios`
+    expects. Returns a payload like ``{"bid_ask_mid": {"legs":
+    {"front": {bid, ask, mid}, "back": {bid, ask, mid}}}}``.
+
+    Why an adapter: the chain row carries bid/ask/mid as columns,
+    while build_execution_scenarios was designed against the live
+    quote-snapshot payload shape used elsewhere in the engine. Rather
+    than duplicate the scenario math here we adapt the inputs so the
+    same code-path produces the same numbers regardless of upstream
+    quote source.
+
+    A leg whose bid or ask is missing (None / NaN) flows through
+    cleanly: build_execution_scenarios returns ``None`` for every
+    scenario value at that leg, and compare_execution_scenarios then
+    propagates ``None`` for the per-scenario realized return. The mid
+    path is unaffected because the simulator computes
+    ``mid_realized_return_pct`` directly from the row mids, not from
+    the scenario block.
+    """
+    return {
+        "bid_ask_mid": {
+            "legs": {
+                "front": {
+                    "bid": safe_float(front_row.get("bid"), np.nan),
+                    "ask": safe_float(front_row.get("ask"), np.nan),
+                    "mid": safe_float(front_row.get("mid"), np.nan),
+                },
+                "back": {
+                    "bid": safe_float(back_row.get("bid"), np.nan),
+                    "ask": safe_float(back_row.get("ask"), np.nan),
+                    "mid": safe_float(back_row.get("mid"), np.nan),
+                },
+            }
+        }
+    }
 
 
 def lookup_exact_contract_row(
@@ -316,6 +377,93 @@ def simulate_candidate_shadow_outcome(
         if np.isfinite(entry_back_iv) and np.isfinite(exit_back_iv) else None
     )
 
+    # PR #64 (execution realism foundations): emit per-scenario debit /
+    # exit / realized-return alongside the existing mid-only fields.
+    # The new fields are ADDITIVE — `mid_realized_return_pct` is still
+    # computed directly from the row mids above (not via
+    # `compare_execution_scenarios`) so its value is byte-identical to
+    # pre-PR-#64 outputs and the existing aggregator + resolver paths
+    # are unaffected.
+    #
+    # Promotion eligibility (`is_promotion_eligible` in
+    # candidate_shadow_provenance.py) still gates on
+    # `mid_realized_return_pct`; PR #65 will be the policy refactor
+    # that consumes these new labeled returns. PR #64 only makes the
+    # evidence substrate honest.
+    #
+    # Bid/ask gaps degrade gracefully: missing leg quotes flow through
+    # `build_execution_scenarios` as None scenario values, and
+    # `compare_execution_scenarios` propagates None into the per-
+    # scenario realized return. The mid column is independent of
+    # bid/ask in the existing simulator (mid was either provided
+    # directly or computed as (bid+ask)/2 by `prepare_feature_chain`
+    # upstream), so the mid path always survives. This is by design:
+    # historical chains with sparse bid/ask coverage should still
+    # produce promotion-evidence rows for the mid-priced
+    # research-grade label.
+    structure_for_scenarios = "call_calendar" if call_put == "C" else "put_calendar"
+    try:
+        entry_scenarios = build_execution_scenarios(
+            structure=structure_for_scenarios,
+            quote_payload=_quote_payload_from_leg_rows(entry_front, entry_back),
+            phase="entry",
+        )
+        exit_scenarios = build_execution_scenarios(
+            structure=structure_for_scenarios,
+            quote_payload=_quote_payload_from_leg_rows(exit_front, exit_back),
+            phase="exit",
+        )
+        scenario_compare = compare_execution_scenarios(
+            entry=entry_scenarios.to_dict(),
+            exit=exit_scenarios.to_dict(),
+        )
+        entry_scenario_values = dict(entry_scenarios.scenario_values)
+        exit_scenario_values = dict(exit_scenarios.scenario_values)
+        execution_scenario_returns_pct = dict(scenario_compare.get("realized_return_pct", {}))
+        execution_scenario_pnl = dict(scenario_compare.get("realized_pnl", {}))
+    except Exception:
+        # Defense in depth: any helper failure must not break the mid
+        # path. Stamp empty scenario dicts and continue. We surface
+        # this only via the structure of the returned scenario blocks
+        # (all-None) rather than a separate status, because the
+        # legacy `status` enum is part of the resolver's stable
+        # contract.
+        entry_scenario_values = _empty_scenario_dict()
+        exit_scenario_values = _empty_scenario_dict()
+        execution_scenario_returns_pct = _empty_scenario_dict()
+        execution_scenario_pnl = _empty_scenario_dict()
+
+    # Anchor the "mid" entries to the simulator's own canonical
+    # values rather than trusting the upstream helper, so the
+    # research-grade promotion-evidence numbers are preserved
+    # byte-for-byte if the helper's mid path ever drifts.
+    #
+    # UNIT CONTRACT (Codex P1 fix on PR #64):
+    #
+    # * `entry_scenario_values` / `exit_scenario_values` are in
+    #   raw option-price points — same scale as the helper's
+    #   `entry_scenarios.scenario_values` / `exit_scenarios.scenario_values`
+    #   and same scale as `entry_debit_mid` / `exit_value_mid`.
+    #
+    # * `execution_scenario_returns_pct` is in percent — matches
+    #   `mid_realized_return_pct` and the helper's
+    #   `realized_return_pct` (both are
+    #   ((exit - entry) / entry) * 100).
+    #
+    # * `execution_scenario_pnl` is in dollars-per-contract — the
+    #   helper computes `(exit - entry) * 100.0` (the equity-option
+    #   multiplier). The simulator's `mid_pnl` is in raw points
+    #   (`exit_value_mid - entry_debit_mid`), so the mid overwrite
+    #   must multiply by 100 to keep the whole dict in one unit.
+    #   Without the `* 100` the dict mixed units —
+    #   `{"mid": 0.3, "cross_25": 20.0, "cross_50": 10.0}` for the
+    #   happy-path fixture — which would silently corrupt any
+    #   per-scenario PnL aggregation in PR #65's gate refactor.
+    execution_scenario_returns_pct["mid"] = mid_realized_return_pct
+    execution_scenario_pnl["mid"] = mid_pnl * 100.0
+    entry_scenario_values["mid"] = entry_debit_mid
+    exit_scenario_values["mid"] = exit_value_mid
+
     return {
         "status": "ok",
         "labels": dict(_CANDIDATE_SHADOW_LABELS),
@@ -337,4 +485,12 @@ def simulate_candidate_shadow_outcome(
         "mid_realized_return_pct": mid_realized_return_pct,
         "iv_change_front": iv_change_front,
         "iv_change_back": iv_change_back,
+        # PR #64: per-scenario evidence. Same stable-shape contract as
+        # the rest of the outcome block — every scenario in
+        # SCENARIO_LEVELS is present; values are None when bid/ask was
+        # missing or the scenario couldn't be priced.
+        "entry_scenario_values": entry_scenario_values,
+        "exit_scenario_values": exit_scenario_values,
+        "execution_scenario_returns_pct": execution_scenario_returns_pct,
+        "execution_scenario_pnl": execution_scenario_pnl,
     }
