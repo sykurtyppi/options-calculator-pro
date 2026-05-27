@@ -1,0 +1,148 @@
+# Continuous integration for options_calculator_pro.
+#
+# Triggers:
+#   * Every pull request targeting main — block merge on test failures.
+#   * Pushes to main — catch the rare case where a force-push or
+#     out-of-band commit lands without going through a PR.
+#
+# Two independent jobs run in parallel so frontend feedback doesn't
+# wait on the backend matrix:
+#
+#   backend-tests   pytest -q on the full unit suite (Python 3.11 +
+#                   pip install -r requirements.txt with the web
+#                   constraints layered in, matching the parity setup
+#                   documented in README.md).
+#
+#   frontend-tests  npm test on the React trust-layer suite (Node 22
+#                   + Vite 6 build smoke). Node 22 specifically — see
+#                   the comment on the Set up Node step below for why
+#                   Node 20 doesn't work with the package.json test
+#                   script.
+#
+# Single-platform Linux on purpose: the production target is macOS
+# (launchd jobs), but the runtime code is POSIX-portable and we want
+# CI to fail loudly if any test accidentally takes a macOS-only
+# dependency. Adding a macos-latest matrix would double compute for
+# no portability gain — anything macOS-specific belongs in
+# scripts/automation/ (launchd plists / installer), not in the
+# pytest suite.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least-privilege default for all jobs in this workflow. The CI runs
+# only need to clone the repo and report status checks — they never
+# write back to the repository, post comments, push container images,
+# or open issues. Explicit `contents: read` overrides the
+# repo-default token, which would otherwise be granted broader
+# permissions inherited from the workflow runner's defaults. Any
+# future job that needs more (releases, packages, deployments)
+# should add a per-job `permissions:` block rather than widen this
+# workflow-wide one.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same PR/branch — saves CI minutes on
+# rapid push amends without losing the latest run's signal.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: Backend (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # Cache wheel downloads keyed on requirements.txt content.
+          # Restored cache cuts the cold-install ~90s install down to
+          # ~10s on subsequent runs.
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            web/api/requirements-web.txt
+
+      - name: Install backend dependencies
+        # Mirrors the parity-setup block in README.md so CI's
+        # dependency graph matches what developers run locally:
+        #   1. The uv-compiled root requirements (the canonical
+        #      pin set; requirements.lock and requirements.txt are
+        #      both derived from pyproject.toml).
+        #   2. The web layer's requirements, constrained against
+        #      its own constraints file so transitive versions
+        #      don't drift from what the API was tested against.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r web/api/requirements-web.txt -c web/api/constraints-web.txt
+
+      - name: Run unit tests
+        # `-q` matches the local invocation in the test-plan
+        # checklists across the recent PRs (PR #58 onwards). Failure
+        # exits non-zero and fails the job.
+        run: pytest tests/unit -q
+
+  frontend-tests:
+    name: Frontend (node --test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web/frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          # Node 22 (LTS) is required, not 20: package.json's test
+          # script is `node --test 'src/**/*.test.js'`, and native
+          # glob expansion inside `node --test` only landed in
+          # Node 22. On Node 20 the quoted glob arrives as a
+          # literal string because Ubuntu bash doesn't expand `**`
+          # without `shopt -s globstar`, and the runner exits with
+          # "Could not find 'src/**/*.test.js'". macOS shells +
+          # Node 22+ both handle the glob, so this matches the
+          # local dev environment without touching the package.json
+          # test script.
+          node-version: "22"
+          # Cache npm ~/.npm keyed on package-lock.json so repeated
+          # runs skip the 30s download phase.
+          cache: npm
+          cache-dependency-path: web/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        # `npm ci` is stricter than `npm install`: refuses if the
+        # lockfile is out of sync with package.json. The right
+        # default for CI — a forgotten lockfile update should fail
+        # here rather than silently produce a different dep tree.
+        run: npm ci
+
+      - name: Run frontend tests
+        # `npm test` runs `node --test 'src/**/*.test.js'` per the
+        # package.json script. Failures from any .test.js file fail
+        # the job.
+        run: npm test
+
+      - name: Vite production build smoke
+        # The runbook's first-run verification step requires `npm run
+        # build` to succeed and produce web/frontend/dist/index.html.
+        # Building in CI catches the class of bugs where a runtime
+        # import works but the production bundler trips on it (esm/
+        # cjs interop, missing default exports, etc.).
+        run: npm run build
