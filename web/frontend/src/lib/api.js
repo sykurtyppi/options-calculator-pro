@@ -115,6 +115,73 @@ const RAW_API_BASE = resolveRawApiBase(_env)
 
 export const API_BASE = validateApiBase(RAW_API_BASE)
 
+// ──────────────────────────────────────────────────────────────────────────
+// 401 redirect side-effect (PR #69)
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Pre-PR-#69 contract: a 401 on any apiFetch call surfaced as the
+// generic "HTTP 401" string thrown by the caller's error handling.
+// The operator saw a red banner and had no recovery affordance —
+// session expiry was indistinguishable from any other network
+// failure, and refreshing didn't help because no UI flow sent the
+// user back through /login.
+//
+// PR #69 fix: apiFetch detects 401 and triggers a hard navigation
+// to /login (the same mechanism the Logout button uses). The
+// in-flight 401 response still resolves to the caller — we don't
+// throw or reject — so any cleanup the caller wants to do still
+// runs. window.location.assign is async-ish (the navigation fires
+// while the JS turn completes), so the caller's .then() may or
+// may not observe the 401 before the page swaps out.
+//
+// Loop guard: if the user is already on /login when a 401 fires
+// (e.g. the login page itself makes an apiFetch — rare but
+// possible if a future panel embeds a session-status probe), we
+// skip the redirect. Without this, the page would re-navigate to
+// itself and the operator would see a brief flash.
+//
+// Testability: the redirect callable is module-private but
+// reassignable via `_setRedirectToLogin` and `_resetRedirectToLogin`
+// (underscore prefix = "module-private; do not import from outside
+// tests"). The defaults reference `window` lazily so this module
+// remains importable from node --test scripts that have no DOM.
+
+function _defaultRedirectToLogin() {
+  if (typeof window !== 'undefined' && window.location) {
+    window.location.assign('/login')
+  }
+}
+
+let _redirectToLogin = _defaultRedirectToLogin
+
+/**
+ * Test hook: replace the 401-redirect side effect. Use to capture
+ * redirect calls in tests without touching the real DOM.
+ * @param {() => void} fn
+ */
+export function _setRedirectToLogin(fn) {
+  _redirectToLogin = fn
+}
+
+/**
+ * Test hook: restore the production redirect behaviour.
+ */
+export function _resetRedirectToLogin() {
+  _redirectToLogin = _defaultRedirectToLogin
+}
+
+/**
+ * Whether the current location is already the login page. Lifted
+ * to a helper so the test suite can stub it independently of the
+ * redirect itself.
+ *
+ * @returns {boolean}
+ */
+function _isAlreadyOnLoginPage() {
+  if (typeof window === 'undefined' || !window.location) return false
+  return window.location.pathname === '/login'
+}
+
 /**
  * Fetch wrapper that injects ``credentials: 'include'`` so the
  * session cookie is sent on every authenticated request.
@@ -124,10 +191,20 @@ export const API_BASE = validateApiBase(RAW_API_BASE)
  * ``credentials: 'omit'`` we honour that, since they're presumably
  * fetching a public resource.
  *
+ * PR #69: on a 401 response, triggers a hard navigation to /login
+ * (skipped if the user is already on the login page, to avoid a
+ * self-redirect flash). The 401 response itself is still returned
+ * to the caller; the redirect is a side effect.
+ *
  * @param {string | URL | Request} input
  * @param {RequestInit} [options]
  */
 export function apiFetch(input, options = {}) {
   const opts = { credentials: 'include', ...options }
-  return fetch(input, opts)
+  return fetch(input, opts).then((response) => {
+    if (response.status === 401 && !_isAlreadyOnLoginPage()) {
+      _redirectToLogin()
+    }
+    return response
+  })
 }
