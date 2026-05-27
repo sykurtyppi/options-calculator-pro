@@ -260,31 +260,53 @@ def _session_token(now: Optional[datetime] = None) -> str:
     return f"{payload}.{_session_signature(payload)}"
 
 
-def _valid_session(cookie_val: str) -> bool:
-    if not _SHARE_AUTH_ENABLED:
-        return True
-    if not cookie_val or not _SHARE_PASSWORD:
-        return False
+def _extract_session_token(cookie_val: str) -> Optional[Tuple[str, int]]:
+    """Parse and HMAC-verify *cookie_val*.
+
+    Returns ``(nonce, issued_at)`` if the cookie's signature is valid
+    AND it's within the normal session age window; otherwise ``None``.
+    Does NOT consult the revocation set — that's the caller's job in
+    :func:`_valid_session`. By keeping the verification gate separate
+    from the revocation check, ``POST /logout`` can use this helper
+    to decide whether a cookie is worth revoking *at all* (Codex
+    web-audit follow-up P1).
+
+    Without this gate, ``/logout`` accepts any syntactically shaped
+    cookie and inserts its nonce into ``_revoked_nonces`` — turning a
+    public endpoint into a memory-pressure surface. Forged cookies
+    with absurd timestamps could also blow up ``int(issued_at_raw)``
+    with ``OverflowError``; that's caught here too.
+    """
+    if not _SHARE_AUTH_ENABLED or not cookie_val or not _SHARE_PASSWORD:
+        return None
     try:
         version, issued_at_raw, nonce, signature = cookie_val.split(".", 3)
         if version != "v1" or not nonce:
-            return False
+            return None
         issued_at = int(issued_at_raw)
         age = int(datetime.now(timezone.utc).timestamp()) - issued_at
         if age < 0 or age > _SESSION_MAX_AGE:
-            return False
+            return None
         payload = f"{version}.{issued_at_raw}.{nonce}"
         if not hmac.compare_digest(signature, _session_signature(payload)):
-            return False
-        # Web-audit P1-2: even a signature-valid cookie is rejected if the
-        # nonce has been revoked via POST /logout. Without this check, the
-        # only way to invalidate a leaked cookie before its 7-day TTL was
-        # to rotate SESSION_SECRET — which kicks every other session.
-        if _is_nonce_revoked(nonce):
-            return False
+            return None
+        return (nonce, issued_at)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _valid_session(cookie_val: str) -> bool:
+    if not _SHARE_AUTH_ENABLED:
         return True
-    except Exception:
+    parsed = _extract_session_token(cookie_val)
+    if parsed is None:
         return False
+    nonce, _issued_at = parsed
+    # Web-audit P1-2: even a signature-valid cookie is rejected if the
+    # nonce has been revoked via POST /logout. Without this check, the
+    # only way to invalidate a leaked cookie before its 7-day TTL was
+    # to rotate SESSION_SECRET — which kicks every other session.
+    return not _is_nonce_revoked(nonce)
 
 
 def _revoke_nonce(nonce: str, expiry_ts: float) -> None:
@@ -504,8 +526,8 @@ _LOCALHOST_DEV_ORIGINS = [
 
 
 def _compute_allowed_origins(share_auth_enabled: bool, origins_env: str) -> List[str]:
-    """Resolve the CORS ``allow_origins`` list with the safety rail from
-    Web-audit P2-2.
+    """Resolve the CORS ``allow_origins`` list with the safety rails from
+    Web-audit P2-2 plus the Codex audit follow-up.
 
     The localhost-dev defaults grant credentialed CORS access to any
     cross-port local web service. That's fine when share-auth is off
@@ -514,14 +536,36 @@ def _compute_allowed_origins(share_auth_enabled: bool, origins_env: str) -> List
     malicious localhost service the operator runs in the same browser
     can ``fetch(credentials: "include")`` against this app and read
     session-cookie-protected data. Force operators to set
-    ``OPTIONS_CALCULATOR_ALLOWED_ORIGINS`` explicitly in that case.
+    ``OPTIONS_CALCULATOR_ALLOWED_ORIGINS`` explicitly in that case AND
+    refuse the two values that would undo the entire gate:
+
+      * ``"*"`` — combined with ``allow_credentials=True`` this is the
+        confused-deputy footgun the gate was meant to close. Starlette
+        does fail-closed at the middleware layer when both are passed,
+        but failing here (with a clear error) catches the misconfig at
+        startup instead of producing silent 4xx CORS errors later.
+      * ``"null"`` — the literal origin string emitted by sandboxed
+        iframes, ``file://`` documents, and some redirect chains.
+        Allowing it grants implicit trust to anything that opens this
+        app inside a sandbox.
 
     Extracted into a function so tests can exercise the contract without
     importing the FastAPI app at startup (which would lock in whatever
     env vars happen to be set at import time).
     """
     if origins_env.strip():
-        return [origin.strip() for origin in origins_env.split(",") if origin.strip()]
+        origins = [origin.strip() for origin in origins_env.split(",") if origin.strip()]
+        if share_auth_enabled:
+            forbidden = {"*", "null"}
+            bad = sorted({o for o in origins if o in forbidden})
+            if bad:
+                raise RuntimeError(
+                    "OPTIONS_CALCULATOR_ALLOWED_ORIGINS cannot include "
+                    f"{bad!r} when ENABLE_SHARE_AUTH=true: allow_credentials=True "
+                    "is on and these values would undo the credentialed-CORS gate. "
+                    "Use an explicit list of origins (e.g., 'https://app.example.com')."
+                )
+        return origins
     if share_auth_enabled:
         raise RuntimeError(
             "ENABLE_SHARE_AUTH=true requires OPTIONS_CALCULATOR_ALLOWED_ORIGINS to be "
@@ -597,18 +641,22 @@ async def logout(request: Request):
     Web-audit P1-2. POST-only on purpose — a GET would let an attacker
     log the operator out via an ``<img src="…/logout">`` tag from any
     site. Annoyance, not security breach, but easy to close.
+
+    Codex web-audit follow-up P1: only revoke a nonce after the cookie's
+    HMAC + age have been verified by :func:`_extract_session_token`.
+    Otherwise an unauthenticated attacker could POST forged cookies with
+    arbitrary nonces and timestamps to grow ``_revoked_nonces``
+    unboundedly. The ``delete_cookie`` below still runs on every call,
+    so users with malformed or expired cookies are still cleanly
+    logged out — they just don't get anything written to the revocation
+    set (there's nothing valid to revoke).
     """
     session = request.cookies.get(_SESSION_COOKIE, "")
     if session:
-        try:
-            version, issued_at_raw, nonce, _sig = session.split(".", 3)
-            if version == "v1" and nonce:
-                expiry_ts = float(int(issued_at_raw) + _SESSION_MAX_AGE)
-                _revoke_nonce(nonce, expiry_ts)
-        except (ValueError, TypeError):
-            # Malformed cookie — nothing valid to revoke; the delete_cookie
-            # below still clears whatever's there. Fail open is safe here.
-            pass
+        parsed = _extract_session_token(session)
+        if parsed is not None:
+            nonce, issued_at = parsed
+            _revoke_nonce(nonce, float(issued_at + _SESSION_MAX_AGE))
     response = RedirectResponse(url="/login", status_code=303)
     response.delete_cookie(
         _SESSION_COOKIE,
@@ -1367,8 +1415,28 @@ def _execute_oos_logic(request: OOSReportRequest) -> Dict[str, Any]:
 
 
 @app.post("/api/oos/report-card", response_model=OOSReportResponse)
-def run_oos_report_card(request: OOSReportRequest) -> OOSReportResponse:
-    """Synchronous OOS endpoint (legacy). Prefer /api/oos/submit for long runs."""
+def run_oos_report_card(
+    request: OOSReportRequest, http_request: Request
+) -> OOSReportResponse:
+    """Synchronous OOS endpoint (legacy). Prefer /api/oos/submit for long runs.
+
+    Codex web-audit follow-up P2: shares the ``oos_submit`` rate-limit
+    bucket with the async submit endpoint — otherwise an auth'd client
+    (or stolen cookie) could bypass the new /api/oos/submit limit by
+    hammering this synchronous variant instead, burning a worker thread
+    per call for the full _OOS_VALIDATION_TIMEOUT_SECONDS wall-clock.
+    Same bucket key (`"oos_submit"`) on purpose: the user's *intent* is
+    the same (run an OOS analysis), regardless of which endpoint they
+    chose, so attempts should count against a single quota.
+    """
+    if not _check_rate_limit(
+        "oos_submit", _client_ip(http_request),
+        _OOS_SUBMIT_RATE_LIMIT_PER_MIN, _OOS_SUBMIT_RATE_LIMIT_PER_HOUR,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="OOS submission rate limit exceeded. Wait a minute and try again.",
+        )
     try:
         data = _execute_oos_logic(request)
         return OOSReportResponse(

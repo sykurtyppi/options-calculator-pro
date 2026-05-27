@@ -1783,6 +1783,122 @@ class TestApiEndpoints(unittest.TestCase):
             app_module._check_rate_limit("ml_train", "1.2.3.4", 5, 100)
         )
 
+    # ── Codex web-audit follow-up P1: /logout HMAC-verifies before revoke ─
+
+    def test_logout_does_not_revoke_forged_nonce(self):
+        """A forged cookie that *parses* but doesn't HMAC-verify must NOT
+        end up in the revocation set. Otherwise /logout becomes a public
+        memory-pressure surface — an attacker can POST infinitely many
+        forged cookies with future-dated timestamps and grow
+        _revoked_nonces unboundedly."""
+        app_module._reset_revoked_nonces()
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True), \
+             patch.object(app_module, "_SHARE_PASSWORD", "secret"), \
+             patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+            forged = "v1.99999999999.attacker_nonce.deadbeef" * 1
+            self.client.cookies.set(app_module._SESSION_COOKIE, forged)
+            try:
+                response = self.client.post("/logout", follow_redirects=False)
+            finally:
+                self.client.cookies.clear()
+            self.assertEqual(response.status_code, 303)
+            # The signature didn't verify, so the attacker's nonce was
+            # NOT inserted into _revoked_nonces.
+            self.assertNotIn("attacker_nonce", app_module._revoked_nonces)
+        app_module._reset_revoked_nonces()
+
+    def test_extract_session_token_rejects_huge_timestamp(self):
+        """A cookie with a multi-thousand-digit timestamp must return
+        None instead of letting int() blow up with OverflowError. Without
+        this guard, an attacker could DoS /logout (and /any-auth-gated-
+        path) by sending oversized timestamps."""
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True), \
+             patch.object(app_module, "_SHARE_PASSWORD", "secret"), \
+             patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+            huge = "v1." + ("9" * 1000) + ".nonce.sig"
+            # Must not raise; must return None.
+            self.assertIsNone(app_module._extract_session_token(huge))
+
+    def test_extract_session_token_returns_payload_on_valid_cookie(self):
+        """The new helper must return (nonce, issued_at) for a freshly
+        minted valid token — that's how /logout decides to revoke."""
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True), \
+             patch.object(app_module, "_SHARE_PASSWORD", "secret"), \
+             patch.object(app_module, "_SESSION_SECRET", "x" * 32):
+            token = app_module._session_token()
+            parsed = app_module._extract_session_token(token)
+            self.assertIsNotNone(parsed)
+            nonce, issued_at = parsed
+            self.assertGreater(len(nonce), 0)
+            self.assertGreater(issued_at, 0)
+
+    # ── Codex web-audit follow-up P2-a: CORS wildcard / null gated ───────
+
+    def test_compute_allowed_origins_rejects_wildcard_under_share_auth(self):
+        """A bare '*' combined with allow_credentials=True is exactly the
+        confused-deputy footgun the gate was meant to close."""
+        with self.assertRaisesRegex(RuntimeError, r"\*"):
+            app_module._compute_allowed_origins(True, "*")
+
+    def test_compute_allowed_origins_rejects_null_under_share_auth(self):
+        """'null' is the literal origin string for sandboxed iframes and
+        file:// — must fail closed too."""
+        with self.assertRaisesRegex(RuntimeError, "null"):
+            app_module._compute_allowed_origins(True, "null")
+
+    def test_compute_allowed_origins_rejects_mixed_list_with_wildcard(self):
+        """Mixing legit origins with '*' must still fail — otherwise
+        operators can sneak in the wildcard by hiding it in a list."""
+        with self.assertRaisesRegex(RuntimeError, r"\*"):
+            app_module._compute_allowed_origins(
+                True, "https://app.example.com,*"
+            )
+
+    def test_compute_allowed_origins_wildcard_allowed_when_share_auth_off(self):
+        """When share-auth is off there's no credentialed session to steal,
+        so '*' is acceptable (matches dev defaults). Don't gate when there's
+        nothing to gate."""
+        # Should not raise.
+        result = app_module._compute_allowed_origins(False, "*")
+        self.assertEqual(result, ["*"])
+
+    # ── Codex web-audit follow-up P2-b: legacy sync OOS rate-limit ───────
+
+    def test_oos_report_card_is_rate_limited(self):
+        """The legacy synchronous /api/oos/report-card shares the
+        oos_submit bucket — otherwise an attacker can bypass the
+        /api/oos/submit limit by hitting the sync endpoint instead."""
+        app_module._reset_rate_limits()
+        with patch.object(app_module, "_OOS_SUBMIT_RATE_LIMIT_PER_MIN", 0):
+            response = self.client.post(
+                "/api/oos/report-card",
+                json={"oos_stability_profile": "stability_auto"},
+            )
+        self.assertEqual(response.status_code, 429)
+        detail = response.json().get("detail", "").lower()
+        self.assertIn("rate limit", detail)
+
+    def test_oos_report_card_and_submit_share_a_bucket(self):
+        """Burning the oos_submit bucket via /api/oos/submit must also
+        block /api/oos/report-card (and vice versa). Different endpoints,
+        same workload class, one quota."""
+        app_module._reset_rate_limits()
+        # Two submits exhaust the bucket.
+        with patch.object(app_module, "_OOS_SUBMIT_RATE_LIMIT_PER_MIN", 2):
+            for _ in range(2):
+                # Both endpoints share bucket name "oos_submit"; we use the
+                # helper directly to avoid the job-capacity check.
+                self.assertTrue(
+                    app_module._check_rate_limit("oos_submit", "testclient", 2, 100)
+                )
+            # Bucket exhausted — the next request to either endpoint is 429.
+            response = self.client.post(
+                "/api/oos/report-card",
+                json={"oos_stability_profile": "stability_auto"},
+            )
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("rate limit", response.json().get("detail", "").lower())
+
 
 if __name__ == "__main__":
     unittest.main()
