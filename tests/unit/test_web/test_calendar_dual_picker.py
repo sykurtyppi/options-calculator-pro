@@ -19,10 +19,13 @@ import pandas as pd
 import pytest
 
 from web.api.edge_engine import (
+    _CANDIDATE_SHADOW_OUTCOME_FIELDS,
     _aggregate_experimental_candidate_evidence,
     _build_experimental_contract_selection,
     _dual_picker_calendar_selection,
+    _empty_candidate_shadow_outcome,
     _empty_dual_picker,
+    _simulate_candidate_shadow_outcome,
 )
 
 # Canonical dual_picker key set — every code path that produces a
@@ -641,5 +644,292 @@ class TestExperimentalContractSelection:
                      "outperform", "expected pnl"]
         for s in forbidden:
             assert s not in flat, f"performance claim {s!r} leaked"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# _simulate_candidate_shadow_outcome  (PR-AD commit 1)
+# ──────────────────────────────────────────────────────────────────────────
+
+# Canonical key set produced by both _empty_candidate_shadow_outcome
+# and the happy-path return. Asserted via tests so any future schema
+# drift fails loudly.
+CANDIDATE_SHADOW_KEYS = frozenset({"status"} | set(_CANDIDATE_SHADOW_OUTCOME_FIELDS))
+
+
+def _candidate_only_dual_picker(
+    *,
+    front_expiry: str = "2024-05-17",
+    back_expiry: str = "2024-06-21",
+    strike: float = 100.0,
+    side: str = "call",
+) -> Dict[str, Any]:
+    """Minimal dual_picker block with only the fields the candidate
+    shadow simulator reads. Avoids having to construct a full
+    CalendarSelection.to_metadata_dict() in every test."""
+    return {
+        "shadow_status": "ok",
+        "legacy_selection": None,  # legacy doesn't matter for these tests
+        "candidate_selection": {
+            "side": side,
+            "strike": strike,
+            "front_expiry": front_expiry,
+            "back_expiry": back_expiry,
+        },
+        "pickers_diverged": False,
+        "candidate_min_front_dte_days": 14,
+        "experimental_note": "...",
+    }
+
+
+def _chain_with_contracts(rows):
+    """Build a chain DataFrame in the format _lookup_exact_contract_row expects.
+
+    Rows: (expiry_date, strike, call_put, mid, iv, bid, ask)
+    """
+    return pd.DataFrame(rows, columns=["expiry", "strike", "call_put", "mid", "iv", "bid", "ask"])
+
+
+# ── Empty-state factory shape ────────────────────────────────────────────
+
+class TestEmptyCandidateShadowOutcome:
+    def test_empty_block_has_canonical_key_set(self):
+        block = _empty_candidate_shadow_outcome("skipped:test")
+        assert set(block.keys()) == set(CANDIDATE_SHADOW_KEYS)
+        assert block["status"] == "skipped:test"
+        # Every non-status field is None
+        for k in _CANDIDATE_SHADOW_OUTCOME_FIELDS:
+            assert block[k] is None, f"{k} should be None in empty block, got {block[k]!r}"
+
+    def test_status_string_preserved(self):
+        for status in ("skipped:no_dual_picker", "skipped:no_candidate_selection",
+                       "skipped:missing_entry_quote", "error:Boom"):
+            assert _empty_candidate_shadow_outcome(status)["status"] == status
+
+
+# ── Happy path: candidate resolved to PnL ────────────────────────────────
+
+class TestCandidateShadowOutcomeHappyPath:
+    def test_resolves_candidate_pnl_with_both_chains(self):
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        assert result["status"] == "ok"
+        # Sanity-check PnL math
+        # entry_debit = 2.0 - 1.0 = 1.0
+        # exit_value  = 1.7 - 0.4 = 1.3
+        # mid_pnl     = 1.3 - 1.0 = 0.3
+        # return_pct  = 0.3/1.0 * 100 = 30.0
+        assert result["entry_debit_mid"] == pytest.approx(1.0)
+        assert result["exit_value_mid"] == pytest.approx(1.3)
+        assert result["mid_pnl"] == pytest.approx(0.3)
+        assert result["realized_return_pct"] == pytest.approx(30.0)
+        # IV change is exit - entry (front crushed -10pp, back -5pp)
+        assert result["iv_change_front"] == pytest.approx(-0.10)
+        assert result["iv_change_back"] == pytest.approx(-0.05)
+        # Side + identifiers preserved
+        assert result["side"] == "call"
+        assert result["strike"] == 100.0
+        assert result["front_expiry"] == "2024-05-17"
+        assert result["back_expiry"] == "2024-06-21"
+
+    def test_put_side_resolves_against_put_chain(self):
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "P", 1.5, 0.32, 1.45, 1.55),
+            (pd.Timestamp("2024-06-21"), 100.0, "P", 2.8, 0.31, 2.75, 2.85),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "P", 0.6, 0.22, 0.55, 0.65),
+            (pd.Timestamp("2024-06-21"), 100.0, "P", 2.3, 0.26, 2.25, 2.35),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(side="put"),
+        )
+        assert result["status"] == "ok"
+        assert result["side"] == "put"
+        # entry_debit = 2.8 - 1.5 = 1.3, exit_value = 2.3 - 0.6 = 1.7
+        assert result["entry_debit_mid"] == pytest.approx(1.3)
+        assert result["exit_value_mid"] == pytest.approx(1.7)
+
+
+# ── Skip statuses ─────────────────────────────────────────────────────────
+
+class TestCandidateShadowOutcomeSkips:
+    def test_none_dual_picker(self):
+        assert _simulate_candidate_shadow_outcome(
+            entry_chain=pd.DataFrame(), exit_chain=pd.DataFrame(),
+            dual_picker=None,
+        )["status"] == "skipped:no_dual_picker"
+
+    def test_dual_picker_failed(self):
+        dp = _empty_dual_picker("skipped:missing_entry_chain")
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=pd.DataFrame(), exit_chain=pd.DataFrame(),
+            dual_picker=dp,
+        )
+        # Inherits dual_picker's failure reason
+        assert result["status"] == "skipped:dual_picker_status:skipped:missing_entry_chain"
+
+    def test_no_candidate_selection(self):
+        # dual_picker.shadow_status == "ok" but candidate_selection is None
+        # (legitimate — candidate picker had no eligible front)
+        dp = _candidate_only_dual_picker()
+        dp["candidate_selection"] = None
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=pd.DataFrame(), exit_chain=pd.DataFrame(),
+            dual_picker=dp,
+        )
+        assert result["status"] == "skipped:no_candidate_selection"
+
+    def test_malformed_candidate_selection(self):
+        dp = _candidate_only_dual_picker()
+        dp["candidate_selection"] = {"side": "call"}  # missing strike, expiries
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=pd.DataFrame(), exit_chain=pd.DataFrame(),
+            dual_picker=dp,
+        )
+        assert result["status"] == "skipped:malformed_candidate_selection"
+
+    def test_missing_entry_quote(self):
+        # Entry chain doesn't contain candidate's contracts
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-07-19"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        assert result["status"] == "skipped:missing_entry_quote"
+
+    def test_missing_exit_quote(self):
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            # Different expiry; candidate's contracts not present at exit
+            (pd.Timestamp("2024-07-19"), 100.0, "C", 0.5, 0.25, 0.45, 0.55),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        assert result["status"] == "skipped:missing_exit_quote"
+
+    def test_negative_debit_mirrors_legacy_behavior(self):
+        # front more expensive than back at entry → entry_debit <= 0
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 3.0, 0.30, 2.95, 3.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.25, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.8, 0.26, 1.75, 1.85),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        assert result["status"] == "skipped:negative_debit"
+
+
+# ── Schema stability ──────────────────────────────────────────────────────
+
+class TestCandidateShadowOutcomeShape:
+    def test_happy_path_uses_canonical_key_set(self):
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        assert set(result.keys()) == set(CANDIDATE_SHADOW_KEYS)
+
+    def test_every_skip_status_uses_canonical_key_set(self):
+        """Every failure path must produce the same key set as the
+        happy path. Drift would break the ledger schema in PR-AD
+        commit 2."""
+        dp_ok = _candidate_only_dual_picker()
+
+        cases = [
+            # (description, kwargs producing each status)
+            ("no_dual_picker", dict(entry_chain=pd.DataFrame(),
+                                    exit_chain=pd.DataFrame(),
+                                    dual_picker=None)),
+            ("no_candidate_selection",
+             dict(entry_chain=pd.DataFrame(), exit_chain=pd.DataFrame(),
+                  dual_picker={**dp_ok, "candidate_selection": None})),
+            ("malformed_candidate",
+             dict(entry_chain=pd.DataFrame(), exit_chain=pd.DataFrame(),
+                  dual_picker={**dp_ok, "candidate_selection": {"side": "call"}})),
+            ("missing_chain",
+             dict(entry_chain=None, exit_chain=None, dual_picker=dp_ok)),
+        ]
+        for description, kwargs in cases:
+            result = _simulate_candidate_shadow_outcome(**kwargs)
+            assert set(result.keys()) == set(CANDIDATE_SHADOW_KEYS), (
+                f"key drift on {description}: extra={set(result.keys()) - set(CANDIDATE_SHADOW_KEYS)}, "
+                f"missing={set(CANDIDATE_SHADOW_KEYS) - set(result.keys())}"
+            )
+            # Every non-status field must be None on skip paths
+            for k in _CANDIDATE_SHADOW_OUTCOME_FIELDS:
+                assert result[k] is None, f"{description}: {k} is {result[k]!r}, expected None"
+
+    def test_output_is_json_safe(self):
+        import json
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        json.dumps(result)  # must not raise
+
+    def test_no_performance_claims_in_outputs(self):
+        """Hard requirement carried over from PR-AC: the candidate
+        shadow outcome block must not embed any performance-language
+        substrings that could be confused with promotion claims."""
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        flat = str(result).lower()
+        for forbidden in ("+11%", "+23%", "73% win", "outperform", "validated"):
+            assert forbidden not in flat, (
+                f"performance/validation claim {forbidden!r} leaked into outcome"
+            )
 
 
