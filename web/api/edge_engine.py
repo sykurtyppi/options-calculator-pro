@@ -612,7 +612,9 @@ from services.candidate_shadow_provenance import (  # noqa: E402
     VALID_SAMPLE_PROVENANCES,
     _empty_candidate_shadow_outcome,
     _tag_live_forward_observation,
+    candidate_return_for_gate,
     is_promotion_eligible,
+    is_promotion_eligible_for_scenario,
     normalize_sample_provenance,
 )
 
@@ -1105,6 +1107,40 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
     # widen the filter.
     promotion_eligible_event_pnls: Dict[Any, List[float]] = {}
 
+    # PR #66: scenario-aware visibility infrastructure. These counters
+    # answer the operational question "what fraction of
+    # promotion-eligible events have execution-cost-aware evidence?"
+    # — the data needed to justify a future gate refactor to scenario-
+    # aware promotion criteria.
+    #
+    # The default gate scenario is the same baseline structure_scorecard
+    # uses for historical priors (cross_25), so the visibility metric
+    # answers a uniform question across the whole pipeline.
+    #
+    # CRITICAL: this aggregator NEVER substitutes mid for a missing
+    # scenario value. `allow_mid_fallback=False` is hardcoded below.
+    # PR #66 ships visibility, not policy — the `fallback_events`
+    # counter exists so a future PR that flips a caller to
+    # `allow_mid_fallback=True` automatically gets the substitution
+    # surface in the daily diagnostic output. Until then, the count
+    # stays at 0 by construction.
+    _GATE_SCENARIO_FOR_VISIBILITY = "cross_25"
+    # Per-event scenario observations. We collect one bool per
+    # (eligible offset, event) — True iff cross_25 was priced for
+    # that offset — then reduce to one classification per event
+    # after the trade loop. Doing the classification per trade
+    # (instead of per event) caused a Codex P1 on PR #66 first
+    # round: a single earnings event evaluated at N entry offsets
+    # could land in BOTH the priced and missing sets simultaneously
+    # if any offset had bid/ask coverage and any other didn't —
+    # breaking the documented invariant
+    # `scenario_priced_events + missing_scenario_events == n_events`.
+    # The fix moves classification to event-level reduction with
+    # the "any priced offset → event priced" rule (see comment
+    # below the loop).
+    per_event_scenario_priced_flags: Dict[Any, List[bool]] = {}
+    scenario_missing_reason_counts: Dict[str, int] = {}
+
     # Event-level (deduplicated on (symbol, event_date))
     unique_events: set = set()
     unique_events_with_legacy: set = set()
@@ -1185,6 +1221,52 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
             promotion_eligible_event_pnls.setdefault(event_key, []).append(
                 float(outcome["mid_realized_return_pct"])
             )
+
+            # PR #66 visibility: among the promotion-eligible records,
+            # observe whether the gate-baseline scenario (cross_25
+            # today) was priced. Fail-closed — `allow_mid_fallback=False`
+            # is the only mode this PR uses in any production call
+            # site. A missing cross_25 contributes a False to this
+            # event's flag list; per-trade dedup is NOT done here.
+            # The flags are reduced to one classification per event
+            # AFTER the loop (see "event-level scenario classification"
+            # block below). Codex P1 reproducer (multi-offset event
+            # with mixed coverage) is pinned by a test in
+            # tests/unit/test_web/test_calendar_dual_picker.py.
+            _scenario_value, _scenario_meta = candidate_return_for_gate(
+                outcome,
+                _GATE_SCENARIO_FOR_VISIBILITY,
+                allow_mid_fallback=False,
+            )
+            per_event_scenario_priced_flags.setdefault(event_key, []).append(
+                _scenario_value is not None
+            )
+            if _scenario_value is None:
+                # Reason breakdown is per-trade (we want to see, e.g.,
+                # "5 offsets failed because of NaN bid/ask" vs "2
+                # offsets failed because the candidate selection was
+                # skipped"). Event-level reduction below sums these
+                # into the n_events denominator, but the breakdown
+                # keeps trade-level granularity because that's the
+                # actionable diagnostic.
+                _reason = _scenario_meta.get("missing_reason") or "unknown"
+                scenario_missing_reason_counts[_reason] = (
+                    scenario_missing_reason_counts.get(_reason, 0) + 1
+                )
+            # `fallback_events` is intentionally NOT computed here.
+            # By construction every is_promotion_eligible(record)
+            # record carries a finite mid (check #5 of the existing
+            # gate), so `missing_scenario_events` would be identical
+            # to "events that would have been rescued by mid fallback."
+            # That makes a second `allow_mid_fallback=True` call
+            # redundant — and crucially, including such a call would
+            # violate the PR #66 invariant "no production call site
+            # passes allow_mid_fallback=True." A future gate-flip PR
+            # will bump `fallback_events` from its own code path
+            # (typically by recording fallback_used decisions through
+            # its own counter) at which point the field becomes
+            # non-zero through actual policy use, not aggregator
+            # speculation.
 
         # Outcome bucketing only applies when shadow logging actually ran.
         if status != "ok":
@@ -1285,6 +1367,35 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
     # becomes non-empty only when forward observations accumulate via
     # the live API path.
     promotion_eligible_summary = _summarize_event_level_pnls(promotion_eligible_event_pnls)
+
+    # PR #66 event-level scenario classification.
+    #
+    # Reduces per-event flag lists to one classification each. Rule:
+    # an event is "priced" if AT LEAST ONE of its eligible offsets
+    # had a finite cross_25; "missing" only if NO offset did. This
+    # matches the existing `promotion_eligible_event_pnls`
+    # convention (which averages over offsets so any single eligible
+    # offset gives the event a representative number), and keeps the
+    # invariant `scenario_priced_events + missing_scenario_events
+    # == n_events` true on every input shape including the
+    # multi-offset mixed-coverage case Codex flagged on PR #66
+    # first round.
+    #
+    # Stricter alternatives considered + rejected:
+    #   - "ALL offsets must price" — would understate execution
+    #     evidence for events where the chain has missing bid/ask
+    #     on some offsets but the simulator ran fine on others.
+    #   - "MAJORITY of offsets must price" — arbitrary threshold,
+    #     unstable under offset count changes.
+    # The "any priced" rule is the minimum useful coverage and is
+    # explicit in the test pinning this invariant.
+    scenario_priced_event_keys: set = set()
+    missing_scenario_event_keys: set = set()
+    for ev_key, flags in per_event_scenario_priced_flags.items():
+        if any(flags):
+            scenario_priced_event_keys.add(ev_key)
+        else:
+            missing_scenario_event_keys.add(ev_key)
 
     # Event-level outcome buckets. Conservative classification: an event
     # is in `both_succeeded` ONLY when every ok-status trade for that
@@ -1422,6 +1533,58 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
                 "averaging step. Document this when reporting."
             ),
             **promotion_eligible_summary,
+        },
+        # PR #66 visibility infrastructure. ADDITIVE — does NOT replace
+        # `promotion_eligible_candidate_stats` above. Answers the
+        # operational question "what fraction of promotion-eligible
+        # events have execution-cost-aware evidence (cross_25 priced)?"
+        # — the data needed to justify a future scenario-aware gate
+        # refactor.
+        #
+        # CRITICAL INVARIANTS pinned by tests (see PR #66):
+        #   * `n_events` == promotion_eligible_candidate_stats.n_events
+        #     (the existing mid-based eligibility check is the
+        #     denominator).
+        #   * `scenario_priced_events + missing_scenario_events
+        #     == n_events`.
+        #   * Missing cross_25 values are NEVER counted as priced via
+        #     mid — `allow_mid_fallback=False` is hardcoded at this
+        #     call site.
+        #   * `fallback_events` stays 0 in PR #66 (no production
+        #     caller enables the flag). A future gate-flip PR that
+        #     opts into `allow_mid_fallback=True` will bump this from
+        #     its own code path, making the substitution visible.
+        "promotion_eligible_execution_scenario_stats": {
+            "note": (
+                "Visibility-only block (PR #66). Reports how many "
+                "promotion-eligible events have execution-cost-aware "
+                "evidence (cross_25 priced) versus mid-only. Fail-"
+                "closed: missing cross_25 reduces scenario_priced_events "
+                "and is NEVER rescued by mid here. The current "
+                "promotion-eligibility gate still routes through "
+                "is_promotion_eligible(record), which is mid-based; "
+                "this block exists so a future scenario-aware gate "
+                "refactor can be justified by data showing what "
+                "fraction of forward observations would qualify."
+            ),
+            "scenario": _GATE_SCENARIO_FOR_VISIBILITY,
+            "n_events": int(len(promotion_eligible_event_pnls)),
+            "scenario_priced_events": int(len(scenario_priced_event_keys)),
+            "missing_scenario_events": int(len(missing_scenario_event_keys)),
+            # Stays 0 in PR #66 by construction. A future PR that
+            # flips a real gate caller to `allow_mid_fallback=True`
+            # will increment this from that caller's own counter.
+            "fallback_events": 0,
+            # Per-reason breakdown of why cross_25 was missing —
+            # operationally most useful diagnostic for whether the
+            # gap is "outcome.status not ok" (no candidate selection
+            # was made), "scenario_value_absent" (bid/ask missing in
+            # the chain), or something else. Keys are the
+            # `missing_reason` codes documented on
+            # candidate_return_for_gate.
+            "missing_reason_counts": {
+                k: int(v) for k, v in sorted(scenario_missing_reason_counts.items())
+            },
         },
         "diverged_sample": diverged_sample,
     }
