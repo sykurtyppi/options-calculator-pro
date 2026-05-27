@@ -32,6 +32,30 @@ def main() -> int:
     parser.add_argument("--structured-run-log", type=Path, default=None)
     parser.add_argument("--candidate-resolver-jsonl", type=Path, default=None)
     parser.add_argument("--candidate-resolver-log", type=Path, default=None)
+    # Ops-AE C1e (Codex P3 audit): the launchd plist's
+    # StartCalendarInterval is LOCAL time, but EvidenceHealthConfig's
+    # resolver_due_hour_utc / resolver_due_minute_utc are UTC. The
+    # defaults (12, 30) match the plist (Hour=12, Minute=30) only
+    # when the system local timezone IS UTC (e.g. Iceland year-round).
+    # Users in other tz must override here. See
+    # scripts/automation/README.md for the mapping table.
+    parser.add_argument(
+        "--resolver-due-hour-utc",
+        type=int,
+        default=None,
+        help=(
+            "UTC hour at which the candidate exit resolver launchd "
+            "job fires today. Defaults to 12. Override if your "
+            "system local timezone is not UTC; e.g. for US/Pacific "
+            "(PT = UTC-8) with launchd local 12:30, pass 20."
+        ),
+    )
+    parser.add_argument(
+        "--resolver-due-minute-utc",
+        type=int,
+        default=None,
+        help="UTC minute portion of the resolver due time. Defaults to 30.",
+    )
     parser.add_argument("--no-completion-log-required", action="store_true")
     args = parser.parse_args()
 
@@ -59,6 +83,16 @@ def main() -> int:
         max_candidate_resolver_run_age_hours=base.max_candidate_resolver_run_age_hours,
         max_candidate_awaiting_days=base.max_candidate_awaiting_days,
         require_completion_log=not args.no_completion_log_required,
+        resolver_due_hour_utc=(
+            args.resolver_due_hour_utc
+            if args.resolver_due_hour_utc is not None
+            else base.resolver_due_hour_utc
+        ),
+        resolver_due_minute_utc=(
+            args.resolver_due_minute_utc
+            if args.resolver_due_minute_utc is not None
+            else base.resolver_due_minute_utc
+        ),
     )
     payload = build_evidence_health_status(config=config, now=datetime.now().astimezone())
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))

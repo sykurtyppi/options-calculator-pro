@@ -714,6 +714,38 @@ def _candidate_resolver_log_summary(cfg: EvidenceHealthConfig, now: datetime) ->
                 "Inspect candidate_exit_resolver_launchd.log and candidate_exit_resolutions.jsonl for an unbucketed resolver outcome.",
             )
         )
+    # Ops-AE C1e (Codex P2 audit fix): the resolver CLI ALWAYS prints
+    # a `count_balance_holds: true|false` line in its summary block —
+    # see scripts/resolve_candidate_exits.py:_format_summary. If the
+    # launchd log shows a complete run with no parseable verdict,
+    # something is wrong: stdout was truncated, the CLI was modified,
+    # or the wrapper redirected output incorrectly. Absence of the
+    # invariant verdict is itself an operational anomaly that should
+    # alert.
+    #
+    # Conditions for the emission: the latest run completed (we have a
+    # `complete` marker) AND no count_balance_holds line was matched
+    # in the run's stdout. We don't emit when latest_complete is None
+    # because the "no completion marker" WARN already covers that
+    # case, and emitting both would be redundant noise.
+    if latest_complete is not None and count_balance_holds is None:
+        issues.append(
+            _issue(
+                "WARN",
+                "candidate_exit_resolver",
+                (
+                    "Candidate exit resolver completed without a parseable "
+                    "count_balance_holds verdict in the launchd log."
+                ),
+                (
+                    "Inspect candidate_exit_resolver_launchd.log near the "
+                    "latest 'complete' marker. The resolver CLI's summary "
+                    "block should always emit 'count_balance_holds: "
+                    "true|false'. Verify the wrapper script and CLI are "
+                    "unchanged."
+                ),
+            )
+        )
 
     return {
         "summary": {

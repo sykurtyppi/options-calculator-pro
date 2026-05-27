@@ -120,6 +120,25 @@ def main() -> int:
     parser.add_argument("--no-completion-log-required", action="store_true")
     parser.add_argument("--candidate-resolver-jsonl", type=Path, default=None)
     parser.add_argument("--candidate-resolver-log", type=Path, default=None)
+    # Ops-AE C1e (Codex P3 audit): see scripts/check_evidence_health.py
+    # for the rationale. launchd fires at LOCAL 12:30; the resolver
+    # due-window check uses UTC. Defaults work for UTC machines only.
+    parser.add_argument(
+        "--resolver-due-hour-utc",
+        type=int,
+        default=None,
+        help=(
+            "UTC hour at which the candidate exit resolver launchd "
+            "job fires today. Defaults to 12. Override if your "
+            "system local timezone is not UTC."
+        ),
+    )
+    parser.add_argument(
+        "--resolver-due-minute-utc",
+        type=int,
+        default=None,
+        help="UTC minute portion of the resolver due time. Defaults to 30.",
+    )
     parser.add_argument("--not-due-before-hour", type=int, default=22)
     parser.add_argument("--not-due-before-minute", type=int, default=15)
     parser.add_argument("--force-alert", action="store_true", help="Send even if this failure was already alerted.")
@@ -171,6 +190,16 @@ def main() -> int:
             expected_date=expected,
             candidate_resolver_jsonl=args.candidate_resolver_jsonl or resolver_base.candidate_resolver_jsonl,
             candidate_resolver_launchd_log_path=args.candidate_resolver_log or resolver_base.candidate_resolver_launchd_log_path,
+            resolver_due_hour_utc=(
+                args.resolver_due_hour_utc
+                if args.resolver_due_hour_utc is not None
+                else resolver_base.resolver_due_hour_utc
+            ),
+            resolver_due_minute_utc=(
+                args.resolver_due_minute_utc
+                if args.resolver_due_minute_utc is not None
+                else resolver_base.resolver_due_minute_utc
+            ),
             max_candidate_resolver_run_age_hours=resolver_base.max_candidate_resolver_run_age_hours,
             max_candidate_awaiting_days=resolver_base.max_candidate_awaiting_days,
         ),

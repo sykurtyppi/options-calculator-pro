@@ -714,6 +714,166 @@ def test_ops_ae_c1d_missing_log_after_due_window_is_alertable(
     assert "not due yet" not in missing_log_issues[0]["message"]
 
 
+def test_ops_ae_c1e_completed_run_without_count_balance_verdict_alerts(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (Codex Ops-AE C1d P2 audit): the resolver CLI ALWAYS
+    prints a ``count_balance_holds: true|false`` line in its summary
+    block. If the launchd log shows a completed run but no
+    parseable verdict, something is wrong: stdout was truncated,
+    the CLI was modified, or the wrapper redirected output
+    incorrectly.
+
+    Absence of the integrity invariant verdict is itself an
+    operational anomaly that MUST alert. Previously this passed
+    silently (count_balance_holds stayed None and the downstream
+    check only fired on explicit False).
+    """
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+
+    # Log shows start + complete markers but NO count_balance_holds
+    # line — the summary block was truncated or never written.
+    cfg.candidate_resolver_launchd_log_path.write_text(
+        "===== 2026-04-27T12:30:00Z candidate exit resolver start =====\n"
+        "PR-AE resolver run @ 2026-04-27T12:30:00+00:00 (now=2026-04-27)\n"
+        "  scanned:                   0 candidate rows from ledger\n"
+        # NOTE: no count_balance_holds line — the bug scenario.
+        "===== 2026-04-27T12:31:00Z candidate exit resolver complete =====\n",
+        encoding="utf-8",
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 22, 15, tzinfo=timezone.utc),
+    )
+
+    verdict_issues = [
+        issue for issue in status["issues"]
+        if issue["check"] == "candidate_exit_resolver"
+        and "count_balance_holds verdict" in issue["message"]
+    ]
+    assert len(verdict_issues) == 1, (
+        f"A completed resolver run without a count_balance_holds "
+        f"verdict must emit a WARN. Got: {[i['message'] for i in status['issues']]}"
+    )
+    # And it must be alertable (the integrity invariant is missing —
+    # operator should investigate, not just observe).
+    assert verdict_issues[0].get("alertable", True) is True
+    assert status["candidate_exit_resolver"]["count_balance_holds"] is None
+
+
+def test_ops_ae_c1e_completed_run_with_true_verdict_does_not_alert(
+    tmp_path: Path,
+) -> None:
+    """Positive companion: a normal completed run WITH a true
+    verdict must NOT trigger the new C1e missing-verdict alert."""
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    # Default _seed_ok_files writes a log with count_balance_holds: true.
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 22, 15, tzinfo=timezone.utc),
+    )
+
+    assert not any(
+        "count_balance_holds verdict" in issue["message"]
+        for issue in status["issues"]
+    )
+    assert status["candidate_exit_resolver"]["count_balance_holds"] is True
+
+
+def test_ops_ae_c1e_no_completion_marker_does_not_emit_verdict_warn(
+    tmp_path: Path,
+) -> None:
+    """When latest_complete is None (no completion marker at all),
+    the C1e missing-verdict WARN must NOT also fire — that case is
+    already covered by the existing "no completion marker" WARN
+    and emitting both would be redundant noise.
+
+    Plant a log with only a `start` marker (no `complete` marker
+    and no count_balance_holds line) and assert the C1e verdict
+    WARN does not fire.
+    """
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    cfg.candidate_resolver_launchd_log_path.write_text(
+        # No complete marker, no count_balance_holds — incomplete run.
+        "===== 2026-04-27T12:30:00Z candidate exit resolver start =====\n"
+        "PR-AE resolver run @ 2026-04-27T12:30:00+00:00 (now=2026-04-27)\n",
+        encoding="utf-8",
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 22, 15, tzinfo=timezone.utc),
+    )
+
+    # Existing "no completion marker" or similar WARN may fire, but
+    # the NEW C1e verdict-absence WARN must NOT (it's gated on
+    # latest_complete being non-None).
+    assert not any(
+        "count_balance_holds verdict" in issue["message"]
+        for issue in status["issues"]
+    )
+
+
+def test_ops_ae_c1e_resolver_due_window_respects_config_override(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (Codex Ops-AE C1d P3 audit): the launchd plist's
+    StartCalendarInterval is LOCAL time but
+    EvidenceHealthConfig.resolver_due_hour_utc is UTC. Defaults match
+    only on UTC machines. Users in other tz must override.
+
+    This test exercises the override path: a config set for US/Pacific
+    (12:30 PT == 20:30 UTC) correctly treats 19:00 UTC as "still
+    before due window" (it is, in PT terms: 11:00 local).
+    """
+    cfg_pst = EvidenceHealthConfig(
+        expected_date=date(2026, 4, 27),
+        report_dir=tmp_path / "reports" / "daily",
+        weekly_report_dir=tmp_path / "reports" / "weekly",
+        structured_run_log=tmp_path / "logs" / "evidence_cycle_runs.jsonl",
+        launchd_log_path=tmp_path / "logs" / "daily_evidence_cycle_launchd.log",
+        candidate_resolver_jsonl=tmp_path / "logs" / "candidate_exit_resolutions.jsonl",
+        candidate_resolver_launchd_log_path=tmp_path / "logs" / "candidate_exit_resolver_launchd.log",
+        ledger_path=tmp_path / "db" / "ledger.sqlite",
+        outcome_store_path=tmp_path / "db" / "outcomes.sqlite",
+        baseline_store_path=tmp_path / "db" / "baselines.sqlite",
+        telemetry_store_path=tmp_path / "db" / "telemetry.sqlite",
+        # US/Pacific PST: local 12:30 = UTC 20:30.
+        resolver_due_hour_utc=20,
+        resolver_due_minute_utc=30,
+    )
+    _seed_ok_files(cfg_pst)
+    cfg_pst.candidate_resolver_launchd_log_path.unlink()
+
+    # 19:00 UTC = 11:00 PST = before today's 12:30 PT fire.
+    # The override (20:30 UTC + 60min grace = 21:30 UTC) means now is
+    # BEFORE the due window, so missing log → alertable=False.
+    status = build_evidence_health_status(
+        config=cfg_pst,
+        now=datetime(2026, 4, 27, 19, 0, tzinfo=timezone.utc),
+    )
+
+    missing_log_issues = [
+        issue for issue in status["issues"]
+        if issue["check"] == "candidate_exit_resolver"
+        and "does not exist yet" in issue["message"]
+    ]
+    assert len(missing_log_issues) == 1
+    assert missing_log_issues[0].get("alertable") is False, (
+        "With PST-correct override (due_hour_utc=20), the resolver "
+        "should NOT be considered due yet at 19:00 UTC (= 11:00 PST). "
+        "Missing log → alertable=False. Without the override (default "
+        "due_hour_utc=12), the resolver would be considered due since "
+        "9:30 UTC, and missing log at 19:00 UTC would erroneously "
+        "be alertable."
+    )
+
+
 def test_ops_ae_c1d_existing_issue_dicts_default_alertable_true(tmp_path: Path) -> None:
     """The new `alertable` field on _issue() defaults to True so all
     existing issue-emission sites remain alertable without explicit
