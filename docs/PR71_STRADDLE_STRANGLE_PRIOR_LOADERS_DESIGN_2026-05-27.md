@@ -1,9 +1,19 @@
 # PR #71 Design Note — Straddle/Strangle Prior Loaders
 
-**Status**: Draft for review (no code yet).
+**Status**: Implemented as PR #71 + Codex P2 follow-up
+(`fix/trade-log-prior-loaders`). This document captures the
+design decisions made before the code landed; left in place as
+the durable rationale for the loader architecture.
 **Audit ref**: Calculations audit P1 #2 (multi-counting in
 `structure_scorecard._load_straddle_prior_from_reports` and the
 scoreboard-fallback path of `_load_strangle_prior_from_reports`).
+**Codex P2 follow-up**: every loader now scopes through
+`_latest_strangle_run_dir()` first, so the fallback chain
+(trade_log → scoreboard) operates within ONE point-in-time run
+snapshot. Pre-fix, a newer run with only a scoreboard could be
+silently bypassed in favor of an older run's trade log. The
+regression test `test_newer_run_without_trade_log_does_not_fall_back_to_older_trade_log`
+pins the fix.
 **Author**: Claude with verification by Codex.
 
 ---
@@ -304,4 +314,10 @@ source exists in production artifacts, the diff is bounded
 (~150 LOC + ~150 LOC of tests), and the fallback keeps
 back-compat in case of report-path edge cases.
 
-Awaiting Codex review of this design note before any code.
+**Implementation status**: shipped as PR #71 (`fix/trade-log-prior-loaders`).
+First Codex review found one real bug (P2 — stale-trade-log /
+newer-scoreboard mismatch from independent `_latest_report_file`
+calls); fix landed in the same branch with a dedicated regression
+test. Leave this document in `docs/` as the design rationale for
+future readers wondering why the loaders are scoped to
+`_latest_strangle_run_dir()`.

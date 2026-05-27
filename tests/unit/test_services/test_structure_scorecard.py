@@ -525,14 +525,27 @@ class TestPriorLoadersFromTradeLog(unittest.TestCase):
         # in, win_rate would be 7/11 or higher.
 
     def test_no_realized_count_weighting(self):
-        """Codex's specific concern: the trade-log loader must NOT
+        """Codex P1 concern: the trade-log loader must NOT
         re-introduce a weighting bias. Each physical trade gets
         equal weight, not weight-by-realized_count.
 
-        Fixture: 2 baseline trades (one winner, one loser) plus 50
-        non-baseline winners. If the loader weighted by some
-        per-row "count" field it would skew the win_rate; with
-        per-trade equal weight the answer is 1/2 = 0.50."""
+        Codex review of PR #71 first round asked for a stronger
+        version of this test: inject a fake ``realized_count``
+        column with EXTREME asymmetric values across winners vs
+        losers, and assert the loader ignores it. If the loader
+        ever accidentally re-introduces weighting (e.g., a future
+        refactor that reads from a more aggregated source), the
+        weighted win_rate would diverge sharply from the
+        trade-level win_rate.
+
+        Fixture:
+          - 1 baseline WINNER with realized_count = 1 (tight filter)
+          - 1 baseline LOSER  with realized_count = 999 (loose filter)
+          A weighted-by-realized_count win_rate would be ≈ 0.001
+          (1 / (1+999)). The trade-level (correct) answer is 0.50.
+          The assertion at 0.50 catches any drift toward the
+          weighted value.
+        """
         from services.structure_scorecard import _load_prior_from_trade_log
         import tempfile
         from pathlib import Path
@@ -541,13 +554,25 @@ class TestPriorLoadersFromTradeLog(unittest.TestCase):
                 "services.structure_scorecard.REPORTS_ROOT", Path(tmp),
             ):
                 rows = [
-                    self._baseline_row(pnl_cross_25=1.0, return_cross_25_pct=5.0),
-                    self._baseline_row(pnl_cross_25=-1.0, return_cross_25_pct=-5.0),
+                    # WINNER with low scoreboard-style realized_count
+                    self._baseline_row(
+                        pnl_cross_25=1.0, return_cross_25_pct=5.0,
+                        realized_count=1,  # would be weighted low
+                    ),
+                    # LOSER with very high realized_count — if a
+                    # future refactor weighted by this column, the
+                    # win_rate would collapse to ~0.
+                    self._baseline_row(
+                        pnl_cross_25=-1.0, return_cross_25_pct=-5.0,
+                        realized_count=999,  # would be weighted high
+                    ),
                 ]
-                # 50 winners but at wrong offsets — must NOT count.
+                # Plus 50 winners at wrong offsets — must NOT count,
+                # regardless of any realized_count or weighting bug.
                 rows.extend([
                     self._baseline_row(
-                        entry_offset_bdays=2, pnl_cross_25=99.0, return_cross_25_pct=99.0,
+                        entry_offset_bdays=2, pnl_cross_25=99.0,
+                        return_cross_25_pct=99.0, realized_count=10000,
                     )
                     for _ in range(50)
                 ])
@@ -557,6 +582,9 @@ class TestPriorLoadersFromTradeLog(unittest.TestCase):
                     prior_structure_label="atm_straddle",
                 )
         self.assertIsNotNone(prior)
+        # 2 baseline trades, equal weight → 1 winner of 2 = 0.50.
+        # If realized_count weighting leaked back in, this would
+        # be ~0.001 instead.
         self.assertEqual(prior.history_count, 2)
         self.assertAlmostEqual(prior.win_rate, 0.50, places=10)
 
@@ -699,6 +727,86 @@ class TestPriorLoadersFromTradeLog(unittest.TestCase):
         self.assertNotIn("legacy_scoreboard_fallback", prior.source)
         self.assertEqual(prior.history_count, 42)
         self.assertAlmostEqual(prior.win_rate, 0.6905, places=4)
+
+    def test_newer_run_without_trade_log_does_not_fall_back_to_older_trade_log(self):
+        """Codex P2 regression on PR #71 first review.
+
+        Pre-fix bug: ``_load_prior_from_trade_log`` called
+        ``_latest_report_file("...trade_log.csv")`` — which returns
+        the latest file matching the glob across ALL run
+        directories. If a newer run had a scoreboard but no trade
+        log, the straddle loader silently used the OLDER run's
+        trade log instead of the newer run's scoreboard.
+
+        Codex's exact repro: older run with trade log, newer run
+        with scoreboard only. The loader should prefer the newer
+        run (scoreboard fallback inside it) — NOT pick a stale
+        trade log from a different point in time.
+
+        Fix: every loader now scopes through
+        ``_latest_strangle_run_dir()`` first, so the fallback chain
+        operates within a single run snapshot.
+
+        This test pins the contract by name AND by source label —
+        the post-fix loader must report
+        ``legacy_scoreboard_fallback`` for the NEWER run, not
+        ``trade_log:baseline`` for the older one.
+        """
+        from services.structure_scorecard import _load_straddle_prior_from_reports
+        import pandas as pd
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "services.structure_scorecard.REPORTS_ROOT", Path(tmp),
+            ):
+                # OLDER run — has trade log only.
+                older_dir = Path(tmp) / "pre_earnings_otm_strangle_20260101T000000Z"
+                older_dir.mkdir()
+                self._write_trade_log_fixture(Path(tmp), [
+                    self._baseline_row(pnl_cross_25=1.0, return_cross_25_pct=5.0),
+                    self._baseline_row(pnl_cross_25=2.0, return_cross_25_pct=10.0),
+                ], suffix="20260101T000000Z")
+
+                # NEWER run — has scoreboard, no trade log.
+                newer_dir = Path(tmp) / "pre_earnings_otm_strangle_20260201T000000Z"
+                newer_dir.mkdir()
+                pd.DataFrame([{
+                    "structure": "atm_straddle",
+                    "execution_scenario": "cross_25",
+                    "realized_count": 20,
+                    "win_rate": 0.42,
+                    "avg_pnl_per_trade": -1.0,
+                }]).to_csv(
+                    newer_dir / "pre_earnings_otm_strangle_scoreboard.csv",
+                    index=False,
+                )
+
+                prior = _load_straddle_prior_from_reports()
+
+        # The loader must have picked the NEWER run, not the older
+        # trade log. Source label proves which path fired AND which
+        # run dir was scoped.
+        self.assertIn(
+            "20260201T000000Z", prior.source,
+            f"loader must scope to the newer run; got source: {prior.source}",
+        )
+        self.assertIn(
+            "legacy_scoreboard_fallback", prior.source,
+            "newer run has only a scoreboard, so the fallback must "
+            "be the scoreboard-legacy path inside that run.",
+        )
+        self.assertNotIn(
+            "20260101T000000Z", prior.source,
+            "older run's trade log MUST NOT leak in as a substitute "
+            "for the newer run's missing trade log.",
+        )
+        self.assertNotIn(
+            "trade_log", prior.source,
+            "newer run has no trade log; the trade_log path must "
+            "not fire.",
+        )
 
     def test_live_trade_log_has_required_schema_columns(self):
         """Schema-stability guard (Codex correction: column

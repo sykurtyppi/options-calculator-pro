@@ -877,6 +877,31 @@ _TRADE_LOG_REQUIRED_COLUMNS = (
 )
 
 
+def _latest_strangle_run_dir() -> Optional[Path]:
+    """Return the latest ``pre_earnings_otm_strangle_*`` run
+    directory under REPORTS_ROOT, or None if no run exists.
+
+    Codex P2 fix on PR #71 first review: prior loaders independently
+    selected the "latest" trade_log / scoreboard / summary file
+    across ALL run directories via separate ``_latest_report_file``
+    calls. That meant a newer run with only a scoreboard (no trade
+    log) could be silently bypassed in favor of an OLDER run's trade
+    log — the fallback was scoped to "latest file matching a glob,"
+    not "latest run that has any of these files." This helper anchors
+    every loader to the SAME run directory so the fallback chain
+    (trade_log → scoreboard) operates within one consistent
+    point-in-time snapshot.
+
+    Listing convention: sorted lexicographically. Run-directory
+    names embed an ISO timestamp (``pre_earnings_otm_strangle_20260417T180430Z``),
+    so lexicographic == chronological. Directories only — a stray
+    file matching the glob would otherwise sort into the result.
+    """
+    matches = sorted(REPORTS_ROOT.glob("pre_earnings_otm_strangle_*"))
+    matches = [m for m in matches if m.is_dir()]
+    return matches[-1] if matches else None
+
+
 def _load_prior_from_trade_log(
     *,
     structure_kind: str,           # value in trade_log.structure column
@@ -901,11 +926,17 @@ def _load_prior_from_trade_log(
     Codex P1 fix on PR #71: replaces the
     ``realized_count``-weighted scoreboard aggregation that
     multi-counted overlapping filter rows.
+
+    Codex P2 fix on PR #71 first review: scoped to the latest
+    run directory rather than "latest trade_log.csv anywhere." A
+    newer run that has only a scoreboard no longer gets silently
+    bypassed in favor of an older run's trade log.
     """
-    path = _latest_report_file(
-        "pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_trade_log.csv"
-    )
-    if path is None:
+    run_dir = _latest_strangle_run_dir()
+    if run_dir is None:
+        return None
+    path = run_dir / "pre_earnings_otm_strangle_trade_log.csv"
+    if not path.exists():
         return None
 
     try:
@@ -964,11 +995,17 @@ def _load_straddle_prior_from_scoreboard_legacy() -> WalkForwardPrior:
     fires.
 
     This is the pre-PR #71 implementation of
-    ``_load_straddle_prior_from_reports``, unchanged except for the
-    source-label suffix.
+    ``_load_straddle_prior_from_reports``, modulo two changes:
+    the source-label suffix flags the contaminated path, and the
+    file lookup is scoped to ``_latest_strangle_run_dir()`` (Codex
+    P2 follow-up) so the scoreboard belongs to the same point-in-
+    time run as whichever primary path was checked first.
     """
-    path = _latest_report_file("pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_scoreboard.csv")
-    if path is None:
+    run_dir = _latest_strangle_run_dir()
+    if run_dir is None:
+        return _neutral_prior("atm_straddle", source="neutral_missing_strangle_report")
+    path = run_dir / "pre_earnings_otm_strangle_scoreboard.csv"
+    if not path.exists():
         return _neutral_prior("atm_straddle", source="neutral_missing_strangle_report")
 
     frame = pd.read_csv(path)
@@ -1025,9 +1062,17 @@ def _load_strangle_prior_from_summary_baseline() -> Optional[WalkForwardPrior]:
     Returns ``None`` when the summary file is absent or has no
     matching baseline row, so the caller can fall through to the
     trade-log secondary path.
+
+    Codex P2 follow-up: scoped to ``_latest_strangle_run_dir()``
+    rather than "latest summary.json anywhere" so all three
+    fallback layers (summary / trade_log / scoreboard) operate
+    inside the same point-in-time run snapshot.
     """
-    summary_path = _latest_report_file("pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_summary.json")
-    if summary_path is None:
+    run_dir = _latest_strangle_run_dir()
+    if run_dir is None:
+        return None
+    summary_path = run_dir / "pre_earnings_otm_strangle_summary.json"
+    if not summary_path.exists():
         return None
     import json
 
@@ -1070,9 +1115,15 @@ def _load_strangle_prior_from_scoreboard_legacy() -> WalkForwardPrior:
     path; now it's a last-resort fallback with the
     ``legacy_scoreboard_fallback`` source label so a downstream
     consumer can detect when the contaminated path fires.
+
+    Codex P2 follow-up: scoped to ``_latest_strangle_run_dir()`` —
+    same reasoning as the straddle scoreboard-legacy variant above.
     """
-    path = _latest_report_file("pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_scoreboard.csv")
-    if path is None:
+    run_dir = _latest_strangle_run_dir()
+    if run_dir is None:
+        return _neutral_prior("otm_strangle", source="neutral_missing_strangle_report")
+    path = run_dir / "pre_earnings_otm_strangle_scoreboard.csv"
+    if not path.exists():
         return _neutral_prior("otm_strangle", source="neutral_missing_strangle_report")
 
     frame = pd.read_csv(path)
