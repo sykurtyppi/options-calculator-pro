@@ -32,6 +32,8 @@ from web.api.edge_engine import (
     _empty_candidate_shadow_outcome,
     _empty_dual_picker,
     _simulate_candidate_shadow_outcome,
+    is_promotion_eligible,
+    tag_live_forward_observation,
 )
 
 # Canonical dual_picker key set — every code path that produces a
@@ -737,7 +739,7 @@ class TestCandidateShadowOutcomeHappyPath:
         assert result["entry_debit_mid"] == pytest.approx(1.0)
         assert result["exit_value_mid"] == pytest.approx(1.3)
         assert result["mid_pnl"] == pytest.approx(0.3)
-        assert result["realized_return_pct"] == pytest.approx(30.0)
+        assert result["mid_realized_return_pct"] == pytest.approx(30.0)
         # IV change is exit - entry (front crushed -10pp, back -5pp)
         assert result["iv_change_front"] == pytest.approx(-0.10)
         assert result["iv_change_back"] == pytest.approx(-0.05)
@@ -1052,7 +1054,7 @@ class TestCandidateOutcomeIndependentOfLegacy:
         )
         # Candidate resolves cleanly despite legacy being unresolvable
         assert result["status"] == "ok"
-        assert result["realized_return_pct"] == pytest.approx(30.0)
+        assert result["mid_realized_return_pct"] == pytest.approx(30.0)
 
 
 class TestCandidateOutcomeExpiryFormatRobustness:
@@ -1112,5 +1114,207 @@ class TestCandidateOutcomeExpiryFormatRobustness:
             entry_chain=pd.DataFrame(), exit_chain=pd.DataFrame(), dual_picker=dp,
         )
         assert result["status"] == "skipped:bad_expiry_parse"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR-AD commit 1c — Codex round-2 hardening
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestIsPromotionEligible:
+    """Codex P1 + 'fail closed on UNKNOWN': the single source of truth
+    for which records count toward promotion. Aggregators MUST route
+    through this helper rather than open-coding the check."""
+
+    def test_forward_post_freeze_is_eligible(self):
+        record = {"sample_provenance": SAMPLE_PROVENANCE_FORWARD_POST_FREEZE}
+        assert is_promotion_eligible(record) is True
+
+    def test_preregistered_holdout_is_eligible(self):
+        record = {"sample_provenance": SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED}
+        assert is_promotion_eligible(record) is True
+
+    def test_historical_replay_is_never_eligible(self):
+        """The single most important assertion in PR-AD: historical
+        replay output cannot become promotion-eligible no matter what."""
+        record = {"sample_provenance": SAMPLE_PROVENANCE_HISTORICAL_REPLAY}
+        assert is_promotion_eligible(record) is False
+
+    def test_unknown_is_never_eligible(self):
+        record = {"sample_provenance": SAMPLE_PROVENANCE_UNKNOWN}
+        assert is_promotion_eligible(record) is False
+
+    def test_missing_key_fails_closed(self):
+        record = {"symbol": "AAPL"}  # no sample_provenance key at all
+        assert is_promotion_eligible(record) is False
+
+    def test_none_value_fails_closed(self):
+        record = {"sample_provenance": None}
+        assert is_promotion_eligible(record) is False
+
+    def test_arbitrary_string_fails_closed(self):
+        """Defense against typos / drift: only the canonical promotion-
+        eligible constants count. A clever string can't slip through."""
+        for s in ("forward", "forward_post_pr_ad", "promotion_eligible_pls",
+                  "out_of_sample", "validated", ""):
+            record = {"sample_provenance": s}
+            assert is_promotion_eligible(record) is False, (
+                f"non-canonical string {s!r} should not be promotion-eligible"
+            )
+
+    def test_non_dict_input_fails_closed(self):
+        """Defensive: arbitrary inputs do not crash the helper."""
+        assert is_promotion_eligible(None) is False
+        assert is_promotion_eligible("string") is False
+        assert is_promotion_eligible([]) is False
+
+
+class TestTagLiveForwardObservation:
+    """tag_live_forward_observation is the SINGLE function authorized to
+    assign SAMPLE_PROVENANCE_FORWARD_POST_FREEZE. The regression test
+    further down (TestForwardProvenanceAssignmentBoundary) enforces
+    that no other code path writes the constant."""
+
+    def test_assigns_forward_post_freeze(self):
+        record = {"symbol": "AAPL"}
+        tag_live_forward_observation(record)
+        assert record["sample_provenance"] == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+        assert is_promotion_eligible(record) is True
+
+    def test_overwrites_existing_provenance(self):
+        """If the record was previously tagged UNKNOWN/HISTORICAL by
+        default initialization, calling the live-forward tagger replaces
+        it. This is the intended behavior — the live API path knows it
+        is producing forward observations regardless of the default."""
+        record = {"sample_provenance": SAMPLE_PROVENANCE_UNKNOWN}
+        tag_live_forward_observation(record)
+        assert record["sample_provenance"] == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+
+    def test_returns_the_same_record_for_chaining(self):
+        record = {"symbol": "AAPL"}
+        result = tag_live_forward_observation(record)
+        assert result is record  # mutated in-place
+
+
+class TestForwardProvenanceAssignmentBoundary:
+    """Codex's defense-in-depth requirement: 'forward provenance must
+    be assigned only by the live evidence-cycle path, not by a generic
+    script flag anyone can pass casually.'
+
+    Source-grep regression: the string value of
+    SAMPLE_PROVENANCE_FORWARD_POST_FREEZE may appear in the codebase
+    ONLY in three legitimate sites:
+      1. The constant definition itself
+      2. The body of tag_live_forward_observation
+      3. The PROMOTION_ELIGIBLE_PROVENANCES set definition
+    Anywhere else is a research-leakage hazard."""
+
+    def test_forward_post_freeze_string_assignment_sites_are_audited(self):
+        """Scan the production source tree (services/ + web/) for any
+        line that assigns the string literal "forward_post_freeze".
+        Allowlist the legitimate definition sites; flag anything else."""
+        import re
+        import pathlib
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        # Production code only — tests legitimately reference the
+        # string for testing purposes.
+        prod_dirs = [repo_root / "services", repo_root / "web", repo_root / "scripts"]
+        suspect_lines: list[str] = []
+        pattern = re.compile(r'"forward_post_freeze"|\'forward_post_freeze\'')
+        for d in prod_dirs:
+            if not d.exists():
+                continue
+            for py_file in d.rglob("*.py"):
+                with open(py_file) as f:
+                    for lineno, line in enumerate(f, 1):
+                        if pattern.search(line):
+                            rel = py_file.relative_to(repo_root)
+                            suspect_lines.append(f"{rel}:{lineno}: {line.strip()}")
+
+        # Allowlist: legitimate occurrences in edge_engine.py only.
+        # All matches MUST be in that file. If a match shows up in
+        # scripts/ or services/ (other than edge_engine), that's the
+        # leakage hazard Codex warned about.
+        non_edge_engine = [
+            s for s in suspect_lines
+            if "web/api/edge_engine.py" not in s
+        ]
+        assert non_edge_engine == [], (
+            "forward_post_freeze string assignment leaked outside the "
+            "edge_engine.py file. Only tag_live_forward_observation is "
+            "authorized to assign this value. Found:\n  "
+            + "\n  ".join(non_edge_engine)
+        )
+
+
+class TestHistoricalReplayCannotBecomePromotionEligible:
+    """Codex's hard requirement: 'historical replay candidate outcomes
+    are never promotion-eligible.' Tested at the simulator output level
+    so a future change to _simulate_pre_earnings_calendar_trade can't
+    accidentally tag its output with a promotion-eligible provenance."""
+
+    def test_simulator_record_base_is_historical_replay(self):
+        """The `base` dict produced inside _simulate_pre_earnings_
+        calendar_trade carries HISTORICAL_REPLAY. Any record that flows
+        from it inherits the tag."""
+        # We can verify this by reading the source — the tag is hardcoded
+        # in the `base` dict construction. The test asserts that the
+        # canonical value (read from the module) is what's referenced.
+        import inspect
+        from web.api import edge_engine
+        src = inspect.getsource(edge_engine._simulate_pre_earnings_calendar_trade)
+        # The `base` dict must assign SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+        # not the forward variant.
+        assert "SAMPLE_PROVENANCE_HISTORICAL_REPLAY" in src
+        assert "SAMPLE_PROVENANCE_FORWARD_POST_FREEZE" not in src, (
+            "_simulate_pre_earnings_calendar_trade must NOT reference the "
+            "forward provenance constant — historical replay is in-sample"
+        )
+
+    def test_promotion_eligible_set_invariant_holds(self):
+        """Even if someone refactors the simulator, the promotion-
+        eligible set MUST NOT include HISTORICAL_REPLAY. This is the
+        first line of defense against any leakage attempt."""
+        # Construct a record the way the simulator would
+        record = {"sample_provenance": SAMPLE_PROVENANCE_HISTORICAL_REPLAY}
+        assert is_promotion_eligible(record) is False
+        # And the converse: no historical_replay should ever appear in
+        # the promotion-eligible set
+        assert SAMPLE_PROVENANCE_HISTORICAL_REPLAY not in PROMOTION_ELIGIBLE_PROVENANCES
+
+
+class TestPricingGradeNaming:
+    """Codex: 'all candidate outcome returns are named/labeled as
+    mid/research returns.' Field names embed the pricing grade so
+    downstream aggregators cannot quietly relabel them as execution
+    returns."""
+
+    def test_return_field_is_named_mid_realized(self):
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        # New name present
+        assert "mid_realized_return_pct" in result
+        # Old name absent — no silent dual-naming
+        assert "realized_return_pct" not in result
+
+    def test_pnl_and_value_fields_carry_mid_qualifier(self):
+        """Adjacent monetary fields also embed the pricing grade in
+        their names — entry_debit_mid, exit_value_mid, mid_pnl. None
+        of them should be called the bare `return` or `pnl`."""
+        block = _empty_candidate_shadow_outcome("skipped:test")
+        assert "entry_debit_mid" in block
+        assert "exit_value_mid" in block
+        assert "mid_pnl" in block
+        assert "pnl" not in block  # the bare name is a research-leakage
+                                    # hazard if used in promotion stats
 
 
