@@ -2000,6 +2000,83 @@ class TestPRSixtySixScenarioVisibilityBlock:
         sc = result["promotion_eligible_execution_scenario_stats"]
         assert sc["n_events"] == pe["n_events"] == 2
 
+    def test_multi_offset_event_with_mixed_coverage_counts_once(self):
+        """Codex P1 regression on PR #66 first round.
+
+        The same earnings event evaluated at N entry offsets must
+        classify EXACTLY ONCE in the visibility block. Before the
+        fix, a single event with one offset pricing cross_25 and a
+        different offset missing cross_25 would land in BOTH the
+        priced and missing sets — breaking the invariant
+        ``priced + missing == n_events`` and double-counting the
+        same event on both sides.
+
+        The fix collects per-event scenario flags during the trade
+        loop and reduces to one classification per event after.
+        The rule: priced if AT LEAST ONE offset has finite cross_25;
+        missing only if NO offset has it. This matches the
+        ``promotion_eligible_event_pnls`` convention (any single
+        eligible offset gives the event a representative number).
+
+        Reproducer below mirrors Codex's repro: same AAPL event,
+        two offsets, mixed coverage.
+        """
+        priced_offset = _forward_eligible_trade_with_scenario(
+            mid=10.0, cross_25=6.0,
+            symbol="AAPL", event_date="2026-06-01",
+            entry_date="2026-05-29",
+        )
+        missing_offset = _forward_eligible_trade_with_scenario(
+            mid=10.0, cross_25=None,
+            symbol="AAPL", event_date="2026-06-01",  # SAME event
+            entry_date="2026-05-15",                  # different offset
+        )
+        result = _aggregate_experimental_candidate_evidence(
+            [priced_offset, missing_offset]
+        )
+        sc = result["promotion_eligible_execution_scenario_stats"]
+        # The single event must classify exactly once.
+        assert sc["n_events"] == 1, (
+            f"Two offsets of the same event must dedup to one event, "
+            f"got n_events={sc['n_events']}."
+        )
+        # "Any priced offset → event priced" rule.
+        assert sc["scenario_priced_events"] == 1
+        assert sc["missing_scenario_events"] == 0
+        # The load-bearing invariant Codex's repro broke pre-fix.
+        assert (
+            sc["scenario_priced_events"] + sc["missing_scenario_events"]
+            == sc["n_events"]
+        )
+
+    def test_multi_offset_event_with_all_missing_classifies_as_missing(self):
+        """Companion to the mixed-coverage test: an event whose
+        EVERY offset is missing cross_25 classifies as missing
+        exactly once. Pinned because the "any priced" rule's
+        boundary case is the all-missing event, and the
+        classification must remain unambiguous."""
+        first_offset = _forward_eligible_trade_with_scenario(
+            mid=10.0, cross_25=None,
+            symbol="AAPL", event_date="2026-06-01",
+            entry_date="2026-05-29",
+        )
+        second_offset = _forward_eligible_trade_with_scenario(
+            mid=10.0, cross_25=None,
+            symbol="AAPL", event_date="2026-06-01",
+            entry_date="2026-05-15",
+        )
+        result = _aggregate_experimental_candidate_evidence(
+            [first_offset, second_offset]
+        )
+        sc = result["promotion_eligible_execution_scenario_stats"]
+        assert sc["n_events"] == 1
+        assert sc["scenario_priced_events"] == 0
+        assert sc["missing_scenario_events"] == 1
+        assert (
+            sc["scenario_priced_events"] + sc["missing_scenario_events"]
+            == sc["n_events"]
+        )
+
     def test_split_priced_vs_missing_sums_to_total(self):
         """scenario_priced_events + missing_scenario_events == n_events
         on every input. Pinned because a future change that adds a

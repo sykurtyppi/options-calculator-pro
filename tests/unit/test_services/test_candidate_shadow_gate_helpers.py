@@ -164,14 +164,17 @@ def test_strict_mode_returns_none_when_outcome_is_not_dict() -> None:
 
 
 def test_strict_mode_returns_none_when_scenario_label_unknown() -> None:
-    """A typo'd or future scenario label resolves to
-    scenario_value_absent — visible enough that a downstream
-    consumer can see "this scenario name didn't match anything"
-    rather than silently no-op."""
+    """Codex P2 (PR #66): a typo'd or future scenario label that is
+    NOT in SCENARIO_LEVELS or _SCENARIO_ALIASES resolves to
+    ``unknown_scenario_label`` — distinct from ``scenario_value_absent``,
+    which is reserved for the case where the label IS recognized but
+    its value is missing from the specific outcome dict. The
+    distinction matters for the fallback contract (see the next
+    test): unknown labels must NEVER fall back to mid."""
     outcome = _ok_outcome()
     value, meta = candidate_return_for_gate(outcome, "cross_99")
     assert value is None
-    assert meta["missing_reason"] == "scenario_value_absent"
+    assert meta["missing_reason"] == "unknown_scenario_label"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -209,6 +212,34 @@ def test_fallback_does_not_fire_when_scenario_actually_priced() -> None:
     assert meta["scenario_used"] == "cross_25"
     assert meta["fallback_used"] is False
     assert meta["missing_reason"] is None
+
+
+def test_fallback_does_not_rescue_unknown_scenario_labels() -> None:
+    """Codex P2 regression on PR #66: a typo'd scenario label
+    (``cross_99``) with ``allow_mid_fallback=True`` MUST still fail
+    closed. The dangerous prior behavior was returning the mid value
+    with ``fallback_used=True`` — i.e. a misspelled execution scenario
+    would silently become research-mid evidence.
+
+    The fix is to validate the requested label against
+    ``SCENARIO_LEVELS + _SCENARIO_ALIASES`` BEFORE entering the
+    fallback path. Unknown labels return ``(None, meta)`` with
+    ``missing_reason=\"unknown_scenario_label\"`` regardless of the
+    fallback flag.
+    """
+    outcome = _ok_outcome(mid=12.5)
+    value, meta = candidate_return_for_gate(
+        outcome, "cross_99", allow_mid_fallback=True,
+    )
+    assert value is None, (
+        "Unknown scenario label must NEVER be rescued by mid "
+        "fallback — that would let typos in gate configuration "
+        "silently re-introduce research-mid evidence into "
+        "execution-aware gates."
+    )
+    assert meta["missing_reason"] == "unknown_scenario_label"
+    assert meta["scenario_used"] is None
+    assert meta["fallback_used"] is False
 
 
 def test_fallback_returns_none_when_mid_also_unusable() -> None:

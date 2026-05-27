@@ -299,6 +299,22 @@ def _canonical_scenario_label(scenario: str) -> str:
     return _SCENARIO_ALIASES.get(scenario, scenario)
 
 
+def _known_scenario_labels() -> set[str]:
+    """Return the set of canonical + alias scenario labels recognized
+    by `candidate_return_for_gate`.
+
+    Lazy import of execution_scenarios at call time avoids a circular
+    import (candidate_shadow_outcome imports both modules; if
+    candidate_shadow_provenance imports execution_scenarios at module
+    top, the cycle becomes provenance → scenarios → ... → provenance
+    on a future addition). Function-local import is the convention
+    used elsewhere in this module — see `_empty_scenario_block`.
+    """
+    from services.execution_scenarios import SCENARIO_LEVELS
+    canonical = {name for name, _distance in SCENARIO_LEVELS}
+    return canonical | set(_SCENARIO_ALIASES.keys())
+
+
 def candidate_return_for_gate(
     outcome: Optional[Dict[str, Any]],
     scenario: str,
@@ -330,28 +346,45 @@ def candidate_return_for_gate(
 
         Missing reasons (failure-only):
 
-          - ``outcome_not_dict``      outcome arg was not a dict
-          - ``outcome_status_not_ok`` outcome.status != "ok"
-          - ``scenario_block_missing`` execution_scenario_returns_pct
-                                      key absent from the outcome
-          - ``scenario_value_absent`` requested scenario not in the
-                                      block (caller used a label not
-                                      in SCENARIO_LEVELS)
+          - ``outcome_not_dict``        outcome arg was not a dict
+          - ``outcome_status_not_ok``   outcome.status != "ok"
+          - ``unknown_scenario_label``  requested scenario is not in
+                                        SCENARIO_LEVELS or
+                                        _SCENARIO_ALIASES — a typo or
+                                        a future label the simulator
+                                        doesn't yet emit. Fails closed
+                                        EVEN IF ``allow_mid_fallback=
+                                        True`` is passed.
+          - ``scenario_block_missing``  execution_scenario_returns_pct
+                                        key absent from the outcome
+                                        (legacy outcome shape pre-
+                                        PR #64). Falls back to mid
+                                        when opted in.
+          - ``scenario_value_absent``   recognized scenario, but key
+                                        not present in the outcome's
+                                        block (simulator emitted a
+                                        partial block — should be
+                                        rare). Falls back when opted
+                                        in.
           - ``scenario_value_not_finite`` value present but NaN / inf
-                                          / non-numeric / bool
+                                          / non-numeric / bool. Falls
+                                          back when opted in.
 
     Fail-closed by default. ``allow_mid_fallback=False`` is the only
     behavior any current production caller uses (PR #66 ships no
     call site that flips this).
 
-    When ``allow_mid_fallback=True`` and the requested scenario is
-    missing-but-the-outcome-is-ok, this falls back to
-    ``mid_realized_return_pct`` on the outcome and stamps
+    Codex P2 on PR #66 first round: unknown scenario labels must
+    NEVER fall back to mid even when the caller opts into fallback.
+    A typo like ``cross_99`` should be a loud failure, not a silent
+    mid substitution. The ``unknown_scenario_label`` branch enforces
+    this — fallback skipped, helper returns ``(None, metadata)``.
+
+    When ``allow_mid_fallback=True`` AND the scenario label is
+    KNOWN but its value is missing or non-finite, this falls back
+    to ``mid_realized_return_pct`` on the outcome and stamps
     ``fallback_used=True`` + ``scenario_used="mid"`` so downstream
-    aggregators can count the substitution. This is the contract
-    that lets a future gate refactor flip to scenario-aware gating
-    while keeping a visible audit trail of how often missing-quote
-    coverage drives the fallback path.
+    aggregators can count the substitution.
     """
     canonical = _canonical_scenario_label(scenario)
 
@@ -367,6 +400,16 @@ def candidate_return_for_gate(
         return None, meta
     if outcome.get("status") != "ok":
         meta["missing_reason"] = "outcome_status_not_ok"
+        return None, meta
+
+    # Codex P2 (PR #66): validate the scenario label BEFORE inspecting
+    # the outcome's scenario block. Unknown labels (typos like
+    # "cross_99", or a future scenario the simulator doesn't yet
+    # emit) MUST fail closed even when fallback is opted in —
+    # otherwise a misspelled execution scenario silently becomes mid
+    # and the call site has no signal that anything went wrong.
+    if scenario not in _known_scenario_labels():
+        meta["missing_reason"] = "unknown_scenario_label"
         return None, meta
 
     scenario_block = outcome.get("execution_scenario_returns_pct")

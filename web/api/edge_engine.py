@@ -1125,8 +1125,20 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
     # surface in the daily diagnostic output. Until then, the count
     # stays at 0 by construction.
     _GATE_SCENARIO_FOR_VISIBILITY = "cross_25"
-    scenario_priced_event_keys: set = set()
-    missing_scenario_event_keys: set = set()
+    # Per-event scenario observations. We collect one bool per
+    # (eligible offset, event) — True iff cross_25 was priced for
+    # that offset — then reduce to one classification per event
+    # after the trade loop. Doing the classification per trade
+    # (instead of per event) caused a Codex P1 on PR #66 first
+    # round: a single earnings event evaluated at N entry offsets
+    # could land in BOTH the priced and missing sets simultaneously
+    # if any offset had bid/ask coverage and any other didn't —
+    # breaking the documented invariant
+    # `scenario_priced_events + missing_scenario_events == n_events`.
+    # The fix moves classification to event-level reduction with
+    # the "any priced offset → event priced" rule (see comment
+    # below the loop).
+    per_event_scenario_priced_flags: Dict[Any, List[bool]] = {}
     scenario_missing_reason_counts: Dict[str, int] = {}
 
     # Event-level (deduplicated on (symbol, event_date))
@@ -1211,24 +1223,32 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
             )
 
             # PR #66 visibility: among the promotion-eligible records,
-            # classify each by whether the gate-baseline scenario
-            # (cross_25 today) was actually priced. Fail-closed —
-            # `allow_mid_fallback=False` (the only mode this PR ships
-            # in any production call site). A missing cross_25 reduces
-            # `scenario_priced_events` and increments
-            # `missing_scenario_events`; it CANNOT be silently
-            # rescued by mid here. Event-level dedup (a single event
-            # at multiple offsets counts once) is consistent with how
-            # `promotion_eligible_event_pnls` dedups above.
+            # observe whether the gate-baseline scenario (cross_25
+            # today) was priced. Fail-closed — `allow_mid_fallback=False`
+            # is the only mode this PR uses in any production call
+            # site. A missing cross_25 contributes a False to this
+            # event's flag list; per-trade dedup is NOT done here.
+            # The flags are reduced to one classification per event
+            # AFTER the loop (see "event-level scenario classification"
+            # block below). Codex P1 reproducer (multi-offset event
+            # with mixed coverage) is pinned by a test in
+            # tests/unit/test_web/test_calendar_dual_picker.py.
             _scenario_value, _scenario_meta = candidate_return_for_gate(
                 outcome,
                 _GATE_SCENARIO_FOR_VISIBILITY,
                 allow_mid_fallback=False,
             )
-            if _scenario_value is not None:
-                scenario_priced_event_keys.add(event_key)
-            else:
-                missing_scenario_event_keys.add(event_key)
+            per_event_scenario_priced_flags.setdefault(event_key, []).append(
+                _scenario_value is not None
+            )
+            if _scenario_value is None:
+                # Reason breakdown is per-trade (we want to see, e.g.,
+                # "5 offsets failed because of NaN bid/ask" vs "2
+                # offsets failed because the candidate selection was
+                # skipped"). Event-level reduction below sums these
+                # into the n_events denominator, but the breakdown
+                # keeps trade-level granularity because that's the
+                # actionable diagnostic.
                 _reason = _scenario_meta.get("missing_reason") or "unknown"
                 scenario_missing_reason_counts[_reason] = (
                     scenario_missing_reason_counts.get(_reason, 0) + 1
@@ -1347,6 +1367,35 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
     # becomes non-empty only when forward observations accumulate via
     # the live API path.
     promotion_eligible_summary = _summarize_event_level_pnls(promotion_eligible_event_pnls)
+
+    # PR #66 event-level scenario classification.
+    #
+    # Reduces per-event flag lists to one classification each. Rule:
+    # an event is "priced" if AT LEAST ONE of its eligible offsets
+    # had a finite cross_25; "missing" only if NO offset did. This
+    # matches the existing `promotion_eligible_event_pnls`
+    # convention (which averages over offsets so any single eligible
+    # offset gives the event a representative number), and keeps the
+    # invariant `scenario_priced_events + missing_scenario_events
+    # == n_events` true on every input shape including the
+    # multi-offset mixed-coverage case Codex flagged on PR #66
+    # first round.
+    #
+    # Stricter alternatives considered + rejected:
+    #   - "ALL offsets must price" — would understate execution
+    #     evidence for events where the chain has missing bid/ask
+    #     on some offsets but the simulator ran fine on others.
+    #   - "MAJORITY of offsets must price" — arbitrary threshold,
+    #     unstable under offset count changes.
+    # The "any priced" rule is the minimum useful coverage and is
+    # explicit in the test pinning this invariant.
+    scenario_priced_event_keys: set = set()
+    missing_scenario_event_keys: set = set()
+    for ev_key, flags in per_event_scenario_priced_flags.items():
+        if any(flags):
+            scenario_priced_event_keys.add(ev_key)
+        else:
+            missing_scenario_event_keys.add(ev_key)
 
     # Event-level outcome buckets. Conservative classification: an event
     # is in `both_succeeded` ONLY when every ok-status trade for that
