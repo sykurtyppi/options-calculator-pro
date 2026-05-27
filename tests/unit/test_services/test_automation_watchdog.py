@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta, timezone
 
+import pytest
+
+from services import automation_watchdog
 from services.automation_watchdog import (
     EvidenceWatchdogConfig,
     IMessageConfig,
@@ -149,3 +152,72 @@ def test_watchdog_alert_does_not_crash_when_state_write_fails(tmp_path, monkeypa
     assert result["sent"] is True
     assert result["state_persisted"] is False
     assert "PermissionError" in result["state_error"]
+
+
+# ── Hardening P2-6 / P2-7 regression tests ───────────────────────────────
+
+
+def test_write_alert_state_replaces_atomically_and_leaves_no_tmp(tmp_path) -> None:
+    """Hardening P2-6: _write_alert_state must use tmp + os.replace so
+    a crash mid-write can't corrupt the dedup state file."""
+    state_path = tmp_path / "state" / "alerts.json"
+    automation_watchdog._write_alert_state(state_path, {"signature": "abc", "n": 1})
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload == {"signature": "abc", "n": 1}
+    # No leftover .alerts.json.<pid>.tmp.
+    assert list(state_path.parent.glob(".alerts.json.*.tmp")) == []
+
+
+def test_write_alert_state_preserves_existing_on_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the encode/write step fails, the previous state file must
+    survive — losing a dedup record causes either pager noise (re-alert)
+    or a missed alert."""
+    state_path = tmp_path / "alerts.json"
+    state_path.write_text(json.dumps({"signature": "prior", "n": 0}), encoding="utf-8")
+
+    real_dump = automation_watchdog.json.dump
+
+    def boom(*args, **kwargs):  # noqa: ANN001
+        raise OSError("simulated full disk")
+
+    monkeypatch.setattr(automation_watchdog.json, "dump", boom)
+    with pytest.raises(OSError, match="simulated full disk"):
+        automation_watchdog._write_alert_state(state_path, {"signature": "new", "n": 1})
+    monkeypatch.setattr(automation_watchdog.json, "dump", real_dump)
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"signature": "prior", "n": 0}
+    assert list(state_path.parent.glob(".alerts.json.*.tmp")) == []
+
+
+def test_read_json_surfaces_os_error_on_stderr(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Hardening P2-7: a perms regression must be visible on stderr so
+    the operator can see the failure mode (chmod, not JSON corruption)."""
+    target = tmp_path / "perms.json"
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o000)
+    try:
+        result = automation_watchdog._read_json(target)
+    finally:
+        target.chmod(0o600)
+
+    assert result is None
+    captured = capsys.readouterr()
+    assert "_read_json" in captured.err
+    assert "cannot read" in captured.err
+
+
+def test_read_json_silent_on_malformed_json(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Malformed JSON stays silent — the caller already produces its own
+    'not valid JSON' warning."""
+    target = tmp_path / "bad.json"
+    target.write_text("{not json", encoding="utf-8")
+
+    assert automation_watchdog._read_json(target) is None
+    assert capsys.readouterr().err == ""

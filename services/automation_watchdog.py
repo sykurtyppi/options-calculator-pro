@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -40,10 +41,24 @@ def _parse_datetime(value: Any) -> datetime | None:
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
+    # Hardening P2-7: distinguish "can't read the file" (perms regression,
+    # mount unavailable) from "file is malformed JSON". Both still return
+    # None — the callers' control flow stays unchanged — but an OSError
+    # is now visible in the launchd stderr capture so an operator can see
+    # whether to fix chmod vs investigate JSON corruption. JSONDecodeError
+    # remains silent because the caller (build_evidence_watchdog_status)
+    # already emits its own "not valid JSON" warning.
     try:
         raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        sys.stderr.write(
+            f"automation_watchdog._read_json: cannot read {path} "
+            f"({type(exc).__name__}: {exc})\n"
+        )
+        return None
+    try:
         payload = json.loads(raw)
-    except Exception:
+    except json.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -217,8 +232,26 @@ def _load_alert_state(path: Path) -> dict[str, Any]:
 
 
 def _write_alert_state(path: Path, payload: Mapping[str, Any]) -> None:
+    # Hardening P2-6: atomic write via tmp + os.replace. A crash between
+    # the open and the rename previously could corrupt the dedup state
+    # file, which on the next watchdog tick would either be unreadable
+    # (re-firing the same alert — pager noise) or partial (missing a
+    # legitimate alert). Mirrors the pattern in
+    # scripts/run_evidence_cycle._atomic_write_json.
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(dict(payload), indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(dict(payload), fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def maybe_send_watchdog_alert(

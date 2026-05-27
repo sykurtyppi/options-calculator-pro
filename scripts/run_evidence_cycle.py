@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -65,14 +66,20 @@ def run_evidence_cycle(
     if not dry_run:
         report_dir.mkdir(parents=True, exist_ok=True)
         path = report_dir / f"evidence_report_{cycle_date.isoformat()}.json"
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
-        (report_dir / "latest.json").write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        # Hardening P0-1: atomic write via tmp + os.replace. A launchd kill
+        # mid-write previously left the daily report or latest.json torn,
+        # which made the watchdog emit a false-positive page (see
+        # services/automation_watchdog._read_json — it returns None on
+        # malformed JSON and the watchdog records that as an error).
+        # Mirrors the pattern in services/structure_prior_store._save_locked.
+        _atomic_write_json(path, payload)
+        _atomic_write_json(report_dir / "latest.json", payload)
         payload["report_path"] = str(path)
         if weekly_report is not None:
             weekly_report_dir.mkdir(parents=True, exist_ok=True)
             weekly_path = weekly_report_dir / f"weekly_evidence_report_{cycle_date.isoformat()}.json"
-            weekly_path.write_text(json.dumps(weekly_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
-            (weekly_report_dir / "weekly_latest.json").write_text(json.dumps(weekly_report, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            _atomic_write_json(weekly_path, weekly_report)
+            _atomic_write_json(weekly_report_dir / "weekly_latest.json", weekly_report)
             payload["weekly_report_path"] = str(weekly_path)
         if notify_summary:
             payload["notification_summary"] = _send_local_summary(report, weekly_report=weekly_report, dry_run=False)
@@ -197,6 +204,36 @@ def _run_log_payload(
     }
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write JSON to *path* atomically.
+
+    Hardening P0-1: writes to ``.<name>.<pid>.tmp`` in the destination
+    directory, fsyncs the body, then ``os.replace``\\ s onto *path*.
+    A crash or launchd kill between the open and the replace leaves the
+    pre-existing file (if any) intact — the watchdog never observes a
+    torn JSON document. Same pattern used by
+    :func:`services.structure_prior_store.StructurePriorStore._save_locked`
+    and :func:`services.calibration_service.CalibrationStore._save`.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True, default=str)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                # Pre-existing tmp from a prior crash; next successful
+                # write will replace it. Don't propagate — the
+                # destination is already correct.
+                pass
+
+
 def _append_structured_run_log(path: Path, event: dict) -> None:
     if bool(event.get("dry_run")):
         return
@@ -204,9 +241,20 @@ def _append_structured_run_log(path: Path, event: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True, default=str) + "\n")
-    except Exception:
-        # Logging must never break evidence collection.
-        pass
+    except (OSError, ValueError) as exc:
+        # Hardening P0-2: narrow the exception and surface the failure
+        # via stderr (launchd captures it into the wrapper's log file).
+        # Previously a bare ``except: pass`` hid disk-full and perms
+        # regressions, which silently disabled the structured run log
+        # — the very stream services/evidence_health.py uses to confirm
+        # that the cycle ran. We still don't re-raise: the cycle's real
+        # work (report files, ledger writes) has already completed by
+        # the time this is called, and discarding that would be worse
+        # than losing one JSONL line.
+        sys.stderr.write(
+            "WARNING: run_evidence_cycle failed to append structured run "
+            f"log: {type(exc).__name__}: {exc} (path={path})\n"
+        )
 
 
 if __name__ == "__main__":

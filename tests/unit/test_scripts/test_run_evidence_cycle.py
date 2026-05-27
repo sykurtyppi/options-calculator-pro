@@ -4,6 +4,8 @@ import json
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 import scripts.run_evidence_cycle as evidence_cycle
 
 
@@ -86,3 +88,74 @@ def test_run_evidence_cycle_dry_run_does_not_write_reports(monkeypatch, tmp_path
     assert "report_path" not in payload
     assert not (tmp_path / "daily").exists()
     assert not (tmp_path / "weekly").exists()
+
+
+# ── Hardening P0-1 regression tests ──────────────────────────────────────
+
+
+def test_atomic_write_json_replaces_destination_and_leaves_no_tmp(tmp_path: Path) -> None:
+    """The atomic-write helper must replace the destination atomically
+    and remove its tmp file even on the happy path."""
+    dest = tmp_path / "report.json"
+    evidence_cycle._atomic_write_json(dest, {"hello": "world"})
+
+    assert dest.exists()
+    assert json.loads(dest.read_text(encoding="utf-8")) == {"hello": "world"}
+    # No leftover ``.report.json.<pid>.tmp`` siblings.
+    tmps = list(tmp_path.glob(".report.json.*.tmp"))
+    assert tmps == []
+
+
+def test_atomic_write_json_preserves_existing_file_on_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the body write raises, the pre-existing destination must
+    survive untouched (this is the whole point of the tmp+replace
+    pattern — a launchd kill mid-write previously corrupted the
+    daily report)."""
+    dest = tmp_path / "report.json"
+    original = {"as_of_date": "2026-04-27", "trusted": True}
+    dest.write_text(json.dumps(original), encoding="utf-8")
+
+    real_dump = evidence_cycle.json.dump
+
+    def boom(*args, **kwargs):  # noqa: ANN001
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(evidence_cycle.json, "dump", boom)
+    with pytest.raises(OSError, match="simulated disk full"):
+        evidence_cycle._atomic_write_json(dest, {"would_corrupt": True})
+    monkeypatch.setattr(evidence_cycle.json, "dump", real_dump)
+
+    # Destination untouched, tmp cleaned up.
+    assert json.loads(dest.read_text(encoding="utf-8")) == original
+    assert list(tmp_path.glob(".report.json.*.tmp")) == []
+
+
+def test_append_structured_run_log_emits_stderr_on_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Hardening P0-2: a disk-full / perms failure on the structured
+    run log must surface via stderr (which launchd captures) so the
+    operator can see the cycle's audit trail is broken."""
+    target = tmp_path / "logs" / "evidence_cycle_runs.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    class FailingPath:
+        """Stand-in that explodes when opened for append."""
+
+        @property
+        def parent(self):  # noqa: ANN001
+            return target.parent
+
+        def open(self, *args, **kwargs):  # noqa: ANN001
+            raise PermissionError("simulated chmod regression")
+
+    evidence_cycle._append_structured_run_log(
+        FailingPath(),  # type: ignore[arg-type]
+        {"event_type": "evidence_cycle_run", "status": "success", "dry_run": False},
+    )
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "PermissionError" in captured.err
+    assert "run_evidence_cycle" in captured.err

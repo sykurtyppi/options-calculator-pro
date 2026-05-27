@@ -48,6 +48,10 @@ cd "${PROJECT_ROOT}"
 
 {
   echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence watchdog start ====="
+  # Hardening P1-4: capture and propagate the Python heredoc's exit code
+  # so launchd sees the watchdog's true exit (e.g. 2 = watchdog FAIL).
+  # See run_candidate_exit_resolver.sh for the canonical pattern.
+  set +e
   "${PYTHON_BIN}" - "${PYTHON_BIN}" "scripts/watch_daily_evidence_cycle.py" "${TIMEOUT_SECONDS}" <<'PY'
 import subprocess
 import sys
@@ -61,5 +65,13 @@ except subprocess.TimeoutExpired:
     raise SystemExit(124)
 raise SystemExit(result.returncode)
 PY
-  echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence watchdog complete ====="
+  EXIT_CODE=$?
+  set -e
+  if [ "${EXIT_CODE}" -eq 0 ]; then
+    echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence watchdog complete ====="
+  else
+    echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence watchdog failed exit_code=${EXIT_CODE} ====="
+  fi
 } >> "${LOG_FILE}" 2>&1
+
+exit "${EXIT_CODE}"

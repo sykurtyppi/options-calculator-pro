@@ -48,6 +48,17 @@ cd "${PROJECT_ROOT}"
 
 {
   echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence cycle start ====="
+  # Hardening P1-4: capture and propagate the Python heredoc's exit code
+  # the same way scripts/automation/run_candidate_exit_resolver.sh does
+  # (set +e around the call, then EXIT_CODE=$?, then a branch on the
+  # code, then explicit `exit ${EXIT_CODE}` at the bottom of the script).
+  # The previous version ran the heredoc inside a brace block that
+  # didn't capture $? — launchd saw exit 0 on a hard failure (e.g.
+  # SystemExit(124) on timeout), masking the real outcome from anything
+  # that greps launchd's tracking later. The watchdog still detects the
+  # missing completion marker, so this isn't a silent failure, but
+  # operators expect exit codes to tell the truth.
+  set +e
   "${PYTHON_BIN}" - "${PYTHON_BIN}" "scripts/run_evidence_cycle.py" "${TIMEOUT_SECONDS}" <<'PY'
 import subprocess
 import sys
@@ -61,5 +72,13 @@ except subprocess.TimeoutExpired:
     raise SystemExit(124)
 raise SystemExit(result.returncode)
 PY
-  echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence cycle complete ====="
+  EXIT_CODE=$?
+  set -e
+  if [ "${EXIT_CODE}" -eq 0 ]; then
+    echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence cycle complete ====="
+  else
+    echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence cycle failed exit_code=${EXIT_CODE} ====="
+  fi
 } >> "${LOG_FILE}" 2>&1
+
+exit "${EXIT_CODE}"
