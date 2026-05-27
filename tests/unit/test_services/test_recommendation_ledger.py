@@ -665,3 +665,213 @@ def test_picker_provenance_column_added_by_migration(tmp_path: Path) -> None:
     )
     record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
     assert ledger.get(rec_id)["picker_provenance_json"]["structure"] == "call_calendar"
+
+
+# ── PR-AD commit 3: candidate_shadow_outcome + sample_provenance round-trip ──
+
+
+def _sample_candidate_shadow_outcome() -> dict:
+    """Realistic candidate_shadow_outcome block from PR-AD commit 1 +
+    1b/1c hardening — happy-path resolved candidate PnL."""
+    return {
+        "status": "ok",
+        "labels": {
+            "research_mid": True,
+            "shadow_only": True,
+            "not_execution_grade": True,
+        },
+        "side": "call",
+        "strike": 100.0,
+        "front_expiry": "2024-05-17",
+        "back_expiry": "2024-06-21",
+        "entry_front_mid": 1.0,
+        "entry_back_mid": 2.0,
+        "exit_front_mid": 0.4,
+        "exit_back_mid": 1.7,
+        "entry_front_iv": 0.30,
+        "entry_back_iv": 0.30,
+        "exit_front_iv": 0.20,
+        "exit_back_iv": 0.25,
+        "entry_debit_mid": 1.0,
+        "exit_value_mid": 1.3,
+        "mid_pnl": 0.3,
+        "mid_realized_return_pct": 30.0,
+        "iv_change_front": -0.10,
+        "iv_change_back": -0.05,
+    }
+
+
+def test_candidate_shadow_outcome_persists_on_historical_replay_record(tmp_path: Path) -> None:
+    """Codex prerequisite: the ledger must persist the resolved
+    candidate PnL block. On historical replay records the block
+    carries the candidate outcome and the sample_provenance is
+    historical_replay_in_sample_or_research."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    analysis.candidate_shadow_outcome = _sample_candidate_shadow_outcome()
+    analysis.sample_provenance = "historical_replay_in_sample_or_research"
+
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="candidate-shadow-roundtrip",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    row = ledger.get(rec_id)
+    assert row is not None
+
+    cso = row["candidate_shadow_outcome_json"]
+    assert cso["status"] == "ok"
+    assert cso["labels"]["research_mid"] is True
+    assert cso["labels"]["shadow_only"] is True
+    assert cso["labels"]["not_execution_grade"] is True
+    assert cso["mid_realized_return_pct"] == 30.0
+    assert cso["entry_debit_mid"] == 1.0
+    assert cso["mid_pnl"] == 0.3
+    # Denormalized provenance column round-trips too
+    assert row["sample_provenance"] == "historical_replay_in_sample_or_research"
+
+
+def test_candidate_shadow_outcome_empty_when_absent_from_analysis(tmp_path: Path) -> None:
+    """Live API recommendations produced BEFORE an exit resolver runs
+    have no candidate_shadow_outcome. Ledger persists empty dict +
+    None provenance, never raises."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="atm_straddle",
+        salt="no-candidate-outcome",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    row = ledger.get(rec_id)
+    assert row["candidate_shadow_outcome_json"] == {}
+    assert row["sample_provenance"] is None
+
+
+def test_sample_provenance_invalid_value_normalizes_to_unknown(tmp_path: Path) -> None:
+    """REGRESSION (Codex round-4 P2): invalid / typo / non-canonical
+    sample_provenance values get normalized to "unknown" — NOT None.
+    "unknown" is observable in downstream aggregator
+    provenance_counts (it surfaces under the unknown bucket), so
+    operators can see how many rows were rejected for invalid tags.
+    None would silently disappear as a missing key, hurting
+    observability. is_promotion_eligible still rejects "unknown"
+    because it isn't in PROMOTION_ELIGIBLE_PROVENANCES."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    analysis.sample_provenance = "forward_post_pr_ad"  # non-canonical typo
+
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="invalid-provenance",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    persisted = ledger.get(rec_id)["sample_provenance"]
+    assert persisted == "unknown", (
+        f"Invalid provenance should normalize to observable 'unknown', "
+        f"got {persisted!r}"
+    )
+
+    # When the analysis has NO sample_provenance at all, the column
+    # stays None (different signal — "caller didn't tag" rather than
+    # "caller tagged with an invalid value").
+    analysis2 = _analysis()
+    rec_id2 = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="missing-provenance",
+    )
+    record_recommendation(analysis2, ledger=ledger, recommendation_id=rec_id2)
+    assert ledger.get(rec_id2)["sample_provenance"] is None
+
+
+def test_top_level_provenance_is_canonical_nested_does_not_override(tmp_path: Path) -> None:
+    """REGRESSION (Codex round-4 P1#2): if a future shape change ever
+    puts a `sample_provenance` field INSIDE the candidate_shadow_outcome
+    dict, the ledger must treat the TOP-LEVEL record.sample_provenance
+    as canonical. The nested duplicate is preserved verbatim in the
+    candidate_shadow_outcome_json blob (for audit) but does NOT
+    override the persisted top-level column.
+
+    This policy means: if the two ever disagree, the analyst can see
+    BOTH in the row (top-level column + nested JSON field), but
+    is_promotion_eligible reads only the top-level column."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    outcome = _sample_candidate_shadow_outcome()
+    # Inject a divergent sample_provenance nested INSIDE the outcome.
+    # This isn't a shape we ship today — but if a future refactor
+    # adds it, the policy must be unambiguous.
+    outcome["sample_provenance"] = "forward_post_pr_ad"  # bad / divergent
+    analysis.candidate_shadow_outcome = outcome
+    analysis.sample_provenance = "historical_replay_in_sample_or_research"  # canonical
+
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="provenance-mismatch",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    row = ledger.get(rec_id)
+
+    # Top-level column wins for filtering / promotion eligibility
+    assert row["sample_provenance"] == "historical_replay_in_sample_or_research"
+    # Nested duplicate is preserved verbatim in the JSON blob for audit
+    # (the storage layer doesn't mutate the outcome shape)
+    assert row["candidate_shadow_outcome_json"]["sample_provenance"] == "forward_post_pr_ad"
+
+
+def test_candidate_shadow_outcome_column_added_by_migration(tmp_path: Path) -> None:
+    """Pre-PR-AD ledger DB lacks the new columns. Opening it must add
+    both candidate_shadow_outcome_json and sample_provenance without
+    losing data."""
+    db_path = tmp_path / "ledger.sqlite"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """CREATE TABLE recommendations (
+            recommendation_id TEXT PRIMARY KEY,
+            created_at TEXT,
+            symbol TEXT,
+            picker_provenance_json TEXT,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            engine_version TEXT NOT NULL DEFAULT 'event_vol_selector_v1'
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO recommendations (recommendation_id, created_at, symbol, picker_provenance_json)"
+        " VALUES (?, ?, ?, ?)",
+        ("legacy_pr_ac_row", "2026-01-01T00:00:00+00:00", "AAPL", "{}"),
+    )
+    conn.commit()
+    conn.close()
+
+    ledger = RecommendationLedger(ledger_path=db_path)
+    cols = {row["name"] for row in ledger._conn.execute(  # noqa: SLF001
+        "PRAGMA table_info(recommendations)"
+    ).fetchall()}
+    assert "candidate_shadow_outcome_json" in cols
+    assert "sample_provenance" in cols
+
+    # Legacy row preserved with no data loss
+    row = ledger._conn.execute(  # noqa: SLF001
+        "SELECT recommendation_id, symbol FROM recommendations WHERE recommendation_id = ?",
+        ("legacy_pr_ac_row",),
+    ).fetchone()
+    assert row is not None
+    assert row["symbol"] == "AAPL"
+
+    # New records write the new fields cleanly
+    analysis = _analysis()
+    analysis.candidate_shadow_outcome = _sample_candidate_shadow_outcome()
+    analysis.sample_provenance = "historical_replay_in_sample_or_research"
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="post-pr-ad-migration",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    persisted = ledger.get(rec_id)
+    assert persisted["candidate_shadow_outcome_json"]["status"] == "ok"
+    assert persisted["sample_provenance"] == "historical_replay_in_sample_or_research"

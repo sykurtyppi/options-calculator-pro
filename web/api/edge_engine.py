@@ -419,10 +419,23 @@ def _best_contract_row(frame: pd.DataFrame) -> Optional[pd.Series]:
     if frame is None or frame.empty:
         return None
     ranked = frame.copy()
-    ranked["_liq"] = pd.to_numeric(ranked.get("liquidity_score"), errors="coerce").fillna(0.0)
-    ranked["_oi"] = pd.to_numeric(ranked.get("open_interest"), errors="coerce").fillna(0.0)
-    ranked["_vol"] = pd.to_numeric(ranked.get("volume"), errors="coerce").fillna(0.0)
-    ranked["_spread_pct"] = pd.to_numeric(ranked.get("spread_pct"), errors="coerce").fillna(np.inf)
+    # Parallel to the PR-AC commit-1b fix in services/calendar_leg_picker
+    # `_best_row`: when an optional column is absent, `frame.get("col")`
+    # returns a scalar (None), then `pd.to_numeric(scalar).fillna(...)`
+    # raises AttributeError because the scalar has no .fillna. Use an
+    # index-aligned fallback Series instead. Production FeatureStore
+    # chains always carry these columns, but synthetic test chains and
+    # any future provider with a sparser schema would otherwise crash.
+    zero = pd.Series(0.0, index=ranked.index)
+    inf_series = pd.Series(np.inf, index=ranked.index)
+    def _coerce(col: str, fallback: pd.Series) -> pd.Series:
+        if col in ranked.columns:
+            return pd.to_numeric(ranked[col], errors="coerce").fillna(fallback.iloc[0])
+        return fallback
+    ranked["_liq"] = _coerce("liquidity_score", zero)
+    ranked["_oi"] = _coerce("open_interest", zero)
+    ranked["_vol"] = _coerce("volume", zero)
+    ranked["_spread_pct"] = _coerce("spread_pct", inf_series)
     ranked = ranked.sort_values(
         ["_liq", "_oi", "_vol", "_spread_pct"],
         ascending=[False, False, False, True],
@@ -593,6 +606,179 @@ def _lookup_exact_contract_row(
     return _best_contract_row(subset)
 
 
+# ── PR-AD commit 1: candidate shadow outcome simulator ────────────────────
+#
+# PR-AC commit 2 added shadow-mode dual-picker logging that records WHICH
+# contracts the legacy and candidate pickers would have selected. That
+# alone is not enough to answer "did the candidate make more money than
+# legacy?" — for that we also need the candidate's exit pricing. This
+# simulator closes the gap: given the entry chain, exit chain, and
+# dual_picker block, it resolves the candidate's contracts through
+# entry+exit pricing and computes candidate PnL alongside legacy.
+#
+# CRITICAL: outcomes produced here on the historical-backtest events are
+# IN-SAMPLE for the +14d rule (the rule was discovered on this exact
+# data in PR-AB). Per docs/CALENDAR_PICKER_PROMOTION_2026-05-27.md, the
+# candidate_realized_return_pct from these events must NOT be used as
+# out-of-sample evidence. Promotion criteria reference forward
+# (post-PR-AD-merge) events only.
+# Provenance taxonomy, shape constants, and pure helpers moved to
+# services/candidate_shadow_provenance.py in PR-AD commit 4 (Codex
+# review): the storage / service layer should not depend on the
+# web/API layer. Re-imported here for module-local use AND re-exported
+# as part of edge_engine's public surface so existing test imports
+# (and any downstream callers) keep working without changes.
+from services.candidate_shadow_provenance import (  # noqa: E402
+    _CANDIDATE_SHADOW_LABELS,
+    _CANDIDATE_SHADOW_OUTCOME_FIELDS,
+    PROMOTION_ELIGIBLE_PROVENANCES,
+    SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+    SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED,
+    SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+    SAMPLE_PROVENANCE_UNKNOWN,
+    VALID_SAMPLE_PROVENANCES,
+    _empty_candidate_shadow_outcome,
+    _tag_live_forward_observation,
+    is_promotion_eligible,
+    normalize_sample_provenance,
+)
+
+
+def _simulate_candidate_shadow_outcome(
+    *,
+    entry_chain: Optional[pd.DataFrame],
+    exit_chain: Optional[pd.DataFrame],
+    dual_picker: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Resolve the candidate picker's contracts through entry + exit
+    pricing. Pure shadow simulation — no selector/scoring side effects.
+
+    Inputs are the entry chain DataFrame, the exit chain DataFrame, and
+    the dual_picker block produced by ``_dual_picker_calendar_selection``
+    (PR-AC commit 2). The candidate selection inside dual_picker carries
+    the (front_expiry, back_expiry, strike, side) needed to look up the
+    actual contracts.
+
+    Returns a stable-shape dict — every key in
+    ``_CANDIDATE_SHADOW_OUTCOME_FIELDS`` is always present with None
+    when not applicable. Status enum:
+
+      "ok"                                  — full PnL resolved
+      "skipped:no_dual_picker"              — dual_picker arg was None
+      "skipped:dual_picker_status:*"        — dual picker itself failed
+      "skipped:no_candidate_selection"      — candidate picker abstained
+      "skipped:malformed_candidate_selection" — missing required fields
+      "skipped:bad_expiry_parse"            — expiry strings unparseable
+      "skipped:missing_chain"               — entry/exit chain was None
+      "skipped:missing_entry_quote"         — candidate's leg not in
+                                              entry chain
+      "skipped:missing_exit_quote"          — leg not in exit chain
+      "skipped:non_finite_quote"            — quote mid was NaN/inf
+      "skipped:negative_debit"              — entry debit <= 0 (mirrors
+                                              the legacy simulator's
+                                              negative-debit gate)
+    """
+    if dual_picker is None:
+        return _empty_candidate_shadow_outcome("skipped:no_dual_picker")
+    if dual_picker.get("shadow_status") != "ok":
+        return _empty_candidate_shadow_outcome(
+            f"skipped:dual_picker_status:{dual_picker.get('shadow_status') or 'unknown'}"
+        )
+
+    candidate = dual_picker.get("candidate_selection")
+    if candidate is None:
+        return _empty_candidate_shadow_outcome("skipped:no_candidate_selection")
+
+    side = candidate.get("side")
+    call_put = "C" if side == "call" else "P" if side == "put" else None
+    strike = candidate.get("strike")
+    front_expiry_str = candidate.get("front_expiry")
+    back_expiry_str = candidate.get("back_expiry")
+    if call_put is None or strike is None or not front_expiry_str or not back_expiry_str:
+        return _empty_candidate_shadow_outcome("skipped:malformed_candidate_selection")
+
+    try:
+        front_expiry = pd.Timestamp(front_expiry_str)
+        back_expiry = pd.Timestamp(back_expiry_str)
+    except (ValueError, TypeError):
+        return _empty_candidate_shadow_outcome("skipped:bad_expiry_parse")
+
+    if entry_chain is None or exit_chain is None:
+        return _empty_candidate_shadow_outcome("skipped:missing_chain")
+
+    entry_front = _lookup_exact_contract_row(
+        entry_chain, expiry=front_expiry, strike=float(strike), call_put=call_put,
+    )
+    entry_back = _lookup_exact_contract_row(
+        entry_chain, expiry=back_expiry, strike=float(strike), call_put=call_put,
+    )
+    if entry_front is None or entry_back is None:
+        return _empty_candidate_shadow_outcome("skipped:missing_entry_quote")
+
+    exit_front = _lookup_exact_contract_row(
+        exit_chain, expiry=front_expiry, strike=float(strike), call_put=call_put,
+    )
+    exit_back = _lookup_exact_contract_row(
+        exit_chain, expiry=back_expiry, strike=float(strike), call_put=call_put,
+    )
+    if exit_front is None or exit_back is None:
+        return _empty_candidate_shadow_outcome("skipped:missing_exit_quote")
+
+    entry_front_mid = _safe_float(entry_front.get("mid"), np.nan)
+    entry_back_mid = _safe_float(entry_back.get("mid"), np.nan)
+    exit_front_mid = _safe_float(exit_front.get("mid"), np.nan)
+    exit_back_mid = _safe_float(exit_back.get("mid"), np.nan)
+    if not (np.isfinite(entry_front_mid) and np.isfinite(entry_back_mid)
+            and np.isfinite(exit_front_mid) and np.isfinite(exit_back_mid)):
+        return _empty_candidate_shadow_outcome("skipped:non_finite_quote")
+
+    # Calendar P&L: long back, short front. Entry debit = back - front.
+    # Mirrors the legacy simulator's convention so legacy and candidate
+    # PnLs are directly comparable.
+    entry_debit_mid = float(entry_back_mid - entry_front_mid)
+    if entry_debit_mid <= 0:
+        return _empty_candidate_shadow_outcome("skipped:negative_debit")
+    exit_value_mid = float(exit_back_mid - exit_front_mid)
+    mid_pnl = float(exit_value_mid - entry_debit_mid)
+    mid_realized_return_pct = float((mid_pnl / entry_debit_mid) * 100.0)
+
+    entry_front_iv = _safe_float(entry_front.get("iv"), np.nan)
+    entry_back_iv = _safe_float(entry_back.get("iv"), np.nan)
+    exit_front_iv = _safe_float(exit_front.get("iv"), np.nan)
+    exit_back_iv = _safe_float(exit_back.get("iv"), np.nan)
+    iv_change_front = (
+        float(exit_front_iv - entry_front_iv)
+        if np.isfinite(entry_front_iv) and np.isfinite(exit_front_iv) else None
+    )
+    iv_change_back = (
+        float(exit_back_iv - entry_back_iv)
+        if np.isfinite(entry_back_iv) and np.isfinite(exit_back_iv) else None
+    )
+
+    return {
+        "status": "ok",
+        "labels": dict(_CANDIDATE_SHADOW_LABELS),
+        "side": side,
+        "front_expiry": front_expiry_str,
+        "back_expiry": back_expiry_str,
+        "strike": float(strike),
+        "entry_front_mid": float(entry_front_mid),
+        "entry_back_mid": float(entry_back_mid),
+        "exit_front_mid": float(exit_front_mid),
+        "exit_back_mid": float(exit_back_mid),
+        "entry_front_iv": float(entry_front_iv) if np.isfinite(entry_front_iv) else None,
+        "entry_back_iv": float(entry_back_iv) if np.isfinite(entry_back_iv) else None,
+        "exit_front_iv": float(exit_front_iv) if np.isfinite(exit_front_iv) else None,
+        "exit_back_iv": float(exit_back_iv) if np.isfinite(exit_back_iv) else None,
+        "entry_debit_mid": entry_debit_mid,
+        "exit_value_mid": exit_value_mid,
+        "mid_pnl": mid_pnl,
+        "mid_realized_return_pct": mid_realized_return_pct,
+        "iv_change_front": iv_change_front,
+        "iv_change_back": iv_change_back,
+    }
+
+
 def _simulate_pre_earnings_calendar_trade(
     symbol: str,
     store: Any,
@@ -609,6 +795,14 @@ def _simulate_pre_earnings_calendar_trade(
         "exit_date": pd.Timestamp(exit_date).date().isoformat(),
         "entry_offset_days": int(entry_offset),
         "exit_offset_days": int(EXPANSION_EXIT_OFFSET),
+        # PR-AD commit 1b (Codex review): every record produced by the
+        # historical-backtest path is tagged in-sample regardless of
+        # when the script ran. The +14d rule was discovered on this
+        # exact code path; re-running it tomorrow does not produce
+        # out-of-sample evidence. Promotion criteria filter on
+        # PROMOTION_ELIGIBLE_PROVENANCES, which does NOT include this
+        # value.
+        "sample_provenance": SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
     }
 
     try:
@@ -630,6 +824,15 @@ def _simulate_pre_earnings_calendar_trade(
     # comparison data, NOT a behavior change.
     base["dual_picker"] = _dual_picker_calendar_selection(
         entry_chain, event_date=event_date, side="call",
+    )
+
+    # PR-AD commit 1: placeholder candidate shadow outcome. The real
+    # outcome can only be computed once the exit chain is loaded; for
+    # every return path that fails before that point, this placeholder
+    # preserves a uniform record shape. Status overwritten below the
+    # moment the exit chain succeeds.
+    base["candidate_shadow_outcome"] = _empty_candidate_shadow_outcome(
+        "skipped:trade_failed_before_exit_chain"
     )
 
     selection = _select_pre_earnings_calendar_contracts(entry_chain, event_date=pd.Timestamp(event_date))
@@ -665,6 +868,17 @@ def _simulate_pre_earnings_calendar_trade(
         exit_chain = store.query_chain(symbol, trade_date=base["exit_date"], call_put="C", limit=5000)
     except Exception as exc:
         return {**base, "status": "missing_exit_chain", "reason": str(exc)}
+
+    # PR-AD commit 1: with both chains in hand, resolve the candidate
+    # picker's PnL too. Independent of whether legacy succeeds below —
+    # we want candidate outcomes even on events where legacy fails on
+    # its exit quote (the candidate may have selected different
+    # contracts that ARE quoted at exit). Pure shadow logging.
+    base["candidate_shadow_outcome"] = _simulate_candidate_shadow_outcome(
+        entry_chain=entry_chain,
+        exit_chain=exit_chain,
+        dual_picker=base.get("dual_picker"),
+    )
 
     exit_front = _lookup_exact_contract_row(exit_chain, expiry=front_expiry, strike=strike, call_put="C")
     exit_back = _lookup_exact_contract_row(exit_chain, expiry=back_expiry, strike=strike, call_put="C")
@@ -1015,6 +1229,29 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
     # Shadow-status breakdown across ALL trades (incl. non-ok)
     shadow_status_counts: Dict[str, int] = {}
 
+    # PR-AD commit 2 — provenance + candidate-outcome accounting.
+    # Codex hard rules:
+    #   - Show all records in diagnostics, including unknown / replay /
+    #     skipped / malformed.
+    #   - Compute promotion stats ONLY on records that pass
+    #     is_promotion_eligible(record).
+    #   - Never mix historical replay and forward evidence into one
+    #     "candidate performance" number.
+    provenance_counts: Dict[str, int] = {}
+    candidate_outcome_status_counts: Dict[str, int] = {}
+
+    # Per-event candidate PnL by provenance bucket. The outer key is
+    # the sample_provenance string; the inner dict maps event_key to
+    # the list of mid_realized_return_pct values seen at that event
+    # (one per ok-status candidate outcome across entry offsets).
+    candidate_pnl_by_provenance_and_event: Dict[str, Dict[Any, List[float]]] = {}
+
+    # Same shape, restricted to records that pass is_promotion_eligible.
+    # Used for the promotion_eligible_candidate_stats block. Kept
+    # separate so a downstream typo in the aggregator can't accidentally
+    # widen the filter.
+    promotion_eligible_event_pnls: Dict[Any, List[float]] = {}
+
     # Event-level (deduplicated on (symbol, event_date))
     unique_events: set = set()
     unique_events_with_legacy: set = set()
@@ -1037,9 +1274,64 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
         status = dp.get("shadow_status")
         shadow_status_counts[status or "missing"] = shadow_status_counts.get(status or "missing", 0) + 1
 
-        event_key = (trade.get("symbol"), trade.get("event_date"))
-        if event_key != (None, None):
+        # Codex P2a: dedupe key includes option_type so call_calendar
+        # and put_calendar outcomes for the same earnings event do NOT
+        # collapse into a single bucket once put-side support lands.
+        # Today historical replay is calls-only ("C") so this has no
+        # effect on current data — but future-proofing now means the
+        # put-side commit doesn't need to touch the aggregator at all.
+        side_key = trade.get("option_type") or (
+            ((trade.get("dual_picker") or {}).get("candidate_selection") or {}).get("side")
+            or "unknown"
+        )
+        # Normalize "call"/"put" → "C"/"P" so both sources line up
+        if side_key == "call":
+            side_key = "C"
+        elif side_key == "put":
+            side_key = "P"
+        event_key = (trade.get("symbol"), trade.get("event_date"), side_key)
+        if (trade.get("symbol") is not None
+                and trade.get("event_date") is not None):
             unique_events.add(event_key)
+
+        # PR-AD commit 2 accounting — observability first, gating second.
+        prov = trade.get("sample_provenance") or "missing"
+        provenance_counts[prov] = provenance_counts.get(prov, 0) + 1
+
+        outcome = trade.get("candidate_shadow_outcome") or {}
+        outcome_status = outcome.get("status") or "missing"
+        candidate_outcome_status_counts[outcome_status] = (
+            candidate_outcome_status_counts.get(outcome_status, 0) + 1
+        )
+
+        # Collect candidate PnL by provenance for diagnostics. The
+        # in_sample_diagnostic block reads from this; the promotion
+        # block uses is_promotion_eligible() instead so the strict
+        # checks apply uniformly.
+        candidate_pnl = outcome.get("mid_realized_return_pct")
+        if (
+            outcome_status == "ok"
+            and isinstance(candidate_pnl, (int, float))
+            and not isinstance(candidate_pnl, bool)
+            and np.isfinite(candidate_pnl)
+            and trade.get("symbol") is not None
+            and trade.get("event_date") is not None
+        ):
+            candidate_pnl_by_provenance_and_event.setdefault(prov, {}).setdefault(
+                event_key, []
+            ).append(float(candidate_pnl))
+
+        # Strict gate for promotion-eligible bucket. Routes through the
+        # single source of truth so any future change to the eligibility
+        # definition automatically tightens this aggregator too.
+        if (
+            is_promotion_eligible(trade)
+            and trade.get("symbol") is not None
+            and trade.get("event_date") is not None
+        ):
+            promotion_eligible_event_pnls.setdefault(event_key, []).append(
+                float(outcome["mid_realized_return_pct"])
+            )
 
         # Outcome bucketing only applies when shadow logging actually ran.
         if status != "ok":
@@ -1085,6 +1377,61 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
                         "candidate_front_dte": (candidate_sel or {}).get("front_dte_days"),
                     }
                 )
+
+    # PR-AD commit 2: compute event-level candidate PnL summary stats.
+    # Reduces to per-event mean PnL first (so multiple eligible offsets
+    # of the same event don't get extra weight), then aggregates across
+    # events. Returns None on empty input rather than NaN or 0.0 — a
+    # missing stat must be visibly missing, never zero-coded.
+    def _summarize_event_level_pnls(event_pnls: Dict[Any, List[float]]) -> Dict[str, Any]:
+        if not event_pnls:
+            return {
+                "n_events": 0,
+                "candidate_mid_realized_return_pct_mean": None,
+                "candidate_mid_realized_return_pct_median": None,
+                "candidate_mid_realized_return_pct_win_rate": None,
+            }
+        per_event_mean = [
+            sum(pnls) / len(pnls) for pnls in event_pnls.values() if pnls
+        ]
+        n = len(per_event_mean)
+        if n == 0:
+            return {
+                "n_events": 0,
+                "candidate_mid_realized_return_pct_mean": None,
+                "candidate_mid_realized_return_pct_median": None,
+                "candidate_mid_realized_return_pct_win_rate": None,
+            }
+        per_event_mean_sorted = sorted(per_event_mean)
+        if n % 2 == 1:
+            median = per_event_mean_sorted[n // 2]
+        else:
+            median = 0.5 * (per_event_mean_sorted[n // 2 - 1] + per_event_mean_sorted[n // 2])
+        wins = sum(1 for v in per_event_mean if v > 0)
+        return {
+            "n_events": int(n),
+            "candidate_mid_realized_return_pct_mean": float(sum(per_event_mean) / n),
+            "candidate_mid_realized_return_pct_median": float(median),
+            "candidate_mid_realized_return_pct_win_rate": float(wins / n),
+        }
+
+    # In-sample diagnostic stats — historical replay subset ONLY.
+    # Codex hard rule: never mix replay and forward evidence into one
+    # number. We compute stats from the HISTORICAL_REPLAY bucket and
+    # label the block exhaustively so a downstream reader cannot
+    # mistake these for promotion evidence.
+    in_sample_summary = _summarize_event_level_pnls(
+        candidate_pnl_by_provenance_and_event.get(
+            SAMPLE_PROVENANCE_HISTORICAL_REPLAY, {}
+        )
+    )
+
+    # Promotion-eligible stats — gated by is_promotion_eligible(record).
+    # On the historical replay code path this is empty by construction
+    # (HISTORICAL_REPLAY is not in PROMOTION_ELIGIBLE_PROVENANCES). It
+    # becomes non-empty only when forward observations accumulate via
+    # the live API path.
+    promotion_eligible_summary = _summarize_event_level_pnls(promotion_eligible_event_pnls)
 
     # Event-level outcome buckets. Conservative classification: an event
     # is in `both_succeeded` ONLY when every ok-status trade for that
@@ -1165,6 +1512,63 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
         # picker outcomes.
         "shadow_status_counts": {
             k: int(v) for k, v in sorted(shadow_status_counts.items())
+        },
+        # PR-AD commit 2 — provenance + candidate-outcome accounting.
+        # Counts every record regardless of provenance or outcome
+        # status (Codex hard rule: "show all records in diagnostics").
+        # Empty buckets are still present with count 0 if seen.
+        "provenance_counts": {
+            k: int(v) for k, v in sorted(provenance_counts.items())
+        },
+        "candidate_outcome_status_counts": {
+            k: int(v) for k, v in sorted(candidate_outcome_status_counts.items())
+        },
+        # In-sample diagnostic candidate stats. Computed from the
+        # HISTORICAL_REPLAY provenance bucket and labeled explicitly
+        # as in-sample so a downstream reader CANNOT mistake this for
+        # validation evidence. Exists for sanity-checking simulator
+        # math (e.g., the in-sample mean should roughly match PR-AB
+        # reported numbers); it is NOT promotion evidence.
+        "in_sample_diagnostic_candidate_stats": {
+            "note": (
+                "IN-SAMPLE diagnostic only. The +14d rule was discovered "
+                "on this exact dataset (PR-AB). Use this block to verify "
+                "the candidate shadow simulator is mathematically correct "
+                "— never as out-of-sample evidence or promotion criterion "
+                "input."
+            ),
+            "sample_provenance": SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+            **in_sample_summary,
+        },
+        # Promotion-eligible candidate stats. Gated by
+        # is_promotion_eligible(record) — the SINGLE source of truth
+        # for promotion-eligibility. Empty (n_events=0) on any historical
+        # replay aggregation by construction; populated only once
+        # forward observations accumulate via the live API path.
+        # Codex hard rule: this is the ONLY block promotion criteria
+        # may reference.
+        "promotion_eligible_candidate_stats": {
+            "note": (
+                "Computed ONLY from records that pass "
+                "is_promotion_eligible(record). Required properties: "
+                "sample_provenance in PROMOTION_ELIGIBLE_PROVENANCES "
+                "(today only forward_post_freeze), candidate "
+                "outcome.status == 'ok', finite numeric "
+                "mid_realized_return_pct, and intact research_mid / "
+                "shadow_only / not_execution_grade labels.\n\n"
+                "AGGREGATION CONVENTION (Codex review P3): when a "
+                "single earnings event is evaluated at N entry "
+                "offsets, the N per-offset PnLs are first reduced to a "
+                "single per-event mean, and only then is the "
+                "cross-event statistic computed. This prevents "
+                "entry-offset replication from inflating denominator "
+                "weights. As a side effect, comparing these stats to "
+                "live forward observations (where each event has only "
+                "ONE entry) is not strictly apples-to-apples — the "
+                "live forward path produces one PnL per event, no "
+                "averaging step. Document this when reporting."
+            ),
+            **promotion_eligible_summary,
         },
         "diverged_sample": diverged_sample,
     }

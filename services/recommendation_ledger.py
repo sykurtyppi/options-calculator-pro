@@ -38,6 +38,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Literal, Optional
 
+from services.candidate_shadow_provenance import normalize_sample_provenance
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2  # Bumped: introduces recommendation_revisions
@@ -89,6 +91,21 @@ CREATE TABLE IF NOT EXISTS recommendations (
     -- observations between legacy and candidate picker rules. Schema
     -- documented in the PR-AC commit 3 response surface.
     picker_provenance_json        TEXT,
+    -- PR-AD commit 3: candidate_shadow_outcome block serialized
+    -- verbatim. On historical replay records it carries the candidate
+    -- picker's resolved PnL (entry_debit_mid, exit_value_mid, mid_pnl,
+    -- mid_realized_return_pct, IV changes) plus labels (research_mid /
+    -- shadow_only / not_execution_grade). On live forward records
+    -- produced before an exit resolver runs, this column is empty {}
+    -- — see docs/CALENDAR_PICKER_PROMOTION_2026-05-27.md prerequisites
+    -- for the exit-resolver gap.
+    candidate_shadow_outcome_json TEXT,
+    -- PR-AD commit 3: sample provenance for promotion-eligibility
+    -- filtering. Denormalized so SQL queries can filter without
+    -- parsing JSON. Values come from SAMPLE_PROVENANCE_* constants
+    -- in web/api/edge_engine.py; promotion criteria reference only
+    -- the PROMOTION_ELIGIBLE_PROVENANCES set defined there.
+    sample_provenance             TEXT,
     schema_version                INTEGER NOT NULL,
     engine_version                TEXT NOT NULL
 );
@@ -157,6 +174,9 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "metadata_json": "TEXT",
     # PR-AC commit 4 — picker provenance for forward-validation.
     "picker_provenance_json": "TEXT",
+    # PR-AD commit 3 — candidate shadow outcome + provenance tag.
+    "candidate_shadow_outcome_json": "TEXT",
+    "sample_provenance": "TEXT",
     "schema_version": "INTEGER NOT NULL DEFAULT 1",
     "engine_version": "TEXT NOT NULL DEFAULT 'event_vol_selector_v1'",
 }
@@ -195,6 +215,14 @@ class RecommendationRecord:
     # call/put_calendar). Required for downstream promotion-criterion
     # analysis to attribute forward observations to their picker rule.
     picker_provenance: Dict[str, Any] = field(default_factory=dict)
+    # PR-AD commit 3: candidate_shadow_outcome block (from the
+    # historical replay simulator) and sample_provenance tag. For
+    # forward live observations both are populated when the live API
+    # path supplies them; the candidate outcome will be empty until a
+    # live exit resolver runs (see docs/CALENDAR_PICKER_PROMOTION
+    # prerequisites).
+    candidate_shadow_outcome: Dict[str, Any] = field(default_factory=dict)
+    sample_provenance: Optional[str] = None
     schema_version: int = SCHEMA_VERSION
     engine_version: str = ENGINE_VERSION
 
@@ -276,9 +304,10 @@ class RecommendationLedger:
                 surface_iv_anomaly_count,
                 vol_snapshot_json, structure_scorecards_json, selector_output_json,
                 explanation_json, metadata_json, picker_provenance_json,
+                candidate_shadow_outcome_json, sample_provenance,
                 schema_version, engine_version
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
         """
         params = (
@@ -315,6 +344,8 @@ class RecommendationLedger:
             _json(record.explanation),
             _json(record.metadata),
             _json(record.picker_provenance),
+            _json(record.candidate_shadow_outcome),
+            record.sample_provenance,
             int(record.schema_version),
             record.engine_version,
         )
@@ -570,6 +601,28 @@ def build_record_from_analysis(
     # any earlier analysis payloads.
     picker_provenance = _as_dict(metrics.get("experimental_contract_selection") or {})
 
+    # PR-AD commit 3: capture the candidate_shadow_outcome block and
+    # the top-level sample_provenance tag. The analysis is typically an
+    # EdgeSnapshot (live API) or a SimpleNamespace (historical replay
+    # wrapper). For the live API today the candidate outcome is empty
+    # — exit resolver is a pending prerequisite per the promotion doc.
+    # For historical replay records the outcome carries the resolved
+    # candidate PnL produced by _simulate_candidate_shadow_outcome.
+    candidate_shadow_outcome = _as_dict(
+        _get(analysis, "candidate_shadow_outcome", {}) or {}
+    )
+    raw_sample_provenance = _get(analysis, "sample_provenance", None)
+    # Codex round-4 review fix: normalize to "unknown" (observable in
+    # diagnostics) rather than silently dropping to None. Invalid /
+    # typo / non-canonical values become SAMPLE_PROVENANCE_UNKNOWN so
+    # they appear in provenance_counts under the unknown bucket
+    # instead of disappearing as missing keys. Routes through the
+    # neutral service module — no inverted dependency on web/api.
+    if raw_sample_provenance is None:
+        sample_provenance = None
+    else:
+        sample_provenance = normalize_sample_provenance(raw_sample_provenance)
+
     return RecommendationRecord(
         recommendation_id=recommendation_id,
         created_at=created_at,
@@ -600,6 +653,8 @@ def build_record_from_analysis(
             **(metadata or {}),
         },
         picker_provenance=picker_provenance,
+        candidate_shadow_outcome=candidate_shadow_outcome,
+        sample_provenance=sample_provenance,
     )
 
 
@@ -634,6 +689,7 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "explanation_json",
         "metadata_json",
         "picker_provenance_json",
+        "candidate_shadow_outcome_json",
     ):
         payload[key] = _loads(payload.get(key))
     payload["earnings_source_stale"] = bool(payload.get("earnings_source_stale"))
