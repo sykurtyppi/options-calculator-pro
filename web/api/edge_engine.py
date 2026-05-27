@@ -341,16 +341,12 @@ def _utc_today_date():
     return datetime.now(timezone.utc).date()
 
 
-def _safe_float(value: Any, default: float = np.nan) -> float:
-    try:
-        if value is None:
-            return float(default)
-        parsed = float(value)
-        if not np.isfinite(parsed):
-            return float(default)
-        return parsed
-    except (TypeError, ValueError):
-        return float(default)
+# PR-AE C2: extracted to services/candidate_shadow_outcome.py so the
+# upcoming resolver (services/candidate_exit_resolver.py, PR-AE C4)
+# does not need to import upward from web/. The private name
+# _safe_float is preserved here as an alias so every existing call
+# site below works unchanged.
+from services.candidate_shadow_outcome import safe_float as _safe_float  # noqa: E402
 
 
 def _get_feature_store() -> Optional[Any]:
@@ -393,54 +389,15 @@ def _business_days_before(sessions: pd.DatetimeIndex, target_date: pd.Timestamp,
     return pd.Timestamp(sessions[idx]).normalize()
 
 
-def _prepare_feature_chain(chain_df: pd.DataFrame, call_put: str = "C") -> pd.DataFrame:
-    if chain_df is None or chain_df.empty:
-        return pd.DataFrame()
-    df = chain_df.copy()
-    if "call_put" in df.columns:
-        df["call_put"] = df["call_put"].astype(str).str.upper()
-        df = df[df["call_put"] == call_put.upper()]
-    for col in ("trade_date", "expiry"):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce").dt.normalize()
-    for col in ("strike", "bid", "ask", "mid", "iv", "open_interest", "volume", "liquidity_score", "underlying_price", "spread_pct"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    if {"bid", "ask"}.issubset(df.columns):
-        df = df[(df["bid"] >= 0) & (df["ask"] >= df["bid"])]
-    if "mid" in df.columns:
-        df = df[np.isfinite(df["mid"]) & (df["mid"] > 0)]
-    if "strike" in df.columns:
-        df = df[np.isfinite(df["strike"])]
-    return df
-
-
-def _best_contract_row(frame: pd.DataFrame) -> Optional[pd.Series]:
-    if frame is None or frame.empty:
-        return None
-    ranked = frame.copy()
-    # Parallel to the PR-AC commit-1b fix in services/calendar_leg_picker
-    # `_best_row`: when an optional column is absent, `frame.get("col")`
-    # returns a scalar (None), then `pd.to_numeric(scalar).fillna(...)`
-    # raises AttributeError because the scalar has no .fillna. Use an
-    # index-aligned fallback Series instead. Production FeatureStore
-    # chains always carry these columns, but synthetic test chains and
-    # any future provider with a sparser schema would otherwise crash.
-    zero = pd.Series(0.0, index=ranked.index)
-    inf_series = pd.Series(np.inf, index=ranked.index)
-    def _coerce(col: str, fallback: pd.Series) -> pd.Series:
-        if col in ranked.columns:
-            return pd.to_numeric(ranked[col], errors="coerce").fillna(fallback.iloc[0])
-        return fallback
-    ranked["_liq"] = _coerce("liquidity_score", zero)
-    ranked["_oi"] = _coerce("open_interest", zero)
-    ranked["_vol"] = _coerce("volume", zero)
-    ranked["_spread_pct"] = _coerce("spread_pct", inf_series)
-    ranked = ranked.sort_values(
-        ["_liq", "_oi", "_vol", "_spread_pct"],
-        ascending=[False, False, False, True],
-    )
-    return ranked.iloc[0]
+# PR-AE C2: extracted to services/candidate_shadow_outcome.py. Aliased
+# back to the private names here so every existing call site (legacy
+# historical simulator in _simulate_pre_earnings_calendar_trade,
+# _select_pre_earnings_calendar_contracts, etc.) continues to use the
+# same identifiers byte-for-byte.
+from services.candidate_shadow_outcome import (  # noqa: E402
+    best_contract_row as _best_contract_row,
+    prepare_feature_chain as _prepare_feature_chain,
+)
 
 
 def _select_pre_earnings_calendar_contracts(
@@ -592,18 +549,14 @@ def _dual_picker_calendar_selection(
     }
 
 
-def _lookup_exact_contract_row(
-    chain_df: pd.DataFrame,
-    *,
-    expiry: pd.Timestamp,
-    strike: float,
-    call_put: str = "C",
-) -> Optional[pd.Series]:
-    df = _prepare_feature_chain(chain_df, call_put=call_put)
-    if df.empty:
-        return None
-    subset = df[(df["expiry"] == pd.Timestamp(expiry).normalize()) & np.isclose(df["strike"], float(strike), atol=1e-8)]
-    return _best_contract_row(subset)
+# PR-AE C2: extracted to services/candidate_shadow_outcome.py. Aliased
+# under the private name here so legacy historical-replay call sites
+# (lines 709-724 in the previous simulator body, plus 883-884 in
+# _simulate_pre_earnings_calendar_trade's exit-chain lookup) work
+# unchanged.
+from services.candidate_shadow_outcome import (  # noqa: E402
+    lookup_exact_contract_row as _lookup_exact_contract_row,
+)
 
 
 # ── PR-AD commit 1: candidate shadow outcome simulator ────────────────────
@@ -644,139 +597,19 @@ from services.candidate_shadow_provenance import (  # noqa: E402
 )
 
 
-def _simulate_candidate_shadow_outcome(
-    *,
-    entry_chain: Optional[pd.DataFrame],
-    exit_chain: Optional[pd.DataFrame],
-    dual_picker: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Resolve the candidate picker's contracts through entry + exit
-    pricing. Pure shadow simulation — no selector/scoring side effects.
-
-    Inputs are the entry chain DataFrame, the exit chain DataFrame, and
-    the dual_picker block produced by ``_dual_picker_calendar_selection``
-    (PR-AC commit 2). The candidate selection inside dual_picker carries
-    the (front_expiry, back_expiry, strike, side) needed to look up the
-    actual contracts.
-
-    Returns a stable-shape dict — every key in
-    ``_CANDIDATE_SHADOW_OUTCOME_FIELDS`` is always present with None
-    when not applicable. Status enum:
-
-      "ok"                                  — full PnL resolved
-      "skipped:no_dual_picker"              — dual_picker arg was None
-      "skipped:dual_picker_status:*"        — dual picker itself failed
-      "skipped:no_candidate_selection"      — candidate picker abstained
-      "skipped:malformed_candidate_selection" — missing required fields
-      "skipped:bad_expiry_parse"            — expiry strings unparseable
-      "skipped:missing_chain"               — entry/exit chain was None
-      "skipped:missing_entry_quote"         — candidate's leg not in
-                                              entry chain
-      "skipped:missing_exit_quote"          — leg not in exit chain
-      "skipped:non_finite_quote"            — quote mid was NaN/inf
-      "skipped:negative_debit"              — entry debit <= 0 (mirrors
-                                              the legacy simulator's
-                                              negative-debit gate)
-    """
-    if dual_picker is None:
-        return _empty_candidate_shadow_outcome("skipped:no_dual_picker")
-    if dual_picker.get("shadow_status") != "ok":
-        return _empty_candidate_shadow_outcome(
-            f"skipped:dual_picker_status:{dual_picker.get('shadow_status') or 'unknown'}"
-        )
-
-    candidate = dual_picker.get("candidate_selection")
-    if candidate is None:
-        return _empty_candidate_shadow_outcome("skipped:no_candidate_selection")
-
-    side = candidate.get("side")
-    call_put = "C" if side == "call" else "P" if side == "put" else None
-    strike = candidate.get("strike")
-    front_expiry_str = candidate.get("front_expiry")
-    back_expiry_str = candidate.get("back_expiry")
-    if call_put is None or strike is None or not front_expiry_str or not back_expiry_str:
-        return _empty_candidate_shadow_outcome("skipped:malformed_candidate_selection")
-
-    try:
-        front_expiry = pd.Timestamp(front_expiry_str)
-        back_expiry = pd.Timestamp(back_expiry_str)
-    except (ValueError, TypeError):
-        return _empty_candidate_shadow_outcome("skipped:bad_expiry_parse")
-
-    if entry_chain is None or exit_chain is None:
-        return _empty_candidate_shadow_outcome("skipped:missing_chain")
-
-    entry_front = _lookup_exact_contract_row(
-        entry_chain, expiry=front_expiry, strike=float(strike), call_put=call_put,
-    )
-    entry_back = _lookup_exact_contract_row(
-        entry_chain, expiry=back_expiry, strike=float(strike), call_put=call_put,
-    )
-    if entry_front is None or entry_back is None:
-        return _empty_candidate_shadow_outcome("skipped:missing_entry_quote")
-
-    exit_front = _lookup_exact_contract_row(
-        exit_chain, expiry=front_expiry, strike=float(strike), call_put=call_put,
-    )
-    exit_back = _lookup_exact_contract_row(
-        exit_chain, expiry=back_expiry, strike=float(strike), call_put=call_put,
-    )
-    if exit_front is None or exit_back is None:
-        return _empty_candidate_shadow_outcome("skipped:missing_exit_quote")
-
-    entry_front_mid = _safe_float(entry_front.get("mid"), np.nan)
-    entry_back_mid = _safe_float(entry_back.get("mid"), np.nan)
-    exit_front_mid = _safe_float(exit_front.get("mid"), np.nan)
-    exit_back_mid = _safe_float(exit_back.get("mid"), np.nan)
-    if not (np.isfinite(entry_front_mid) and np.isfinite(entry_back_mid)
-            and np.isfinite(exit_front_mid) and np.isfinite(exit_back_mid)):
-        return _empty_candidate_shadow_outcome("skipped:non_finite_quote")
-
-    # Calendar P&L: long back, short front. Entry debit = back - front.
-    # Mirrors the legacy simulator's convention so legacy and candidate
-    # PnLs are directly comparable.
-    entry_debit_mid = float(entry_back_mid - entry_front_mid)
-    if entry_debit_mid <= 0:
-        return _empty_candidate_shadow_outcome("skipped:negative_debit")
-    exit_value_mid = float(exit_back_mid - exit_front_mid)
-    mid_pnl = float(exit_value_mid - entry_debit_mid)
-    mid_realized_return_pct = float((mid_pnl / entry_debit_mid) * 100.0)
-
-    entry_front_iv = _safe_float(entry_front.get("iv"), np.nan)
-    entry_back_iv = _safe_float(entry_back.get("iv"), np.nan)
-    exit_front_iv = _safe_float(exit_front.get("iv"), np.nan)
-    exit_back_iv = _safe_float(exit_back.get("iv"), np.nan)
-    iv_change_front = (
-        float(exit_front_iv - entry_front_iv)
-        if np.isfinite(entry_front_iv) and np.isfinite(exit_front_iv) else None
-    )
-    iv_change_back = (
-        float(exit_back_iv - entry_back_iv)
-        if np.isfinite(entry_back_iv) and np.isfinite(exit_back_iv) else None
-    )
-
-    return {
-        "status": "ok",
-        "labels": dict(_CANDIDATE_SHADOW_LABELS),
-        "side": side,
-        "front_expiry": front_expiry_str,
-        "back_expiry": back_expiry_str,
-        "strike": float(strike),
-        "entry_front_mid": float(entry_front_mid),
-        "entry_back_mid": float(entry_back_mid),
-        "exit_front_mid": float(exit_front_mid),
-        "exit_back_mid": float(exit_back_mid),
-        "entry_front_iv": float(entry_front_iv) if np.isfinite(entry_front_iv) else None,
-        "entry_back_iv": float(entry_back_iv) if np.isfinite(entry_back_iv) else None,
-        "exit_front_iv": float(exit_front_iv) if np.isfinite(exit_front_iv) else None,
-        "exit_back_iv": float(exit_back_iv) if np.isfinite(exit_back_iv) else None,
-        "entry_debit_mid": entry_debit_mid,
-        "exit_value_mid": exit_value_mid,
-        "mid_pnl": mid_pnl,
-        "mid_realized_return_pct": mid_realized_return_pct,
-        "iv_change_front": iv_change_front,
-        "iv_change_back": iv_change_back,
-    }
+# PR-AE C2: simulator extracted to services/candidate_shadow_outcome.py
+# (Codex design-review required change). The full body — including the
+# status enum, the calendar P&L convention, and the IV-change handling
+# — lives there now. This alias preserves the private name so existing
+# call sites in this module (in particular line ~877 inside
+# _simulate_pre_earnings_calendar_trade) keep their existing identifier
+# byte-for-byte.
+#
+# Upcoming PR-AE C4 (services/candidate_exit_resolver.py) imports the
+# PUBLIC name `simulate_candidate_shadow_outcome` from the new module.
+from services.candidate_shadow_outcome import (  # noqa: E402
+    simulate_candidate_shadow_outcome as _simulate_candidate_shadow_outcome,
+)
 
 
 def _simulate_pre_earnings_calendar_trade(
