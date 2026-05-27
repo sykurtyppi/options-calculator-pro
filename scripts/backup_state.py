@@ -136,8 +136,9 @@ def main(argv: list[str] | None = None) -> int:
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y%m%dT%H%M%SZ"
     )
-    archive_name = f"options_calculator_pro-state-{timestamp}-v{ARCHIVE_SCHEMA_VERSION}.tar.gz"
-    archive_path = output_dir / archive_name
+    archive_path = _next_available_archive_path(
+        output_dir=output_dir, timestamp=timestamp,
+    )
 
     try:
         _write_archive(state_dir=state_dir, archive_path=archive_path)
@@ -204,6 +205,60 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     if args.retention < 0:
         parser.error("--retention must be >= 0")
     return args
+
+
+def _next_available_archive_path(*, output_dir: Path, timestamp: str) -> Path:
+    """Return an archive path that doesn't already exist in
+    *output_dir*.
+
+    The base name is::
+
+        options_calculator_pro-state-<timestamp>-v<schema>.tar.gz
+
+    If that path is already taken (two backups firing in the same
+    UTC second, typically from a script that double-fires by
+    mistake), append a numeric counter so the second backup writes
+    a distinct archive instead of overwriting the first::
+
+        ...-state-<timestamp>-v<schema>-2.tar.gz
+        ...-state-<timestamp>-v<schema>-3.tar.gz
+        ...
+
+    Codex P2 (non-blocking) on PR #67: without this, two backups
+    in the same second silently overwrite each other. The doc says
+    simultaneous backups aren't safe (they race on the staging
+    dir and tar write), but the second-collision case is just bad
+    UX, not an actual race — a counter suffix turns a destructive
+    foot-gun into a recoverable double-write.
+    """
+    base = (
+        f"options_calculator_pro-state-{timestamp}"
+        f"-v{ARCHIVE_SCHEMA_VERSION}.tar.gz"
+    )
+    candidate = output_dir / base
+    if not candidate.exists():
+        return candidate
+    # Collision — find the next free counter suffix. Start at 2
+    # because the original (un-suffixed) archive is implicitly "1".
+    counter = 2
+    while True:
+        suffixed = (
+            f"options_calculator_pro-state-{timestamp}"
+            f"-v{ARCHIVE_SCHEMA_VERSION}-{counter}.tar.gz"
+        )
+        candidate = output_dir / suffixed
+        if not candidate.exists():
+            return candidate
+        counter += 1
+        if counter > 9999:
+            # Practically unreachable — if we hit 10000 collisions
+            # in a single second something is very wrong. Surface
+            # as an exception rather than spin forever.
+            raise RuntimeError(
+                f"too many archive name collisions in {output_dir} "
+                f"for timestamp {timestamp} — investigate "
+                f"runaway double-fires of backup_state.py"
+            )
 
 
 def _write_archive(*, state_dir: Path, archive_path: Path) -> None:
@@ -345,6 +400,25 @@ def _hot_backup_sqlite(*, src: Path, dst: Path) -> None:
         src_conn.close()
 
 
+# Regex matching every archive filename shape this script can
+# write, including collision-suffixed ones. Used by the retention
+# pruner so newly-suffixed archives don't slip past the cleanup
+# pass.
+#
+# Matches:
+#   options_calculator_pro-state-<ts>-v<schema>.tar.gz
+#   options_calculator_pro-state-<ts>-v<schema>-<counter>.tar.gz
+import re as _re  # local alias so the top-of-module import block
+                  # stays focused on the public-API imports.
+_ARCHIVE_FILENAME_PATTERN = _re.compile(
+    r"^options_calculator_pro-state-"
+    r"(?P<ts>\d{8}T\d{6}Z)"
+    r"-v(?P<version>\d+)"
+    r"(?:-(?P<counter>\d+))?"
+    r"\.tar\.gz$"
+)
+
+
 def _prune_old_archives(output_dir: Path, *, retention: int) -> list[Path]:
     """Keep the newest *retention* archives in *output_dir*; delete
     the rest. Returns the list of pruned paths so the caller can
@@ -352,14 +426,36 @@ def _prune_old_archives(output_dir: Path, *, retention: int) -> list[Path]:
 
     `retention=0` disables pruning entirely. A negative value is
     rejected at arg-parse time.
+
+    Eligibility: an archive in *output_dir* is a prune candidate
+    iff its filename matches the canonical pattern AND its schema
+    version equals the current ``ARCHIVE_SCHEMA_VERSION``. Files
+    that don't match — operator-renamed archives, archives from a
+    future schema version, unrelated tarballs the operator dropped
+    into the folder — are left untouched. This protects manual
+    "DEFINITELY_KEEP_<name>.tar.gz" style hold-aside copies and
+    makes a future schema-version bump non-destructive to old
+    archives.
+
+    Sort: lexicographic on filename. The canonical pattern places
+    the timestamp before the counter, so this correctly orders
+    archives across timestamps. Within a single same-second
+    collision burst the un-suffixed archive sorts AFTER its
+    counter-suffixed siblings — a minor ordering quirk that
+    doesn't matter for retention since same-second archives are
+    operationally equivalent.
     """
     if retention == 0:
         return []
-    archives = sorted(
-        output_dir.glob(
-            f"options_calculator_pro-state-*-v{ARCHIVE_SCHEMA_VERSION}.tar.gz"
-        )
-    )
+    candidates: list[Path] = []
+    for path in output_dir.glob("options_calculator_pro-state-*.tar.gz"):
+        match = _ARCHIVE_FILENAME_PATTERN.match(path.name)
+        if match is None:
+            continue
+        if int(match.group("version")) != ARCHIVE_SCHEMA_VERSION:
+            continue
+        candidates.append(path)
+    archives = sorted(candidates)
     if len(archives) <= retention:
         return []
     to_delete = archives[: len(archives) - retention]

@@ -64,8 +64,18 @@ DEFAULT_TARGET_DIR = Path.home() / ".options_calculator_pro"
 
 # Archive filename shape:
 #   options_calculator_pro-state-YYYYMMDDTHHMMSSZ-vN.tar.gz
+#   options_calculator_pro-state-YYYYMMDDTHHMMSSZ-vN-<counter>.tar.gz
+#
+# The optional ``-<counter>`` suffix is appended by backup_state.py
+# when two backups land in the same UTC second to prevent silent
+# overwrites. Restore must accept both shapes so collision-suffixed
+# archives are restorable.
 _ARCHIVE_FILENAME_RE = re.compile(
-    r"^options_calculator_pro-state-(?P<ts>\d{8}T\d{6}Z)-v(?P<version>\d+)\.tar\.gz$"
+    r"^options_calculator_pro-state-"
+    r"(?P<ts>\d{8}T\d{6}Z)"
+    r"-v(?P<version>\d+)"
+    r"(?:-(?P<counter>\d+))?"
+    r"\.tar\.gz$"
 )
 
 
@@ -255,33 +265,75 @@ def _extract(*, archive_path: Path, target_dir: Path) -> None:
     ``/tmp/restored_state/.options_calculator_pro/logs/...``.
 
     Defensive validation per member:
-      * Absolute paths rejected (would write outside target).
-      * Any ``..`` component rejected (path traversal).
-      * Empty paths or root-only entries skipped.
+
+      * **Path validation:** absolute paths rejected; any path
+        containing a ``..`` component rejected. Catches the
+        "../escape.txt" class of malicious archives.
+
+      * **Member-type validation:** ONLY regular files and
+        directories are accepted. ``backup_state.py`` is the only
+        thing that should ever produce an archive this script
+        ingests, and it only writes those two types via
+        ``staging.mkdir()`` / ``shutil.copy2`` / ``sqlite3.backup``.
+        Symlinks, hardlinks, FIFOs, character/block devices —
+        anything else came from outside the trusted writer.
+
+        Path-only validation is NOT sufficient. A symlink member
+        with a safe-looking name (e.g. ``logs/escape_link``) but a
+        ``linkname`` pointing outside the target (e.g.
+        ``../../etc/passwd``) extracts successfully under name-
+        only validation, planting a symlink that any downstream
+        reader could follow to a destination of the attacker's
+        choice. This is the Codex P1 finding on PR #67 first
+        round; the regression test in
+        ``test_backup_restore.py`` carries Codex's exact
+        reproducer.
     """
     with tarfile.open(archive_path, mode="r:gz") as tf:
         members = tf.getmembers()
-        # First pass: reject the whole archive if ANY member tries
-        # to escape via absolute paths or `..` traversal. Bailing
-        # before extraction means no partial-write left to clean
-        # up.
+        # First pass: validate every member. Bail BEFORE extracting
+        # anything so a single bad member doesn't leave a partial
+        # restore on disk. The order of checks matters: path checks
+        # first (cheap string ops on member.name), then type
+        # checks (which require inspecting the tar header).
         for member in members:
-            # Absolute paths.
             if member.name.startswith("/"):
                 raise tarfile.TarError(
-                    f"unsafe path in archive: {member.name!r}"
+                    f"unsafe path in archive: absolute path "
+                    f"{member.name!r}"
                 )
-            # `..` anywhere in the path (including a leading
-            # `..` like "../escape.txt", which has Path parts
-            # ("..", "escape.txt")).
             if ".." in Path(member.name).parts:
                 raise tarfile.TarError(
-                    f"unsafe path in archive: {member.name!r}"
+                    f"unsafe path in archive: path traversal in "
+                    f"{member.name!r}"
+                )
+            if not (member.isfile() or member.isdir()):
+                # Identify the rejected type for the operator's
+                # diagnostic logs. The tarfile API has type
+                # predicates for each shape; we report the most
+                # specific one available.
+                if member.issym():
+                    kind = "symbolic link"
+                elif member.islnk():
+                    kind = "hard link"
+                elif member.isfifo():
+                    kind = "FIFO"
+                elif member.ischr() or member.isblk():
+                    kind = "device node"
+                else:
+                    kind = f"unsupported type ({member.type!r})"
+                raise tarfile.TarError(
+                    f"unsafe member type in archive: {kind} at "
+                    f"{member.name!r}. backup_state.py only writes "
+                    f"regular files and directories; this archive "
+                    f"appears to come from another source or has "
+                    f"been tampered with."
                 )
 
-        # Strip the leading directory component from each member's
-        # name so contents land inside target_dir at the same
-        # relative depth they had inside the original state dir.
+        # Second pass: strip the leading directory component from
+        # each member's name so contents land inside target_dir at
+        # the same relative depth they had inside the original
+        # state dir.
         for member in members:
             parts = Path(member.name).parts
             if len(parts) <= 1:

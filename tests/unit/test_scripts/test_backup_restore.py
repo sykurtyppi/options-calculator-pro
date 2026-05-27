@@ -539,6 +539,206 @@ def test_restore_rejects_tar_with_path_traversal(tmp_path: Path) -> None:
     assert not (tmp_path / "escape.txt").exists()
 
 
+def test_restore_rejects_tar_with_symlink_member(tmp_path: Path) -> None:
+    """Codex P1 regression on PR #67.
+
+    Path-only validation of tar member names is not sufficient. A
+    symlink member can have a safe-looking ``name`` (e.g.
+    ``.options_calculator_pro/logs/escape_link``) but a
+    ``linkname`` pointing outside the restore target. Under the
+    pre-fix code, ``tarfile.extract()`` planted that symlink at
+    the safe path, and any downstream process that opened the
+    "logs/escape_link" file would silently follow the symlink to
+    the attacker-controlled destination.
+
+    Fix: restore rejects any member that isn't a regular file or
+    directory. backup_state.py only writes those two types via
+    ``staging.mkdir()`` / ``shutil.copy2`` / ``sqlite3.backup``,
+    so anything else came from outside the trusted writer.
+
+    Reproducer mirrors Codex's exact case: a symlink at a
+    safe-looking path inside the archive's top-level dir, with a
+    linkname pointing to a sibling of the restore target.
+    """
+    archive_path = tmp_path / (
+        "options_calculator_pro-state-20260527T120000Z-v1.tar.gz"
+    )
+    # Sentinel file the attacker's symlink would point to.
+    outside_secret = tmp_path / "outside-target"
+    outside_secret.write_text("attacker-controlled", encoding="utf-8")
+
+    with tarfile.open(archive_path, mode="w:gz") as tf:
+        # Top-level dir (matches what backup_state writes).
+        dir_info = tarfile.TarInfo(name=".options_calculator_pro")
+        dir_info.type = tarfile.DIRTYPE
+        tf.addfile(dir_info)
+        logs_info = tarfile.TarInfo(name=".options_calculator_pro/logs")
+        logs_info.type = tarfile.DIRTYPE
+        tf.addfile(logs_info)
+        # The malicious symlink: name looks safe; linkname escapes.
+        sym = tarfile.TarInfo(name=".options_calculator_pro/logs/escape_link")
+        sym.type = tarfile.SYMTYPE
+        sym.linkname = "../../outside-target"
+        tf.addfile(sym)
+
+    target = tmp_path / "restored"
+    rc = restore_state.main([str(archive_path), "--target-dir", str(target)])
+    # Reject the whole archive — exit 1 (setup/validation failure,
+    # not an integrity failure).
+    assert rc == 1, (
+        f"restore must reject symlink members; got rc={rc}. The "
+        f"current restored target may contain attacker-controlled "
+        f"symlinks pointing outside it."
+    )
+    # No symlink planted under the target.
+    assert not (target / "logs" / "escape_link").exists()
+    assert not (target / "logs" / "escape_link").is_symlink()
+
+
+def test_restore_rejects_tar_with_hardlink_member(tmp_path: Path) -> None:
+    """Same threat class as symlinks. Hardlinks in tar archives
+    point at the archive's internal namespace, but at extraction
+    time tarfile interprets the linkname as a path relative to
+    the extraction root — exposing the same attacker-controlled-
+    target shape as symlinks. backup_state.py never emits
+    hardlinks, so restore must reject them too."""
+    archive_path = tmp_path / (
+        "options_calculator_pro-state-20260527T120000Z-v1.tar.gz"
+    )
+    with tarfile.open(archive_path, mode="w:gz") as tf:
+        dir_info = tarfile.TarInfo(name=".options_calculator_pro")
+        dir_info.type = tarfile.DIRTYPE
+        tf.addfile(dir_info)
+        # Hardlink member with a safe name but suspicious linkname.
+        hl = tarfile.TarInfo(name=".options_calculator_pro/hardlink")
+        hl.type = tarfile.LNKTYPE
+        hl.linkname = "/etc/passwd"
+        tf.addfile(hl)
+
+    target = tmp_path / "restored"
+    rc = restore_state.main([str(archive_path), "--target-dir", str(target)])
+    assert rc == 1
+    # No hardlink planted under the target.
+    assert not (target / "hardlink").exists()
+
+
+def test_backup_appends_counter_on_filename_collision(tmp_path: Path) -> None:
+    """Codex P2 (non-blocking) on PR #67.
+
+    Two backups firing in the same UTC second produce the same
+    base filename. Without a collision suffix, the second
+    overwrites the first — silent data loss in the
+    operator-double-fire case.
+
+    Fix: when the target archive path already exists, append a
+    numeric suffix (-2, -3, ...) before the .tar.gz extension.
+    The schema-version regex on restore accepts the suffixed
+    shape so collision-suffixed archives remain restorable.
+
+    This test fakes the collision by pre-creating an archive
+    file at the path backup_state would have chosen, then
+    running backup_state and verifying it picked a -2 suffix.
+    """
+    src = tmp_path / "state"
+    _populate_state_dir(src, ledger_rows=10)
+    output_dir = tmp_path / "backups"
+    output_dir.mkdir()
+
+    # Run one real backup to learn the timestamp it picks.
+    rc = backup_state.main([
+        "--state-dir", str(src),
+        "--output-dir", str(output_dir),
+        "--retention", "0",
+    ])
+    assert rc == 0
+    first_archive = next(output_dir.glob("*.tar.gz"))
+    assert "-v1.tar.gz" in first_archive.name
+    assert "-v1-" not in first_archive.name  # no counter on first
+
+    # Force a same-second collision by pre-creating a dummy file
+    # at every name the backup might pick over the next few
+    # seconds. We can't reliably control the OS clock, so instead
+    # we re-run the backup and assert that whichever timestamp it
+    # picks, IF that path already exists, the suffix kicks in.
+    # Simpler: directly invoke the collision-suffix helper.
+    from scripts.backup_state import _next_available_archive_path
+
+    # Same timestamp as the first archive — should yield a -2 suffix.
+    # Extract the timestamp from the first archive's filename.
+    import re
+    m = re.search(r"-(\d{8}T\d{6}Z)-v", first_archive.name)
+    assert m is not None
+    ts = m.group(1)
+
+    next_path = _next_available_archive_path(
+        output_dir=output_dir, timestamp=ts,
+    )
+    assert next_path.name.endswith("-v1-2.tar.gz"), (
+        f"expected -v1-2.tar.gz suffix on collision, got {next_path.name}"
+    )
+
+    # Pre-create the -2 file too; helper should bump to -3.
+    next_path.write_bytes(b"placeholder")
+    third_path = _next_available_archive_path(
+        output_dir=output_dir, timestamp=ts,
+    )
+    assert third_path.name.endswith("-v1-3.tar.gz"), (
+        f"expected -v1-3.tar.gz suffix on second collision, got {third_path.name}"
+    )
+
+
+def test_restore_accepts_collision_suffixed_archive(tmp_path: Path) -> None:
+    """Roundtrip pin for the collision-suffix shape. A backup
+    written with a -2 suffix must round-trip through restore
+    cleanly — the schema-version regex must accept the suffixed
+    filename."""
+    # Pre-populate a state dir and force the backup to take a
+    # collision-suffixed name by creating the un-suffixed path
+    # first.
+    src = tmp_path / "state"
+    _populate_state_dir(src, ledger_rows=10)
+    output_dir = tmp_path / "backups"
+    output_dir.mkdir()
+
+    # First backup (no collision).
+    backup_state.main([
+        "--state-dir", str(src),
+        "--output-dir", str(output_dir),
+    ])
+    first = next(output_dir.glob("*-v1.tar.gz"))
+    assert "-v1-" not in first.name
+
+    # Force a collision by re-running with the same timestamp.
+    # The simplest deterministic way: monkey-patch datetime.now
+    # to return a fixed time. We do this via the helper directly.
+    from scripts.backup_state import _next_available_archive_path
+    import re
+    m = re.search(r"-(\d{8}T\d{6}Z)-v", first.name)
+    assert m is not None
+    ts = m.group(1)
+    collision_path = _next_available_archive_path(
+        output_dir=output_dir, timestamp=ts,
+    )
+    assert collision_path.name.endswith("-v1-2.tar.gz")
+
+    # Materialize a real backup at that collision path by
+    # invoking _write_archive directly.
+    from scripts.backup_state import _write_archive
+    _write_archive(state_dir=src, archive_path=collision_path)
+
+    # Now restore the collision-suffixed archive — the schema
+    # regex must accept it.
+    target = tmp_path / "restored"
+    rc = restore_state.main([
+        str(collision_path), "--target-dir", str(target),
+    ])
+    assert rc == 0, (
+        f"restore must accept collision-suffixed archive name; "
+        f"got rc={rc} on {collision_path.name}"
+    )
+    assert (target / "recommendations" / "recommendation_ledger.sqlite").exists()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Empty/missing source handling
 # ──────────────────────────────────────────────────────────────────────────
