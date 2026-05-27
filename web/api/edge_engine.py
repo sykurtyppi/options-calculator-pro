@@ -880,6 +880,111 @@ def _summarize_pre_earnings_expansion(
     return summary
 
 
+def _build_experimental_contract_selection(
+    *,
+    best_structure: Optional[str],
+    chain_df: Optional[pd.DataFrame],
+    earnings_event_date: Optional[Any],
+) -> Optional[Dict[str, Any]]:
+    """Live-API shadow surface for candidate calendar contracts.
+
+    PR-AC commit 3. Strict shadow-mode: never replaces or modifies any
+    existing recommendation field; returned as a separate, clearly-labeled
+    `experimental_contract_selection` block.
+
+    Coverage matrix:
+      best_structure       | behavior
+      ---------------------|------------------------------------------
+      call_calendar        | runs _dual_picker_calendar_selection on
+                           | the live calls chain; surfaces both
+                           | legacy and candidate selections.
+      put_calendar         | returns put_side_not_yet_supported
+                           | placeholder. The historical backtest path
+                           | only queries the calls chain, so we have
+                           | NO put-side forward-validation evidence
+                           | yet. Surfacing call-side contracts under a
+                           | put_calendar response would falsely imply
+                           | we know what we're doing on the put side.
+                           | This is a deliberate Codex review hard
+                           | requirement.
+      anything else        | returns None (no calendar contracts to
+                           | recommend).
+    """
+    if best_structure not in ("call_calendar", "put_calendar"):
+        return None
+
+    base = {
+        "structure": best_structure,
+        "labels": {
+            "experimental": True,
+            "shadow_mode": True,
+            "not_execution_guidance": True,
+            "out_of_sample_validated": False,
+        },
+        "note": (
+            "Experimental candidate contract selection. The candidate "
+            "picker uses an in-sample +14d min-front-DTE rule from "
+            "PR-AB; not yet out-of-sample validated. Treat as research "
+            "input, not as an order recommendation."
+        ),
+    }
+
+    if best_structure == "put_calendar":
+        # CODEX HARD REQUIREMENT: must not silently route call-side
+        # data here. Put-side dual-picker requires querying the puts
+        # chain through the historical backtest path, which is a
+        # separate correctness change.
+        return {
+            **base,
+            "status": "put_side_not_yet_supported",
+            "reason": (
+                "The historical backtest only queries the calls chain, "
+                "so no put-side forward-validation evidence exists yet. "
+                "Surfacing call-side contracts here would falsely imply "
+                "put-side validation. Wiring puts through the historical "
+                "simulation is a separate change."
+            ),
+            "candidate_contracts": None,
+        }
+
+    # call_calendar branch — invoke the dual picker on the live chain.
+    if chain_df is None or earnings_event_date is None:
+        return {
+            **base,
+            "status": "skipped:missing_inputs",
+            "reason": "Live chain or earnings event date unavailable.",
+            "candidate_contracts": None,
+        }
+
+    # The live MDApp chain uses `expiration_date`; the picker module
+    # expects `expiry`. Normalize here per the picker docstring's
+    # "callers must normalize column names" requirement.
+    normalized = chain_df
+    if "expiration_date" in chain_df.columns and "expiry" not in chain_df.columns:
+        normalized = chain_df.copy()
+        normalized["expiry"] = normalized["expiration_date"]
+
+    try:
+        dp = _dual_picker_calendar_selection(
+            normalized,
+            event_date=pd.Timestamp(earnings_event_date),
+            side="call",
+        )
+    except Exception as exc:
+        logger.debug("experimental_contract_selection failed: %s", exc)
+        return {
+            **base,
+            "status": f"error:{type(exc).__name__}",
+            "candidate_contracts": None,
+        }
+
+    return {
+        **base,
+        "status": dp.get("shadow_status", "unknown"),
+        "candidate_contracts": dp,
+    }
+
+
 def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Aggregate dual-picker shadow logs into an evidence block.
 
@@ -3261,6 +3366,23 @@ def analyze_single_ticker(
     else:
         structure_payoff = None
 
+    # ── Experimental: candidate calendar contract selection ──────────────────
+    # PR-AC commit 3 — strict shadow surface. Only call_calendar gets live
+    # contract recommendations; put_calendar receives an explicit placeholder
+    # because we have no put-side forward-validation evidence yet. See
+    # _build_experimental_contract_selection docstring for the coverage matrix.
+    _earnings_event_date_for_picker = (
+        resolved_earnings_event.earnings_date
+        if resolved_earnings_event is not None
+        and getattr(resolved_earnings_event, "earnings_date", None) is not None
+        else None
+    )
+    experimental_contract_selection = _build_experimental_contract_selection(
+        best_structure=_best_structure,
+        chain_df=chain_df,
+        earnings_event_date=_earnings_event_date_for_picker,
+    )
+
     # ── 7. Hard gates (unchanged) ─────────────────────────────────────────────
     hard_gate_reasons: List[str] = []
     implied_move_val = _safe_float(implied_move_total_pct, np.nan)
@@ -3711,6 +3833,12 @@ def analyze_single_ticker(
         ),
         # ── Structure-specific payoff (matches the recommended structure) ────
         "structure_payoff": structure_payoff,
+        # ── Experimental candidate contract selection (PR-AC commit 3) ──────
+        # Shadow surface. None for non-calendar structures. For call_calendar,
+        # carries the dual-picker output for the live chain. For put_calendar,
+        # carries an explicit "not yet supported" placeholder. Never replaces
+        # any existing field; intended as a research diagnostic only.
+        "experimental_contract_selection": experimental_contract_selection,
         # ── Calendar spread P&L diagram (legacy panel) ─────────────────────
         "calendar_payoff": calendar_payoff,
         # Fix 4: calendar spread viability

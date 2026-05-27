@@ -20,6 +20,7 @@ import pytest
 
 from web.api.edge_engine import (
     _aggregate_experimental_candidate_evidence,
+    _build_experimental_contract_selection,
     _dual_picker_calendar_selection,
     _empty_dual_picker,
 )
@@ -470,3 +471,175 @@ class TestExperimentalCandidateEvidenceAggregation:
         # right denominator
         assert "unique_events_observed" in note  # mentioned by name
         assert "should not be used as a denominator" in note
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# _build_experimental_contract_selection  (PR-AC commit 3)
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestExperimentalContractSelection:
+    """Live-API shadow surface tests. The hardest constraint here is the
+    put-side guardrail: put_calendar must NEVER receive call-side
+    contracts. That mistake is exactly the kind of silent-routing error
+    Codex's review flagged."""
+
+    @staticmethod
+    def _live_chain():
+        # Live chain uses MDApp column name `expiration_date`. The helper
+        # must normalize it to the picker's `expiry` schema.
+        return pd.DataFrame([
+            {"expiration_date": date(2024, 5, 3), "strike": 100.0,
+             "call_put": "C", "mid": 1.0, "iv": 0.30, "underlying_price": 100.0},
+            {"expiration_date": date(2024, 5, 17), "strike": 100.0,
+             "call_put": "C", "mid": 2.0, "iv": 0.30, "underlying_price": 100.0},
+            {"expiration_date": date(2024, 6, 21), "strike": 100.0,
+             "call_put": "C", "mid": 3.0, "iv": 0.30, "underlying_price": 100.0},
+            # Include puts so we can verify they're NOT used for call_calendar
+            {"expiration_date": date(2024, 5, 17), "strike": 100.0,
+             "call_put": "P", "mid": 2.1, "iv": 0.31, "underlying_price": 100.0},
+            {"expiration_date": date(2024, 6, 21), "strike": 100.0,
+             "call_put": "P", "mid": 3.2, "iv": 0.31, "underlying_price": 100.0},
+        ])
+
+    def test_returns_none_for_non_calendar_structures(self):
+        for structure in (None, "atm_straddle", "otm_strangle", "iron_condor", ""):
+            result = _build_experimental_contract_selection(
+                best_structure=structure,
+                chain_df=self._live_chain(),
+                earnings_event_date=date(2024, 5, 1),
+            )
+            assert result is None, (
+                f"non-calendar structure {structure!r} should not receive "
+                f"experimental_contract_selection, got {result}"
+            )
+
+    def test_call_calendar_returns_dual_picker_candidates(self):
+        result = _build_experimental_contract_selection(
+            best_structure="call_calendar",
+            chain_df=self._live_chain(),
+            earnings_event_date=date(2024, 5, 1),
+        )
+        assert result is not None
+        assert result["structure"] == "call_calendar"
+        assert result["status"] == "ok"
+        # Labels must communicate this is shadow / experimental
+        labels = result["labels"]
+        assert labels["experimental"] is True
+        assert labels["shadow_mode"] is True
+        assert labels["not_execution_guidance"] is True
+        assert labels["out_of_sample_validated"] is False
+        # Candidate contracts populated via dual picker
+        cc = result["candidate_contracts"]
+        assert cc is not None
+        assert cc["legacy_selection"] is not None
+        assert cc["candidate_selection"] is not None
+        # Both pickers should diverge on this chain (5/3 vs 5/17)
+        assert cc["pickers_diverged"] is True
+
+    def test_put_calendar_returns_placeholder_not_call_side_contracts(self):
+        """REGRESSION: the most important guardrail in this commit.
+        put_calendar must NEVER receive call-side contract data — we
+        have no put-side forward-validation evidence yet. Surfacing
+        call-side contracts under a put_calendar response would falsely
+        imply put-side validation."""
+        chain = self._live_chain()
+        result = _build_experimental_contract_selection(
+            best_structure="put_calendar",
+            chain_df=chain,  # contains both calls and puts
+            earnings_event_date=date(2024, 5, 1),
+        )
+        assert result is not None
+        assert result["structure"] == "put_calendar"
+        # The critical assertion: status is the explicit placeholder
+        assert result["status"] == "put_side_not_yet_supported"
+        # AND candidate_contracts must be None — no leakage
+        assert result["candidate_contracts"] is None
+        # Reason explains why
+        assert "calls chain" in result["reason"].lower()
+        # Labels still applied
+        assert result["labels"]["experimental"] is True
+
+    def test_put_calendar_does_not_invoke_picker_at_all(self, monkeypatch):
+        """Defense in depth: even if a future refactor changes the
+        placeholder string, the picker MUST NOT be called for puts."""
+        called = {"count": 0}
+        from web.api import edge_engine
+        original = edge_engine._dual_picker_calendar_selection
+
+        def _spy(*args, **kwargs):
+            called["count"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(edge_engine, "_dual_picker_calendar_selection", _spy)
+        _build_experimental_contract_selection(
+            best_structure="put_calendar",
+            chain_df=self._live_chain(),
+            earnings_event_date=date(2024, 5, 1),
+        )
+        assert called["count"] == 0, (
+            "put_calendar must not invoke the dual picker — that would "
+            "produce call-side selections from the call-only path"
+        )
+
+    def test_missing_chain_returns_skipped_status(self):
+        result = _build_experimental_contract_selection(
+            best_structure="call_calendar",
+            chain_df=None,
+            earnings_event_date=date(2024, 5, 1),
+        )
+        assert result is not None
+        assert result["status"] == "skipped:missing_inputs"
+        assert result["candidate_contracts"] is None
+
+    def test_missing_event_date_returns_skipped_status(self):
+        result = _build_experimental_contract_selection(
+            best_structure="call_calendar",
+            chain_df=self._live_chain(),
+            earnings_event_date=None,
+        )
+        assert result is not None
+        assert result["status"] == "skipped:missing_inputs"
+        assert result["candidate_contracts"] is None
+
+    def test_normalizes_mdapp_expiration_date_column(self):
+        """The MDApp chain uses `expiration_date`; the picker expects
+        `expiry`. The helper must normalize the column rather than
+        silently returning no contracts."""
+        # Verified implicitly by test_call_calendar_returns_dual_picker_
+        # candidates passing — but assert explicitly here for clarity.
+        chain = self._live_chain()
+        assert "expiration_date" in chain.columns
+        assert "expiry" not in chain.columns
+        result = _build_experimental_contract_selection(
+            best_structure="call_calendar",
+            chain_df=chain,
+            earnings_event_date=date(2024, 5, 1),
+        )
+        # Status ok proves normalization worked
+        assert result["status"] == "ok"
+        assert result["candidate_contracts"]["legacy_selection"] is not None
+
+    def test_output_is_json_safe(self):
+        import json
+        result = _build_experimental_contract_selection(
+            best_structure="call_calendar",
+            chain_df=self._live_chain(),
+            earnings_event_date=date(2024, 5, 1),
+        )
+        json.dumps(result)  # must not raise
+
+    def test_no_performance_claims_in_labels_or_note(self):
+        """Codex hard requirement: no performance language at the
+        experimental surface."""
+        result = _build_experimental_contract_selection(
+            best_structure="call_calendar",
+            chain_df=self._live_chain(),
+            earnings_event_date=date(2024, 5, 1),
+        )
+        flat = str(result).lower()
+        forbidden = ["+11%", "+23%", "73% win", "12% return",
+                     "outperform", "expected pnl"]
+        for s in forbidden:
+            assert s not in flat, f"performance claim {s!r} leaked"
+
+
