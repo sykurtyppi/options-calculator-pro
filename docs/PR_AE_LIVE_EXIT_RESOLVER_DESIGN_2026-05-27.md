@@ -482,17 +482,19 @@ The two key non-obvious rules:
   resolver to give up before the data shows up. Already noted in
   the eligibility section; restated here so both sections agree.
 
-A subtle case: when the resolver re-runs and lands the EXACT same
+A subtle case: when the resolver re-runs on the terminal-failure
+write path (`increment_attempts=True`) and lands the EXACT same
 `retrying` outcome as the prior revision, the
 `UNIQUE(recommendation_id, content_hash)` constraint dedupes the
 new row → `record_resolution_and_attempt` returns `"duplicate"`,
 BUT the counter still increments. This is intentional: without it,
 a row stuck in `retrying` with no upstream chain change would never
 escalate to `permanently_failed`. The counter tracks "resolver
-attempts made," not "revisions written." (Verified by
-`test_pr_ae_atomic_helper_duplicate_outcome_does_not_bump_counter`'s
-positive-counter-increment assertion — the test name is the inverse
-of what the assertion checks; counter DOES increment on duplicate.)
+attempts made," not "revisions written." Verified by
+`test_pr_ae_atomic_helper_duplicate_outcome_still_bumps_counter`
+(renamed from the C1b draft name in the C1c clarification
+commit — the original name read as the inverse of the asserted
+behavior).
 
 **Atomicity contract (Codex C1 P1 audit)**: the revision insert and
 the counter UPDATE happen in the SAME transaction via

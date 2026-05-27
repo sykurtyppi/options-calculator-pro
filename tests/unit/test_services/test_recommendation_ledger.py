@@ -1743,19 +1743,30 @@ def test_pr_ae_atomic_helper_raises_for_unknown_id(tmp_path: Path) -> None:
         )
 
 
-def test_pr_ae_atomic_helper_duplicate_outcome_does_not_bump_counter(
+def test_pr_ae_atomic_helper_duplicate_outcome_still_bumps_counter(
     tmp_path: Path,
 ) -> None:
-    """Subtle case: if a retry lands the EXACT same payload as the
-    most recent revision, the revisions UNIQUE constraint dedupes the
-    new row (record() returns "duplicate"). The counter still
-    increments — the resolver did do an attempt, even if its output
-    happened to match the prior state.
+    """REGRESSION (Codex C1b audit clarification): on the
+    terminal-failure write path (increment_attempts=True), a duplicate
+    revision payload STILL increments the counter.
+
+    Subtle case: if a retry lands the EXACT same payload as the most
+    recent revision, the revisions UNIQUE constraint dedupes the new
+    row (record() returns "duplicate"). The counter still increments —
+    the resolver did do an attempt, even if its output happened to
+    match the prior state.
 
     Rationale: if we did NOT increment on duplicate, a row stuck in
     "retrying" with no upstream chain change would never escalate to
     permanently_failed (each retry would be a duplicate). Incrementing
-    on duplicate preserves the retry-budget semantics."""
+    on duplicate preserves the retry-budget semantics.
+
+    Pairs with the rule table in the design doc:
+      - retrying  → increment_attempts=True  → counter bumps (always)
+      - permanently_failed:*  → same
+      - ok  → increment_attempts=False  → counter unchanged
+      - awaiting_chain_data  → increment_attempts=False  → counter unchanged
+    """
     ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
     ledger.record(_forward_record(recommendation_id="rec_stuck"))
 
