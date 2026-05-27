@@ -39,8 +39,11 @@ launchctl list | grep optionscalculator
 | `com.optionscalculator.evidence-cycle` | Daily at 21:30 |
 | `com.optionscalculator.evidence-watchdog` | Daily at 22:15 |
 | `com.optionscalculator.weekly-evidence-report` | Mondays at 22:45 |
+| `com.optionscalculator.log-rotation` | Daily at 03:00 |
 
 All jobs use `RunAtLoad=false`; they fire only on the calendar schedule, never on `launchctl load`.
+
+The log-rotation job runs at 03:00 local — chosen to be safely away from every other launchd job so no other job has an active handle on the `.log` files we rotate. Rotation is size-based (default 5 MB threshold) with gzip + 7-archive retention per file; see `scripts/rotate_launchd_logs.py --help` for the exact contract and tunables. Only `*_launchd*.log` shapes are touched — the Python-logger files (`__main__.log`, `services.*.log`) manage their own rotation via `RotatingFileHandler`.
 
 The candidate exit resolver is scheduled at 12:30 local time so prior-day post-event chains have time to settle before the resolver scans pending forward observations. It is operational infrastructure only: it records whether candidate shadow outcomes could be resolved, and it never alerts on positive/negative PnL or candidate-vs-legacy performance.
 
