@@ -745,10 +745,13 @@ def _neutral_prior(structure: str, *, source: str) -> WalkForwardPrior:
         after:  rank_score ≈ 0.308571  (history_score=0 dominates)
 
     This shifts the no-data baseline DOWN, not up — structures
-    with even one observed prior gain a meaningful rank advantage
-    over no-data structures, which is the desired direction (the
-    selector should prefer evidence-backed structures to
-    no-evidence structures).
+    with enough thin positive evidence (Codex review nit: the
+    history_score band starts at history_count=5, so a single
+    observation alone doesn't beat the no-data baseline; positive
+    win-rate / return signal plus ~5 obs does) gain a meaningful
+    rank advantage over no-data structures, which is the desired
+    direction (the selector should prefer evidence-backed
+    structures to no-evidence structures).
     """
     return WalkForwardPrior(
         structure=structure,
