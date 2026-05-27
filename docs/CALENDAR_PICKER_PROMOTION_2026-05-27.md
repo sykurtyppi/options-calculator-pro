@@ -1,6 +1,6 @@
-# Calendar Picker Promotion Criteria — PR-AC
+# Calendar Picker Promotion Criteria — PR-AC + PR-AD
 
-**Status**: Provisional. **Last reviewed**: 2026-05-27.
+**Status**: Provisional. **Last reviewed**: 2026-05-27 (PR-AD update).
 
 This document defines the governance rules for moving the
 `candidate_min_dte` calendar leg-picker rule from experimental shadow
@@ -10,24 +10,34 @@ infrastructure work before being evaluable.
 
 ---
 
-## TL;DR
+## TL;DR (updated for PR-AD)
 
-PR-AC records *which contracts each picker would have chosen* at trade
-entry. It does **not** record *what those contracts would have realized
-at exit* for the candidate picker. Therefore:
+The state of the validation pipeline as of PR-AD:
 
-- **Outcome-based criteria** (candidate mean return, candidate win rate)
-  are **not yet measurable**. Treating them as actionable today would
-  recreate the research-leakage failure mode PR-AC was designed to
-  prevent.
-- **Selection-quality criteria** (divergence rate, coverage, stability)
-  **are measurable today**. They can establish that the rule is
-  well-defined and produces sensible contracts — but they do **not**
-  prove it makes money.
+- ✅ **Selection-quality** (divergence rate, coverage, stability) is
+  measurable today.
+- ✅ **In-sample candidate PnL** is now resolvable on the historical
+  replay path (PR-AD commit 1). It is recorded into the ledger
+  alongside picker selection (PR-AD commit 3). The aggregator
+  surfaces it as **diagnostic only** (`in_sample_diagnostic_candidate_
+  stats`) — explicitly labeled as not promotion evidence.
+- ⚠️ **Live forward candidate PnL** is NOT yet resolvable. PR-AD's
+  candidate shadow outcome simulator runs only inside the historical
+  backtest path (`_simulate_pre_earnings_calendar_trade`). When the
+  live API records an upcoming-earnings recommendation, no exit chain
+  exists yet — the candidate outcome can be RESOLVED only after the
+  earnings event closes, which requires a separate **exit resolver**
+  service that does not yet exist.
+- ❌ **Outcome-based promotion criteria** (`candidate_mean_return ≥
+  legacy + 3pp`, etc.) therefore remain **not actionable**. The
+  aggregator computes them but the `promotion_eligible_candidate_
+  stats` block is empty by construction on every history-only data
+  source. It will populate only after a live exit resolver lands AND
+  enough forward earnings events accumulate.
 
-A full promotion decision requires the outcome-based criteria. Until
-candidate shadow outcome resolution is built (see _Prerequisites_
-below), promotion-by-fiat is not allowed under this governance.
+A full promotion decision requires both the exit-resolver
+infrastructure AND post-PR-AD forward observations on it. Until the
+former is built, promotion-by-fiat is not allowed.
 
 ---
 
@@ -104,33 +114,58 @@ merge date.
 
 ## Prerequisites for evaluating outcome-based criteria
 
-These are concrete code changes that would need to land in a separate
-PR before any return-based or win-rate-based promotion threshold can be
-applied:
+Status as of PR-AD merge:
 
-1. **Candidate shadow simulation through historical events.** Extend
-   `_simulate_pre_earnings_calendar_trade` (or write a parallel
-   simulator) to also use the candidate picker's selection and look up
-   that selection's exit pricing in the exit chain. Produce a
-   `candidate_pnl` per event.
+1. ✅ **Candidate shadow simulation through historical events.**
+   Done in PR-AD commit 1: `_simulate_candidate_shadow_outcome` resolves
+   the candidate picker's contracts through entry + exit chains and
+   computes `mid_pnl` + `mid_realized_return_pct` for every historical
+   simulated trade. Outputs are tagged
+   `sample_provenance: historical_replay_in_sample_or_research` and are
+   NEVER promotion-eligible by themselves.
 
-2. **Schema extension.** Add `candidate_realized_return_pct` and
-   `candidate_pickers_outcome_resolved: bool` to the persisted
-   evidence (either as JSON keys inside `picker_provenance_json` or as
-   dedicated columns).
+2. ✅ **Schema extension.** Done in PR-AD commit 3: the recommendation
+   ledger gained `candidate_shadow_outcome_json` (the full resolved
+   outcome) and `sample_provenance` (denormalized for SQL filtering)
+   columns. Both come with a backward-compatible migration.
 
-3. **Forward-data accumulation period.** After (1) and (2) merge,
-   accumulate observations on events **after that merge date**. The
-   PR-AB sweep's 139 events do not count because they are in-sample.
+3. ⚠️ **Live forward exit resolver — STILL PENDING.** This is the
+   largest remaining gap. The live API records an upcoming-earnings
+   recommendation at trade-entry time, but the candidate exit price
+   is unknown until after the event. A separate **exit resolver
+   service** must:
+   - Periodically scan the ledger for forward observations whose
+     event_date has passed but whose `candidate_shadow_outcome` is
+     still empty.
+   - Pull the post-event chain (from the existing feature store).
+   - Look up the candidate's recorded contracts in that exit chain.
+   - Compute `mid_pnl` + `mid_realized_return_pct`.
+   - Update the ledger row with the resolved outcome.
+   Until this exists, the `promotion_eligible_candidate_stats`
+   block in the aggregator is empty by construction on every
+   data source. Without forward outcome resolution there is NO
+   way to produce promotion-grade candidate PnL — only the in-sample
+   diagnostic stats exist.
 
-4. **Put-side parity.** PR-AC commit 2 only queries the calls chain in
-   the historical backtest. `put_calendar` evidence is currently
-   absent from the dual-path logger by design (Codex review). Promoting
-   a `candidate_min_dte` rule that applies to put_calendar requires
-   put-side simulation parity first.
+4. ⚠️ **Forward-data accumulation period — gated on (3).** Once the
+   exit resolver lands, observations need time to accumulate on events
+   **after** the resolver's merge date. PR-AB / PR-AC / PR-AD events
+   do not count — they're either in-sample (PR-AB) or recorded before
+   the exit resolver existed (PR-AC/PR-AD). The clock for forward
+   accumulation starts at the exit-resolver merge.
 
-Only after all four prerequisites land can the outcome-based criteria
-below be evaluated honestly.
+5. ⚠️ **Put-side parity — STILL PENDING.** PR-AC commit 2 only queries
+   the calls chain in the historical backtest. PR-AD commit 1 inherits
+   that limitation. `put_calendar` candidate evidence is therefore
+   absent from the dual-path logger today. Promoting `candidate_min_dte`
+   for put_calendar requires put-chain querying in the simulator AND
+   in any exit resolver, plus its own forward accumulation period.
+   (PR-AD commit 3 future-proofed the aggregator's event-dedupe key to
+   include `option_type` so call and put outcomes for the same event
+   won't collide once put-side support lands.)
+
+Only after (3) AND (4) AND optionally (5) are done can the
+outcome-based criteria below be evaluated honestly.
 
 ---
 
@@ -224,6 +259,14 @@ begins:
 
 ## Document history
 
-- 2026-05-27: Initial version. Conservative scope per Codex review of
-  PR-AC commit 4 — outcome-based criteria documented but explicitly
-  marked NOT YET EVALUABLE.
+- 2026-05-27: Initial version (PR-AC commit 5). Conservative scope per
+  Codex review of PR-AC commit 4 — outcome-based criteria documented
+  but explicitly marked NOT YET EVALUABLE.
+- 2026-05-27: PR-AD update. Per Codex review of PR-AD commit 2 ("do
+  not overclaim that live forward validation is complete"):
+  prerequisite (1) marked DONE for historical replay; prerequisite (2)
+  marked DONE for ledger persistence; new prerequisite (3) **Live
+  forward exit resolver — STILL PENDING** explicitly added as the
+  largest remaining gap. The `promotion_eligible_candidate_stats`
+  aggregator block exists but is empty by construction until forward
+  exit resolution exists.

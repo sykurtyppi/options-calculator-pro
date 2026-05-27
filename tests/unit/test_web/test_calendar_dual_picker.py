@@ -1643,6 +1643,41 @@ class TestAggregatorPromotionEligibleBucket:
         assert result["provenance_counts"][SAMPLE_PROVENANCE_FORWARD_POST_FREEZE] == 1
         assert result["promotion_eligible_candidate_stats"]["n_events"] == 0
 
+    def test_event_dedupe_includes_option_type_for_put_side_support(self):
+        """REGRESSION (Codex P2a): once put-side support lands, the
+        same earnings event can have BOTH a call_calendar candidate
+        outcome and a put_calendar candidate outcome. The event_key
+        must include option_type so they don't collapse into a single
+        bucket. Today the historical sim is calls-only, but extending
+        the key now means the put-side commit doesn't need to touch
+        the aggregator."""
+        # Simulate the future state: same (symbol, event_date) but
+        # different option_type. Each should count as a distinct
+        # bucket in the aggregator.
+        trades = [
+            {
+                **_forward_eligible_trade(
+                    symbol="AAPL", event_date="2026-06-01",
+                    entry_date="2026-05-29", mid_realized_return_pct=10.0,
+                ),
+                "option_type": "C",
+            },
+            {
+                **_forward_eligible_trade(
+                    symbol="AAPL", event_date="2026-06-01",
+                    entry_date="2026-05-29", mid_realized_return_pct=20.0,
+                ),
+                "option_type": "P",
+            },
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        pe = result["promotion_eligible_candidate_stats"]
+        # TWO distinct buckets: call_calendar's AAPL 2026-06-01 and
+        # put_calendar's AAPL 2026-06-01. They do NOT collapse.
+        assert pe["n_events"] == 2
+        # Mean of 10 and 20 = 15
+        assert pe["candidate_mid_realized_return_pct_mean"] == pytest.approx(15.0)
+
     def test_event_level_dedupe_across_entry_offsets(self):
         """The same event seen at multiple entry offsets should count
         ONCE in the promotion-eligible event count, not N times. PnL
@@ -1714,6 +1749,69 @@ class TestAggregatorInSampleDiagnostic:
         # Only the historical_replay row contributes
         assert diag["n_events"] == 1
         assert diag["candidate_mid_realized_return_pct_mean"] == pytest.approx(20.0)
+
+    def test_in_sample_stats_exclude_skipped_outcomes(self):
+        """REGRESSION (Codex P2b round-3 review of commit 2): the
+        in-sample diagnostic stats must aggregate ONLY records with
+        candidate_shadow_outcome.status == 'ok' and finite numeric
+        mid_realized_return_pct. Skipped/malformed historical-replay
+        rows still appear in candidate_outcome_status_counts (for
+        observability) but must NOT enter the mean/median/win-rate
+        calculations."""
+        trades = [
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2024-05-01", entry_date="2024-04-29",
+                sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                outcome_status="ok", mid_realized_return_pct=10.0,
+            ),
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2024-08-01", entry_date="2024-07-30",
+                sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                outcome_status="skipped:missing_exit_quote",
+            ),
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2024-11-01", entry_date="2024-10-30",
+                sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                outcome_status="skipped:negative_debit",
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+
+        # Observability: skip reasons appear in the diagnostic counts
+        assert result["candidate_outcome_status_counts"]["ok"] == 1
+        assert result["candidate_outcome_status_counts"]["skipped:missing_exit_quote"] == 1
+        assert result["candidate_outcome_status_counts"]["skipped:negative_debit"] == 1
+
+        # But ONLY the ok row contributes to the diagnostic stats
+        diag = result["in_sample_diagnostic_candidate_stats"]
+        assert diag["n_events"] == 1
+        assert diag["candidate_mid_realized_return_pct_mean"] == pytest.approx(10.0)
+
+    def test_in_sample_stats_exclude_non_finite_returns(self):
+        """A record with status=ok but mid_realized_return_pct=NaN or
+        None must NOT enter the in-sample mean. The collector's
+        np.isfinite check is the gatekeeper."""
+        trades = [
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2024-05-01", entry_date="2024-04-29",
+                sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                outcome_status="ok", mid_realized_return_pct=10.0,
+            ),
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2024-08-01", entry_date="2024-07-30",
+                sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                outcome_status="ok", mid_realized_return_pct=float("nan"),
+            ),
+            _trade_with_provenance_and_outcome(
+                symbol="AAPL", event_date="2024-11-01", entry_date="2024-10-30",
+                sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+                outcome_status="ok", mid_realized_return_pct=None,
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        diag = result["in_sample_diagnostic_candidate_stats"]
+        assert diag["n_events"] == 1  # only the finite-PnL row
+        assert diag["candidate_mid_realized_return_pct_mean"] == pytest.approx(10.0)
 
 
 class TestAggregatorNoMixingOfProvenance:

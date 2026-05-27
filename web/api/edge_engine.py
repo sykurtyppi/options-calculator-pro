@@ -1453,8 +1453,24 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
         status = dp.get("shadow_status")
         shadow_status_counts[status or "missing"] = shadow_status_counts.get(status or "missing", 0) + 1
 
-        event_key = (trade.get("symbol"), trade.get("event_date"))
-        if event_key != (None, None):
+        # Codex P2a: dedupe key includes option_type so call_calendar
+        # and put_calendar outcomes for the same earnings event do NOT
+        # collapse into a single bucket once put-side support lands.
+        # Today historical replay is calls-only ("C") so this has no
+        # effect on current data — but future-proofing now means the
+        # put-side commit doesn't need to touch the aggregator at all.
+        side_key = trade.get("option_type") or (
+            ((trade.get("dual_picker") or {}).get("candidate_selection") or {}).get("side")
+            or "unknown"
+        )
+        # Normalize "call"/"put" → "C"/"P" so both sources line up
+        if side_key == "call":
+            side_key = "C"
+        elif side_key == "put":
+            side_key = "P"
+        event_key = (trade.get("symbol"), trade.get("event_date"), side_key)
+        if (trade.get("symbol") is not None
+                and trade.get("event_date") is not None):
             unique_events.add(event_key)
 
         # PR-AD commit 2 accounting — observability first, gating second.
@@ -1477,7 +1493,8 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
             and isinstance(candidate_pnl, (int, float))
             and not isinstance(candidate_pnl, bool)
             and np.isfinite(candidate_pnl)
-            and event_key != (None, None)
+            and trade.get("symbol") is not None
+            and trade.get("event_date") is not None
         ):
             candidate_pnl_by_provenance_and_event.setdefault(prov, {}).setdefault(
                 event_key, []
@@ -1486,7 +1503,11 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
         # Strict gate for promotion-eligible bucket. Routes through the
         # single source of truth so any future change to the eligibility
         # definition automatically tightens this aggregator too.
-        if is_promotion_eligible(trade) and event_key != (None, None):
+        if (
+            is_promotion_eligible(trade)
+            and trade.get("symbol") is not None
+            and trade.get("event_date") is not None
+        ):
             promotion_eligible_event_pnls.setdefault(event_key, []).append(
                 float(outcome["mid_realized_return_pct"])
             )
@@ -1713,9 +1734,18 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
                 "(today only forward_post_freeze), candidate "
                 "outcome.status == 'ok', finite numeric "
                 "mid_realized_return_pct, and intact research_mid / "
-                "shadow_only / not_execution_grade labels. Reduces to "
-                "per-event mean PnL before cross-event aggregation so "
-                "entry-offset replication cannot inflate weights."
+                "shadow_only / not_execution_grade labels.\n\n"
+                "AGGREGATION CONVENTION (Codex review P3): when a "
+                "single earnings event is evaluated at N entry "
+                "offsets, the N per-offset PnLs are first reduced to a "
+                "single per-event mean, and only then is the "
+                "cross-event statistic computed. This prevents "
+                "entry-offset replication from inflating denominator "
+                "weights. As a side effect, comparing these stats to "
+                "live forward observations (where each event has only "
+                "ONE entry) is not strictly apples-to-apples — the "
+                "live forward path produces one PnL per event, no "
+                "averaging step. Document this when reporting."
             ),
             **promotion_eligible_summary,
         },
