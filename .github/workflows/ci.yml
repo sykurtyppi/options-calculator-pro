@@ -13,8 +13,11 @@
 #                   constraints layered in, matching the parity setup
 #                   documented in README.md).
 #
-#   frontend-tests  npm test on the React trust-layer suite (Node 20
-#                   + Vite 6 build smoke).
+#   frontend-tests  npm test on the React trust-layer suite (Node 22
+#                   + Vite 6 build smoke). Node 22 specifically — see
+#                   the comment on the Set up Node step below for why
+#                   Node 20 doesn't work with the package.json test
+#                   script.
 #
 # Single-platform Linux on purpose: the production target is macOS
 # (launchd jobs), but the runtime code is POSIX-portable and we want
