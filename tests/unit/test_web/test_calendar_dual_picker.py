@@ -1960,12 +1960,14 @@ class TestPRAECCThreeLiveForwardTagging:
             assert snapshot.candidate_shadow_outcome["labels"][label] is True
 
     def test_attach_live_forward_provenance_is_idempotent(self):
-        """Calling the helper twice on the same snapshot is safe:
-        sample_provenance stays at the forward value (still assigned
-        by the same helper), and candidate_shadow_outcome remains the
-        awaiting-stub. Important because analyze_single_ticker is a
-        public API that might one day be called repeatedly inside a
-        single request."""
+        """Calling the helper twice on the same snapshot is safe.
+        sample_provenance stays at the forward value, and
+        candidate_shadow_outcome remains the awaiting-stub.
+
+        After the PR-AE C3b non-overwrite guard, the second call
+        recognizes the non-empty status and PRESERVES the first call's
+        outcome dict by reference — not just by value equality. The
+        is-identity check below tightens the idempotency contract."""
         from web.api.edge_engine import (
             EdgeSnapshot,
             _attach_live_forward_provenance,
@@ -1981,11 +1983,117 @@ class TestPRAECCThreeLiveForwardTagging:
         _attach_live_forward_provenance(snapshot)
         first_outcome = snapshot.candidate_shadow_outcome
         _attach_live_forward_provenance(snapshot)
-        # Same provenance and status; outcome dict was freshly
-        # constructed (not the same reference) but compares equal
         assert snapshot.sample_provenance == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
         assert snapshot.candidate_shadow_outcome["status"] == "awaiting_exit_resolver"
-        assert snapshot.candidate_shadow_outcome == first_outcome
+        # PR-AE C3b: same reference, not a freshly-constructed dict.
+        # Guarantees the helper performs ZERO writes to
+        # candidate_shadow_outcome on the second call.
+        assert snapshot.candidate_shadow_outcome is first_outcome
+
+    # ── PR-AE C3b non-overwrite guard (Codex audit P1) ───────────────────
+    #
+    # The four tests below pin the contract: when
+    # candidate_shadow_outcome already carries a non-empty status,
+    # _attach_live_forward_provenance MUST NOT replace it. The guard
+    # protects against a future caller (or future request middleware)
+    # accidentally clobbering a resolved outcome with the
+    # awaiting_exit_resolver stub.
+
+    def test_attach_preserves_existing_ok_outcome(self):
+        """Resolver wrote status=ok onto a snapshot. Re-running the
+        live tagger MUST preserve the ok outcome verbatim — otherwise
+        a future code path that loops live → resolver → live would
+        wipe the resolution every time it cycled."""
+        from web.api.edge_engine import (
+            EdgeSnapshot,
+            _attach_live_forward_provenance,
+        )
+        resolved_outcome = {
+            "status": "ok",
+            "labels": {"research_mid": True, "shadow_only": True,
+                       "not_execution_grade": True},
+            "side": "call",
+            "strike": 200.0,
+            "mid_realized_return_pct": 12.5,
+        }
+        snapshot = EdgeSnapshot(
+            symbol="AAPL", recommendation="Candidate",
+            confidence_pct=72.0, setup_score=0.72,
+            metrics={}, rationale=[],
+            candidate_shadow_outcome=dict(resolved_outcome),
+        )
+        _attach_live_forward_provenance(snapshot)
+        # The ok outcome survives, byte-for-byte
+        assert snapshot.candidate_shadow_outcome == resolved_outcome
+        # Provenance still gets assigned — that's unconditional
+        assert snapshot.sample_provenance == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+
+    def test_attach_preserves_existing_permanently_failed_outcome(self):
+        """Same protection for terminal-failure statuses. The C4
+        resolver writes permanently_failed:* statuses that must not
+        be re-armed for retry by a stray helper call."""
+        from web.api.edge_engine import (
+            EdgeSnapshot,
+            _attach_live_forward_provenance,
+        )
+        terminal_outcome = {
+            "status": "permanently_failed:no_post_event_chain",
+            "labels": {"research_mid": True, "shadow_only": True,
+                       "not_execution_grade": True},
+        }
+        snapshot = EdgeSnapshot(
+            symbol="AAPL", recommendation="Candidate",
+            confidence_pct=72.0, setup_score=0.72,
+            metrics={}, rationale=[],
+            candidate_shadow_outcome=dict(terminal_outcome),
+        )
+        _attach_live_forward_provenance(snapshot)
+        assert snapshot.candidate_shadow_outcome == terminal_outcome
+        assert snapshot.sample_provenance == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+
+    def test_attach_preserves_existing_retrying_outcome(self):
+        """Mid-cycle non-terminal statuses (retrying,
+        awaiting_chain_data) also survive. They are NOT terminal,
+        but the C4 resolver is the only authorized writer — the live
+        tagger must not reset them either."""
+        from web.api.edge_engine import (
+            EdgeSnapshot,
+            _attach_live_forward_provenance,
+        )
+        retrying_outcome = {
+            "status": "retrying",
+            "labels": {"research_mid": True, "shadow_only": True,
+                       "not_execution_grade": True},
+        }
+        snapshot = EdgeSnapshot(
+            symbol="AAPL", recommendation="Candidate",
+            confidence_pct=72.0, setup_score=0.72,
+            metrics={}, rationale=[],
+            candidate_shadow_outcome=dict(retrying_outcome),
+        )
+        _attach_live_forward_provenance(snapshot)
+        assert snapshot.candidate_shadow_outcome == retrying_outcome
+
+    def test_attach_initializes_stub_when_outcome_is_explicit_none(self):
+        """Edge case: if a caller explicitly sets
+        candidate_shadow_outcome to None (rather than the default
+        empty dict), the guard treats that as "no prior outcome"
+        and initializes the stub. Fail-closed because is_promotion_
+        eligible would already reject the None-payload row, and the
+        resolver expects to see the awaiting_exit_resolver sentinel."""
+        from web.api.edge_engine import (
+            EdgeSnapshot,
+            _attach_live_forward_provenance,
+        )
+        snapshot = EdgeSnapshot(
+            symbol="AAPL", recommendation="Candidate",
+            confidence_pct=72.0, setup_score=0.72,
+            metrics={}, rationale=[],
+            candidate_shadow_outcome=None,  # type: ignore[arg-type]
+        )
+        _attach_live_forward_provenance(snapshot)
+        assert isinstance(snapshot.candidate_shadow_outcome, dict)
+        assert snapshot.candidate_shadow_outcome["status"] == "awaiting_exit_resolver"
 
     def test_edge_snapshot_carries_pr_ae_c3_fields_with_safe_defaults(self):
         """A bare EdgeSnapshot (constructed without invoking the

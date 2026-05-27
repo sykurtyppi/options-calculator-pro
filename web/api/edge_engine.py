@@ -3086,10 +3086,14 @@ def _attach_live_forward_provenance(edge_snapshot: "EdgeSnapshot") -> None:
         ``_tag_live_forward_observation`` (the underscore-prefixed
         helper that lives in
         ``services/candidate_shadow_provenance.py``).
-      - ``candidate_shadow_outcome`` → the stable empty-block factory
-        output with status ``"awaiting_exit_resolver"`` — the
-        sentinel the PR-AE C4 resolver uses to recognize "this row
-        is mine to fill in after the earnings event."
+      - ``candidate_shadow_outcome`` → initialized to the stable
+        empty-block factory output with status
+        ``"awaiting_exit_resolver"`` ONLY when the snapshot does not
+        already carry an outcome. Any prior outcome — including
+        ``ok``, ``permanently_failed:*``, ``retrying``,
+        ``awaiting_chain_data``, or even the
+        ``awaiting_exit_resolver`` stub itself — is preserved
+        verbatim (PR-AE C3b, Codex audit follow-up).
 
     Mutates the snapshot in place; returns None.
 
@@ -3109,6 +3113,19 @@ def _attach_live_forward_provenance(edge_snapshot: "EdgeSnapshot") -> None:
          It flows through the helper from
          ``services/candidate_shadow_provenance.py`` only.
 
+    Defensive non-overwrite (PR-AE C3b — Codex audit P1): the
+    candidate_shadow_outcome guard exists so a future caller that
+    re-runs this helper on a snapshot already carrying a resolved
+    outcome cannot clobber the resolution. In normal flow
+    analyze_single_ticker hands the helper a fresh snapshot whose
+    candidate_shadow_outcome is the default empty dict, but the
+    guard makes the helper safe under any call pattern. The
+    sample_provenance assignment is intentionally unconditional —
+    the live API path always knows it is producing a forward
+    observation, and the underscore-prefixed tagger is the SOLE
+    authorized writer of that constant regardless of any prior
+    value.
+
     Historical replay does NOT flow through this helper.
     ``_simulate_pre_earnings_calendar_trade`` builds a plain dict
     with ``sample_provenance = SAMPLE_PROVENANCE_HISTORICAL_REPLAY``
@@ -3117,9 +3134,23 @@ def _attach_live_forward_provenance(edge_snapshot: "EdgeSnapshot") -> None:
     live_record: Dict[str, Any] = {}
     _tag_live_forward_observation(live_record)
     edge_snapshot.sample_provenance = live_record["sample_provenance"]
-    edge_snapshot.candidate_shadow_outcome = _empty_candidate_shadow_outcome(
-        "awaiting_exit_resolver"
+
+    # PR-AE C3b non-overwrite guard. Treat the snapshot's current
+    # candidate_shadow_outcome as authoritative whenever it carries a
+    # non-empty status string. Empty (no status, or {}/None) means
+    # "the live path just created this snapshot," and we initialize
+    # the stub. Any non-empty status — including the very stub we
+    # would otherwise write — is preserved.
+    existing = edge_snapshot.candidate_shadow_outcome
+    existing_status = (
+        str(existing.get("status") or "")
+        if isinstance(existing, dict)
+        else ""
     )
+    if not existing_status:
+        edge_snapshot.candidate_shadow_outcome = _empty_candidate_shadow_outcome(
+            "awaiting_exit_resolver"
+        )
 
 
 def analyze_single_ticker(
