@@ -76,12 +76,42 @@ export function validateApiBase(raw) {
   )
 }
 
-// Resolved at module load. ``import.meta.env`` is a Vite-only API; the
-// optional-chaining + fallback keeps this importable from node --test
-// scripts that don't go through Vite (the test for validateApiBase
-// imports just that function and never reads this constant).
-const RAW_API_BASE =
-  (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_BASE) || ''
+/**
+ * Resolve the raw (pre-validation) API base from a Vite env object.
+ *
+ * Codex follow-up P1: the previous implementation defaulted to ``''``
+ * (same-origin) when ``VITE_API_BASE`` was unset. That's correct for
+ * production (frontend served from backend), but broke local dev,
+ * where Vite runs on ``:5173`` and the backend on ``:8000`` with no
+ * proxy — fetches were going to ``:5173/api/...`` and 404'ing.
+ *
+ * Contract:
+ *   - ``VITE_API_BASE`` set → use it verbatim (will be validated next)
+ *   - ``DEV=true`` and no explicit env → ``http://127.0.0.1:8000``
+ *     (matches the pre-PR-#60 dev default; backend's documented port)
+ *   - otherwise → ``''`` (same-origin; production default)
+ *
+ * Pure function so it can be unit-tested under node ``--test`` (which
+ * has no ``import.meta.env``). Pass a plain object to exercise each
+ * branch.
+ *
+ * @param {Record<string, any>} env
+ * @returns {string}
+ */
+export function resolveRawApiBase(env) {
+  const e = env || {}
+  if (e.VITE_API_BASE) return String(e.VITE_API_BASE)
+  if (e.DEV) return 'http://127.0.0.1:8000'
+  return ''
+}
+
+// ``import.meta.env`` is a Vite-only API. The optional-chaining +
+// fallback keeps this importable from node --test scripts that don't
+// go through Vite — the test imports the pure helpers and never has
+// to evaluate this module-level constant.
+const _env =
+  typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {}
+const RAW_API_BASE = resolveRawApiBase(_env)
 
 export const API_BASE = validateApiBase(RAW_API_BASE)
 

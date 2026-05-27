@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 
+import { apiFetch } from '../../lib/api'
 const NA = '—'
 
 function fmt(v, digits = 1) {

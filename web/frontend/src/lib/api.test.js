@@ -7,7 +7,41 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { validateApiBase } from './api.js'
+import { resolveRawApiBase, validateApiBase } from './api.js'
+
+
+// ── resolveRawApiBase ────────────────────────────────────────────────────
+// Codex follow-up P1: production default is same-origin (''), but DEV
+// mode must fall back to the documented backend port so `npm run dev`
+// works without manual .env.development setup.
+
+test('resolveRawApiBase: explicit VITE_API_BASE wins', () => {
+  assert.equal(
+    resolveRawApiBase({ VITE_API_BASE: 'https://app.example.com', DEV: true }),
+    'https://app.example.com',
+  )
+  // Even in production mode, explicit env is respected.
+  assert.equal(
+    resolveRawApiBase({ VITE_API_BASE: 'https://api.example.com', DEV: false }),
+    'https://api.example.com',
+  )
+})
+
+test('resolveRawApiBase: unset env + DEV=true → backend localhost', () => {
+  assert.equal(
+    resolveRawApiBase({ DEV: true }),
+    'http://127.0.0.1:8000',
+  )
+})
+
+test('resolveRawApiBase: unset env + DEV=false → same-origin', () => {
+  assert.equal(resolveRawApiBase({ DEV: false }), '')
+  assert.equal(resolveRawApiBase({}), '')
+  assert.equal(resolveRawApiBase(undefined), '')
+})
+
+
+// ── validateApiBase ──────────────────────────────────────────────────────
 
 
 test('validateApiBase: empty string → same-origin', () => {

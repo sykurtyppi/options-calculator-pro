@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { apiFetch } from '../../lib/api'
 import { buildCalibrationModel } from './selectorViewModel'
 
 export default function CalibrationInsightPanel({ apiBase, score, curveData = null }) {
