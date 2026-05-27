@@ -433,14 +433,34 @@ def simulate_candidate_shadow_outcome(
         execution_scenario_returns_pct = _empty_scenario_dict()
         execution_scenario_pnl = _empty_scenario_dict()
 
-    # `mid` scenario in the labeled returns must equal
-    # `mid_realized_return_pct` (definitionally — both are
-    # ((exit_value - entry_debit) / entry_debit) * 100). Anchor it
-    # explicitly rather than trusting the upstream helper, so the
-    # "mid" key here remains the canonical research-grade number even
-    # if the helper's mid path drifts in some future refactor.
+    # Anchor the "mid" entries to the simulator's own canonical
+    # values rather than trusting the upstream helper, so the
+    # research-grade promotion-evidence numbers are preserved
+    # byte-for-byte if the helper's mid path ever drifts.
+    #
+    # UNIT CONTRACT (Codex P1 fix on PR #64):
+    #
+    # * `entry_scenario_values` / `exit_scenario_values` are in
+    #   raw option-price points — same scale as the helper's
+    #   `entry_scenarios.scenario_values` / `exit_scenarios.scenario_values`
+    #   and same scale as `entry_debit_mid` / `exit_value_mid`.
+    #
+    # * `execution_scenario_returns_pct` is in percent — matches
+    #   `mid_realized_return_pct` and the helper's
+    #   `realized_return_pct` (both are
+    #   ((exit - entry) / entry) * 100).
+    #
+    # * `execution_scenario_pnl` is in dollars-per-contract — the
+    #   helper computes `(exit - entry) * 100.0` (the equity-option
+    #   multiplier). The simulator's `mid_pnl` is in raw points
+    #   (`exit_value_mid - entry_debit_mid`), so the mid overwrite
+    #   must multiply by 100 to keep the whole dict in one unit.
+    #   Without the `* 100` the dict mixed units —
+    #   `{"mid": 0.3, "cross_25": 20.0, "cross_50": 10.0}` for the
+    #   happy-path fixture — which would silently corrupt any
+    #   per-scenario PnL aggregation in PR #65's gate refactor.
     execution_scenario_returns_pct["mid"] = mid_realized_return_pct
-    execution_scenario_pnl["mid"] = mid_pnl
+    execution_scenario_pnl["mid"] = mid_pnl * 100.0
     entry_scenario_values["mid"] = entry_debit_mid
     exit_scenario_values["mid"] = exit_value_mid
 

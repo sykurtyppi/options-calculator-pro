@@ -602,6 +602,85 @@ def test_simulate_emits_per_scenario_returns_when_bid_ask_present() -> None:
     )
 
 
+def test_execution_scenario_pnl_uses_one_unit_across_all_labels() -> None:
+    """Regression for Codex P1 on PR #64.
+
+    `compare_execution_scenarios()` returns `realized_pnl` as
+    dollars-per-contract — `(exit - entry) * 100.0` — to match the
+    equity-options multiplier. The simulator's own `mid_pnl` is the
+    raw point P&L (`exit_value_mid - entry_debit_mid`), so the
+    anchor line that overwrites `execution_scenario_pnl["mid"]`
+    MUST multiply by 100 to keep the dict's units uniform.
+
+    Before the fix this dict mixed units — e.g. happy-path output
+    was `{"mid": 0.3, "cross_25": 20.0, "cross_50": 10.0}` — which
+    would silently corrupt any PR #65 gate that aggregates per-
+    scenario PnLs. This test asserts unit uniformity by checking
+    the mid-vs-cross ratio falls in a plausible range given the
+    same underlying chain: with mid debit ~= 1.0 and cross debits
+    differing by at most a few percent, mid PnL should be the same
+    order of magnitude as the cross PnLs.
+    """
+    from services.candidate_shadow_outcome import simulate_candidate_shadow_outcome
+
+    entry, exit_, dp = _happy_path_inputs()
+    out = simulate_candidate_shadow_outcome(
+        entry_chain=entry, exit_chain=exit_, dual_picker=dp,
+    )
+    assert out["status"] == "ok"
+    pnl_block = out["execution_scenario_pnl"]
+
+    # Happy path: mid_pnl = 0.3 raw points → 30.0 dollarized.
+    # cross_25 and cross_50 land in the same magnitude (each <100
+    # because the cross debit is only slightly different from mid).
+    # The pre-fix value was 0.3, the post-fix value is 30.0.
+    assert pnl_block["mid"] == pytest.approx(30.0), (
+        f"mid PnL should be dollarized to match the cross_* labels; "
+        f"got {pnl_block['mid']!r}. If you see 0.3 here, the "
+        f"`mid_pnl * 100.0` anchor was reverted."
+    )
+
+    # Unit-uniformity check: every non-None scenario PnL must be the
+    # same order of magnitude. We define "same order" as the max/min
+    # ratio of absolute values being < 100. A pre-fix run produced
+    # mid=0.3, cross_25=20.0 — ratio ~67 but on the boundary — so we
+    # use the stricter ratio < 10 to be unambiguous about catching
+    # the original bug.
+    finite_pnls = [
+        abs(v) for v in pnl_block.values()
+        if v is not None and abs(v) > 0
+    ]
+    assert finite_pnls, "expected at least one finite scenario PnL on happy path"
+    if len(finite_pnls) >= 2:
+        ratio = max(finite_pnls) / min(finite_pnls)
+        assert ratio < 10.0, (
+            f"scenario PnL values span more than an order of magnitude "
+            f"(ratio {ratio:.1f}) — this likely indicates a unit mismatch "
+            f"between the simulator's mid_pnl (option-price points) and "
+            f"compare_execution_scenarios's realized_pnl (dollarized). "
+            f"Block: {pnl_block!r}"
+        )
+
+
+def test_execution_scenario_pnl_mid_equals_dollarized_mid_pnl() -> None:
+    """Tight pin: `execution_scenario_pnl["mid"]` must equal
+    `mid_pnl * 100` exactly. This is the literal post-Codex-P1
+    contract — any future refactor that reverts the `* 100` will
+    fail this assertion immediately rather than corrupting downstream
+    aggregations silently.
+    """
+    from services.candidate_shadow_outcome import simulate_candidate_shadow_outcome
+
+    entry, exit_, dp = _happy_path_inputs()
+    out = simulate_candidate_shadow_outcome(
+        entry_chain=entry, exit_chain=exit_, dual_picker=dp,
+    )
+    assert out["status"] == "ok"
+    assert out["execution_scenario_pnl"]["mid"] == pytest.approx(
+        out["mid_pnl"] * 100.0
+    )
+
+
 def test_simulate_degrades_gracefully_when_bid_ask_missing() -> None:
     """A chain whose rows have NaN bid/ask must still produce a
     populated mid path (the mid is independent of bid/ask once
