@@ -117,7 +117,7 @@ import.
 | `SHARE_PASSWORD` | `ENABLE_SHARE_AUTH=true` | Single shared access code. `hmac.compare_digest` is used on compare. |
 | `SESSION_SECRET` | `ENABLE_SHARE_AUTH=true` | ≥24 chars, NOT `change-me-in-env`. Used as HMAC-SHA256 key over `v1.<issued_at>.<nonce>` cookie payload. |
 | `OPTIONS_CALCULATOR_ALLOWED_ORIGINS` | `ENABLE_SHARE_AUTH=true` | Comma-separated. Must NOT include `*` or `null` — the startup validator refuses both because they combine unsafely with `allow_credentials=True`. |
-| `OPTIONS_CALCULATOR_SECURE_COOKIES` or `OPTIONS_CALCULATOR_HOSTED_MODE` or `OPTIONS_CALCULATOR_ALLOW_INSECURE_SESSION_COOKIE` | exactly one when `ENABLE_SHARE_AUTH=true` | Hosted mode implies Secure cookies. The "allow insecure" escape hatch is for plaintext-HTTP local dev; production should always use Secure. |
+| `OPTIONS_CALCULATOR_SECURE_COOKIES` or `OPTIONS_CALCULATOR_HOSTED_MODE` or `OPTIONS_CALCULATOR_ALLOW_INSECURE_SESSION_COOKIE` | **at least one** when `ENABLE_SHARE_AUTH=true` | Hosted mode implies Secure cookies (so setting both is harmless and common). The "allow insecure" escape hatch is for plaintext-HTTP local dev; production should always use Secure. Multiple flags can coexist — the validator only requires that at least one safe posture is selected. |
 
 ### B. Recommended for production-behind-tunnel
 
@@ -171,8 +171,13 @@ ENABLE_SHARE_AUTH=true
 SHARE_PASSWORD=long-random-shared-code
 SESSION_SECRET=at-least-24-random-chars-totally-not-the-default
 
-# Production posture (any one of these turns on Secure cookies +
-# protects /docs + trusts the proxy's X-Forwarded-For)
+# Production posture. HOSTED_MODE is a convenience flag that implies
+# all three of:
+#   - OPTIONS_CALCULATOR_SECURE_COOKIES=true   (cookie marked Secure)
+#   - OPTIONS_CALCULATOR_PROTECT_API_DOCS=true (/docs and /redoc behind auth)
+#   - OPTIONS_CALCULATOR_TRUST_PROXY_HEADERS=true (XFF honoured for rate-limit)
+# Set the individual flags instead if you want to opt into only some of
+# these behaviours.
 OPTIONS_CALCULATOR_HOSTED_MODE=true
 
 # CORS (NO wildcards allowed under share-auth)
@@ -411,8 +416,14 @@ print('rows:', get_recommendation_ledger().count())
 
 ### iMessage alert anatomy
 
-The watchdog sends iMessage to `WATCHDOG_IMESSAGE_TO` when daily
-evidence cycle health is `FAIL` after 22:15 local. Format:
+The watchdog sends iMessage to `WATCHDOG_IMESSAGE_TO` when the
+combined daily-cycle + candidate-resolver health has an alertable
+`FAIL` *or* `WARN` after 22:15 local. (Ops-AE C1c escalated specific
+resolver `WARN` severities — stuck-awaiting >10 days, stale completion
+— into the alert path. Most `WARN` issues stay observation-only; the
+ones that page have `alertable=True` in the resolver health payload.
+See [What alerts ARE](#what-alerts-are) below for the full list.)
+Format:
 
 ```
 [Options Calculator Watchdog] Daily evidence cycle failed.
