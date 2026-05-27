@@ -822,9 +822,190 @@ def _load_calendar_prior_from_reports(structure: str) -> WalkForwardPrior:
     )
 
 
-def _load_straddle_prior_from_reports() -> WalkForwardPrior:
-    path = _latest_report_file("pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_scoreboard.csv")
-    if path is None:
+# ──────────────────────────────────────────────────────────────────────────
+# PR #71: trade-log-based prior loading
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Pre-PR #71 the straddle / strangle priors weighted by
+# ``realized_count`` over a scoreboard CSV that is the cartesian
+# product of (structure × entry_offset × exit_offset × oi_threshold
+# × spread_cap × execution_scenario). The same physical trade
+# appears in multiple scoreboard rows because looser OI/spread
+# filters inherit trades from tighter ones; weighting by
+# ``realized_count`` over-weights the loose filters. Measured
+# contamination on the live report set:
+#   - atm_straddle cross_25: scoreboard win_rate 0.5392 vs raw
+#     trade-log win_rate 0.5077 (≈3.1 pp inflation)
+#   - aggregate count inflation ≈ 37× (sum 2409 across 60 rows
+#     vs 65 actual physical trades)
+#
+# The fix reads from `pre_earnings_otm_strangle_trade_log.csv`
+# directly and filters to the canonical baseline configuration so
+# each physical trade is counted exactly once. The legacy
+# scoreboard aggregation is preserved as a fallback (visible via
+# the ``legacy_scoreboard_fallback`` source label) for cases where
+# the trade log is unavailable.
+
+# Baseline backtest configuration — must match the constants in
+# scripts/backtest_pre_earnings_otm_strangle.py
+# (BASE_ENTRY_OFFSET=3, BASE_EXIT_OFFSET=0) plus a fixed
+# (OI>=100, spread<=10%) liquidity filter.
+#
+# Pinned in code rather than read from the backtest config because
+# a backtest-side change to these baselines is a selector-affecting
+# decision that should be reviewed deliberately, not absorbed
+# automatically. If a future PR moves the backtest to a different
+# baseline, these constants update in lock-step.
+_BACKTEST_BASELINE_ENTRY_OFFSET = 3
+_BACKTEST_BASELINE_EXIT_OFFSET = 0
+_BACKTEST_BASELINE_OI_FILTER_COL = "entry_pass_oi_100"
+_BACKTEST_BASELINE_SPREAD_FILTER_COL = "entry_pass_spread_10"
+
+# Columns the trade-log loader depends on. Listed once so the
+# schema-stability test can assert all of them exist. A backtest
+# refactor that drops any of these columns fails the test before
+# the loader silently returns bogus priors.
+_TRADE_LOG_REQUIRED_COLUMNS = (
+    "structure",
+    "entry_offset_bdays",
+    "exit_offset_bdays",
+    _BACKTEST_BASELINE_OI_FILTER_COL,
+    _BACKTEST_BASELINE_SPREAD_FILTER_COL,
+    "priceable_realized",
+    f"pnl_{PROMOTION_BASELINE_SCENARIO}",
+    f"return_{PROMOTION_BASELINE_SCENARIO}_pct",
+)
+
+
+def _latest_strangle_run_dir() -> Optional[Path]:
+    """Return the latest ``pre_earnings_otm_strangle_*`` run
+    directory under REPORTS_ROOT, or None if no run exists.
+
+    Codex P2 fix on PR #71 first review: prior loaders independently
+    selected the "latest" trade_log / scoreboard / summary file
+    across ALL run directories via separate ``_latest_report_file``
+    calls. That meant a newer run with only a scoreboard (no trade
+    log) could be silently bypassed in favor of an OLDER run's trade
+    log — the fallback was scoped to "latest file matching a glob,"
+    not "latest run that has any of these files." This helper anchors
+    every loader to the SAME run directory so the fallback chain
+    (trade_log → scoreboard) operates within one consistent
+    point-in-time snapshot.
+
+    Listing convention: sorted lexicographically. Run-directory
+    names embed an ISO timestamp (``pre_earnings_otm_strangle_20260417T180430Z``),
+    so lexicographic == chronological. Directories only — a stray
+    file matching the glob would otherwise sort into the result.
+    """
+    matches = sorted(REPORTS_ROOT.glob("pre_earnings_otm_strangle_*"))
+    matches = [m for m in matches if m.is_dir()]
+    return matches[-1] if matches else None
+
+
+def _load_prior_from_trade_log(
+    *,
+    structure_kind: str,           # value in trade_log.structure column
+    prior_structure_label: str,    # label on the returned WalkForwardPrior
+) -> Optional[WalkForwardPrior]:
+    """Read the latest backtest trade log, apply the canonical
+    baseline filter (entry/exit offset, OI, spread, realized,
+    finite cross_25 PnL), and compute a prior at the physical-
+    trade level.
+
+    Returns ``None`` when the trade log file is absent (caller
+    routes to a fallback) or when no rows match the baseline
+    filter (caller routes to a neutral prior). Returning ``None``
+    rather than a neutral prior here keeps the fallback policy in
+    the caller — different callers handle "absent" differently
+    (strangle has a separate primary path; straddle does not).
+
+    Each physical trade is counted exactly once. Avg-return uses
+    ``return_{scenario}_pct`` (percentage) so the result matches
+    the unit ``_compute_rank_score`` expects.
+
+    Codex P1 fix on PR #71: replaces the
+    ``realized_count``-weighted scoreboard aggregation that
+    multi-counted overlapping filter rows.
+
+    Codex P2 fix on PR #71 first review: scoped to the latest
+    run directory rather than "latest trade_log.csv anywhere." A
+    newer run that has only a scoreboard no longer gets silently
+    bypassed in favor of an older run's trade log.
+    """
+    run_dir = _latest_strangle_run_dir()
+    if run_dir is None:
+        return None
+    path = run_dir / "pre_earnings_otm_strangle_trade_log.csv"
+    if not path.exists():
+        return None
+
+    try:
+        frame = pd.read_csv(path)
+    except (OSError, pd.errors.ParserError):
+        return None
+
+    # Defensive schema check — if any required column is missing,
+    # silently failing back to None lets the caller use its
+    # fallback. The schema-stability TEST asserts presence loudly
+    # so a real schema regression doesn't quietly degrade priors.
+    if any(col not in frame.columns for col in _TRADE_LOG_REQUIRED_COLUMNS):
+        return None
+
+    pnl_col = f"pnl_{PROMOTION_BASELINE_SCENARIO}"
+    return_col = f"return_{PROMOTION_BASELINE_SCENARIO}_pct"
+
+    subset = frame[
+        (frame["structure"] == structure_kind)
+        & (frame["entry_offset_bdays"] == _BACKTEST_BASELINE_ENTRY_OFFSET)
+        & (frame["exit_offset_bdays"] == _BACKTEST_BASELINE_EXIT_OFFSET)
+        & (frame[_BACKTEST_BASELINE_OI_FILTER_COL] == True)  # noqa: E712
+        & (frame[_BACKTEST_BASELINE_SPREAD_FILTER_COL] == True)  # noqa: E712
+        & (frame["priceable_realized"] == True)  # noqa: E712
+        & (pd.to_numeric(frame[pnl_col], errors="coerce").notna())
+    ]
+    if subset.empty:
+        return None
+
+    n = int(len(subset))
+    pnl_numeric = pd.to_numeric(subset[pnl_col], errors="coerce")
+    win_rate = float((pnl_numeric > 0).mean())
+
+    return_numeric = pd.to_numeric(subset[return_col], errors="coerce").dropna()
+    avg_return = float(return_numeric.mean()) if not return_numeric.empty else 0.0
+
+    rank = _compute_rank_score(
+        win_rate=win_rate, avg_return_pct=avg_return, history_count=n,
+    )
+    return WalkForwardPrior(
+        structure=prior_structure_label,
+        history_count=n,
+        win_rate=win_rate,
+        avg_return_pct=avg_return,
+        rank_score=rank,
+        source=f"{path.parent.name}:trade_log:baseline:{PROMOTION_BASELINE_SCENARIO}",
+    )
+
+
+def _load_straddle_prior_from_scoreboard_legacy() -> WalkForwardPrior:
+    """Legacy scoreboard-aggregation path for the atm_straddle
+    prior. KEPT as a fallback for cases where the trade log file
+    is absent (partial deployment / hand-curated reports), but
+    flagged via the ``legacy_scoreboard_fallback`` source label so
+    a downstream consumer can detect when the contaminated path
+    fires.
+
+    This is the pre-PR #71 implementation of
+    ``_load_straddle_prior_from_reports``, modulo two changes:
+    the source-label suffix flags the contaminated path, and the
+    file lookup is scoped to ``_latest_strangle_run_dir()`` (Codex
+    P2 follow-up) so the scoreboard belongs to the same point-in-
+    time run as whichever primary path was checked first.
+    """
+    run_dir = _latest_strangle_run_dir()
+    if run_dir is None:
+        return _neutral_prior("atm_straddle", source="neutral_missing_strangle_report")
+    path = run_dir / "pre_earnings_otm_strangle_scoreboard.csv"
+    if not path.exists():
         return _neutral_prior("atm_straddle", source="neutral_missing_strangle_report")
 
     frame = pd.read_csv(path)
@@ -847,43 +1028,102 @@ def _load_straddle_prior_from_reports() -> WalkForwardPrior:
         win_rate=win_rate,
         avg_return_pct=float(avg_return),
         rank_score=rank,
-        source=f"{path.parent.name}:{PROMOTION_BASELINE_SCENARIO}",
+        source=f"{path.parent.name}:legacy_scoreboard_fallback:{PROMOTION_BASELINE_SCENARIO}",
     )
 
 
-def _load_strangle_prior_from_reports() -> WalkForwardPrior:
-    summary_path = _latest_report_file("pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_summary.json")
-    if summary_path is not None:
-        import json
+def _load_straddle_prior_from_reports() -> WalkForwardPrior:
+    """Two-tier loader for the atm_straddle prior.
 
+    Primary: trade-log aggregation at the canonical baseline
+    filter. Each physical trade counted exactly once.
+    Fallback: legacy scoreboard aggregation with a
+    ``legacy_scoreboard_fallback`` source label. Used only when
+    the trade log is unavailable.
+
+    See PR #71 design note (docs/PR71_STRADDLE_STRANGLE_PRIOR_LOADERS_DESIGN_2026-05-27.md)
+    for the contamination measurements that justify the rewrite.
+    """
+    prior = _load_prior_from_trade_log(
+        structure_kind="atm_straddle",
+        prior_structure_label="atm_straddle",
+    )
+    if prior is not None:
+        return prior
+    return _load_straddle_prior_from_scoreboard_legacy()
+
+
+def _load_strangle_prior_from_summary_baseline() -> Optional[WalkForwardPrior]:
+    """Primary loader for the otm_strangle prior — reads the
+    canonical baseline row from the summary JSON's
+    ``baseline_cost_table``. This path was already clean pre-PR
+    #71 (one row, no aggregation), so PR #71 doesn't touch it.
+
+    Returns ``None`` when the summary file is absent or has no
+    matching baseline row, so the caller can fall through to the
+    trade-log secondary path.
+
+    Codex P2 follow-up: scoped to ``_latest_strangle_run_dir()``
+    rather than "latest summary.json anywhere" so all three
+    fallback layers (summary / trade_log / scoreboard) operate
+    inside the same point-in-time run snapshot.
+    """
+    run_dir = _latest_strangle_run_dir()
+    if run_dir is None:
+        return None
+    summary_path = run_dir / "pre_earnings_otm_strangle_summary.json"
+    if not summary_path.exists():
+        return None
+    import json
+
+    try:
         with summary_path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        baseline_rows = payload.get("baseline_cost_table") or []
-        match = next(
-            (
-                row for row in baseline_rows
-                if str(row.get("execution_scenario")) == PROMOTION_BASELINE_SCENARIO
-            ),
-            None,
-        )
-        if match is not None:
-            avg_return = _avg_return_proxy_from_frame(pd.DataFrame([match]))
-            if avg_return is None:
-                avg_return = 0.0
-            history_count = int(match.get("realized_count", 0) or 0)
-            win_rate = float(match.get("win_rate", 0.50) or 0.50)
-            rank = _compute_rank_score(win_rate=win_rate, avg_return_pct=avg_return, history_count=history_count)
-            return WalkForwardPrior(
-                structure="otm_strangle",
-                history_count=history_count,
-                win_rate=win_rate,
-                avg_return_pct=float(avg_return),
-                rank_score=rank,
-                source=f"{summary_path.parent.name}:baseline:{PROMOTION_BASELINE_SCENARIO}",
-            )
+    except (OSError, json.JSONDecodeError):
+        return None
+    baseline_rows = payload.get("baseline_cost_table") or []
+    match = next(
+        (
+            row for row in baseline_rows
+            if str(row.get("execution_scenario")) == PROMOTION_BASELINE_SCENARIO
+        ),
+        None,
+    )
+    if match is None:
+        return None
+    avg_return = _avg_return_proxy_from_frame(pd.DataFrame([match]))
+    if avg_return is None:
+        avg_return = 0.0
+    history_count = int(match.get("realized_count", 0) or 0)
+    win_rate = float(match.get("win_rate", 0.50) or 0.50)
+    rank = _compute_rank_score(
+        win_rate=win_rate, avg_return_pct=avg_return, history_count=history_count,
+    )
+    return WalkForwardPrior(
+        structure="otm_strangle",
+        history_count=history_count,
+        win_rate=win_rate,
+        avg_return_pct=float(avg_return),
+        rank_score=rank,
+        source=f"{summary_path.parent.name}:baseline:{PROMOTION_BASELINE_SCENARIO}",
+    )
 
-    path = _latest_report_file("pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_scoreboard.csv")
-    if path is None:
+
+def _load_strangle_prior_from_scoreboard_legacy() -> WalkForwardPrior:
+    """Tertiary fallback for the otm_strangle prior — the legacy
+    scoreboard-aggregation path. Pre-PR #71 this was the secondary
+    path; now it's a last-resort fallback with the
+    ``legacy_scoreboard_fallback`` source label so a downstream
+    consumer can detect when the contaminated path fires.
+
+    Codex P2 follow-up: scoped to ``_latest_strangle_run_dir()`` —
+    same reasoning as the straddle scoreboard-legacy variant above.
+    """
+    run_dir = _latest_strangle_run_dir()
+    if run_dir is None:
+        return _neutral_prior("otm_strangle", source="neutral_missing_strangle_report")
+    path = run_dir / "pre_earnings_otm_strangle_scoreboard.csv"
+    if not path.exists():
         return _neutral_prior("otm_strangle", source="neutral_missing_strangle_report")
 
     frame = pd.read_csv(path)
@@ -906,8 +1146,33 @@ def _load_strangle_prior_from_reports() -> WalkForwardPrior:
         win_rate=win_rate,
         avg_return_pct=float(avg_return),
         rank_score=rank,
-        source=f"{path.parent.name}:{PROMOTION_BASELINE_SCENARIO}",
+        source=f"{path.parent.name}:legacy_scoreboard_fallback:{PROMOTION_BASELINE_SCENARIO}",
     )
+
+
+def _load_strangle_prior_from_reports() -> WalkForwardPrior:
+    """Three-tier loader for the otm_strangle prior.
+
+    Primary: summary JSON's ``baseline_cost_table`` (single
+        canonical row; clean since pre-PR #71).
+    Secondary: trade-log aggregation at canonical baseline filter
+        (PR #71 addition — replaces the prior scoreboard-fallback
+        path with a clean physical-trade aggregation).
+    Tertiary: legacy scoreboard aggregation with a
+        ``legacy_scoreboard_fallback`` source label.
+
+    See PR #71 design note for the rationale.
+    """
+    primary = _load_strangle_prior_from_summary_baseline()
+    if primary is not None:
+        return primary
+    secondary = _load_prior_from_trade_log(
+        structure_kind="otm_strangle_3pct",
+        prior_structure_label="otm_strangle",
+    )
+    if secondary is not None:
+        return secondary
+    return _load_strangle_prior_from_scoreboard_legacy()
 
 
 def _walk_forward_prior_signature(
@@ -919,6 +1184,11 @@ def _walk_forward_prior_signature(
         tracked_paths.append(calendar_path)
     for pattern in (
         "pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_summary.json",
+        # PR #71: trade log is now the primary straddle source and
+        # the secondary strangle source. Must be in the cache
+        # signature so a backtest re-run invalidates the prior
+        # cache via mtime change.
+        "pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_trade_log.csv",
         "pre_earnings_otm_strangle_*/pre_earnings_otm_strangle_scoreboard.csv",
     ):
         path = _latest_report_file(pattern)
