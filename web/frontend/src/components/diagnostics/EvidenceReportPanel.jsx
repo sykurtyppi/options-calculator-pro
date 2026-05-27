@@ -20,7 +20,7 @@ export default function EvidenceReportPanel({ apiBase }) {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch(`${apiBase}/api/diagnostics/evidence-report`)
+      const response = await apiFetch(`${apiBase}/api/diagnostics/evidence-report`)
       if (!response.ok) throw new Error(`Evidence report failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {

@@ -34,7 +34,7 @@ export default function ProviderTelemetryPanel({ apiBase }) {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch(endpoint)
+      const response = await apiFetch(endpoint)
       if (!response.ok) throw new Error(`Provider telemetry failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {

@@ -16,7 +16,7 @@ export default function CalibrationInsightPanel({ apiBase, score, curveData = nu
     setLoading(true)
     setError('')
 
-    fetch(`${apiBase}/api/calibration/curve`)
+    apiFetch(`${apiBase}/api/calibration/curve`)
       .then(async (response) => {
         if (!response.ok) {
           const body = await response.json().catch(() => ({}))

@@ -188,8 +188,8 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
     setError('')
     try {
       const [recentResponse, summaryResponse] = await Promise.all([
-        fetch(endpoint),
-        fetch(`${apiBase}/api/diagnostics/recommendations/summary`),
+        apiFetch(endpoint),
+        apiFetch(`${apiBase}/api/diagnostics/recommendations/summary`),
       ])
       if (!recentResponse.ok) throw new Error(`Ledger query failed (${recentResponse.status})`)
       if (!summaryResponse.ok) throw new Error(`Ledger summary failed (${summaryResponse.status})`)
@@ -213,8 +213,8 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
     setError('')
     try {
       const [detailResponse, linkageResponse] = await Promise.all([
-        fetch(`${apiBase}/api/diagnostics/recommendations/${encodeURIComponent(recommendationId)}`),
-        fetch(`${apiBase}/api/diagnostics/recommendations/${encodeURIComponent(recommendationId)}/linkage`),
+        apiFetch(`${apiBase}/api/diagnostics/recommendations/${encodeURIComponent(recommendationId)}`),
+        apiFetch(`${apiBase}/api/diagnostics/recommendations/${encodeURIComponent(recommendationId)}/linkage`),
       ])
       if (!detailResponse.ok) throw new Error(`Ledger detail failed (${detailResponse.status})`)
       if (!linkageResponse.ok) throw new Error(`Ledger linkage failed (${linkageResponse.status})`)

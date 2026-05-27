@@ -18,7 +18,7 @@ export default function DataQualityDiagnosticsPanel({ apiBase }) {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch(`${apiBase}/api/diagnostics/data-quality`)
+      const response = await apiFetch(`${apiBase}/api/diagnostics/data-quality`)
       if (!response.ok) throw new Error(`Data-quality diagnostics failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {

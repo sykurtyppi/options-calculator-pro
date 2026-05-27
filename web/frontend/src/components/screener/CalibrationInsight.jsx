@@ -30,7 +30,7 @@ export default function CalibrationInsight({ apiBase, score }) {
     setLoading(true)
     setError('')
 
-    fetch(`${apiBase}/api/calibration/curve`)
+    apiFetch(`${apiBase}/api/calibration/curve`)
       .then(async (r) => {
         if (!r.ok) {
           const body = await r.json().catch(() => ({}))
