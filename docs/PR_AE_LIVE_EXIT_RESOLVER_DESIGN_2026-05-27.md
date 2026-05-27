@@ -9,8 +9,7 @@
 - **rev 1** — initial draft. Proposed a lazy `from web.api.edge_engine
   import _simulate_candidate_shadow_outcome` inside the resolver
   function.
-- **rev 2 (this revision)** — applies the Codex design-review
-  required changes:
+- **rev 2** — applies the Codex design-review required changes:
   1. Extract `_simulate_candidate_shadow_outcome` into a neutral
      `services/candidate_shadow_outcome.py` module **before** the
      resolver lands. Both `web/api/edge_engine.py` and the resolver
@@ -20,6 +19,27 @@
      counter rules on no-op runs.
   3. Telemetry counts taxonomy made explicit.
   4. Added historical-replay-tag-rejection regression test.
+- **rev 3 (this revision)** — applies the Codex C1 audit
+  follow-ups (landed as commit C1b on the branch, ahead of C2):
+  1. P1 atomicity: add
+     `RecommendationLedger.record_resolution_and_attempt(...)` as
+     the resolver's primary write path — revision insert AND
+     counter UPDATE happen inside a single transaction. The
+     resolver must never call the legacy two-step pattern.
+     `record_resolution_payload(...)` becomes a convenience wrapper
+     for the `increment_attempts=False` path.
+  2. P2 calendar-day clarification: bump default
+     `min_days_after_event` from 2 → 3 (calendar days). Document
+     that the resolver layer applies BDay-aware chain-date selection
+     inside the lookahead window; the ledger filter is a coarse
+     post-event gate.
+  3. P2 telemetry freshness: per-row JSONL telemetry adds
+     `days_in_awaiting_state` so "awaiting forever" rows are
+     visible to the daily watchdog (commit C5 enhancement).
+  4. Test-count baseline clarified: `tests/unit/` collected 906
+     before C1, 929 after C1, 937 after C1b. The earlier "619"
+     figure from the prior session's summary referred to a partial
+     collection scope.
 
 This document is the design contract for PR-AE. **It is intentionally
 scoped narrowly**: PR-AE wires up live-forward provenance tagging and
@@ -246,10 +266,24 @@ Default constants live in `services/candidate_exit_resolver.py`
 and are exported for tests to override:
 
 ```python
-MIN_DAYS_AFTER_EVENT: int = 2
-MAX_LOOKAHEAD_TRADE_DAYS: int = 5  # how far past earnings_date to look for a chain
+MIN_DAYS_AFTER_EVENT: int = 3      # CALENDAR days — covers Fri-earnings → Mon
+MAX_LOOKAHEAD_TRADE_DAYS: int = 5  # how far past earnings_date to look for a chain (BDays)
 MAX_ATTEMPTS: int = 6              # ≈ ~1 week of daily retries before permanent_failed
 ```
+
+`MIN_DAYS_AFTER_EVENT` is measured in **calendar days** because
+`earnings_date` is stored as a plain ISO date string supporting cheap
+lexicographic SQL comparison. The default of 3 covers the common
+edge case where earnings happen on a Friday: 3 calendar days later
+is Monday, by which time the post-event chain should have settled.
+With the original default of 2, eligibility would land on Sunday
+and immediately bounce to `awaiting_chain_data`.
+
+The precise post-event trade date is selected by the resolver layer
+using `pandas.tseries.offsets.BDay` lookahead within
+`MAX_LOOKAHEAD_TRADE_DAYS` business days. The two layers are
+deliberately split: SQL-side coarse "past the window" gate +
+Python-side BDay-aware chain selection.
 
 The eligibility query lives in `recommendation_ledger.py` as a new
 public method `list_pending_candidate_exit_resolutions(...)` returning
@@ -424,18 +458,19 @@ context and is logged at WARNING if it does), `"revision"`, or
 ### 4. Attempt-counter rules on no-op runs
 
 `candidate_exit_resolver_attempts` is incremented by exactly **one**
-when, and only when, the resolver writes a `"revision"` whose
-resolver_status is a terminal-failure status (`retrying` or
-`permanently_failed:*`). The full rule table:
+when, and only when, the resolver writes via the atomic combined
+helper with `increment_attempts=True`. That happens for terminal-
+failure statuses (`retrying` or `permanently_failed:*`). The full
+rule table:
 
-| Run outcome | New revision? | Attempt counter? |
-|---|---|---|
-| Eligibility filter excluded the row (already `ok` or terminal) | no | unchanged |
-| Resolver computed `ok` (first time) | yes | unchanged (success is not a retry) |
-| Resolver computed `ok` (already `ok`, but content_hash matched → duplicate) | no | unchanged |
-| Resolver computed `awaiting_chain_data` (window not elapsed) | yes (if state changed) | unchanged |
-| Resolver computed `retrying` (window elapsed, chain still missing) | yes | **+1** |
-| Resolver computed `permanently_failed:*` | yes | **+1**, then row becomes ineligible |
+| Run outcome | New revision row? | Attempt counter? | Helper called |
+|---|---|---|---|
+| Eligibility filter excluded the row (already `ok` or terminal) | no | unchanged | (resolver early-returns; no ledger write) |
+| Resolver computed `ok` (first time) | yes | unchanged | `record_resolution_payload` (or `record_resolution_and_attempt` with `increment_attempts=False`) |
+| Resolver computed `ok` (already `ok`, but content_hash matched → duplicate) | no | unchanged | same as above; returns `"duplicate"` |
+| Resolver computed `awaiting_chain_data` (window not elapsed) | yes (if state changed) | unchanged | `record_resolution_payload` |
+| Resolver computed `retrying` (window elapsed, chain still missing) | yes | **+1** | `record_resolution_and_attempt(..., increment_attempts=True)` |
+| Resolver computed `permanently_failed:*` | yes | **+1**, then row becomes ineligible | `record_resolution_and_attempt(..., increment_attempts=True)` |
 
 The two key non-obvious rules:
 
@@ -447,12 +482,33 @@ The two key non-obvious rules:
   resolver to give up before the data shows up. Already noted in
   the eligibility section; restated here so both sections agree.
 
-The counter is incremented via the new
-`RecommendationLedger.increment_resolver_attempts(recommendation_id)`
-helper, in the same transaction as the `record()` write. The
-counter UPDATE is the **single** mutation path PR-AE adds to the
-immutable `recommendations` row — justified because the counter is
-process bookkeeping rather than evidence (see "Schema additions"
+A subtle case: when the resolver re-runs and lands the EXACT same
+`retrying` outcome as the prior revision, the
+`UNIQUE(recommendation_id, content_hash)` constraint dedupes the
+new row → `record_resolution_and_attempt` returns `"duplicate"`,
+BUT the counter still increments. This is intentional: without it,
+a row stuck in `retrying` with no upstream chain change would never
+escalate to `permanently_failed`. The counter tracks "resolver
+attempts made," not "revisions written." (Verified by
+`test_pr_ae_atomic_helper_duplicate_outcome_does_not_bump_counter`'s
+positive-counter-increment assertion — the test name is the inverse
+of what the assertion checks; counter DOES increment on duplicate.)
+
+**Atomicity contract (Codex C1 P1 audit)**: the revision insert and
+the counter UPDATE happen in the SAME transaction via
+`record_resolution_and_attempt(...)`. Either both land or both roll
+back. The resolver MUST NOT call `record_resolution_payload(...)`
+followed by `increment_resolver_attempts(...)` as two separate
+operations — a crash in the window between them would leave a
+`retrying` revision on disk while the counter stayed stale,
+breaking retry escalation. The unit suite includes a forced
+mid-transaction rollback test
+(`test_pr_ae_atomic_helper_rolls_back_both_on_mid_tx_failure`)
+that demonstrates the all-or-nothing contract.
+
+The counter UPDATE is the **single** mutation path PR-AE adds to
+the immutable `recommendations` row — justified because the counter
+is process bookkeeping rather than evidence (see "Schema additions"
 section).
 
 ### 5. Concurrent run safety
@@ -681,12 +737,23 @@ One line per row processed. Schema:
   "earnings_date": "2026-05-27",
   "exit_trade_date": "2026-05-29",      // null if no chain found
   "attempt_number": 2,
+  "days_in_awaiting_state": 0,           // Codex P2: see below
   "resolver_status": "ok",               // status from taxonomy above
   "simulator_status": "ok",              // from _simulate_candidate_shadow_outcome
   "mid_realized_return_pct": 12.4,       // null if status != ok
   "duration_ms": 84
 }
 ```
+
+**Freshness visibility (Codex C1 P2 audit)**: `awaiting_chain_data`
+intentionally does not consume retry budget, but without
+observability that could turn into a silent "awaiting forever"
+failure mode. `days_in_awaiting_state` is computed as
+`today - first_revision_with_awaiting_status.revised_at` (calendar
+days). The daily watchdog can raise an alert when any row's
+`days_in_awaiting_state` exceeds a threshold (e.g. 10 days), which
+indicates the post-event chain genuinely never landed and the row
+should be reviewed manually.
 
 JSONL is chosen so daily roll-ups can be done with
 `jq -s 'group_by(.resolver_status)'` and the existing watchdog

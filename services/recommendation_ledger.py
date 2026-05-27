@@ -313,6 +313,27 @@ class RecommendationLedger:
         behavior, which silently overwrote the original evidence on every
         subsequent call — defeating the whole point of an audit ledger.
         """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                return self._write_record_within_tx(cur, record)
+
+    # Internal critical-section helper. Operates on an already-open
+    # cursor inside an already-acquired lock + transaction. Two public
+    # paths reuse it:
+    #
+    #   - record(): single-record write.
+    #   - record_resolution_and_attempt(): single-record write PLUS an
+    #     atomic resolver-counter UPDATE in the same transaction.
+    #
+    # Keeping the SQL + params in one place prevents drift between the
+    # two call sites and is the linchpin of the PR-AE C1b atomicity
+    # guarantee — the resolver cannot land a revision while leaving the
+    # counter stale, because both writes commit (or roll back) together.
+    def _write_record_within_tx(
+        self,
+        cur: sqlite3.Cursor,
+        record: RecommendationRecord,
+    ) -> RecordStatus:
         insert_sql = """
             INSERT OR IGNORE INTO recommendations (
                 recommendation_id, created_at, symbol, as_of_date, earnings_date,
@@ -375,35 +396,33 @@ class RecommendationLedger:
         record_json = _json(_record_to_dict(record))
         revised_at = datetime.now(timezone.utc).isoformat()
 
-        with _WRITE_LOCK:
-            with _tx(self._conn) as cur:
-                cur.execute(insert_sql, params)
-                first_time = cur.rowcount > 0
+        cur.execute(insert_sql, params)
+        first_time = cur.rowcount > 0
 
-                # Always stamp the current content into recommendation_revisions.
-                # On first record, this writes the "version 1" row so the full
-                # history table is complete. On subsequent calls, the
-                # UNIQUE(recommendation_id, content_hash) constraint dedupes
-                # byte-identical re-records (e.g. paper-loop replays of the
-                # same evidence) into a no-op.
-                cur.execute(
-                    """
-                    INSERT OR IGNORE INTO recommendation_revisions
-                        (recommendation_id, revised_at, content_hash, record_json)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        record.recommendation_id,
-                        revised_at,
-                        content_hash,
-                        record_json,
-                    ),
-                )
-                inserted_revision = cur.rowcount > 0
+        # Always stamp the current content into recommendation_revisions.
+        # On first record, this writes the "version 1" row so the full
+        # history table is complete. On subsequent calls, the
+        # UNIQUE(recommendation_id, content_hash) constraint dedupes
+        # byte-identical re-records (e.g. paper-loop replays of the
+        # same evidence) into a no-op.
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO recommendation_revisions
+                (recommendation_id, revised_at, content_hash, record_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                record.recommendation_id,
+                revised_at,
+                content_hash,
+                record_json,
+            ),
+        )
+        inserted_revision = cur.rowcount > 0
 
-                if first_time:
-                    return "inserted"
-                return "revision" if inserted_revision else "duplicate"
+        if first_time:
+            return "inserted"
+        return "revision" if inserted_revision else "duplicate"
 
     def get(self, recommendation_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
@@ -567,14 +586,18 @@ class RecommendationLedger:
     ) -> RecordStatus:
         """Write a new revision overlaying only ``candidate_shadow_outcome``.
 
-        Reconstructs a ``RecommendationRecord`` from the immutable v1
-        row, replaces ``candidate_shadow_outcome`` with the supplied
-        value, and calls ``record()``. All other fields are preserved
-        verbatim from v1 so the revision payload is a complete
-        snapshot of what the record looked like after this resolver
-        pass.
+        Convenience wrapper around
+        :py:meth:`record_resolution_and_attempt` with
+        ``increment_attempts=False``. Use this when the resolver lands
+        a non-counter-incrementing status (currently: ``ok`` or
+        ``awaiting_chain_data``).
 
-        Returns the ``RecordStatus`` from ``record()``:
+        For terminal-failure statuses (``retrying`` or
+        ``permanently_failed:*``) call ``record_resolution_and_attempt``
+        directly with ``increment_attempts=True`` so the revision write
+        and the counter UPDATE happen inside a single transaction.
+
+        Returns the ``RecordStatus`` from the underlying ``record()``:
           - ``"inserted"`` should never appear in resolver context
             (the v1 row must already exist). It does on a defensive
             path if the row was somehow deleted between read and
@@ -586,65 +609,142 @@ class RecommendationLedger:
 
         Raises ``KeyError`` if ``recommendation_id`` is unknown.
         """
-        base = self.get(recommendation_id)
-        if base is None:
-            raise KeyError(
-                f"recommendation_id not found: {recommendation_id}"
-            )
-
-        # _row_to_dict returns JSON columns parsed under their
-        # *_json-suffixed keys. Coerce list-shaped vs dict-shaped
-        # payloads back to their expected RecommendationRecord types,
-        # tolerating the empty-{} default from _loads.
-        scorecards_payload = base.get("structure_scorecards_json")
-        structure_scorecards: List[Dict[str, Any]] = (
-            list(scorecards_payload)
-            if isinstance(scorecards_payload, list)
-            else []
+        return self.record_resolution_and_attempt(
+            recommendation_id=recommendation_id,
+            candidate_shadow_outcome=candidate_shadow_outcome,
+            increment_attempts=False,
         )
 
-        def _dict_or_empty(value: Any) -> Dict[str, Any]:
-            return dict(value) if isinstance(value, dict) else {}
+    def record_resolution_and_attempt(
+        self,
+        *,
+        recommendation_id: str,
+        candidate_shadow_outcome: Dict[str, Any],
+        increment_attempts: bool,
+    ) -> RecordStatus:
+        """Atomic "write resolver outcome + maybe bump counter" path.
 
-        record = RecommendationRecord(
-            recommendation_id=str(base["recommendation_id"]),
-            created_at=str(base["created_at"]),
-            symbol=str(base["symbol"]),
-            as_of_date=base.get("as_of_date"),
-            earnings_date=base.get("earnings_date"),
-            earnings_source=base.get("earnings_source"),
-            earnings_source_confidence=base.get("earnings_source_confidence"),
-            earnings_source_stale=bool(base.get("earnings_source_stale", False)),
-            recommendation=base.get("recommendation"),
-            selected_structure=base.get("selected_structure"),
-            no_trade_reason=base.get("no_trade_reason"),
-            data_quality_score=base.get("data_quality_score"),
-            option_source=base.get("option_source"),
-            underlying_source=base.get("underlying_source"),
-            provider_names=_dict_or_empty(base.get("provider_names_json")),
-            quote_timestamp=base.get("quote_timestamp"),
-            quote_source=base.get("quote_source"),
-            quote_quality=base.get("quote_quality"),
-            bid_ask_mid=_dict_or_empty(base.get("bid_ask_mid_json")),
-            surface_quality=_dict_or_empty(base.get("surface_quality_json")),
-            vol_snapshot=_dict_or_empty(base.get("vol_snapshot_json")),
-            structure_scorecards=structure_scorecards,
-            selector_output=_dict_or_empty(base.get("selector_output_json")),
-            explanation=_dict_or_empty(base.get("explanation_json")),
-            metadata=_dict_or_empty(base.get("metadata_json")),
-            picker_provenance=_dict_or_empty(base.get("picker_provenance_json")),
-            candidate_shadow_outcome=dict(candidate_shadow_outcome),
-            sample_provenance=base.get("sample_provenance"),
-            schema_version=int(base.get("schema_version") or SCHEMA_VERSION),
-            engine_version=str(base.get("engine_version") or ENGINE_VERSION),
-        )
-        return self.record(record)
+        PR-AE Codex review (C1 audit, P1): the resolver MUST NOT call
+        ``record_resolution_payload(...)`` and
+        ``increment_resolver_attempts(...)`` as two independent
+        operations. A crash in the window between them would leave a
+        ``retrying`` revision on disk while the attempt counter stayed
+        at its old value — and since ``retrying`` is non-terminal, the
+        eligibility filter would keep returning the row forever
+        without ever escalating to ``permanently_failed:no_post_event_chain``.
+
+        This helper takes the lock once, opens a single transaction,
+        and inside it:
+
+          1. Reconstructs a full ``RecommendationRecord`` from the v1
+             row preserving everything except
+             ``candidate_shadow_outcome``.
+          2. Calls the shared internal ``_write_record_within_tx``
+             helper to do the recommendations-table no-op insert and
+             the revisions-table conditional insert.
+          3. If ``increment_attempts`` is True, runs the counter
+             UPDATE in the same cursor / same transaction.
+
+        Either all three writes commit, or none do. There is no
+        partial-state failure mode.
+
+        The resolver's call rule (see design doc no-op-run table):
+
+          status == "ok"                     → increment_attempts=False
+          status == "awaiting_chain_data"    → increment_attempts=False
+          status == "retrying"               → increment_attempts=True
+          status startswith "permanently_failed:" → increment_attempts=True
+
+        Raises ``KeyError`` if ``recommendation_id`` is unknown.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                # Read v1 inside the transaction so a concurrent
+                # delete cannot race a stale base into the
+                # reconstruction. SQLite's WAL mode plus the
+                # _WRITE_LOCK + busy_timeout make this safe.
+                base_row = cur.execute(
+                    "SELECT * FROM recommendations WHERE recommendation_id = ?",
+                    (recommendation_id,),
+                ).fetchone()
+                if base_row is None:
+                    raise KeyError(
+                        f"recommendation_id not found: {recommendation_id}"
+                    )
+                base = _row_to_dict(base_row)
+
+                scorecards_payload = base.get("structure_scorecards_json")
+                structure_scorecards: List[Dict[str, Any]] = (
+                    list(scorecards_payload)
+                    if isinstance(scorecards_payload, list)
+                    else []
+                )
+
+                def _dict_or_empty(value: Any) -> Dict[str, Any]:
+                    return dict(value) if isinstance(value, dict) else {}
+
+                record = RecommendationRecord(
+                    recommendation_id=str(base["recommendation_id"]),
+                    created_at=str(base["created_at"]),
+                    symbol=str(base["symbol"]),
+                    as_of_date=base.get("as_of_date"),
+                    earnings_date=base.get("earnings_date"),
+                    earnings_source=base.get("earnings_source"),
+                    earnings_source_confidence=base.get("earnings_source_confidence"),
+                    earnings_source_stale=bool(base.get("earnings_source_stale", False)),
+                    recommendation=base.get("recommendation"),
+                    selected_structure=base.get("selected_structure"),
+                    no_trade_reason=base.get("no_trade_reason"),
+                    data_quality_score=base.get("data_quality_score"),
+                    option_source=base.get("option_source"),
+                    underlying_source=base.get("underlying_source"),
+                    provider_names=_dict_or_empty(base.get("provider_names_json")),
+                    quote_timestamp=base.get("quote_timestamp"),
+                    quote_source=base.get("quote_source"),
+                    quote_quality=base.get("quote_quality"),
+                    bid_ask_mid=_dict_or_empty(base.get("bid_ask_mid_json")),
+                    surface_quality=_dict_or_empty(base.get("surface_quality_json")),
+                    vol_snapshot=_dict_or_empty(base.get("vol_snapshot_json")),
+                    structure_scorecards=structure_scorecards,
+                    selector_output=_dict_or_empty(base.get("selector_output_json")),
+                    explanation=_dict_or_empty(base.get("explanation_json")),
+                    metadata=_dict_or_empty(base.get("metadata_json")),
+                    picker_provenance=_dict_or_empty(base.get("picker_provenance_json")),
+                    candidate_shadow_outcome=dict(candidate_shadow_outcome),
+                    sample_provenance=base.get("sample_provenance"),
+                    schema_version=int(base.get("schema_version") or SCHEMA_VERSION),
+                    engine_version=str(base.get("engine_version") or ENGINE_VERSION),
+                )
+
+                status = self._write_record_within_tx(cur, record)
+
+                if increment_attempts:
+                    cur.execute(
+                        """
+                        UPDATE recommendations
+                           SET candidate_exit_resolver_attempts =
+                               candidate_exit_resolver_attempts + 1
+                         WHERE recommendation_id = ?
+                        """,
+                        (recommendation_id,),
+                    )
+                    if cur.rowcount == 0:
+                        # Defensive — should not happen since we
+                        # read v1 inside the same transaction. If it
+                        # does, raise to roll back the whole tx via
+                        # the _tx context manager.
+                        raise KeyError(
+                            f"recommendation_id vanished mid-transaction: "
+                            f"{recommendation_id}"
+                        )
+
+                return status
 
     def list_pending_candidate_exit_resolutions(
         self,
         *,
         now: Optional[date] = None,
-        min_days_after_event: int = 2,
+        min_days_after_event: int = 3,
         max_attempts: int = 6,
         sample_provenance: str = SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
         selected_structure: str = "call_calendar",
@@ -670,6 +770,24 @@ class RecommendationLedger:
         fail-closed behavior on malformed ``picker_provenance_json``
         — that becomes ``permanently_failed:no_picker_provenance``
         terminal status written via ``record_resolution_payload``.
+
+        **Calendar-day vs trading-day semantics (PR-AE Codex P2 audit):**
+        ``min_days_after_event`` is measured in CALENDAR days, not
+        trading days, because (a) ``earnings_date`` is stored as a plain
+        ISO date string that supports cheap lexicographic SQL comparison
+        and (b) the ledger has no exchange-calendar dependency. The
+        default of 3 covers the common edge case where earnings land on
+        a Friday: 3 calendar days later is Monday, by which time the
+        post-event chain should have settled.
+
+        The PRECISE chain trade-date is selected by the resolver layer
+        using ``pandas.tseries.offsets.BDay`` lookahead within
+        ``MAX_LOOKAHEAD_TRADE_DAYS`` (default 5 business days). This
+        SQL filter is intentionally a coarse "post-event window" gate;
+        any false positives (e.g. earnings on Friday, ``now``
+        Sunday + 3 calendar days = Monday but no chain yet) are absorbed
+        by the resolver writing ``awaiting_chain_data`` and NOT
+        burning retry budget — see the design doc.
         """
         today = now or datetime.now(timezone.utc).date()
         cutoff = today - timedelta(days=int(min_days_after_event))
