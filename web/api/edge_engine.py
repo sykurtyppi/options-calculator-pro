@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from services.dividend_yields import get_dividend_yield
 from services.earnings_event_service import resolve_upcoming_earnings_event
 from services.earnings_vol_snapshot import build_vol_snapshot
 from services.provider_telemetry import classify_error, record_provider_telemetry
@@ -2527,7 +2528,7 @@ def _historical_earnings_move_profile(
 #   comparing against implied volatility (which is itself forward-looking).
 
 def _bsm_greeks(
-    S: float, T_days: float, sigma: float, r: float = 0.045
+    S: float, T_days: float, sigma: float, r: float = 0.045, q: float = 0.0,
 ) -> Dict[str, Optional[float]]:
     """
     Black-Scholes-Merton ATM option greeks (K = S).
@@ -2538,12 +2539,28 @@ def _bsm_greeks(
     T_days : calendar days to option expiry (use earnings DTE for calendar spread context)
     sigma  : annualised implied vol (iv30)
     r      : risk-free rate (default fallback only; callers normally inject a live rate)
+    q      : continuous dividend yield (PR #68 — was missing pre-fix). Default 0.0
+             matches legacy no-dividend behavior byte-for-byte for callers that
+             don't yet resolve a per-symbol q. The live ``analyze_single_ticker``
+             path now resolves q via ``get_dividend_yield(symbol)``.
 
     Returns greeks for a single ATM option leg:
       delta_call/put  — directional sensitivity (call ∈ [0,1], put ∈ [-1,0])
       gamma           — convexity per $1 move (identical for call and put ATM)
       vega            — $ sensitivity per 1 pp IV move (÷100 applied)
       theta_call/put  — daily time decay ($, negative = cost to holder)
+
+    Merton-extension form (PR #68):
+      d1 = (ln(S/K) + (r - q + σ²/2)·T) / (σ·√T)
+      delta_call = e^(−qT)·N(d1)
+      delta_put  = e^(−qT)·(N(d1) − 1)
+      gamma      = e^(−qT)·φ(d1) / (S·σ·√T)
+      vega       = S·e^(−qT)·φ(d1)·√T
+      theta_call = −S·e^(−qT)·φ(d1)·σ/(2√T) − r·K·e^(−rT)·N(d2) + q·S·e^(−qT)·N(d1)
+      theta_put  = −S·e^(−qT)·φ(d1)·σ/(2√T) + r·K·e^(−rT)·N(−d2) − q·S·e^(−qT)·N(−d1)
+
+    Setting q = 0 recovers the original no-dividend formulas exactly — the
+    q = 0 regression test in test_bsm_dividend_yield.py pins this.
     """
     empty: Dict[str, Optional[float]] = {
         k: None for k in ("delta_call", "delta_put", "gamma", "vega", "theta_call", "theta_put")
@@ -2554,8 +2571,8 @@ def _bsm_greeks(
         T = T_days / 365.0
         sq_T = math.sqrt(T)
 
-        # ATM: K = S  →  log(S/K) = 0
-        d1 = ((r + 0.5 * sigma ** 2) * T) / (sigma * sq_T)
+        # ATM: K = S  →  log(S/K) = 0. Carry cost is (r − q).
+        d1 = ((r - q + 0.5 * sigma ** 2) * T) / (sigma * sq_T)
         d2 = d1 - sigma * sq_T
 
         def _ncdf(x: float) -> float:
@@ -2567,17 +2584,30 @@ def _bsm_greeks(
         N_d1 = _ncdf(d1)
         N_d2 = _ncdf(d2)
         n_d1 = _npdf(d1)
+        disc_r = math.exp(-r * T)
+        disc_q = math.exp(-q * T)
 
-        delta_call = float(N_d1)
-        delta_put  = float(N_d1 - 1.0)
-        gamma      = float(n_d1 / (S * sigma * sq_T))
-        vega       = float(S * n_d1 * sq_T * 0.01)          # per 1 pp vol move
-        disc       = math.exp(-r * T)
+        delta_call = float(disc_q * N_d1)
+        delta_put  = float(disc_q * (N_d1 - 1.0))
+        gamma      = float(disc_q * n_d1 / (S * sigma * sq_T))
+        vega       = float(S * disc_q * n_d1 * sq_T * 0.01)  # per 1 pp vol move
+        # Merton theta:
+        #   call: −S·e^(−qT)·φ(d1)·σ/(2√T) − r·K·e^(−rT)·N(d2) + q·S·e^(−qT)·N(d1)
+        #   put : −S·e^(−qT)·φ(d1)·σ/(2√T) + r·K·e^(−rT)·N(−d2) − q·S·e^(−qT)·N(−d1)
+        # ATM: K = S. N(−d2) = 1 − N(d2); N(−d1) = 1 − N(d1).
         theta_call = float(
-            (-S * n_d1 * sigma / (2.0 * sq_T) - r * S * disc * N_d2) / 365.0
+            (
+                -S * disc_q * n_d1 * sigma / (2.0 * sq_T)
+                - r * S * disc_r * N_d2
+                + q * S * disc_q * N_d1
+            ) / 365.0
         )
         theta_put  = float(
-            (-S * n_d1 * sigma / (2.0 * sq_T) + r * S * disc * (1.0 - N_d2)) / 365.0
+            (
+                -S * disc_q * n_d1 * sigma / (2.0 * sq_T)
+                + r * S * disc_r * (1.0 - N_d2)
+                - q * S * disc_q * (1.0 - N_d1)
+            ) / 365.0
         )
         return {
             "delta_call": delta_call, "delta_put": delta_put,
@@ -2682,6 +2712,7 @@ def _calendar_spread_payoff(
     raw_moves_pct: Optional[List[float]] = None,
     implied_move_pct: Optional[float] = None,
     side: str = "call",
+    q: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
     """
     ATM calendar spread payoff at near-leg expiry.
@@ -2689,8 +2720,16 @@ def _calendar_spread_payoff(
     side='call' (default): short near ATM call / long back ATM call
     side='put':            short near ATM put  / long back ATM put
 
-    Both legs are priced at K = S (ATM).  Put prices derived via
-    put-call parity: P = C − S + K·exp(−rT).
+    Both legs are priced at K = S (ATM). Put prices derived via the
+    Merton-extension put-call parity:
+        P = C − S·exp(−qT) + K·exp(−rT)
+
+    PR #68 added the ``q`` parameter (continuous dividend yield). Default
+    ``q=0.0`` matches the legacy no-dividend formulas byte-for-byte. The
+    live ``analyze_single_ticker`` path now resolves q via
+    ``get_dividend_yield(symbol)`` so dividend-paying names get correct
+    put-side debit / payoff math. Pre-fix, dividend names like AAPL/MSFT
+    were systematically mispriced on the put-side calendar.
 
     P&L at near-leg expiry, stock at S_t:
       call: BSM_call(S_t, T_rem, σ_post) − max(S_t−K,0) − debit
@@ -2716,12 +2755,18 @@ def _calendar_spread_payoff(
             if T_yr <= 0 or sigma <= 0 or spot <= 0:
                 return max(spot - K, 0.0)
             sq_T = math.sqrt(T_yr)
-            d1 = (math.log(spot / K) + (r + 0.5 * sigma ** 2) * T_yr) / (sigma * sq_T)
+            # Merton: spot discounted by e^(−qT), carry is (r − q)
+            d1 = (math.log(spot / K) + (r - q + 0.5 * sigma ** 2) * T_yr) / (sigma * sq_T)
             d2 = d1 - sigma * sq_T
-            return spot * _ncdf(d1) - K * math.exp(-r * T_yr) * _ncdf(d2)
+            return spot * math.exp(-q * T_yr) * _ncdf(d1) - K * math.exp(-r * T_yr) * _ncdf(d2)
 
         def _bsm_put(spot: float, T_yr: float, sigma: float) -> float:
-            return _bsm_call(spot, T_yr, sigma) - spot + K * math.exp(-r * T_yr)
+            # Merton-extension put-call parity: P = C − S·e^(−qT) + K·e^(−rT)
+            return (
+                _bsm_call(spot, T_yr, sigma)
+                - spot * math.exp(-q * T_yr)
+                + K * math.exp(-r * T_yr)
+            )
 
         # Entry premiums
         c_near = _bsm_call(S, T_near, iv_near)
@@ -2814,6 +2859,7 @@ def _straddle_payoff(
     n_points: int = 41,
     raw_moves_pct: Optional[List[float]] = None,
     implied_move_pct: Optional[float] = None,
+    q: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
     """
     Long ATM straddle payoff for an earnings play.
@@ -2821,9 +2867,14 @@ def _straddle_payoff(
     Entry: buy ATM call + buy ATM put (K = S, T = T_near_days, σ = iv).
     P&L evaluated 1 day post-event: stock has moved, IV has shifted per scenario.
 
+    PR #68 added the ``q`` parameter (continuous dividend yield). Default
+    ``q=0.0`` preserves the legacy no-dividend behavior byte-for-byte. With
+    q > 0, both call and put prices follow Merton-extension BSM and the
+    put-call parity used internally is ``P = C − S·exp(−qT) + K·exp(−rT)``.
+
     The 1-day residual convention (rather than full expiry) captures the
     dominant risk for earnings straddles — IV crush kills the position even
-    when the stock moves correctly.  IV scenarios come from the same
+    when the stock moves correctly. IV scenarios come from the same
     _derive_iv_scenarios() calibration used by the calendar diagram.
     """
     try:
@@ -2842,12 +2893,16 @@ def _straddle_payoff(
             if T_yr <= 0 or sigma <= 0 or spot <= 0:
                 return max(spot - K, 0.0)
             sq_T = math.sqrt(T_yr)
-            d1 = (math.log(spot / K) + (r + 0.5 * sigma ** 2) * T_yr) / (sigma * sq_T)
+            d1 = (math.log(spot / K) + (r - q + 0.5 * sigma ** 2) * T_yr) / (sigma * sq_T)
             d2 = d1 - sigma * sq_T
-            return spot * _ncdf(d1) - K * math.exp(-r * T_yr) * _ncdf(d2)
+            return spot * math.exp(-q * T_yr) * _ncdf(d1) - K * math.exp(-r * T_yr) * _ncdf(d2)
 
         def _bsm_put(spot: float, T_yr: float, sigma: float) -> float:
-            return _bsm_call(spot, T_yr, sigma) - spot + K * math.exp(-r * T_yr)
+            return (
+                _bsm_call(spot, T_yr, sigma)
+                - spot * math.exp(-q * T_yr)
+                + K * math.exp(-r * T_yr)
+            )
 
         c_entry = _bsm_call(S, T_entry, iv)
         p_entry = _bsm_put(S, T_entry, iv)
@@ -2924,6 +2979,7 @@ def _strangle_payoff(
     n_points: int = 41,
     raw_moves_pct: Optional[List[float]] = None,
     implied_move_pct: Optional[float] = None,
+    q: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
     """
     Long OTM strangle payoff for an earnings play.
@@ -2934,6 +2990,10 @@ def _strangle_payoff(
 
     Entry: buy OTM call at K_c = S*(1+wing/100) and OTM put at K_p = S*(1-wing/100).
     P&L evaluated 1 day post-event with IV scenarios (same as straddle).
+
+    PR #68 added the ``q`` parameter (continuous dividend yield). Default
+    ``q=0.0`` preserves legacy behavior; q > 0 routes through Merton-extension
+    BSM with put-call parity ``P = C − S·exp(−qT) + K·exp(−rT)``.
     """
     try:
         if not (np.isfinite(S) and S > 0 and np.isfinite(iv) and iv > 0
@@ -2953,12 +3013,16 @@ def _strangle_payoff(
             if T_yr <= 0 or sigma <= 0 or spot <= 0:
                 return max(spot - K, 0.0)
             sq_T = math.sqrt(T_yr)
-            d1 = (math.log(spot / K) + (r + 0.5 * sigma ** 2) * T_yr) / (sigma * sq_T)
+            d1 = (math.log(spot / K) + (r - q + 0.5 * sigma ** 2) * T_yr) / (sigma * sq_T)
             d2 = d1 - sigma * sq_T
-            return spot * _ncdf(d1) - K * math.exp(-r * T_yr) * _ncdf(d2)
+            return spot * math.exp(-q * T_yr) * _ncdf(d1) - K * math.exp(-r * T_yr) * _ncdf(d2)
 
         def _bsm_put(spot: float, K: float, T_yr: float, sigma: float) -> float:
-            return _bsm_call(spot, K, T_yr, sigma) - spot + K * math.exp(-r * T_yr)
+            return (
+                _bsm_call(spot, K, T_yr, sigma)
+                - spot * math.exp(-q * T_yr)
+                + K * math.exp(-r * T_yr)
+            )
 
         c_entry = _bsm_call(S, K_c, T_entry, iv)
         p_entry = _bsm_put(S, K_p, T_entry, iv)
@@ -3625,6 +3689,19 @@ def analyze_single_ticker(
 
     # ATM BSM greeks — placed here because we now have dte resolved from section 4
     pricing_risk_free_rate, pricing_risk_free_rate_source = _get_pricing_risk_free_rate()
+
+    # PR #68: resolve continuous dividend yield q once and thread it
+    # through every live BSM call site. Without this, calls/puts/greeks
+    # for dividend-paying names (AAPL, MSFT, JPM, KO, …) were computed
+    # under the wrong forward — ATM put delta biased toward 0, calendar
+    # put-side debit systematically wrong, etc. The `services/dividend_yields`
+    # module (PR-J) was already shipped but its consumer wiring stopped
+    # at the replay path; the live decision path is what this PR adds.
+    #
+    # `get_dividend_yield` fails closed to `(0.0, "fallback_zero")` on
+    # any lookup failure, so non-dividend names and yfinance hiccups
+    # both produce byte-identical-to-legacy pricing.
+    pricing_dividend_yield, pricing_dividend_yield_source = get_dividend_yield(clean_symbol)
     _bsm_T = float(dte) if dte is not None and dte > 0 else np.nan
     greeks = (
         _bsm_greeks(
@@ -3632,6 +3709,7 @@ def analyze_single_ticker(
             T_days=_bsm_T,
             sigma=float(iv30) if np.isfinite(iv30) else np.nan,
             r=pricing_risk_free_rate,
+            q=pricing_dividend_yield,
         )
         if np.isfinite(_bsm_T) and np.isfinite(iv30)
         else {k: None for k in ("delta_call", "delta_put", "gamma", "vega", "theta_call", "theta_put")}
@@ -3794,6 +3872,7 @@ def analyze_single_ticker(
             T_near_days=float(_cal_T_near),
             T_back_days=float(_cal_T_back),
             r=pricing_risk_free_rate,
+            q=pricing_dividend_yield,  # PR #68
             # Fix 5: pass historical moves so scenarios are symbol-calibrated
             raw_moves_pct=_raw_moves if _raw_moves else None,
             implied_move_pct=float(implied_move_total_pct) if np.isfinite(implied_move_total_pct) else None,
@@ -3845,19 +3924,22 @@ def analyze_single_ticker(
         structure_payoff = _calendar_spread_payoff(
             S=current_price, iv_near=float(iv30), iv_back=float(_cal_iv_back),
             T_near_days=_sp_near_dte, T_back_days=_sp_near_dte + 28.0,
-            r=pricing_risk_free_rate, raw_moves_pct=_sp_raw,
+            r=pricing_risk_free_rate, q=pricing_dividend_yield,  # PR #68
+            raw_moves_pct=_sp_raw,
             implied_move_pct=_sp_impl, side="put",
         )
     elif _best_structure == "atm_straddle" and _sp_iv30_ok and _sp_near_dte:
         structure_payoff = _straddle_payoff(
             S=current_price, iv=float(iv30), T_near_days=_sp_near_dte,
-            r=pricing_risk_free_rate, raw_moves_pct=_sp_raw, implied_move_pct=_sp_impl,
+            r=pricing_risk_free_rate, q=pricing_dividend_yield,  # PR #68
+            raw_moves_pct=_sp_raw, implied_move_pct=_sp_impl,
         )
     elif _best_structure == "otm_strangle" and _sp_iv30_ok and _sp_near_dte and _sp_move_ok:
         structure_payoff = _strangle_payoff(
             S=current_price, iv=float(iv30), T_near_days=_sp_near_dte,
             wing_pct=float(implied_move_total_pct),
-            r=pricing_risk_free_rate, raw_moves_pct=_sp_raw, implied_move_pct=_sp_impl,
+            r=pricing_risk_free_rate, q=pricing_dividend_yield,  # PR #68
+            raw_moves_pct=_sp_raw, implied_move_pct=_sp_impl,
         )
     else:
         structure_payoff = None
@@ -4200,6 +4282,15 @@ def analyze_single_ticker(
         "current_price": current_price,
         "pricing_risk_free_rate": float(pricing_risk_free_rate),
         "pricing_risk_free_rate_source": pricing_risk_free_rate_source,
+        # PR #68 Codex follow-up: expose the resolved dividend yield
+        # alongside the risk-free rate so operators can tell whether
+        # pricing used real dividend data ("yfinance" / "env" / "cache")
+        # or fell back to the no-dividend default ("fallback_zero").
+        # Without this, a yfinance hiccup on a dividend-paying name
+        # silently degraded the pricing to the legacy no-dividend
+        # path with no visible signal.
+        "pricing_dividend_yield": float(pricing_dividend_yield),
+        "pricing_dividend_yield_source": pricing_dividend_yield_source,
         "days_to_earnings": dte,
         "earnings_release_time": earnings_release_time,
         "rv30": rv30,
