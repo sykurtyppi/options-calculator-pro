@@ -20,6 +20,12 @@ import pytest
 
 from web.api.edge_engine import (
     _CANDIDATE_SHADOW_OUTCOME_FIELDS,
+    PROMOTION_ELIGIBLE_PROVENANCES,
+    SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+    SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED,
+    SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+    SAMPLE_PROVENANCE_UNKNOWN,
+    VALID_SAMPLE_PROVENANCES,
     _aggregate_experimental_candidate_evidence,
     _build_experimental_contract_selection,
     _dual_picker_calendar_selection,
@@ -653,7 +659,7 @@ class TestExperimentalContractSelection:
 # Canonical key set produced by both _empty_candidate_shadow_outcome
 # and the happy-path return. Asserted via tests so any future schema
 # drift fails loudly.
-CANDIDATE_SHADOW_KEYS = frozenset({"status"} | set(_CANDIDATE_SHADOW_OUTCOME_FIELDS))
+CANDIDATE_SHADOW_KEYS = frozenset({"status", "labels"} | set(_CANDIDATE_SHADOW_OUTCOME_FIELDS))
 
 
 def _candidate_only_dual_picker(
@@ -931,5 +937,180 @@ class TestCandidateShadowOutcomeShape:
             assert forbidden not in flat, (
                 f"performance/validation claim {forbidden!r} leaked into outcome"
             )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PR-AD commit 1b — Codex review fixes
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestCandidateShadowOutcomeLabels:
+    """Codex hard requirement: candidate outcome must be labeled
+    research_mid / shadow_only / not_execution_grade on every path.
+    Mid-based historical PnL is not execution-grade evidence."""
+
+    REQUIRED_LABELS = frozenset({"research_mid", "shadow_only", "not_execution_grade"})
+
+    def test_happy_path_carries_all_required_labels(self):
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        labels = result["labels"]
+        assert set(labels.keys()) >= self.REQUIRED_LABELS
+        for k in self.REQUIRED_LABELS:
+            assert labels[k] is True
+
+    def test_skip_paths_also_carry_labels(self):
+        """Labels describe the kind of block, not whether it
+        succeeded — so they must be present on skip statuses too."""
+        block = _empty_candidate_shadow_outcome("skipped:no_dual_picker")
+        labels = block["labels"]
+        for k in self.REQUIRED_LABELS:
+            assert labels[k] is True
+
+
+class TestSampleProvenanceTaxonomy:
+    """Codex P1: provenance must be based on collection method, NOT
+    timestamp. Re-running historical replay produces in-sample evidence
+    regardless of when the script runs."""
+
+    def test_all_four_values_are_distinct(self):
+        values = {
+            SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+            SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+            SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED,
+            SAMPLE_PROVENANCE_UNKNOWN,
+        }
+        assert len(values) == 4
+
+    def test_valid_set_contains_exactly_the_four_values(self):
+        assert VALID_SAMPLE_PROVENANCES == {
+            SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+            SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+            SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED,
+            SAMPLE_PROVENANCE_UNKNOWN,
+        }
+
+    def test_promotion_eligible_set_excludes_historical_replay(self):
+        """The MOST important assertion in this taxonomy: historical
+        replay output is NEVER promotion-eligible, no matter how it's
+        aggregated. If this fails, the in-sample protections collapse."""
+        assert SAMPLE_PROVENANCE_HISTORICAL_REPLAY not in PROMOTION_ELIGIBLE_PROVENANCES
+
+    def test_promotion_eligible_set_excludes_unknown(self):
+        """Fail-closed: untagged evidence cannot be used for promotion."""
+        assert SAMPLE_PROVENANCE_UNKNOWN not in PROMOTION_ELIGIBLE_PROVENANCES
+
+    def test_promotion_eligible_set_includes_forward_post_freeze(self):
+        assert SAMPLE_PROVENANCE_FORWARD_POST_FREEZE in PROMOTION_ELIGIBLE_PROVENANCES
+
+    def test_promotion_eligible_set_includes_preregistered_holdout(self):
+        assert SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED in PROMOTION_ELIGIBLE_PROVENANCES
+
+
+class TestCandidateOutcomeIndependentOfLegacy:
+    """Codex P2: candidate outcome must still resolve when legacy's
+    exit quote fails but candidate's exit quote exists. The whole
+    point of the +14d rule is that it picks DIFFERENT contracts;
+    those contracts may be quoted at exit even when legacy's aren't.
+
+    We test the helper directly here — the equivalent end-to-end
+    behavior through _simulate_pre_earnings_calendar_trade is verified
+    by the wiring: candidate_shadow_outcome is computed unconditionally
+    once the exit chain loads, regardless of legacy's subsequent
+    success or failure."""
+
+    def test_candidate_resolves_when_legacy_contracts_absent_from_exit(self):
+        # Candidate selects 5/17, 6/21 at strike 100 (different from
+        # what a hypothetical legacy would pick — say 5/3 / 5/17).
+        # Exit chain has the CANDIDATE's contracts but NOT the legacy's.
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+            # Legacy's hypothetical contracts (different expiry)
+            (pd.Timestamp("2024-05-03"), 100.0, "C", 0.7, 0.30, 0.65, 0.75),
+        ])
+        exit_chain = _chain_with_contracts([
+            # Candidate's contracts ARE in exit chain
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+            # Legacy's hypothetical exit contract is NOT here
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(
+                front_expiry="2024-05-17", back_expiry="2024-06-21",
+            ),
+        )
+        # Candidate resolves cleanly despite legacy being unresolvable
+        assert result["status"] == "ok"
+        assert result["realized_return_pct"] == pytest.approx(30.0)
+
+
+class TestCandidateOutcomeExpiryFormatRobustness:
+    """Codex P3: expiry/strike matching must be robust across `date`,
+    `Timestamp`, and string formats. Was a pain point in PR-AC."""
+
+    @pytest.mark.parametrize("entry_expiry_format", [
+        pd.Timestamp("2024-05-17"),
+        pd.Timestamp("2024-05-17").to_pydatetime().date(),
+        # Pandas auto-coerces datetime64[ns] in DataFrame construction;
+        # this just confirms downstream lookup works with that path too.
+    ])
+    def test_entry_chain_expiry_format_variants(self, entry_expiry_format):
+        entry = pd.DataFrame([
+            {"expiry": entry_expiry_format, "strike": 100.0, "call_put": "C",
+             "mid": 1.0, "iv": 0.30, "bid": 0.95, "ask": 1.05},
+            {"expiry": pd.Timestamp("2024-06-21"), "strike": 100.0, "call_put": "C",
+             "mid": 2.0, "iv": 0.30, "bid": 1.95, "ask": 2.05},
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain,
+            dual_picker=_candidate_only_dual_picker(),
+        )
+        # Even with mixed expiry formats the lookup succeeds
+        assert result["status"] == "ok", (
+            f"expiry format {type(entry_expiry_format).__name__} broke lookup: {result['status']}"
+        )
+
+    def test_string_expiry_in_dual_picker_is_parsed(self):
+        # to_metadata_dict serializes expiries as ISO strings — make sure
+        # the simulator parses them back correctly.
+        entry = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 1.0, 0.30, 0.95, 1.05),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 2.0, 0.30, 1.95, 2.05),
+        ])
+        exit_chain = _chain_with_contracts([
+            (pd.Timestamp("2024-05-17"), 100.0, "C", 0.4, 0.20, 0.35, 0.45),
+            (pd.Timestamp("2024-06-21"), 100.0, "C", 1.7, 0.25, 1.65, 1.75),
+        ])
+        dp = _candidate_only_dual_picker(
+            front_expiry="2024-05-17", back_expiry="2024-06-21",
+        )
+        assert isinstance(dp["candidate_selection"]["front_expiry"], str)
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=entry, exit_chain=exit_chain, dual_picker=dp,
+        )
+        assert result["status"] == "ok"
+
+    def test_unparseable_expiry_returns_skip_status(self):
+        dp = _candidate_only_dual_picker()
+        dp["candidate_selection"]["front_expiry"] = "not-a-date"
+        result = _simulate_candidate_shadow_outcome(
+            entry_chain=pd.DataFrame(), exit_chain=pd.DataFrame(), dual_picker=dp,
+        )
+        assert result["status"] == "skipped:bad_expiry_parse"
 
 
