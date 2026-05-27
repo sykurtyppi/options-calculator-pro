@@ -711,13 +711,55 @@ def _clamp01(value: float) -> float:
     return float(np.clip(float(value), 0.0, 1.0))
 
 
+# Default values used by the no-data ("neutral") prior. Lifted to
+# module-level constants so the rank_score below stays in lock-step
+# with `_compute_rank_score` and can be referenced from tests.
+_NEUTRAL_PRIOR_WIN_RATE = 0.50       # coin-flip — no information
+_NEUTRAL_PRIOR_AVG_RETURN_PCT = 0.0  # no observed edge
+_NEUTRAL_PRIOR_HISTORY_COUNT = 0     # zero observations
+
+
 def _neutral_prior(structure: str, *, source: str) -> WalkForwardPrior:
+    """No-data baseline prior for a structure whose walk-forward
+    history hasn't been computed yet (or hasn't accumulated any
+    observations).
+
+    PR #70 fix: ``rank_score`` is now computed by routing the
+    neutral defaults through ``_compute_rank_score`` rather than
+    hardcoded to 0.50. The previous hardcoded value created a
+    perverse inconsistency: a structure with ZERO observations
+    received rank_score=0.50, while a structure with the SAME
+    nominal inputs but at least the contract of having gone
+    through _compute_rank_score
+    (`win_rate=0.50, avg_return_pct=0.0, history_count=0`) computed
+    to 0.308571. Same input, different output — meaning a "no data
+    at all" structure could outrank an "observed-and-genuinely-
+    neutral" structure by ~0.19 in rank, flipping selector
+    decisions on thin-data names.
+
+    The fix routes the neutral defaults through the same scoring
+    function so the consistency property (same input → same
+    output) holds. The numerical impact at the boundary:
+
+        before: rank_score = 0.50
+        after:  rank_score ≈ 0.308571  (history_score=0 dominates)
+
+    This shifts the no-data baseline DOWN, not up — structures
+    with even one observed prior gain a meaningful rank advantage
+    over no-data structures, which is the desired direction (the
+    selector should prefer evidence-backed structures to
+    no-evidence structures).
+    """
     return WalkForwardPrior(
         structure=structure,
-        history_count=0,
-        win_rate=0.50,
-        avg_return_pct=0.0,
-        rank_score=0.50,
+        history_count=_NEUTRAL_PRIOR_HISTORY_COUNT,
+        win_rate=_NEUTRAL_PRIOR_WIN_RATE,
+        avg_return_pct=_NEUTRAL_PRIOR_AVG_RETURN_PCT,
+        rank_score=_compute_rank_score(
+            win_rate=_NEUTRAL_PRIOR_WIN_RATE,
+            avg_return_pct=_NEUTRAL_PRIOR_AVG_RETURN_PCT,
+            history_count=_NEUTRAL_PRIOR_HISTORY_COUNT,
+        ),
         source=source,
     )
 
