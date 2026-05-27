@@ -700,42 +700,97 @@ VALID_SAMPLE_PROVENANCES = frozenset({
 
 # Promotion criteria reference this set. Any evidence outside it is
 # NOT promotion-eligible regardless of magnitudes.
+#
+# DELIBERATELY ONLY ONE VALUE TODAY (PR-AD commit 1d, Codex review):
+# HISTORICAL_HOLDOUT_PREREGISTERED is intentionally EXCLUDED from
+# this set even though the constant exists. A string label is not a
+# preregistration control. Holdout admission requires a verified
+# manifest artifact (frozen symbol/date list, content hash, author,
+# timestamp predating rule discovery) — when that infrastructure is
+# built in a future PR, the constant can be conditionally added to
+# this set via a manifest verification step. Until then, the only way
+# a record becomes promotion-eligible is via tag_live_forward_
+# observation, which is itself restricted to the live API path.
 PROMOTION_ELIGIBLE_PROVENANCES = frozenset({
     SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
-    SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED,
 })
 
 
 def is_promotion_eligible(record: Dict[str, Any]) -> bool:
-    """Return True iff *record* carries a promotion-eligible sample
-    provenance. Fail-closed: missing key, None, UNKNOWN, or any
-    unrecognized string returns False.
+    """Return True iff *record* is a fully-formed forward-validation
+    observation that may contribute to candidate-vs-legacy promotion
+    statistics.
 
-    This helper is the SINGLE source of truth for promotion eligibility.
-    Aggregators, ledger queries, and promotion-criteria evaluation must
-    route through it rather than open-coding `provenance == "..."`
-    checks — otherwise the rule "UNKNOWN never counts" can be silently
-    bypassed by typos or stale code.
+    Fail-closed on every check. All of the following must hold:
+
+      1. *record* is a dict.
+      2. record["sample_provenance"] is in PROMOTION_ELIGIBLE_PROVENANCES.
+         Today that's only SAMPLE_PROVENANCE_FORWARD_POST_FREEZE.
+      3. record["candidate_shadow_outcome"] is a dict.
+      4. candidate_shadow_outcome["status"] == "ok"
+         (skipped/error outcomes do not contribute to promotion
+         denominators — otherwise an eligible-provenance row with no
+         resolved candidate PnL inflates the sample size).
+      5. candidate_shadow_outcome["mid_realized_return_pct"] is a
+         finite number (rules out NaN/inf/string drift).
+      6. candidate_shadow_outcome["labels"] carries each of
+         research_mid=True, shadow_only=True, not_execution_grade=True.
+         These labels describe the pricing grade of the outcome; if a
+         future refactor strips them, the helper rejects the row
+         rather than treating mid-priced data as execution evidence.
+
+    This helper is the SINGLE source of truth for promotion
+    eligibility. Aggregators, ledger queries, and promotion-criteria
+    evaluation MUST route through it rather than open-coding partial
+    checks.
+
+    For diagnostic/observability use (counting UNKNOWN rows, etc.),
+    use the underlying provenance fields directly — do NOT use this
+    helper as a generic "is this row valid" check.
     """
     if not isinstance(record, dict):
         return False
-    return record.get("sample_provenance") in PROMOTION_ELIGIBLE_PROVENANCES
+    if record.get("sample_provenance") not in PROMOTION_ELIGIBLE_PROVENANCES:
+        return False
+    outcome = record.get("candidate_shadow_outcome")
+    if not isinstance(outcome, dict):
+        return False
+    if outcome.get("status") != "ok":
+        return False
+    pnl = outcome.get("mid_realized_return_pct")
+    if not isinstance(pnl, (int, float)) or isinstance(pnl, bool):
+        # bool is a subclass of int — explicitly disqualify it
+        return False
+    if not np.isfinite(pnl):
+        return False
+    labels = outcome.get("labels")
+    if not isinstance(labels, dict):
+        return False
+    for required in ("research_mid", "shadow_only", "not_execution_grade"):
+        if labels.get(required) is not True:
+            return False
+    return True
 
 
-def tag_live_forward_observation(record: Dict[str, Any]) -> Dict[str, Any]:
+def _tag_live_forward_observation(record: Dict[str, Any]) -> Dict[str, Any]:
     """Tag *record* in-place with SAMPLE_PROVENANCE_FORWARD_POST_FREEZE.
 
-    This is the ONLY function in the codebase that should assign the
-    forward-post-freeze provenance value. It is intended to be called
-    exclusively from the live API path (web/api/edge_engine.py's
-    analyze_single_ticker, after EdgeSnapshot construction and before
-    record_recommendation). Historical replay code paths must never
-    call this function — they emit HISTORICAL_REPLAY via
-    _simulate_pre_earnings_calendar_trade's `base` dict.
+    Underscore-prefixed: this is the ONLY function in the codebase
+    authorized to assign the forward-post-freeze provenance value, and
+    the leading underscore signals "module-private, do not import from
+    outside web/api/edge_engine.py." It is intended to be called
+    exclusively from the live API path within this module, after
+    EdgeSnapshot construction and before record_recommendation.
 
-    A regression test confirms that historical-replay output never
-    carries forward-post-freeze provenance no matter what CLI flags
-    were passed to the replay scripts.
+    Historical replay code paths must never call this function — they
+    emit HISTORICAL_REPLAY via _simulate_pre_earnings_calendar_trade's
+    `base` dict. The source-grep regression test
+    (TestForwardProvenanceAssignmentBoundary) scans services/ + web/ +
+    scripts/ for any reference to this function name OR the underlying
+    string literal, and fails if either appears outside edge_engine.py.
+
+    There is intentionally NO public alias — making the function
+    appear "more importable" would defeat the assignment boundary.
     """
     record["sample_provenance"] = SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
     return record

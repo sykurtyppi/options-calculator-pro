@@ -32,8 +32,8 @@ from web.api.edge_engine import (
     _empty_candidate_shadow_outcome,
     _empty_dual_picker,
     _simulate_candidate_shadow_outcome,
+    _tag_live_forward_observation,
     is_promotion_eligible,
-    tag_live_forward_observation,
 )
 
 # Canonical dual_picker key set — every code path that produces a
@@ -1014,8 +1014,22 @@ class TestSampleProvenanceTaxonomy:
     def test_promotion_eligible_set_includes_forward_post_freeze(self):
         assert SAMPLE_PROVENANCE_FORWARD_POST_FREEZE in PROMOTION_ELIGIBLE_PROVENANCES
 
-    def test_promotion_eligible_set_includes_preregistered_holdout(self):
-        assert SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED in PROMOTION_ELIGIBLE_PROVENANCES
+    def test_promotion_eligible_set_excludes_preregistered_holdout_until_manifest_support(self):
+        """REGRESSION (Codex round-3 review): a string label is not a
+        preregistration control. HOLDOUT_PREREGISTERED remains a
+        VALID provenance value (so future records can be tagged once
+        the manifest infrastructure is built), but it is NOT in the
+        promotion-eligible set today. Promotion via this label requires
+        verified manifest support that does not yet exist."""
+        assert SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED in VALID_SAMPLE_PROVENANCES
+        assert SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED not in PROMOTION_ELIGIBLE_PROVENANCES
+
+    def test_promotion_eligible_set_contains_only_forward_post_freeze_today(self):
+        """Pin the entire set so any addition (e.g., accidentally
+        re-adding holdout) trips a regression."""
+        assert PROMOTION_ELIGIBLE_PROVENANCES == frozenset({
+            SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+        })
 
 
 class TestCandidateOutcomeIndependentOfLegacy:
@@ -1120,35 +1134,64 @@ class TestCandidateOutcomeExpiryFormatRobustness:
 # PR-AD commit 1c — Codex round-2 hardening
 # ──────────────────────────────────────────────────────────────────────────
 
+def _eligible_record(**overrides) -> Dict[str, Any]:
+    """A canonical record that PASSES is_promotion_eligible. Tests
+    that want to verify a specific failure mode start from this and
+    perturb a single field."""
+    record = {
+        "sample_provenance": SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+        "candidate_shadow_outcome": _empty_candidate_shadow_outcome("ok"),
+    }
+    # _empty_candidate_shadow_outcome sets status to whatever string we
+    # pass, but its mid_realized_return_pct is None — replace with a
+    # finite number so the strict helper accepts it.
+    record["candidate_shadow_outcome"]["mid_realized_return_pct"] = 5.0
+    record.update(overrides)
+    return record
+
+
 class TestIsPromotionEligible:
-    """Codex P1 + 'fail closed on UNKNOWN': the single source of truth
-    for which records count toward promotion. Aggregators MUST route
-    through this helper rather than open-coding the check."""
+    """Codex P1 + 'fail closed on UNKNOWN' + P2 (strict checks): the
+    single source of truth for which records count toward promotion.
+    Aggregators MUST route through this helper rather than open-coding
+    partial checks."""
 
-    def test_forward_post_freeze_is_eligible(self):
-        record = {"sample_provenance": SAMPLE_PROVENANCE_FORWARD_POST_FREEZE}
-        assert is_promotion_eligible(record) is True
+    # ── Provenance gate ────────────────────────────────────────────
 
-    def test_preregistered_holdout_is_eligible(self):
-        record = {"sample_provenance": SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED}
-        assert is_promotion_eligible(record) is True
+    def test_forward_post_freeze_with_resolved_outcome_is_eligible(self):
+        """Happy path: forward provenance + ok candidate outcome +
+        labels intact → eligible."""
+        assert is_promotion_eligible(_eligible_record()) is True
 
     def test_historical_replay_is_never_eligible(self):
         """The single most important assertion in PR-AD: historical
         replay output cannot become promotion-eligible no matter what."""
-        record = {"sample_provenance": SAMPLE_PROVENANCE_HISTORICAL_REPLAY}
+        record = _eligible_record(
+            sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
+        )
+        assert is_promotion_eligible(record) is False
+
+    def test_holdout_preregistered_not_eligible_until_manifest_support(self):
+        """REGRESSION (Codex round-3 review): holdout label is in
+        VALID_SAMPLE_PROVENANCES but NOT in PROMOTION_ELIGIBLE_
+        PROVENANCES until verified manifest infrastructure exists.
+        is_promotion_eligible must reject these records."""
+        record = _eligible_record(
+            sample_provenance=SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED,
+        )
         assert is_promotion_eligible(record) is False
 
     def test_unknown_is_never_eligible(self):
-        record = {"sample_provenance": SAMPLE_PROVENANCE_UNKNOWN}
+        record = _eligible_record(sample_provenance=SAMPLE_PROVENANCE_UNKNOWN)
         assert is_promotion_eligible(record) is False
 
     def test_missing_key_fails_closed(self):
-        record = {"symbol": "AAPL"}  # no sample_provenance key at all
+        record = _eligible_record()
+        del record["sample_provenance"]
         assert is_promotion_eligible(record) is False
 
     def test_none_value_fails_closed(self):
-        record = {"sample_provenance": None}
+        record = _eligible_record(sample_provenance=None)
         assert is_promotion_eligible(record) is False
 
     def test_arbitrary_string_fails_closed(self):
@@ -1156,7 +1199,7 @@ class TestIsPromotionEligible:
         eligible constants count. A clever string can't slip through."""
         for s in ("forward", "forward_post_pr_ad", "promotion_eligible_pls",
                   "out_of_sample", "validated", ""):
-            record = {"sample_provenance": s}
+            record = _eligible_record(sample_provenance=s)
             assert is_promotion_eligible(record) is False, (
                 f"non-canonical string {s!r} should not be promotion-eligible"
             )
@@ -1167,18 +1210,104 @@ class TestIsPromotionEligible:
         assert is_promotion_eligible("string") is False
         assert is_promotion_eligible([]) is False
 
+    # ── Candidate-outcome quality gate (Codex P2) ──────────────────
+
+    def test_missing_candidate_shadow_outcome_fails_closed(self):
+        """Even with forward provenance, a record with no candidate
+        outcome cannot enter promotion stats."""
+        record = _eligible_record()
+        del record["candidate_shadow_outcome"]
+        assert is_promotion_eligible(record) is False
+
+    def test_candidate_outcome_not_a_dict_fails_closed(self):
+        record = _eligible_record(candidate_shadow_outcome="not a dict")
+        assert is_promotion_eligible(record) is False
+        record = _eligible_record(candidate_shadow_outcome=None)
+        assert is_promotion_eligible(record) is False
+
+    def test_skipped_candidate_outcome_fails_closed(self):
+        """A forward record with candidate_shadow_outcome.status != ok
+        must not enter promotion denominators. Otherwise an event where
+        candidate couldn't resolve its quotes still counts toward the
+        sample size, inflating n."""
+        record = _eligible_record()
+        record["candidate_shadow_outcome"]["status"] = "skipped:missing_exit_quote"
+        assert is_promotion_eligible(record) is False
+
+    def test_non_numeric_return_fails_closed(self):
+        """mid_realized_return_pct must be a finite number — guards
+        against string drift and NaN/inf leakage."""
+        record = _eligible_record()
+        record["candidate_shadow_outcome"]["mid_realized_return_pct"] = "30.0"
+        assert is_promotion_eligible(record) is False
+
+        record = _eligible_record()
+        record["candidate_shadow_outcome"]["mid_realized_return_pct"] = float("nan")
+        assert is_promotion_eligible(record) is False
+
+        record = _eligible_record()
+        record["candidate_shadow_outcome"]["mid_realized_return_pct"] = float("inf")
+        assert is_promotion_eligible(record) is False
+
+        record = _eligible_record()
+        record["candidate_shadow_outcome"]["mid_realized_return_pct"] = None
+        assert is_promotion_eligible(record) is False
+
+    def test_bool_return_fails_closed(self):
+        """bool is a subclass of int in Python — explicit check
+        prevents accidental True/False slipping through as 1/0."""
+        record = _eligible_record()
+        record["candidate_shadow_outcome"]["mid_realized_return_pct"] = True
+        assert is_promotion_eligible(record) is False
+
+    # ── Label-integrity gate (defends against refactor accidents) ──
+
+    def test_missing_labels_dict_fails_closed(self):
+        record = _eligible_record()
+        del record["candidate_shadow_outcome"]["labels"]
+        assert is_promotion_eligible(record) is False
+
+    def test_labels_not_a_dict_fails_closed(self):
+        record = _eligible_record()
+        record["candidate_shadow_outcome"]["labels"] = "research_mid"
+        assert is_promotion_eligible(record) is False
+
+    def test_missing_required_label_fails_closed(self):
+        """All three labels must be present and True. Stripping any
+        one rejects the row."""
+        for label in ("research_mid", "shadow_only", "not_execution_grade"):
+            record = _eligible_record()
+            del record["candidate_shadow_outcome"]["labels"][label]
+            assert is_promotion_eligible(record) is False, (
+                f"missing {label} label should fail-closed"
+            )
+
+    def test_label_set_to_false_fails_closed(self):
+        """If someone refactors away the not_execution_grade label by
+        setting it to False, the helper must reject — defends against
+        mid-priced data being treated as execution evidence."""
+        for label in ("research_mid", "shadow_only", "not_execution_grade"):
+            record = _eligible_record()
+            record["candidate_shadow_outcome"]["labels"][label] = False
+            assert is_promotion_eligible(record) is False, (
+                f"{label}=False should fail-closed"
+            )
+
 
 class TestTagLiveForwardObservation:
-    """tag_live_forward_observation is the SINGLE function authorized to
-    assign SAMPLE_PROVENANCE_FORWARD_POST_FREEZE. The regression test
-    further down (TestForwardProvenanceAssignmentBoundary) enforces
-    that no other code path writes the constant."""
+    """_tag_live_forward_observation is the SINGLE function authorized
+    to assign SAMPLE_PROVENANCE_FORWARD_POST_FREEZE. Underscore-prefixed
+    to signal module-private. The regression test below
+    (TestForwardProvenanceAssignmentBoundary) enforces that no other
+    code path writes the constant OR references the function name."""
 
     def test_assigns_forward_post_freeze(self):
         record = {"symbol": "AAPL"}
-        tag_live_forward_observation(record)
+        _tag_live_forward_observation(record)
         assert record["sample_provenance"] == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
-        assert is_promotion_eligible(record) is True
+        # Note: is_promotion_eligible would still return False here
+        # because the record has no candidate_shadow_outcome. That's
+        # the new strict behavior — see TestIsPromotionEligible.
 
     def test_overwrites_existing_provenance(self):
         """If the record was previously tagged UNKNOWN/HISTORICAL by
@@ -1186,12 +1315,12 @@ class TestTagLiveForwardObservation:
         it. This is the intended behavior — the live API path knows it
         is producing forward observations regardless of the default."""
         record = {"sample_provenance": SAMPLE_PROVENANCE_UNKNOWN}
-        tag_live_forward_observation(record)
+        _tag_live_forward_observation(record)
         assert record["sample_provenance"] == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
 
     def test_returns_the_same_record_for_chaining(self):
         record = {"symbol": "AAPL"}
-        result = tag_live_forward_observation(record)
+        result = _tag_live_forward_observation(record)
         assert result is record  # mutated in-place
 
 
@@ -1200,49 +1329,69 @@ class TestForwardProvenanceAssignmentBoundary:
     be assigned only by the live evidence-cycle path, not by a generic
     script flag anyone can pass casually.'
 
-    Source-grep regression: the string value of
-    SAMPLE_PROVENANCE_FORWARD_POST_FREEZE may appear in the codebase
-    ONLY in three legitimate sites:
-      1. The constant definition itself
-      2. The body of tag_live_forward_observation
-      3. The PROMOTION_ELIGIBLE_PROVENANCES set definition
-    Anywhere else is a research-leakage hazard."""
+    Source-grep regression: BOTH the string value of
+    SAMPLE_PROVENANCE_FORWARD_POST_FREEZE *and* references to the
+    function name `_tag_live_forward_observation` may appear in the
+    codebase ONLY inside web/api/edge_engine.py. Anywhere else is a
+    research-leakage hazard.
 
-    def test_forward_post_freeze_string_assignment_sites_are_audited(self):
-        """Scan the production source tree (services/ + web/) for any
-        line that assigns the string literal "forward_post_freeze".
-        Allowlist the legitimate definition sites; flag anything else."""
-        import re
+    Round-3 update (Codex): grepping the string literal alone is not
+    enough — a replay script could call the helper directly without
+    containing the literal. We now grep for both."""
+
+    @staticmethod
+    def _grep_prod_sources(pattern_obj):
+        """Yield (rel_path, lineno, line) for every match of *pattern*
+        in services/ + web/ + scripts/ Python files."""
         import pathlib
         repo_root = pathlib.Path(__file__).resolve().parents[3]
-        # Production code only — tests legitimately reference the
-        # string for testing purposes.
         prod_dirs = [repo_root / "services", repo_root / "web", repo_root / "scripts"]
-        suspect_lines: list[str] = []
-        pattern = re.compile(r'"forward_post_freeze"|\'forward_post_freeze\'')
         for d in prod_dirs:
             if not d.exists():
                 continue
             for py_file in d.rglob("*.py"):
                 with open(py_file) as f:
                     for lineno, line in enumerate(f, 1):
-                        if pattern.search(line):
-                            rel = py_file.relative_to(repo_root)
-                            suspect_lines.append(f"{rel}:{lineno}: {line.strip()}")
+                        if pattern_obj.search(line):
+                            yield py_file.relative_to(repo_root), lineno, line.strip()
 
-        # Allowlist: legitimate occurrences in edge_engine.py only.
-        # All matches MUST be in that file. If a match shows up in
-        # scripts/ or services/ (other than edge_engine), that's the
-        # leakage hazard Codex warned about.
-        non_edge_engine = [
-            s for s in suspect_lines
-            if "web/api/edge_engine.py" not in s
+    def test_forward_post_freeze_string_only_in_edge_engine(self):
+        """The string literal "forward_post_freeze" must only appear
+        in web/api/edge_engine.py."""
+        import re
+        pattern = re.compile(r'"forward_post_freeze"|\'forward_post_freeze\'')
+        suspects = [
+            f"{rel}:{lineno}: {line}"
+            for rel, lineno, line in self._grep_prod_sources(pattern)
+            if "web/api/edge_engine.py" not in str(rel)
         ]
-        assert non_edge_engine == [], (
+        assert suspects == [], (
             "forward_post_freeze string assignment leaked outside the "
-            "edge_engine.py file. Only tag_live_forward_observation is "
+            "edge_engine.py file. Only _tag_live_forward_observation is "
             "authorized to assign this value. Found:\n  "
-            + "\n  ".join(non_edge_engine)
+            + "\n  ".join(suspects)
+        )
+
+    def test_tag_helper_only_referenced_in_edge_engine(self):
+        """REGRESSION (Codex round 3): the function NAME must also only
+        appear in edge_engine.py. A script could call
+        `_tag_live_forward_observation(record)` without ever writing
+        the forbidden string literal — this grep catches that."""
+        import re
+        # Match both the underscore-prefixed canonical name and any
+        # accidental import without the underscore.
+        pattern = re.compile(r'\b_?tag_live_forward_observation\b')
+        suspects = [
+            f"{rel}:{lineno}: {line}"
+            for rel, lineno, line in self._grep_prod_sources(pattern)
+            if "web/api/edge_engine.py" not in str(rel)
+        ]
+        assert suspects == [], (
+            "_tag_live_forward_observation referenced outside the "
+            "edge_engine.py file. The function is module-private; "
+            "calling it from another module bypasses the assignment "
+            "boundary. Found:\n  "
+            + "\n  ".join(suspects)
         )
 
 
