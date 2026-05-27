@@ -12,7 +12,7 @@ import math
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -333,6 +333,25 @@ class EdgeSnapshot:
     selector_output: Optional[Dict[str, Any]] = None
     structure_scorecards: Optional[List[Dict[str, Any]]] = None
     vol_snapshot: Optional[Dict[str, Any]] = None
+    # PR-AE C3: live-forward observation fields. ``analyze_single_ticker``
+    # populates both before ledger write so the row lands with
+    # ``sample_provenance = forward_post_freeze`` and an empty-but-stable
+    # ``candidate_shadow_outcome`` block carrying status
+    # "awaiting_exit_resolver". The PR-AE C4 resolver picks up these
+    # rows after the earnings event and fills the candidate outcome.
+    #
+    # build_record_from_analysis (services/recommendation_ledger.py)
+    # already reads both attributes via the _get helper, so the
+    # ledger-side wiring is automatic — no additional code change is
+    # required for these fields to flow into the recommendations row.
+    #
+    # NB: historical-replay records do NOT flow through EdgeSnapshot.
+    # _simulate_pre_earnings_calendar_trade builds a plain dict with
+    # sample_provenance=HISTORICAL_REPLAY directly. The boundary test
+    # TestForwardProvenanceAssignmentBoundary enforces that fact via
+    # source-grep.
+    sample_provenance: Optional[str] = None
+    candidate_shadow_outcome: Dict[str, Any] = field(default_factory=dict)
 
 
 # ─── Utility helpers ──────────────────────────────────────────────────────────
@@ -3058,6 +3077,51 @@ def _collect_yf_option_chain_frame(
     return pd.DataFrame(rows)
 
 
+def _attach_live_forward_provenance(edge_snapshot: "EdgeSnapshot") -> None:
+    """Tag *edge_snapshot* as a live forward observation (PR-AE C3).
+
+    Assigns both:
+      - ``sample_provenance`` → ``SAMPLE_PROVENANCE_FORWARD_POST_FREEZE``
+        via the SOLE authorized assigner
+        ``_tag_live_forward_observation`` (the underscore-prefixed
+        helper that lives in
+        ``services/candidate_shadow_provenance.py``).
+      - ``candidate_shadow_outcome`` → the stable empty-block factory
+        output with status ``"awaiting_exit_resolver"`` — the
+        sentinel the PR-AE C4 resolver uses to recognize "this row
+        is mine to fill in after the earnings event."
+
+    Mutates the snapshot in place; returns None.
+
+    Why this exists as a helper instead of inline:
+      1. **Testability**: this is the entire surface of PR-AE C3's
+         behavior change. Extracting it lets unit tests assert the
+         live-tagging contract without standing up the full
+         analyze_single_ticker dependency stack (yfinance, MDApp,
+         VolSnapshot, structure scorecards, selector, …).
+      2. **Boundary preservation**: the only call site of
+         ``_tag_live_forward_observation`` inside this module is
+         here. The source-grep regression
+         ``TestForwardProvenanceAssignmentBoundary`` continues to
+         pass because edge_engine.py is on its allowlist.
+      3. **No literal exposure**: the string
+         ``"forward_post_freeze"`` is NEVER written in this module.
+         It flows through the helper from
+         ``services/candidate_shadow_provenance.py`` only.
+
+    Historical replay does NOT flow through this helper.
+    ``_simulate_pre_earnings_calendar_trade`` builds a plain dict
+    with ``sample_provenance = SAMPLE_PROVENANCE_HISTORICAL_REPLAY``
+    directly. Behavioral tests verify both paths.
+    """
+    live_record: Dict[str, Any] = {}
+    _tag_live_forward_observation(live_record)
+    edge_snapshot.sample_provenance = live_record["sample_provenance"]
+    edge_snapshot.candidate_shadow_outcome = _empty_candidate_shadow_outcome(
+        "awaiting_exit_resolver"
+    )
+
+
 def analyze_single_ticker(
     symbol: str,
     mda_client: Any = None,  # MarketDataClient | None
@@ -4125,6 +4189,14 @@ def analyze_single_ticker(
         structure_scorecards=structure_scorecard_dicts,
         vol_snapshot=vol_snapshot_dict,
     )
+
+    # PR-AE C3: tag this live recommendation with the canonical
+    # forward-post-freeze provenance and attach the pre-resolution
+    # candidate_shadow_outcome stub. The logic lives in the small
+    # helper below so it can be unit-tested in isolation without
+    # running the full analyze_single_ticker pipeline.
+    _attach_live_forward_provenance(edge_snapshot)
+
     if record_to_ledger:
         try:
             from services.recommendation_ledger import record_recommendation

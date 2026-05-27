@@ -1895,3 +1895,244 @@ class TestAggregatorNoMixingOfProvenance:
                         )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# PR-AE C3 — live forward tagging wired into analyze_single_ticker
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestPRAECCThreeLiveForwardTagging:
+    """The two halves PR-AE C3 wires up in web/api/edge_engine.py:
+
+      (a) Live forward observations get tagged with
+          SAMPLE_PROVENANCE_FORWARD_POST_FREEZE before
+          record_recommendation runs, AND attach a placeholder
+          candidate_shadow_outcome with status "awaiting_exit_resolver"
+          for the PR-AE C4 resolver to pick up post-event.
+
+      (b) Historical replay observations (produced by
+          _simulate_pre_earnings_calendar_trade) keep their existing
+          SAMPLE_PROVENANCE_HISTORICAL_REPLAY tag and NEVER acquire the
+          forward variant — even if the simulator is run for the first
+          time on this revision of the code.
+
+    Both halves are guarded behaviorally below. The existing
+    TestForwardProvenanceAssignmentBoundary class still enforces the
+    source-grep boundary on top of these behavioral checks (the
+    underscore-prefixed helper and the literal string may only
+    appear inside two allowlisted modules).
+    """
+
+    def test_attach_live_forward_provenance_assigns_forward_tag(self):
+        """Half (a) — direct behavioral test of the
+        ``_attach_live_forward_provenance`` helper called inside
+        analyze_single_ticker. Constructing the snapshot manually
+        bypasses the full live-API dependency stack (yfinance, MDApp,
+        VolSnapshot, structure scorecards) and tests only the
+        tagging contract."""
+        from web.api.edge_engine import (
+            EdgeSnapshot,
+            _attach_live_forward_provenance,
+        )
+        snapshot = EdgeSnapshot(
+            symbol="AAPL",
+            recommendation="Candidate",
+            confidence_pct=72.0,
+            setup_score=0.72,
+            metrics={},
+            rationale=[],
+            selector_output={"best_structure": "call_calendar"},
+            structure_scorecards=[],
+            vol_snapshot={"symbol": "AAPL"},
+        )
+        # Before tagging: both PR-AE C3 fields carry their defaults
+        assert snapshot.sample_provenance is None
+        assert snapshot.candidate_shadow_outcome == {}
+
+        _attach_live_forward_provenance(snapshot)
+
+        # After tagging: forward provenance set, candidate shadow
+        # outcome carries the resolver-recognized awaiting sentinel
+        assert snapshot.sample_provenance == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+        assert snapshot.candidate_shadow_outcome["status"] == "awaiting_exit_resolver"
+        # Stable-shape labels survive — the C4 resolver and the
+        # aggregator both depend on these three label keys being True.
+        for label in ("research_mid", "shadow_only", "not_execution_grade"):
+            assert snapshot.candidate_shadow_outcome["labels"][label] is True
+
+    def test_attach_live_forward_provenance_is_idempotent(self):
+        """Calling the helper twice on the same snapshot is safe:
+        sample_provenance stays at the forward value (still assigned
+        by the same helper), and candidate_shadow_outcome remains the
+        awaiting-stub. Important because analyze_single_ticker is a
+        public API that might one day be called repeatedly inside a
+        single request."""
+        from web.api.edge_engine import (
+            EdgeSnapshot,
+            _attach_live_forward_provenance,
+        )
+        snapshot = EdgeSnapshot(
+            symbol="AAPL",
+            recommendation="Candidate",
+            confidence_pct=72.0,
+            setup_score=0.72,
+            metrics={},
+            rationale=[],
+        )
+        _attach_live_forward_provenance(snapshot)
+        first_outcome = snapshot.candidate_shadow_outcome
+        _attach_live_forward_provenance(snapshot)
+        # Same provenance and status; outcome dict was freshly
+        # constructed (not the same reference) but compares equal
+        assert snapshot.sample_provenance == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+        assert snapshot.candidate_shadow_outcome["status"] == "awaiting_exit_resolver"
+        assert snapshot.candidate_shadow_outcome == first_outcome
+
+    def test_edge_snapshot_carries_pr_ae_c3_fields_with_safe_defaults(self):
+        """A bare EdgeSnapshot (constructed without invoking the
+        helper) has sample_provenance=None and
+        candidate_shadow_outcome={}. This protects the
+        is_promotion_eligible filter: untagged snapshots fail
+        eligibility on the provenance check (None is not in
+        PROMOTION_ELIGIBLE_PROVENANCES) AND on the outcome check
+        (empty dict has no "status" key)."""
+        from web.api.edge_engine import EdgeSnapshot
+        snapshot = EdgeSnapshot(
+            symbol="AAPL",
+            recommendation="Candidate",
+            confidence_pct=72.0,
+            setup_score=0.72,
+            metrics={},
+            rationale=[],
+        )
+        assert snapshot.sample_provenance is None
+        assert snapshot.candidate_shadow_outcome == {}
+        # Fail-closed: an untagged snapshot is not promotion-eligible
+        assert is_promotion_eligible({
+            "sample_provenance": snapshot.sample_provenance,
+            "candidate_shadow_outcome": snapshot.candidate_shadow_outcome,
+        }) is False
+
+    def test_analyze_single_ticker_source_contains_helper_call(self):
+        """Static guard against accidental removal of the tagging call
+        from analyze_single_ticker during a future refactor. If a
+        future PR moves the call site to a different helper, this test
+        must be updated AND the boundary regression confirmed."""
+        import inspect
+        from web.api import edge_engine
+        src = inspect.getsource(edge_engine.analyze_single_ticker)
+        assert "_attach_live_forward_provenance(edge_snapshot)" in src, (
+            "analyze_single_ticker must call _attach_live_forward_provenance "
+            "so live recommendations land in the ledger tagged "
+            "forward_post_freeze with an awaiting candidate_shadow_outcome. "
+            "Removing this breaks the PR-AE C4 resolver's eligibility "
+            "filter (every live row would be untagged and skipped)."
+        )
+
+    def test_historical_replay_simulator_tags_records_as_historical_replay(self):
+        """Half (b) behavioral — invoke _simulate_pre_earnings_calendar_
+        trade with a mock store whose query_chain raises. The
+        function early-exits returning the ``base`` dict, which by
+        construction carries SAMPLE_PROVENANCE_HISTORICAL_REPLAY. No
+        chain queries succeed, no candidate shadow simulator runs,
+        the forward tagger MUST NOT be invoked anywhere in this code
+        path."""
+        from unittest.mock import MagicMock
+        from web.api.edge_engine import _simulate_pre_earnings_calendar_trade
+
+        store = MagicMock()
+        store.query_chain.side_effect = RuntimeError("synthetic: no chain data")
+
+        result = _simulate_pre_earnings_calendar_trade(
+            "AAPL",
+            store,
+            event_date=pd.Timestamp("2024-05-02"),
+            entry_date=pd.Timestamp("2024-04-30"),
+            exit_date=pd.Timestamp("2024-05-03"),
+            entry_offset=2,
+        )
+
+        assert result["sample_provenance"] == SAMPLE_PROVENANCE_HISTORICAL_REPLAY
+        # Critically: the forward tag must NEVER appear on a
+        # historical-replay record, regardless of when this code path
+        # runs.
+        assert result["sample_provenance"] != SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+        # Early-exit status confirms we exercised the missing-entry-chain
+        # branch (the cleanest seam in the simulator that builds the
+        # base dict and returns).
+        assert result["status"] == "missing_entry_chain"
+
+    def test_historical_replay_does_not_invoke_forward_tagger(self):
+        """Codex C3 watch item, directly behavioral: when the
+        historical replay simulator runs, ``_tag_live_forward_observation``
+        MUST NOT be called. Patching the tagger and verifying its call
+        count is zero is the strongest possible guarantee — a future
+        refactor that accidentally wires it into the historical path
+        will fail this test loudly.
+        """
+        from unittest.mock import MagicMock, patch
+        from web.api.edge_engine import _simulate_pre_earnings_calendar_trade
+
+        store = MagicMock()
+        store.query_chain.side_effect = RuntimeError("synthetic")
+
+        # Patch the tagger AT the import site inside edge_engine.py
+        # (which is where the live path would call it from).
+        with patch("web.api.edge_engine._tag_live_forward_observation") as tagger:
+            _simulate_pre_earnings_calendar_trade(
+                "AAPL",
+                store,
+                event_date=pd.Timestamp("2024-05-02"),
+                entry_date=pd.Timestamp("2024-04-30"),
+                exit_date=pd.Timestamp("2024-05-03"),
+                entry_offset=2,
+            )
+
+        assert tagger.call_count == 0, (
+            "Historical replay must NEVER invoke "
+            "_tag_live_forward_observation. The function is the SOLE "
+            "authorized assigner of forward_post_freeze; calling it "
+            "from the replay path would re-introduce the in-sample-"
+            "into-production research-leakage failure mode PR-AD was "
+            "designed to prevent."
+        )
+
+    def test_attach_live_forward_provenance_invokes_authorized_tagger(self):
+        """Positive companion to the historical-rejection test: the
+        live helper MUST invoke _tag_live_forward_observation exactly
+        once per call. Confirms the assignment boundary is preserved
+        — the literal string never appears in this module; the
+        tagger function is the only writer."""
+        from unittest.mock import patch
+        from web.api.edge_engine import (
+            EdgeSnapshot,
+            _attach_live_forward_provenance,
+        )
+        snapshot = EdgeSnapshot(
+            symbol="AAPL",
+            recommendation="Candidate",
+            confidence_pct=72.0,
+            setup_score=0.72,
+            metrics={},
+            rationale=[],
+        )
+
+        # We can't just patch _tag_live_forward_observation because the
+        # helper depends on it to set the dict's sample_provenance key.
+        # Instead, wrap it as a side-effect spy that still performs the
+        # real work.
+        from web.api import edge_engine as ee
+        real_tagger = ee._tag_live_forward_observation
+        with patch.object(ee, "_tag_live_forward_observation",
+                          wraps=real_tagger) as spy:
+            _attach_live_forward_provenance(snapshot)
+
+        assert spy.call_count == 1
+        # The spy was called with the intermediate dict (not the
+        # snapshot directly). The boundary's tiny-dict pattern keeps
+        # the live snapshot's sample_provenance attribute getting set
+        # via attribute assignment, not directly by the tagger.
+        called_with = spy.call_args.args[0]
+        assert isinstance(called_with, dict)
+        assert called_with.get("sample_provenance") == SAMPLE_PROVENANCE_FORWARD_POST_FREEZE
+
+
