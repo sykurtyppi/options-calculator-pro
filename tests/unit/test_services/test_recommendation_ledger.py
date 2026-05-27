@@ -5,8 +5,10 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+from services import recommendation_ledger as ledger_module
 from services.recommendation_ledger import (
     RecommendationLedger,
+    get_recommendation_ledger,
     make_recommendation_id,
     record_recommendation,
 )
@@ -1940,3 +1942,46 @@ def test_pr_ae_atomic_helper_duplicate_outcome_still_bumps_counter(
     # repeats. The row escalates to permanently_failed after MAX_ATTEMPTS
     # retries regardless of content drift.
     assert counter == 2
+
+
+# ── Hardening P1-5 regression test ───────────────────────────────────────
+
+
+def test_get_recommendation_ledger_closes_previous_instance_on_replacement(
+    tmp_path: Path,
+) -> None:
+    """Hardening P1-5: replacing the module-global ledger via a new
+    ``ledger_path`` must close the previous SQLite connection. Without
+    this, long-running processes (the FastAPI web app, any future
+    daemon) accumulate WAL handles every time the path changes — until
+    eventually they hit ulimit and crash.
+    """
+    first_path = tmp_path / "first.sqlite"
+    second_path = tmp_path / "second.sqlite"
+
+    # Reset the module-global so this test is independent of execution
+    # order. The lock isn't re-entrant; reset is fine outside it.
+    ledger_module._ledger = None
+
+    first = get_recommendation_ledger(ledger_path=first_path)
+    assert first._conn is not None  # noqa: SLF001 — internal handle is the leak surface
+
+    # Holding a reference so we can assert the connection is closed even
+    # though the module-global has moved on to a new instance.
+    leaked_handle = first._conn  # noqa: SLF001
+
+    second = get_recommendation_ledger(ledger_path=second_path)
+    assert second is not first
+    assert second._conn is not leaked_handle  # noqa: SLF001
+
+    # The previous connection's SQLite handle is now closed: any query
+    # raises sqlite3.ProgrammingError ("Cannot operate on a closed
+    # database").
+    import pytest
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        leaked_handle.execute("SELECT 1").fetchone()
+
+    # Cleanup so we don't bleed state into other tests.
+    second.close()
+    ledger_module._ledger = None

@@ -1212,5 +1212,23 @@ def get_recommendation_ledger(ledger_path: Optional[Path] = None) -> Recommendat
     if _ledger is None or ledger_path is not None:
         with _ledger_lock:
             if _ledger is None or ledger_path is not None:
+                # Hardening P1-5: close the previous instance's SQLite
+                # connection before dropping the reference. Without this,
+                # every call that supplies ``ledger_path`` (the web layer
+                # and any test that monkey-patches _DEFAULT_LEDGER) leaks
+                # one SQLite connection plus its WAL file handle. Launchd
+                # entrypoints run once-per-invocation so production
+                # exposure is bounded, but the FastAPI app and any
+                # future daemon would accumulate handles until ulimit
+                # kicks in.
+                if _ledger is not None:
+                    try:
+                        _ledger.close()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "recommendation_ledger: failed to close previous "
+                            "instance before replacement: %s",
+                            exc,
+                        )
                 _ledger = RecommendationLedger(ledger_path or _DEFAULT_LEDGER)
     return _ledger

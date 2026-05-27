@@ -43,6 +43,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import sys
 import time
@@ -236,12 +237,33 @@ def _outcome_to_jsonl_row(
 def _append_jsonl(jsonl_path: Path, rows: List[Dict[str, Any]]) -> None:
     """Append one line per row to *jsonl_path*. Creates the parent
     directory if missing. Newline-terminated for cleanly tail-able
-    streams."""
+    streams.
+
+    Hardening P1-3: holds an advisory ``fcntl.LOCK_EX`` for the duration
+    of the write so concurrent invocations cannot interleave per-row
+    writes and corrupt the JSONL stream. The shell wrapper
+    ``scripts/automation/run_candidate_exit_resolver.sh`` already
+    serializes launchd-driven runs via a directory lock, but an operator
+    invoking this script manually while launchd fires would race that
+    lock's stale-replacement window. flock closes that hole.
+
+    flock is advisory and POSIX-specific; the file handle's lock is
+    automatically released when the ``with`` block closes the
+    descriptor, so we don't need an explicit ``LOCK_UN``.
+    """
+    if not rows:
+        return
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    # Build the entire payload before opening to minimize the time the
+    # lock is held.
+    buffer = "".join(
+        json.dumps(row, sort_keys=True, default=str) + "\n"
+        for row in rows
+    )
     with open(jsonl_path, "a", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, sort_keys=True, default=str))
-            fh.write("\n")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        fh.write(buffer)
+        fh.flush()
 
 
 def _format_summary(
