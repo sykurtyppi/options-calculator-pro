@@ -431,6 +431,77 @@ def test_picker_provenance_handles_put_calendar_placeholder(tmp_path: Path) -> N
     # selector picked put_calendar without having put-side evidence.
 
 
+def test_picker_provenance_field_location_contract(tmp_path: Path) -> None:
+    """REGRESSION (Codex review of commit 4): build_record_from_analysis
+    must read `experimental_contract_selection` from analysis.metrics —
+    not from a top-level analysis attribute, not from selector_output,
+    not from vol_snapshot. The live edge_engine assembles the block as
+    a key inside the `metrics` dict it passes to EdgeSnapshot.
+
+    This test plants the correct payload at metrics[...] AND sentinel
+    decoy values at every plausible-wrong location, then asserts the
+    captured picker_provenance is the metrics-level payload — not any
+    of the decoys. If a future refactor moves the field out of
+    `metrics`, this fails loudly rather than silently dropping picker
+    provenance for every recorded paper trade."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    expected = _sample_experimental_contract_selection()
+    analysis.metrics["experimental_contract_selection"] = expected
+    # Decoys at every other plausible location
+    analysis.selector_output["experimental_contract_selection"] = {"WRONG_LOCATION": "selector_output"}
+    analysis.vol_snapshot["experimental_contract_selection"] = {"WRONG_LOCATION": "vol_snapshot"}
+    # And as a top-level attribute on the namespace itself
+    analysis.experimental_contract_selection = {"WRONG_LOCATION": "top_level"}
+
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="field-location-contract",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    pp = ledger.get(rec_id)["picker_provenance_json"]
+    # The metrics-level payload was captured
+    assert pp["structure"] == "call_calendar"
+    assert pp["candidate_contracts"]["pickers_diverged"] is True
+    # None of the decoys leaked in
+    pp_str = str(pp)
+    assert "WRONG_LOCATION" not in pp_str
+    assert "selector_output" not in pp_str or "selector_output" in str(expected)
+    # (the second clause guards against false negatives if expected itself
+    # mentions "selector_output" in some unrelated field text)
+
+
+def test_malformed_picker_provenance_json_yields_empty_dict_on_read(tmp_path: Path) -> None:
+    """Codex hygiene check: a single row with malformed
+    picker_provenance_json must NOT break the whole ledger read.
+    _loads returns {} on JSONDecodeError; this confirms the contract
+    holds end-to-end so one bad row never blocks the others."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+
+    # Insert a valid record first
+    analysis = _analysis()
+    analysis.metrics["experimental_contract_selection"] = _sample_experimental_contract_selection()
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="malformed-json-test",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+
+    # Corrupt the column on this row
+    ledger._conn.execute(  # noqa: SLF001
+        "UPDATE recommendations SET picker_provenance_json = ? WHERE recommendation_id = ?",
+        ("{not valid json", rec_id),
+    )
+    ledger._conn.commit()
+
+    # Read must not raise; _loads returns {} for malformed JSON
+    row = ledger.get(rec_id)
+    assert row is not None
+    assert row["picker_provenance_json"] == {}
+
+
 def test_picker_provenance_column_added_by_migration(tmp_path: Path) -> None:
     """An existing ledger DB created BEFORE PR-AC commit 4 (no
     picker_provenance_json column) must gain the column on next open,
