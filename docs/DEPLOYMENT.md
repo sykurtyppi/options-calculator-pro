@@ -201,10 +201,13 @@ ls .venv311/bin/python || echo "MISSING — set up the venv first"
 #    a fresh dist/ exists; backend serves it via StaticFiles).
 cd web/frontend && npm install && npm run build && cd ../..
 
-# 3. Confirm .env contains the required share-auth combination (see §C).
-#    The backend will refuse to start if anything is missing — that's
-#    by design. Smoke-test the validator before installing launchd jobs:
-.venv311/bin/python -c "from web.api import app; print('startup ok')"
+# 3. Run the preflight check. Verifies .env, Python venv, frontend
+#    build, wrapper/plist files, startup validators (PR #59), SQLite
+#    quick_check, and the log-rotation dry-run. Exit codes match the
+#    watchdog convention: 0=clean, 1=warnings, 2=failures.
+.venv311/bin/python scripts/preflight_check.py
+# Expected on a clean install: 9 PASS, 1 SKIP (launchagents not yet
+# installed), 0 FAIL. If you see any FAIL, fix it before step 4.
 
 # 4. Install all five launchd jobs. The script template-renders each
 #    plist (substituting __PROJECT_ROOT__ and __HOME__), drops the
@@ -215,6 +218,10 @@ scripts/automation/install_launchd_jobs.sh
 # 5. Confirm the jobs are loaded.
 launchctl list | grep optionscalculator
 # Expected: 5 lines, each ending with "0" (last exit status).
+
+# 6. Re-run preflight to confirm the launchagents check now passes too.
+.venv311/bin/python scripts/preflight_check.py
+# Expected: 10 PASS, 0 WARN, 0 FAIL.
 ```
 
 Expected `launchctl list` output:
