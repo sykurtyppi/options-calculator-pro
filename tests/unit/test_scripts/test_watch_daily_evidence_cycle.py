@@ -215,6 +215,114 @@ def test_resolver_summary_block_surfaces_in_combined_status() -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# C1d alertable-field filter
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _non_alertable_issue(severity: str, message: str) -> dict:
+    """Issue dict with alertable=False — e.g. C1d's
+    'log missing but not due yet' marker."""
+    return {
+        "severity": severity,
+        "check": "candidate_exit_resolver",
+        "message": message,
+        "fix": "no action required",
+        "alertable": False,
+    }
+
+
+def test_ops_ae_c1d_non_alertable_resolver_warn_does_not_flip_ok(
+) -> None:
+    """REGRESSION (Codex Ops-AE C1c P2 audit): an issue tagged
+    ``alertable: False`` (e.g. resolver log missing but not due yet)
+    MUST NOT contribute to ``combined_status['ok']``. The watchdog
+    dispatcher needs this so a fresh install before today's 12:30
+    fire doesn't page the operator at the same-day 22:15 watchdog.
+
+    Without the C1d filter, the C1c rule "any resolver WARN
+    escalates to errors" would page on this perfectly-fine
+    install-day scenario.
+    """
+    combined = _build_combined_watchdog_status(
+        watchdog_status=_make_watchdog_status(ok=True),
+        resolver_health=_make_resolver_health(
+            issues=[
+                _non_alertable_issue(
+                    "WARN",
+                    "Candidate exit resolver launchd log does not exist yet "
+                    "(not due yet — resolver scheduled for 12:30 UTC).",
+                )
+            ],
+        ),
+    )
+    assert combined["ok"] is True, (
+        "Non-alertable WARN must not flip combined ok to False — "
+        "otherwise the C1d not-due-yet escape hatch doesn't work."
+    )
+    # But the issue still appears in warnings for forensics — operator
+    # who reads `scripts/check_evidence_health.py` JSON should see
+    # exactly why nothing alerted.
+    assert any(
+        "not due yet" in warning for warning in combined["warnings"]
+    )
+    # And it does NOT appear in errors (the alert message body).
+    assert not any(
+        "not due yet" in error for error in combined["errors"]
+    )
+
+
+def test_ops_ae_c1d_alertable_default_true_for_legacy_issue_dicts() -> None:
+    """Backward compatibility: issue dicts without an explicit
+    ``alertable`` field default to alertable=True. This preserves the
+    C1c escalation rule for all pre-C1d call sites of _issue() while
+    only the new not-due-yet path opts out.
+
+    Verified by passing an issue dict that omits the ``alertable``
+    key — the resolver WARN still flips ok to False.
+    """
+    legacy_issue = {
+        "severity": "WARN",
+        "check": "candidate_exit_resolver",
+        "message": "Awaiting chain data for 12 day(s).",
+        "fix": "Inspect resolver log.",
+        # `alertable` intentionally absent
+    }
+    combined = _build_combined_watchdog_status(
+        watchdog_status=_make_watchdog_status(ok=True),
+        resolver_health=_make_resolver_health(issues=[legacy_issue]),
+    )
+    assert combined["ok"] is False
+    assert any("Awaiting" in error for error in combined["errors"])
+
+
+def test_ops_ae_c1d_mixed_alertable_issues_filter_correctly() -> None:
+    """When BOTH alertable and non-alertable issues are present, the
+    non-alertable ones go to warnings, the alertable ones go to
+    errors, and ok is False (because at least one alertable issue
+    exists). Exercises the full filter logic in one shot."""
+    combined = _build_combined_watchdog_status(
+        watchdog_status=_make_watchdog_status(ok=True),
+        resolver_health=_make_resolver_health(
+            issues=[
+                _non_alertable_issue("WARN", "Log not due yet."),
+                _issue("WARN", "Stuck awaiting 15 days."),
+                _issue("FAIL", "Simulator error recorded."),
+            ],
+        ),
+    )
+    # Two alertable issues → ok=False
+    assert combined["ok"] is False
+    # Errors contain the two alertable messages
+    assert len(combined["errors"]) == 2
+    assert any("Stuck" in e for e in combined["errors"])
+    assert any("Simulator" in e for e in combined["errors"])
+    # Warnings contain the non-alertable issue (for forensics)
+    assert any("not due yet" in w for w in combined["warnings"])
+    # And the non-alertable issue does NOT leak into errors
+    assert not any("not due yet" in e for e in combined["errors"])
+
+
 def test_combined_status_aggregates_multiple_resolver_issues() -> None:
     """When the resolver reports both a FAIL and one or more WARNs,
     all of them flow into errors so the alert message includes the

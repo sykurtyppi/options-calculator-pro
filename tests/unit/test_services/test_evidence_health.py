@@ -626,3 +626,124 @@ def test_evidence_health_warns_not_fails_before_candidate_resolver_first_run(tmp
         issue["check"] == "candidate_exit_resolver" and "does not exist yet" in issue["message"]
         for issue in status["issues"]
     )
+    # Ops-AE C1d: at 23:00 UTC (well past today's 12:30 UTC + 60min
+    # grace = 13:30 UTC), the missing-log WARN MUST be alertable.
+    # A fresh install whose first scheduled fire never happened is
+    # operationally noteworthy and should page the operator.
+    missing_log_issues = [
+        issue for issue in status["issues"]
+        if issue["check"] == "candidate_exit_resolver"
+        and "does not exist yet" in issue["message"]
+    ]
+    assert all(issue.get("alertable", True) for issue in missing_log_issues)
+
+
+def test_ops_ae_c1d_missing_log_before_due_window_is_non_alertable(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (Codex Ops-AE C1c P2 audit): a fresh install
+    whose launchd log doesn't exist YET because today's 12:30 fire
+    hasn't happened must not false-alert the operator at an earlier
+    health check.
+
+    Scenario: operator runs `scripts/check_evidence_health.py`
+    manually at 10:00 UTC. Today's resolver is due at 12:30 UTC
+    (default). The log doesn't exist. C1c's "all resolver WARN
+    escalates" rule would have caused this to alert.
+
+    C1d fix: when the log is missing AND now is before the resolver
+    due window, the WARN is tagged ``alertable=False``. It appears
+    in the JSON output (for forensics) but the watchdog dispatcher
+    must filter it out of the alert decision.
+    """
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    cfg.candidate_resolver_launchd_log_path.unlink()
+
+    # 10:00 UTC — well before the default 12:30 + 60min = 13:30 UTC
+    # due window.
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 10, 0, tzinfo=timezone.utc),
+    )
+
+    # The issue must appear in the payload for visibility:
+    missing_log_issues = [
+        issue for issue in status["issues"]
+        if issue["check"] == "candidate_exit_resolver"
+        and "does not exist yet" in issue["message"]
+    ]
+    assert len(missing_log_issues) == 1, (
+        f"Expected exactly one missing-log WARN; got {missing_log_issues!r}"
+    )
+    # But it must be tagged non-alertable so the dispatcher doesn't page.
+    assert missing_log_issues[0].get("alertable") is False, (
+        f"Missing-log issue before due window must be alertable=False; "
+        f"got {missing_log_issues[0]!r}"
+    )
+    # And the message must say "not due yet" to give operator context
+    # if they read the JSON output.
+    assert "not due yet" in missing_log_issues[0]["message"]
+
+
+def test_ops_ae_c1d_missing_log_after_due_window_is_alertable(
+    tmp_path: Path,
+) -> None:
+    """Positive companion to the C1d fix: AFTER the due window
+    elapses (e.g. 22:15 UTC, well past today's 13:30 UTC cutoff),
+    a missing log is a real operational concern and MUST remain
+    alertable. The not-due-yet exception is narrow."""
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    cfg.candidate_resolver_launchd_log_path.unlink()
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 22, 15, tzinfo=timezone.utc),
+    )
+
+    missing_log_issues = [
+        issue for issue in status["issues"]
+        if issue["check"] == "candidate_exit_resolver"
+        and "does not exist yet" in issue["message"]
+    ]
+    assert len(missing_log_issues) == 1
+    # Past due → alertable (the C1c escalation rule applies).
+    assert missing_log_issues[0].get("alertable", True) is True
+    # And the message does NOT carry the "not due yet" qualifier.
+    assert "not due yet" not in missing_log_issues[0]["message"]
+
+
+def test_ops_ae_c1d_existing_issue_dicts_default_alertable_true(tmp_path: Path) -> None:
+    """The new `alertable` field on _issue() defaults to True so all
+    existing issue-emission sites remain alertable without explicit
+    opt-in. Verified by checking that any pre-existing _issue() call
+    site (e.g. stuck-awaiting WARN) still pages."""
+    cfg = _config(tmp_path)
+    _seed_ok_files(cfg)
+    _write_candidate_resolver_jsonl(
+        cfg.candidate_resolver_jsonl,
+        [
+            {
+                "ts": "2026-04-27T12:31:00+00:00",
+                "recommendation_id": "rec_stuck_default",
+                "resolver_status": "awaiting_chain_data",
+                "days_in_awaiting_state": 14,
+            }
+        ],
+    )
+
+    status = build_evidence_health_status(
+        config=cfg,
+        now=datetime(2026, 4, 27, 23, 0, tzinfo=timezone.utc),
+    )
+
+    stuck_issues = [
+        issue for issue in status["issues"]
+        if issue["check"] == "candidate_exit_resolver"
+        and "awaiting chain data" in issue["message"]
+    ]
+    assert len(stuck_issues) == 1
+    # Defaults to alertable=True; the explicit-False opt-in is only
+    # on the not-due-yet path.
+    assert stuck_issues[0].get("alertable", True) is True

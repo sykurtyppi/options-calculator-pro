@@ -64,6 +64,15 @@ DEFAULT_MAX_CANDIDATE_AWAITING_DAYS = 10
 DEFAULT_DAILY_DUE_HOUR_UTC = 21
 DEFAULT_DAILY_DUE_MINUTE_UTC = 30
 DEFAULT_DAILY_DUE_GRACE_MINUTES = 60
+# Ops-AE C1d (Codex P2): resolver fire time in UTC (matches the
+# launchd plist StartCalendarInterval Hour=12, Minute=30 for users
+# whose system local tz == UTC; users in other tz must override).
+# Used to suppress false-alarms on a fresh install where the
+# launchd log doesn't exist yet because the first scheduled fire
+# hasn't happened. Grace allows for sleep/wake delays.
+DEFAULT_RESOLVER_DUE_HOUR_UTC = 12
+DEFAULT_RESOLVER_DUE_MINUTE_UTC = 30
+DEFAULT_RESOLVER_DUE_GRACE_MINUTES = 60
 
 
 @dataclass(frozen=True)
@@ -89,6 +98,16 @@ class EvidenceHealthConfig:
     daily_due_hour_utc: int = DEFAULT_DAILY_DUE_HOUR_UTC
     daily_due_minute_utc: int = DEFAULT_DAILY_DUE_MINUTE_UTC
     daily_due_grace_minutes: int = DEFAULT_DAILY_DUE_GRACE_MINUTES
+    # Ops-AE C1d: resolver due-window check for missing-log handling.
+    # When the launchd log doesn't exist AND now is before today's
+    # resolver due time + grace, the missing-log condition is
+    # emitted as a NON-ALERTABLE WARN — the resolver hasn't had a
+    # chance to fire yet, so paging the operator would be a false
+    # alarm. After due-window elapses with no log, the alertable
+    # WARN fires per the C1c escalation.
+    resolver_due_hour_utc: int = DEFAULT_RESOLVER_DUE_HOUR_UTC
+    resolver_due_minute_utc: int = DEFAULT_RESOLVER_DUE_MINUTE_UTC
+    resolver_due_grace_minutes: int = DEFAULT_RESOLVER_DUE_GRACE_MINUTES
 
 
 def build_evidence_health_status(
@@ -618,14 +637,46 @@ def _candidate_resolver_log_summary(cfg: EvidenceHealthConfig, now: datetime) ->
             count_balance_holds = True
 
     if not path.exists():
-        issues.append(
-            _issue(
-                "WARN",
-                "candidate_exit_resolver",
-                f"Candidate exit resolver launchd log does not exist yet: {path}.",
-                "Install/load com.optionscalculator.candidate-exit-resolver and verify the first scheduled run.",
+        # Ops-AE C1d (Codex P2 audit fix): a fresh install where the
+        # resolver hasn't had a chance to fire today yet would have
+        # false-alarmed under the C1c "all resolver WARN escalates"
+        # rule. The launchd log doesn't exist because the first
+        # scheduled fire hasn't happened — not because of an
+        # operational failure.
+        #
+        # Resolution: when now is BEFORE today's resolver due
+        # window + grace, emit a NON-ALERTABLE WARN with explicit
+        # "not due yet" framing. Observable in the JSON payload for
+        # forensics; never pages the operator. After the due
+        # window passes with no log, the alertable WARN fires per
+        # the C1c rule.
+        if _is_before_resolver_due_window(cfg, now):
+            issues.append(
+                _issue(
+                    "WARN",
+                    "candidate_exit_resolver",
+                    (
+                        "Candidate exit resolver launchd log does not "
+                        "exist yet (not due yet — resolver scheduled "
+                        f"for {cfg.resolver_due_hour_utc:02d}:{cfg.resolver_due_minute_utc:02d} UTC)."
+                    ),
+                    (
+                        "No action required — the log will be created "
+                        "after today's scheduled fire. If this persists "
+                        "past the due window, the alertable WARN will fire."
+                    ),
+                    alertable=False,
+                )
             )
-        )
+        else:
+            issues.append(
+                _issue(
+                    "WARN",
+                    "candidate_exit_resolver",
+                    f"Candidate exit resolver launchd log does not exist yet: {path}.",
+                    "Install/load com.optionscalculator.candidate-exit-resolver and verify the first scheduled run.",
+                )
+            )
     elif latest_complete is None:
         issues.append(
             _issue(
@@ -888,8 +939,61 @@ def _is_not_due_error(error: Any, expected_date: date) -> bool:
     return "Daily evidence cycle completion marker is missing" in text
 
 
-def _issue(severity: str, check: str, message: str, fix: str) -> dict[str, str]:
-    return {"severity": severity, "check": check, "message": message, "fix": fix}
+def _resolver_due_deadline(cfg: EvidenceHealthConfig) -> datetime:
+    """Today's resolver fire time + grace, as a UTC datetime.
+
+    Ops-AE C1d helper. Used to decide whether a missing launchd log
+    is alertable. The default config assumes the resolver fires at
+    12:30 UTC; users whose launchd plist fires at a non-UTC local
+    12:30 must override ``resolver_due_hour_utc`` /
+    ``resolver_due_minute_utc`` on EvidenceHealthConfig.
+    """
+    due = datetime(
+        cfg.expected_date.year,
+        cfg.expected_date.month,
+        cfg.expected_date.day,
+        cfg.resolver_due_hour_utc,
+        cfg.resolver_due_minute_utc,
+        tzinfo=timezone.utc,
+    )
+    return due + timedelta(minutes=cfg.resolver_due_grace_minutes)
+
+
+def _is_before_resolver_due_window(
+    cfg: EvidenceHealthConfig, now: datetime
+) -> bool:
+    """Return True iff *now* is BEFORE today's resolver fire time
+    plus the configured grace window. Used to suppress false-alarms
+    on a fresh install where the launchd log doesn't exist yet
+    because the first scheduled fire hasn't happened.
+    """
+    return _ensure_utc(now) < _resolver_due_deadline(cfg)
+
+
+def _issue(
+    severity: str,
+    check: str,
+    message: str,
+    fix: str,
+    *,
+    alertable: bool = True,
+) -> dict[str, Any]:
+    """Construct an issue dict for the aggregated health payload.
+
+    Ops-AE C1d: gained an explicit ``alertable`` flag (default True).
+    Issues marked ``alertable=False`` carry information value for the
+    operator (they still appear in the JSON output) but the
+    watchdog dispatcher MUST NOT escalate them to an alert. Used
+    for "not due yet" type conditions where the absence of a
+    resource is expected by the current point in the daily schedule.
+    """
+    return {
+        "severity": severity,
+        "check": check,
+        "message": message,
+        "fix": fix,
+        "alertable": alertable,
+    }
 
 
 def _aggregate_status(issues: Iterable[dict[str, str]]) -> str:

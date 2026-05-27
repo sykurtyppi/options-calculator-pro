@@ -53,10 +53,14 @@ def _build_combined_watchdog_status(
     evidence_health) silently failed to alert.
 
     Contract:
-      - Resolver FAIL  → contributes to ``ok = False`` AND appears
-        in ``errors`` (for the alert message body).
-      - Resolver WARN  → contributes to ``ok = False`` AND appears
-        in ``errors`` (escalated per Ops-AE taxonomy).
+      - Resolver FAIL          → contributes to ``ok = False`` AND
+        appears in ``errors`` (for the alert message body).
+      - Resolver WARN          → contributes to ``ok = False`` AND
+        appears in ``errors`` (escalated per Ops-AE taxonomy).
+      - Resolver ``alertable=False`` issue (Ops-AE C1d, e.g. "log
+        missing but resolver not due yet") → kept in the JSON
+        payload via the resolver block but NEVER contributes to
+        ``ok`` / ``errors`` regardless of severity. Forensics-only.
       - Daily-cycle WARN (from build_evidence_watchdog_status) →
         stays in ``warnings`` only, observation-only (existing
         behavior preserved).
@@ -65,9 +69,25 @@ def _build_combined_watchdog_status(
     spawning the full CLI.
     """
     resolver_issues = resolver_health.get("issues", [])
-    resolver_failures = [i for i in resolver_issues if i.get("severity") == "FAIL"]
-    resolver_warnings = [i for i in resolver_issues if i.get("severity") == "WARN"]
-    resolver_alertable = resolver_failures + resolver_warnings
+    # Ops-AE C1d: honor the explicit `alertable` flag on issues so
+    # "not due yet" type WARNs (logged for forensics) cannot page
+    # the operator. Default to True for backward compatibility
+    # with any issue dicts produced before C1d.
+    resolver_alertable = [
+        issue
+        for issue in resolver_issues
+        if issue.get("alertable", True)
+        and issue.get("severity") in {"FAIL", "WARN"}
+    ]
+    # Resolver issues that were explicitly tagged non-alertable still
+    # belong in the JSON output's warnings list so the operator can
+    # inspect them via `scripts/check_evidence_health.py` output —
+    # they just don't trigger iMessage alerts.
+    resolver_non_alertable = [
+        issue
+        for issue in resolver_issues
+        if not issue.get("alertable", True)
+    ]
 
     return {
         **watchdog_status,
@@ -76,10 +96,14 @@ def _build_combined_watchdog_status(
             list(watchdog_status.get("errors", []))
             + [str(i.get("message")) for i in resolver_alertable]
         ),
-        # Daily-cycle warnings remain observation-only. Resolver WARNs
-        # have been escalated to `errors` above and intentionally do
-        # NOT appear here too — avoid double-reporting.
-        "warnings": list(watchdog_status.get("warnings", [])),
+        # Daily-cycle warnings + resolver non-alertable warnings.
+        # Resolver alertable WARNs have been escalated to `errors`
+        # above and intentionally do NOT appear here too — avoid
+        # double-reporting in the alert payload.
+        "warnings": (
+            list(watchdog_status.get("warnings", []))
+            + [str(i.get("message")) for i in resolver_non_alertable]
+        ),
         "candidate_exit_resolver": resolver_health.get("summary", {}),
     }
 
