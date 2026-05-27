@@ -10,9 +10,9 @@ infrastructure work before being evaluable.
 
 ---
 
-## TL;DR (updated for PR-AD)
+## TL;DR (updated for PR-AE)
 
-The state of the validation pipeline as of PR-AD:
+The state of the validation pipeline as of PR-AE:
 
 - ✅ **Selection-quality** (divergence rate, coverage, stability) is
   measurable today.
@@ -21,23 +21,39 @@ The state of the validation pipeline as of PR-AD:
   alongside picker selection (PR-AD commit 3). The aggregator
   surfaces it as **diagnostic only** (`in_sample_diagnostic_candidate_
   stats`) — explicitly labeled as not promotion evidence.
-- ⚠️ **Live forward candidate PnL** is NOT yet resolvable. PR-AD's
-  candidate shadow outcome simulator runs only inside the historical
-  backtest path (`_simulate_pre_earnings_calendar_trade`). When the
-  live API records an upcoming-earnings recommendation, no exit chain
-  exists yet — the candidate outcome can be RESOLVED only after the
-  earnings event closes, which requires a separate **exit resolver**
-  service that does not yet exist.
-- ❌ **Outcome-based promotion criteria** (`candidate_mean_return ≥
-  legacy + 3pp`, etc.) therefore remain **not actionable**. The
-  aggregator computes them but the `promotion_eligible_candidate_
-  stats` block is empty by construction on every history-only data
-  source. It will populate only after a live exit resolver lands AND
-  enough forward earnings events accumulate.
+- ✅ **Live forward candidate PnL infrastructure LANDED — accumulating
+  evidence.** PR-AE wired in three things that together close the
+  forward-resolution gap:
+    1. C3 — every live recommendation from `analyze_single_ticker` is
+       now tagged `sample_provenance = forward_post_freeze` (via the
+       sole authorized assigner) before ledger write, with a
+       placeholder `candidate_shadow_outcome.status =
+       "awaiting_exit_resolver"`.
+    2. C4 — `services/candidate_exit_resolver.py` walks pending
+       forward rows post-event, queries the post-event chain via
+       BDay lookahead, re-runs the shared shadow simulator, and
+       writes the resolved outcome atomically through the PR-K
+       revisions table (PR-AE C1b's `record_resolution_and_attempt`).
+    3. C5 — `scripts/resolve_candidate_exits.py` drives the resolver
+       once per invocation (suitable for daily launchd/cron),
+       writes per-row JSONL telemetry, and asserts the count-balance
+       invariant before exit.
+  The aggregator's `promotion_eligible_candidate_stats` block can
+  now populate from forward observations once the resolver has been
+  scheduled and the post-event chains have settled.
+- ⚠️ **Outcome-based promotion criteria** (`candidate_mean_return ≥
+  legacy + 3pp`, etc.) remain **NOT YET ACTIONABLE — clock starts at
+  PR-AE merge.** The infrastructure to evaluate these now exists, but
+  the criteria require ≥40 distinct out-of-sample forward events
+  with resolved candidate PnL accumulated AFTER the PR-AE merge
+  commit. Until that threshold is met by genuine post-PR-AE
+  observations, promotion-by-fiat remains forbidden. **The system is
+  collecting evidence, not yet validating performance.**
 
-A full promotion decision requires both the exit-resolver
-infrastructure AND post-PR-AD forward observations on it. Until the
-former is built, promotion-by-fiat is not allowed.
+A full promotion decision still requires post-PR-AE forward
+observations on actual scheduled resolver runs. "Infrastructure
+landed" is NOT "validated"; it is the prerequisite that lets the
+forward-evidence clock start ticking.
 
 ---
 
@@ -114,7 +130,7 @@ merge date.
 
 ## Prerequisites for evaluating outcome-based criteria
 
-Status as of PR-AD merge:
+Status as of PR-AE merge:
 
 1. ✅ **Candidate shadow simulation through historical events.**
    Done in PR-AD commit 1: `_simulate_candidate_shadow_outcome` resolves
@@ -129,30 +145,62 @@ Status as of PR-AD merge:
    outcome) and `sample_provenance` (denormalized for SQL filtering)
    columns. Both come with a backward-compatible migration.
 
-3. ⚠️ **Live forward exit resolver — STILL PENDING.** This is the
-   largest remaining gap. The live API records an upcoming-earnings
-   recommendation at trade-entry time, but the candidate exit price
-   is unknown until after the event. A separate **exit resolver
-   service** must:
-   - Periodically scan the ledger for forward observations whose
-     event_date has passed but whose `candidate_shadow_outcome` is
-     still empty.
-   - Pull the post-event chain (from the existing feature store).
-   - Look up the candidate's recorded contracts in that exit chain.
-   - Compute `mid_pnl` + `mid_realized_return_pct`.
-   - Update the ledger row with the resolved outcome.
-   Until this exists, the `promotion_eligible_candidate_stats`
-   block in the aggregator is empty by construction on every
-   data source. Without forward outcome resolution there is NO
-   way to produce promotion-grade candidate PnL — only the in-sample
-   diagnostic stats exist.
+3. ✅ **Live forward exit resolver — INFRASTRUCTURE LANDED in PR-AE.**
+   The largest pre-PR-AE gap is now closed. The live API records an
+   upcoming-earnings recommendation at trade-entry time and tags it
+   `forward_post_freeze`; a separate **exit resolver service** then:
+   - Scans the ledger via
+     `ledger.list_pending_candidate_exit_resolutions(now=...)` for
+     forward observations whose event_date has passed (default
+     `min_days_after_event=3` calendar days) and whose
+     `candidate_shadow_outcome` is still pending.
+   - Pulls the post-event chain from the existing feature store via
+     BDay lookahead (default `MAX_LOOKAHEAD_TRADE_DAYS=5`).
+   - Looks up the candidate's recorded contracts in that exit chain.
+   - Computes `mid_pnl` + `mid_realized_return_pct` via the shared
+     `services/candidate_shadow_outcome.simulate_candidate_shadow_outcome`
+     simulator (the same one historical replay uses, extracted to
+     services in PR-AE C2).
+   - Writes the resolved outcome atomically through
+     `record_resolution_and_attempt` (revision + counter UPDATE in
+     one transaction).
+   - The driver script `scripts/resolve_candidate_exits.py` provides
+     a one-shot CLI for daily launchd/cron invocation, with JSONL
+     telemetry at
+     `~/.options_calculator_pro/logs/candidate_exit_resolutions.jsonl`
+     and a stdout summary that surfaces sub-reason breakdowns
+     (no_post_event_chain vs no_entry_chain_replay) for retrying
+     and permanently_failed buckets.
 
-4. ⚠️ **Forward-data accumulation period — gated on (3).** Once the
-   exit resolver lands, observations need time to accumulate on events
-   **after** the resolver's merge date. PR-AB / PR-AC / PR-AD events
-   do not count — they're either in-sample (PR-AB) or recorded before
-   the exit resolver existed (PR-AC/PR-AD). The clock for forward
-   accumulation starts at the exit-resolver merge.
+   What this **DOES NOT** mean:
+   - It does NOT mean the +14d rule has cleared the promotion
+     criteria. Forward outcome evidence still needs to accumulate.
+   - It does NOT mean any promotion criterion has been satisfied.
+   - It does NOT mean the resolver has actually been scheduled —
+     the script is the hook point, but launchd / cron wiring is a
+     separate ops task.
+   - It does NOT short-circuit prerequisite (4) below; the
+     forward-data accumulation clock starts at PR-AE merge, not
+     before.
+
+   What it DOES mean: when the resolver IS scheduled and post-PR-AE
+   forward earnings events occur, the
+   `promotion_eligible_candidate_stats` aggregator block can finally
+   populate from real out-of-sample observations rather than being
+   empty by construction.
+
+4. ⚠️ **Forward-data accumulation period — clock starts at PR-AE
+   merge.** Now that (3) is in place, observations need time to
+   accumulate on events **after the PR-AE merge commit**. PR-AB /
+   PR-AC / PR-AD events do not count — they're either in-sample
+   (PR-AB) or recorded before the exit resolver existed (PR-AC /
+   PR-AD). The relevant cutoff for "post-PR-AE forward observation"
+   is `created_at > <PR-AE merge commit timestamp>` AND
+   `sample_provenance == "forward_post_freeze"` AND
+   `is_promotion_eligible(...)` is True. The first time this
+   condition is satisfiable is whenever earnings events post-merge
+   close AND the scheduled resolver successfully resolves their exit
+   chains.
 
 5. ⚠️ **Put-side parity — STILL PENDING.** PR-AC commit 2 only queries
    the calls chain in the historical backtest. PR-AD commit 1 inherits
@@ -270,3 +318,18 @@ begins:
   largest remaining gap. The `promotion_eligible_candidate_stats`
   aggregator block exists but is empty by construction until forward
   exit resolution exists.
+- 2026-05-27: PR-AE update (commit C6). Per Codex review of PR-AE
+  C5 ("infrastructure landed, accumulating evidence — not
+  validated"): prerequisite (3) flipped from `⚠️ STILL PENDING` to
+  `✅ INFRASTRUCTURE LANDED in PR-AE`. The TL;DR bullet for live
+  forward candidate PnL is updated to reflect that the C3 tagging
+  + C4 resolver service + C5 CLI together close the resolution
+  gap. Outcome-based promotion criteria stay `⚠️ NOT YET
+  ACTIONABLE` because forward-data accumulation (prerequisite 4)
+  needs post-PR-AE-merge events resolved by an actually-scheduled
+  resolver — landing the code is the prerequisite, not the
+  validation. Anti-patterns section is unchanged: in-sample
+  re-validation, sample stitching, and threshold drift remain
+  explicitly forbidden. Put-side parity (prerequisite 5) also
+  remains pending — PR-AE deliberately scoped to call_calendar
+  only.

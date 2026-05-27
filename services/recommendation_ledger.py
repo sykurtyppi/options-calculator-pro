@@ -34,11 +34,14 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Literal, Optional
 
-from services.candidate_shadow_provenance import normalize_sample_provenance
+from services.candidate_shadow_provenance import (
+    SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+    normalize_sample_provenance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +106,21 @@ CREATE TABLE IF NOT EXISTS recommendations (
     -- PR-AD commit 3: sample provenance for promotion-eligibility
     -- filtering. Denormalized so SQL queries can filter without
     -- parsing JSON. Values come from SAMPLE_PROVENANCE_* constants
-    -- in web/api/edge_engine.py; promotion criteria reference only
-    -- the PROMOTION_ELIGIBLE_PROVENANCES set defined there.
+    -- in services/candidate_shadow_provenance.py (canonical source
+    -- after PR-AD commit 4 extracted them out of web/api/edge_engine.py
+    -- for services -> web edge cleanup); promotion criteria
+    -- reference only the PROMOTION_ELIGIBLE_PROVENANCES set
+    -- defined in that same module.
     sample_provenance             TEXT,
+    -- PR-AE commit 1: live-exit-resolver attempt counter. Process
+    -- bookkeeping, NOT part of the recommendation evidence — that is
+    -- why it lives directly on the immutable recommendations row
+    -- rather than inside a revision payload. The resolver increments
+    -- this only on terminal-failure revisions (retrying /
+    -- permanently_failed:*), never on `ok` (success is not a retry)
+    -- and never on `awaiting_chain_data` (data-not-ready is not a
+    -- failed attempt). Defaults to 0 for existing rows on migration.
+    candidate_exit_resolver_attempts INTEGER NOT NULL DEFAULT 0,
     schema_version                INTEGER NOT NULL,
     engine_version                TEXT NOT NULL
 );
@@ -120,6 +135,12 @@ CREATE INDEX IF NOT EXISTS idx_recommendations_selected_structure
     ON recommendations (selected_structure);
 CREATE INDEX IF NOT EXISTS idx_recommendations_recommendation
     ON recommendations (recommendation);
+-- PR-AE commit 1: composite index covers the resolver's eligibility
+-- query (sample_provenance = forward_post_freeze AND earnings_date
+-- <= cutoff). Without it the query would full-scan every time the
+-- daily resolver tick runs.
+CREATE INDEX IF NOT EXISTS idx_recommendations_provenance_earnings
+    ON recommendations (sample_provenance, earnings_date);
 """
 
 _REVISIONS_TABLE_DDL = """
@@ -177,6 +198,10 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     # PR-AD commit 3 — candidate shadow outcome + provenance tag.
     "candidate_shadow_outcome_json": "TEXT",
     "sample_provenance": "TEXT",
+    # PR-AE commit 1 — live-exit-resolver attempt counter (process
+    # bookkeeping; never part of recommendation evidence or
+    # content-hash).
+    "candidate_exit_resolver_attempts": "INTEGER NOT NULL DEFAULT 0",
     "schema_version": "INTEGER NOT NULL DEFAULT 1",
     "engine_version": "TEXT NOT NULL DEFAULT 'event_vol_selector_v1'",
 }
@@ -291,6 +316,27 @@ class RecommendationLedger:
         behavior, which silently overwrote the original evidence on every
         subsequent call — defeating the whole point of an audit ledger.
         """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                return self._write_record_within_tx(cur, record)
+
+    # Internal critical-section helper. Operates on an already-open
+    # cursor inside an already-acquired lock + transaction. Two public
+    # paths reuse it:
+    #
+    #   - record(): single-record write.
+    #   - record_resolution_and_attempt(): single-record write PLUS an
+    #     atomic resolver-counter UPDATE in the same transaction.
+    #
+    # Keeping the SQL + params in one place prevents drift between the
+    # two call sites and is the linchpin of the PR-AE C1b atomicity
+    # guarantee — the resolver cannot land a revision while leaving the
+    # counter stale, because both writes commit (or roll back) together.
+    def _write_record_within_tx(
+        self,
+        cur: sqlite3.Cursor,
+        record: RecommendationRecord,
+    ) -> RecordStatus:
         insert_sql = """
             INSERT OR IGNORE INTO recommendations (
                 recommendation_id, created_at, symbol, as_of_date, earnings_date,
@@ -353,35 +399,33 @@ class RecommendationLedger:
         record_json = _json(_record_to_dict(record))
         revised_at = datetime.now(timezone.utc).isoformat()
 
-        with _WRITE_LOCK:
-            with _tx(self._conn) as cur:
-                cur.execute(insert_sql, params)
-                first_time = cur.rowcount > 0
+        cur.execute(insert_sql, params)
+        first_time = cur.rowcount > 0
 
-                # Always stamp the current content into recommendation_revisions.
-                # On first record, this writes the "version 1" row so the full
-                # history table is complete. On subsequent calls, the
-                # UNIQUE(recommendation_id, content_hash) constraint dedupes
-                # byte-identical re-records (e.g. paper-loop replays of the
-                # same evidence) into a no-op.
-                cur.execute(
-                    """
-                    INSERT OR IGNORE INTO recommendation_revisions
-                        (recommendation_id, revised_at, content_hash, record_json)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        record.recommendation_id,
-                        revised_at,
-                        content_hash,
-                        record_json,
-                    ),
-                )
-                inserted_revision = cur.rowcount > 0
+        # Always stamp the current content into recommendation_revisions.
+        # On first record, this writes the "version 1" row so the full
+        # history table is complete. On subsequent calls, the
+        # UNIQUE(recommendation_id, content_hash) constraint dedupes
+        # byte-identical re-records (e.g. paper-loop replays of the
+        # same evidence) into a no-op.
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO recommendation_revisions
+                (recommendation_id, revised_at, content_hash, record_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                record.recommendation_id,
+                revised_at,
+                content_hash,
+                record_json,
+            ),
+        )
+        inserted_revision = cur.rowcount > 0
 
-                if first_time:
-                    return "inserted"
-                return "revision" if inserted_revision else "duplicate"
+        if first_time:
+            return "inserted"
+        return "revision" if inserted_revision else "duplicate"
 
     def get(self, recommendation_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
@@ -431,6 +475,397 @@ class RecommendationLedger:
                 }
             )
         return result
+
+    # ── PR-AE commit 1: live-exit-resolver support ────────────────────────────
+    #
+    # The four helpers below are the ledger-side surface the resolver
+    # (services/candidate_exit_resolver.py, commit 4) consumes. They are
+    # deliberately small and self-contained:
+    #
+    #   - get_with_latest_resolution: merged "current state" view that
+    #     overlays the latest revision's candidate_shadow_outcome onto
+    #     the immutable v1 row. Everything else stays at v1.
+    #
+    #   - record_resolution_payload: convenience around record() that
+    #     reconstructs a full RecommendationRecord from the v1 row and
+    #     applies only the new candidate_shadow_outcome. Routes the
+    #     write through the existing PR-K revisions table; the
+    #     UNIQUE(recommendation_id, content_hash) constraint dedupes
+    #     byte-identical re-resolutions automatically.
+    #
+    #   - increment_resolver_attempts: single-statement UPDATE on the
+    #     immutable row. This is the ONLY mutation path PR-AE adds to
+    #     the v1 row; justified because the counter is process
+    #     bookkeeping, not part of the recommendation evidence.
+    #
+    #   - list_pending_candidate_exit_resolutions: eligibility query
+    #     scoped to forward_post_freeze + call_calendar + outside the
+    #     post-event window + under MAX_ATTEMPTS. Returns merged-view
+    #     dicts (one row per eligible recommendation).
+    #
+    # Full design contract lives in docs/PR_AE_LIVE_EXIT_RESOLVER_DESIGN
+    # _2026-05-27.md "Idempotent update behavior" section.
+
+    def get_with_latest_resolution(
+        self, recommendation_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the merged "current state" view of a recommendation.
+
+        Loads the immutable v1 row from ``recommendations`` and overlays
+        the latest revision's ``candidate_shadow_outcome`` onto it.
+        Every other field stays at v1 — in particular
+        ``sample_provenance`` (immutable post-tagging) and
+        ``picker_provenance_json`` (immutable selection record).
+
+        Aggregators consuming the resolver's output should call this
+        helper (not ``get()``) so they see post-event resolved
+        outcomes. ``get()`` continues to return strictly the
+        first-write payload for audit purposes.
+
+        Returns ``None`` if the recommendation_id is unknown.
+        """
+        base = self.get(recommendation_id)
+        if base is None:
+            return None
+        revisions = self.get_revisions(recommendation_id)
+        if not revisions:
+            return base
+        latest_payload = revisions[-1].get("record")
+        if not isinstance(latest_payload, dict):
+            return base
+        latest_outcome = latest_payload.get("candidate_shadow_outcome")
+        if not isinstance(latest_outcome, dict):
+            return base
+        merged = dict(base)
+        # _row_to_dict exposes the parsed JSON under the *_json key,
+        # so we mirror that convention here for consistency with
+        # everything else get() returns.
+        merged["candidate_shadow_outcome_json"] = latest_outcome
+        return merged
+
+    def increment_resolver_attempts(self, recommendation_id: str) -> int:
+        """Atomically increment ``candidate_exit_resolver_attempts``.
+
+        Returns the new counter value. Raises ``KeyError`` if no row
+        with the given id exists.
+
+        The resolver calls this ONLY when writing a terminal-failure
+        revision (``retrying`` or ``permanently_failed:*``). It must
+        not be called on ``ok`` (success is not a retry) or
+        ``awaiting_chain_data`` (data-not-ready is not a failed
+        attempt). The full no-op-run rule table lives in the design
+        doc.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    """
+                    UPDATE recommendations
+                       SET candidate_exit_resolver_attempts =
+                           candidate_exit_resolver_attempts + 1
+                     WHERE recommendation_id = ?
+                    """,
+                    (recommendation_id,),
+                )
+                if cur.rowcount == 0:
+                    raise KeyError(
+                        f"recommendation_id not found: {recommendation_id}"
+                    )
+                row = cur.execute(
+                    """
+                    SELECT candidate_exit_resolver_attempts
+                      FROM recommendations
+                     WHERE recommendation_id = ?
+                    """,
+                    (recommendation_id,),
+                ).fetchone()
+                return int(row[0])
+
+    def record_resolution_payload(
+        self,
+        *,
+        recommendation_id: str,
+        candidate_shadow_outcome: Dict[str, Any],
+    ) -> RecordStatus:
+        """Write a new revision overlaying only ``candidate_shadow_outcome``.
+
+        Convenience wrapper around
+        :py:meth:`record_resolution_and_attempt` with
+        ``increment_attempts=False``. Use this when the resolver lands
+        a non-counter-incrementing status (currently: ``ok`` or
+        ``awaiting_chain_data``).
+
+        For terminal-failure statuses (``retrying`` or
+        ``permanently_failed:*``) call ``record_resolution_and_attempt``
+        directly with ``increment_attempts=True`` so the revision write
+        and the counter UPDATE happen inside a single transaction.
+
+        Returns the ``RecordStatus`` from the underlying ``record()``:
+          - ``"inserted"`` should never appear in resolver context
+            (the v1 row must already exist). It does on a defensive
+            path if the row was somehow deleted between read and
+            write; the resolver logs at WARNING.
+          - ``"revision"`` — new content_hash, new revision row
+            written.
+          - ``"duplicate"`` — content_hash matched a prior revision;
+            no new row written, idempotent re-resolution.
+
+        Raises ``KeyError`` if ``recommendation_id`` is unknown.
+        """
+        return self.record_resolution_and_attempt(
+            recommendation_id=recommendation_id,
+            candidate_shadow_outcome=candidate_shadow_outcome,
+            increment_attempts=False,
+        )
+
+    def record_resolution_and_attempt(
+        self,
+        *,
+        recommendation_id: str,
+        candidate_shadow_outcome: Dict[str, Any],
+        increment_attempts: bool,
+    ) -> RecordStatus:
+        """Atomic "write resolver outcome + maybe bump counter" path.
+
+        PR-AE Codex review (C1 audit, P1): the resolver MUST NOT call
+        ``record_resolution_payload(...)`` and
+        ``increment_resolver_attempts(...)`` as two independent
+        operations. A crash in the window between them would leave a
+        ``retrying`` revision on disk while the attempt counter stayed
+        at its old value — and since ``retrying`` is non-terminal, the
+        eligibility filter would keep returning the row forever
+        without ever escalating to ``permanently_failed:no_post_event_chain``.
+
+        This helper takes the lock once, opens a single transaction,
+        and inside it:
+
+          1. Reconstructs a full ``RecommendationRecord`` from the v1
+             row preserving everything except
+             ``candidate_shadow_outcome``.
+          2. Calls the shared internal ``_write_record_within_tx``
+             helper to do the recommendations-table no-op insert and
+             the revisions-table conditional insert.
+          3. If ``increment_attempts`` is True, runs the counter
+             UPDATE in the same cursor / same transaction.
+
+        Either all three writes commit, or none do. There is no
+        partial-state failure mode.
+
+        The resolver's call rule (see design doc no-op-run table):
+
+          status == "ok"                     → increment_attempts=False
+          status == "awaiting_chain_data"    → increment_attempts=False
+          status == "retrying"               → increment_attempts=True
+          status startswith "permanently_failed:" → increment_attempts=True
+
+        Raises ``KeyError`` if ``recommendation_id`` is unknown.
+
+        Revision overlay semantics (Codex C5 audit, P3 — IMPORTANT):
+        =============================================================
+        This helper rebuilds the revision payload from the IMMUTABLE
+        v1 row and overlays ONLY ``candidate_shadow_outcome``. It is
+        NOT a cumulative full-state merge across prior revisions.
+
+        Concretely: if a future enrichment path (some PR-AF, PR-AG, …)
+        writes a revision that modifies ``picker_provenance`` or
+        ``surface_quality`` or any other field, and then the resolver
+        runs against the same row, the resolver's new revision will:
+
+          - carry v1's ``picker_provenance`` / ``surface_quality`` —
+            NOT the most-recent enriched values from the intervening
+            revision.
+          - carry the resolver's new ``candidate_shadow_outcome``.
+
+        This is intentional for PR-AE: the resolver only mutates the
+        candidate outcome, and v1 already carries the right values for
+        every other field. If a future PR needs a true cumulative
+        overlay (merge latest revision's payload + this revision's
+        changes), it must:
+
+          - Read the latest revision via ``get_revisions(...)`` rather
+            than only v1 inside this transaction.
+          - Or add a new dedicated helper with merge-from-latest
+            semantics, leaving this one for "PR-AE-style outcome-only
+            overlays."
+
+        The "PR-AE-only" scope is enforced by the
+        ``test_pr_ae_c5b_revisions_are_overlay_not_cumulative_merge``
+        regression test below; any future helper that introduces true
+        cumulative semantics must add its own test under a different
+        name.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                # Read v1 inside the transaction so a concurrent
+                # delete cannot race a stale base into the
+                # reconstruction. SQLite's WAL mode plus the
+                # _WRITE_LOCK + busy_timeout make this safe.
+                base_row = cur.execute(
+                    "SELECT * FROM recommendations WHERE recommendation_id = ?",
+                    (recommendation_id,),
+                ).fetchone()
+                if base_row is None:
+                    raise KeyError(
+                        f"recommendation_id not found: {recommendation_id}"
+                    )
+                base = _row_to_dict(base_row)
+
+                scorecards_payload = base.get("structure_scorecards_json")
+                structure_scorecards: List[Dict[str, Any]] = (
+                    list(scorecards_payload)
+                    if isinstance(scorecards_payload, list)
+                    else []
+                )
+
+                def _dict_or_empty(value: Any) -> Dict[str, Any]:
+                    return dict(value) if isinstance(value, dict) else {}
+
+                record = RecommendationRecord(
+                    recommendation_id=str(base["recommendation_id"]),
+                    created_at=str(base["created_at"]),
+                    symbol=str(base["symbol"]),
+                    as_of_date=base.get("as_of_date"),
+                    earnings_date=base.get("earnings_date"),
+                    earnings_source=base.get("earnings_source"),
+                    earnings_source_confidence=base.get("earnings_source_confidence"),
+                    earnings_source_stale=bool(base.get("earnings_source_stale", False)),
+                    recommendation=base.get("recommendation"),
+                    selected_structure=base.get("selected_structure"),
+                    no_trade_reason=base.get("no_trade_reason"),
+                    data_quality_score=base.get("data_quality_score"),
+                    option_source=base.get("option_source"),
+                    underlying_source=base.get("underlying_source"),
+                    provider_names=_dict_or_empty(base.get("provider_names_json")),
+                    quote_timestamp=base.get("quote_timestamp"),
+                    quote_source=base.get("quote_source"),
+                    quote_quality=base.get("quote_quality"),
+                    bid_ask_mid=_dict_or_empty(base.get("bid_ask_mid_json")),
+                    surface_quality=_dict_or_empty(base.get("surface_quality_json")),
+                    vol_snapshot=_dict_or_empty(base.get("vol_snapshot_json")),
+                    structure_scorecards=structure_scorecards,
+                    selector_output=_dict_or_empty(base.get("selector_output_json")),
+                    explanation=_dict_or_empty(base.get("explanation_json")),
+                    metadata=_dict_or_empty(base.get("metadata_json")),
+                    picker_provenance=_dict_or_empty(base.get("picker_provenance_json")),
+                    candidate_shadow_outcome=dict(candidate_shadow_outcome),
+                    sample_provenance=base.get("sample_provenance"),
+                    schema_version=int(base.get("schema_version") or SCHEMA_VERSION),
+                    engine_version=str(base.get("engine_version") or ENGINE_VERSION),
+                )
+
+                status = self._write_record_within_tx(cur, record)
+
+                if increment_attempts:
+                    cur.execute(
+                        """
+                        UPDATE recommendations
+                           SET candidate_exit_resolver_attempts =
+                               candidate_exit_resolver_attempts + 1
+                         WHERE recommendation_id = ?
+                        """,
+                        (recommendation_id,),
+                    )
+                    if cur.rowcount == 0:
+                        # Defensive — should not happen since we
+                        # read v1 inside the same transaction. If it
+                        # does, raise to roll back the whole tx via
+                        # the _tx context manager.
+                        raise KeyError(
+                            f"recommendation_id vanished mid-transaction: "
+                            f"{recommendation_id}"
+                        )
+
+                return status
+
+    def list_pending_candidate_exit_resolutions(
+        self,
+        *,
+        now: Optional[date] = None,
+        min_days_after_event: int = 3,
+        max_attempts: int = 6,
+        sample_provenance: str = SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+        selected_structure: str = "call_calendar",
+    ) -> List[Dict[str, Any]]:
+        """Return merged-view dicts for rows ready for exit resolution.
+
+        Eligibility (all must hold):
+          - ``sample_provenance`` matches the provided value (default:
+            forward_post_freeze).
+          - ``selected_structure`` matches the provided value
+            (default: call_calendar; put_calendar is deferred).
+          - ``earnings_date`` is set and ``<= now - min_days_after_event``
+            so we land on a real post-event trade_date.
+          - ``candidate_exit_resolver_attempts < max_attempts``.
+          - The merged-view's ``candidate_shadow_outcome.status`` is
+            not ``"ok"`` and does not start with ``"permanently_failed:"``.
+            Rows already in those terminal states are not retried.
+
+        Returns merged-view dicts in ``earnings_date ASC`` order so
+        older events are resolved first.
+
+        Caller (the resolver) is responsible for further
+        fail-closed behavior on malformed ``picker_provenance_json``
+        — that becomes ``permanently_failed:no_picker_provenance``
+        terminal status written via ``record_resolution_payload``.
+
+        **Calendar-day vs trading-day semantics (PR-AE Codex P2 audit):**
+        ``min_days_after_event`` is measured in CALENDAR days, not
+        trading days, because (a) ``earnings_date`` is stored as a plain
+        ISO date string that supports cheap lexicographic SQL comparison
+        and (b) the ledger has no exchange-calendar dependency. The
+        default of 3 covers the common edge case where earnings land on
+        a Friday: 3 calendar days later is Monday, by which time the
+        post-event chain should have settled.
+
+        The PRECISE chain trade-date is selected by the resolver layer
+        using ``pandas.tseries.offsets.BDay`` lookahead within
+        ``MAX_LOOKAHEAD_TRADE_DAYS`` (default 5 business days). This
+        SQL filter is intentionally a coarse "post-event window" gate;
+        any false positives (e.g. earnings on Friday, ``now``
+        Sunday + 3 calendar days = Monday but no chain yet) are absorbed
+        by the resolver writing ``awaiting_chain_data`` and NOT
+        burning retry budget — see the design doc.
+        """
+        today = now or datetime.now(timezone.utc).date()
+        cutoff = today - timedelta(days=int(min_days_after_event))
+        cutoff_str = cutoff.isoformat()
+
+        rows = self._conn.execute(
+            """
+            SELECT *
+              FROM recommendations
+             WHERE sample_provenance = ?
+               AND selected_structure = ?
+               AND earnings_date IS NOT NULL
+               AND earnings_date <= ?
+               AND candidate_exit_resolver_attempts < ?
+             ORDER BY earnings_date ASC, created_at ASC
+            """,
+            (
+                sample_provenance,
+                selected_structure,
+                cutoff_str,
+                int(max_attempts),
+            ),
+        ).fetchall()
+
+        eligible: List[Dict[str, Any]] = []
+        for row in rows:
+            merged = self.get_with_latest_resolution(str(row["recommendation_id"]))
+            if merged is None:
+                continue
+            outcome = merged.get("candidate_shadow_outcome_json")
+            outcome_status = (
+                str(outcome.get("status") or "")
+                if isinstance(outcome, dict)
+                else ""
+            )
+            if outcome_status == "ok":
+                continue
+            if outcome_status.startswith("permanently_failed:"):
+                continue
+            eligible.append(merged)
+        return eligible
 
     def list_recent(
         self,

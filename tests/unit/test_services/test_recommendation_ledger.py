@@ -875,3 +875,1068 @@ def test_candidate_shadow_outcome_column_added_by_migration(tmp_path: Path) -> N
     persisted = ledger.get(rec_id)
     assert persisted["candidate_shadow_outcome_json"]["status"] == "ok"
     assert persisted["sample_provenance"] == "historical_replay_in_sample_or_research"
+
+
+# ── PR-AE commit 1: live-exit-resolver schema + ledger helpers ────────────────
+
+
+def _forward_record(
+    *,
+    recommendation_id: str = "rec_fw_test",
+    earnings_date: str = "2026-05-01",
+    as_of_date: str = "2026-04-23",
+    selected_structure: str = "call_calendar",
+    sample_provenance: str = "forward_post_freeze",
+    candidate_shadow_outcome: Optional[dict] = None,
+):
+    """Build a forward-post-freeze ledger record shaped the way the
+    PR-AE live API path will produce one: candidate_shadow_outcome
+    starts empty (the resolver will fill it later), sample_provenance
+    is tagged, picker_provenance carries a valid candidate selection."""
+    from services.recommendation_ledger import build_record_from_analysis
+
+    analysis = SimpleNamespace(
+        symbol="AAPL",
+        recommendation="Candidate",
+        setup_score=0.72,
+        metrics={
+            "data_sources": {
+                "options_source": "marketdata_app",
+                "price_rv_source": "yfinance",
+            },
+            "experimental_contract_selection": {
+                "structure": "call_calendar",
+                "labels": {"experimental": True, "shadow_mode": True,
+                           "not_execution_guidance": True,
+                           "out_of_sample_validated": False},
+                "candidate_contracts": {
+                    "candidate_selection": {
+                        "side": "call",
+                        "strike": 200.0,
+                        "front_expiry": "2026-05-08",
+                        "back_expiry": "2026-05-22",
+                    },
+                    "pickers_diverged": True,
+                },
+            },
+        },
+        rationale=["r"],
+        selector_output={
+            "recommendation": "Candidate",
+            "best_structure": selected_structure,
+            "earnings_date": earnings_date,
+            "primary_thesis": "thesis",
+            "primary_risks": [],
+            "why_this_structure": [],
+            "why_not_others": {},
+        },
+        structure_scorecards=[
+            {"structure": selected_structure, "eligible": True,
+             "composite_structure_score": 0.81},
+        ],
+        vol_snapshot={
+            "symbol": "AAPL",
+            "as_of_date": as_of_date,
+            "earnings_date": earnings_date,
+            "earnings_source_primary": "alpha_vantage",
+            "earnings_source_confidence": 0.82,
+            "earnings_source_stale": False,
+            "option_source": "marketdata_app",
+            "underlying_source": "yfinance",
+            "data_quality_score": 0.77,
+        },
+        sample_provenance=sample_provenance,
+        candidate_shadow_outcome=candidate_shadow_outcome or {},
+    )
+    return build_record_from_analysis(
+        analysis,
+        recommendation_id=recommendation_id,
+        quote_payload={
+            "quote_source": "yfinance",
+            "quote_timestamp": f"{as_of_date}T12:00:00+00:00",
+            "quote_quality": "paper_research_mid_not_execution_grade",
+            "bid_ask_mid": {"legs": {"call": {"mid": 4.1}}},
+            "surface_quality": {"status": "valid_evidence", "warning_flags": []},
+        },
+    )
+
+
+def test_pr_ae_schema_adds_resolver_attempts_column(tmp_path: Path) -> None:
+    """A fresh ledger DB created via the current ledger code MUST contain
+    the candidate_exit_resolver_attempts column from the start."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    cols = {
+        row["name"]
+        for row in ledger._conn.execute(  # noqa: SLF001
+            "PRAGMA table_info(recommendations)"
+        ).fetchall()
+    }
+    assert "candidate_exit_resolver_attempts" in cols
+
+
+def test_pr_ae_existing_db_migrates_resolver_attempts_to_zero(
+    tmp_path: Path,
+) -> None:
+    """An existing pre-PR-AE ledger DB (no resolver-attempts column)
+    must gain the column on next open, with default 0 for every
+    existing row. No data loss; legacy rows readable."""
+    db_path = tmp_path / "ledger.sqlite"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """CREATE TABLE recommendations (
+            recommendation_id TEXT PRIMARY KEY,
+            created_at TEXT,
+            symbol TEXT,
+            sample_provenance TEXT,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            engine_version TEXT NOT NULL DEFAULT 'event_vol_selector_v1'
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO recommendations (recommendation_id, created_at, symbol, sample_provenance)"
+        " VALUES (?, ?, ?, ?)",
+        ("legacy_pr_ad_row", "2026-05-01T00:00:00+00:00", "AAPL", "forward_post_freeze"),
+    )
+    conn.commit()
+    conn.close()
+
+    ledger = RecommendationLedger(ledger_path=db_path)
+    cols = {
+        row["name"]
+        for row in ledger._conn.execute(  # noqa: SLF001
+            "PRAGMA table_info(recommendations)"
+        ).fetchall()
+    }
+    assert "candidate_exit_resolver_attempts" in cols
+
+    legacy = ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("legacy_pr_ad_row",),
+    ).fetchone()
+    # NOT NULL DEFAULT 0 applies to existing rows on ADD COLUMN
+    assert legacy is not None
+    assert int(legacy[0]) == 0
+
+
+def test_pr_ae_record_initializes_resolver_attempts_to_zero(
+    tmp_path: Path,
+) -> None:
+    """Every newly recorded row defaults to 0 attempts. The record()
+    INSERT does not need to mention the column — the DEFAULT 0 applies."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_fresh"))
+    row = ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_fresh",),
+    ).fetchone()
+    assert int(row[0]) == 0
+
+
+def test_pr_ae_increment_resolver_attempts_is_atomic_and_returns_new_value(
+    tmp_path: Path,
+) -> None:
+    """Counter goes 0 → 1 → 2; returned value reflects the new state."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_inc"))
+    assert ledger.increment_resolver_attempts("rec_inc") == 1
+    assert ledger.increment_resolver_attempts("rec_inc") == 2
+    row = ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_inc",),
+    ).fetchone()
+    assert int(row[0]) == 2
+
+
+def test_pr_ae_increment_resolver_attempts_raises_for_unknown_id(
+    tmp_path: Path,
+) -> None:
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    import pytest
+    with pytest.raises(KeyError):
+        ledger.increment_resolver_attempts("rec_does_not_exist")
+
+
+def test_pr_ae_get_with_latest_resolution_returns_v1_when_no_revision(
+    tmp_path: Path,
+) -> None:
+    """First write only — get_with_latest_resolution returns v1 verbatim.
+    Note: the PR-K revisions table always records a v1 entry on first
+    record, but the latest_payload's candidate_shadow_outcome equals
+    v1's (empty dict by construction), so the merged view == v1."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_no_resolve"))
+    base = ledger.get("rec_no_resolve")
+    merged = ledger.get_with_latest_resolution("rec_no_resolve")
+    assert merged is not None
+    # v1's candidate_shadow_outcome was empty {}, and the latest
+    # revision (v1 snapshot) carries the same empty dict — so the
+    # merged view's candidate_shadow_outcome_json is also {}.
+    assert merged["candidate_shadow_outcome_json"] == {}
+    # Every other field matches the immutable v1
+    assert merged["sample_provenance"] == base["sample_provenance"]
+    assert merged["selected_structure"] == base["selected_structure"]
+
+
+def test_pr_ae_get_with_latest_resolution_overlays_latest_outcome(
+    tmp_path: Path,
+) -> None:
+    """After a resolver write, get_with_latest_resolution surfaces the
+    NEW candidate_shadow_outcome — get() still returns the immutable v1."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_overlay"))
+
+    resolved = _sample_candidate_shadow_outcome()
+    status = ledger.record_resolution_payload(
+        recommendation_id="rec_overlay",
+        candidate_shadow_outcome=resolved,
+    )
+    assert status == "revision"
+
+    # get() returns the immutable v1 — candidate_shadow_outcome was empty
+    v1 = ledger.get("rec_overlay")
+    assert v1["candidate_shadow_outcome_json"] == {}
+
+    # get_with_latest_resolution overlays the resolved outcome
+    merged = ledger.get_with_latest_resolution("rec_overlay")
+    assert merged is not None
+    assert merged["candidate_shadow_outcome_json"]["status"] == "ok"
+    assert merged["candidate_shadow_outcome_json"]["mid_realized_return_pct"] == 30.0
+    # Sample provenance stays at v1 (immutable post-tagging)
+    assert merged["sample_provenance"] == "forward_post_freeze"
+
+
+def test_pr_ae_get_with_latest_resolution_returns_none_for_unknown_id(
+    tmp_path: Path,
+) -> None:
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    assert ledger.get_with_latest_resolution("rec_does_not_exist") is None
+
+
+def test_pr_ae_record_resolution_payload_writes_revision(tmp_path: Path) -> None:
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_resolve"))
+
+    # First resolver write differs from v1 (which had empty
+    # candidate_shadow_outcome) — content_hash differs, new revision.
+    status = ledger.record_resolution_payload(
+        recommendation_id="rec_resolve",
+        candidate_shadow_outcome=_sample_candidate_shadow_outcome(),
+    )
+    assert status == "revision"
+
+    revisions = ledger.get_revisions("rec_resolve")
+    # v1 (auto-recorded on first record()) + resolver revision = 2
+    assert len(revisions) == 2
+    # The latest revision carries the resolved candidate outcome
+    assert revisions[-1]["record"]["candidate_shadow_outcome"]["status"] == "ok"
+
+
+def test_pr_ae_record_resolution_payload_duplicate_outcome_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """Codex idempotency contract: a second resolver run that lands the
+    SAME candidate_shadow_outcome must return "duplicate" and not add a
+    second revision row. The PR-K UNIQUE(rec_id, content_hash) constraint
+    enforces this without any resolver-side bookkeeping."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_dup_resolve"))
+
+    outcome = _sample_candidate_shadow_outcome()
+    assert (
+        ledger.record_resolution_payload(
+            recommendation_id="rec_dup_resolve",
+            candidate_shadow_outcome=outcome,
+        )
+        == "revision"
+    )
+    # Same outcome again → identical content_hash → duplicate
+    assert (
+        ledger.record_resolution_payload(
+            recommendation_id="rec_dup_resolve",
+            candidate_shadow_outcome=outcome,
+        )
+        == "duplicate"
+    )
+    # Still exactly 2 revision rows (v1 snapshot + first resolver write)
+    assert len(ledger.get_revisions("rec_dup_resolve")) == 2
+
+
+def test_pr_ae_record_resolution_payload_data_drift_yields_new_revision(
+    tmp_path: Path,
+) -> None:
+    """Same row, different resolved outcome (e.g. T9 reprocessed a quote)
+    → different content_hash → new revision. Audit trail must show the
+    state changed because upstream data changed."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_drift"))
+
+    outcome_a = _sample_candidate_shadow_outcome()
+    outcome_b = dict(outcome_a)
+    outcome_b["mid_realized_return_pct"] = 35.0  # drifted
+    outcome_b["mid_pnl"] = 0.35
+
+    assert ledger.record_resolution_payload(
+        recommendation_id="rec_drift",
+        candidate_shadow_outcome=outcome_a,
+    ) == "revision"
+    assert ledger.record_resolution_payload(
+        recommendation_id="rec_drift",
+        candidate_shadow_outcome=outcome_b,
+    ) == "revision"
+
+    # v1 + resolver_v1 + resolver_v2 = 3 revisions
+    assert len(ledger.get_revisions("rec_drift")) == 3
+
+
+def test_pr_ae_record_resolution_payload_raises_for_unknown_id(
+    tmp_path: Path,
+) -> None:
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    import pytest
+    with pytest.raises(KeyError):
+        ledger.record_resolution_payload(
+            recommendation_id="rec_does_not_exist",
+            candidate_shadow_outcome=_sample_candidate_shadow_outcome(),
+        )
+
+
+def test_pr_ae_record_resolution_payload_preserves_v1_picker_provenance(
+    tmp_path: Path,
+) -> None:
+    """The reconstructed RecommendationRecord must carry v1's
+    picker_provenance verbatim — the resolver does not regenerate it.
+    Without this, the revision payload would lose the candidate
+    contract identity and downstream merged views would be incomplete."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_preserves_pp"))
+
+    ledger.record_resolution_payload(
+        recommendation_id="rec_preserves_pp",
+        candidate_shadow_outcome=_sample_candidate_shadow_outcome(),
+    )
+    revisions = ledger.get_revisions("rec_preserves_pp")
+    latest_payload = revisions[-1]["record"]
+    pp = latest_payload["picker_provenance"]
+    # Same shape as v1 — candidate selection survived
+    assert pp["structure"] == "call_calendar"
+    assert pp["candidate_contracts"]["candidate_selection"]["front_expiry"] == "2026-05-08"
+    assert pp["candidate_contracts"]["candidate_selection"]["strike"] == 200.0
+
+
+def test_pr_ae_list_pending_filters_by_sample_provenance(tmp_path: Path) -> None:
+    """Only forward_post_freeze rows are eligible by default. Historical
+    replay rows are explicitly excluded — re-running the resolver on a
+    backtest row would corrupt the audit trail."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    # Forward row — eligible
+    ledger.record(_forward_record(
+        recommendation_id="rec_fw",
+        sample_provenance="forward_post_freeze",
+        earnings_date="2026-04-01",  # well in the past
+    ))
+    # Historical replay row — NOT eligible
+    ledger.record(_forward_record(
+        recommendation_id="rec_hist",
+        sample_provenance="historical_replay_in_sample_or_research",
+        earnings_date="2026-04-01",
+    ))
+    # Unknown-provenance row — NOT eligible
+    ledger.record(_forward_record(
+        recommendation_id="rec_unknown",
+        sample_provenance="unknown",
+        earnings_date="2026-04-01",
+    ))
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 27),  # well past all earnings_dates
+    )
+    ids = {row["recommendation_id"] for row in eligible}
+    assert ids == {"rec_fw"}
+
+
+def test_pr_ae_list_pending_filters_by_selected_structure(tmp_path: Path) -> None:
+    """Only call_calendar rows by default. Put-calendar deferred."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(
+        recommendation_id="rec_call",
+        selected_structure="call_calendar",
+        earnings_date="2026-04-01",
+    ))
+    ledger.record(_forward_record(
+        recommendation_id="rec_put",
+        selected_structure="put_calendar",
+        earnings_date="2026-04-01",
+    ))
+    ledger.record(_forward_record(
+        recommendation_id="rec_straddle",
+        selected_structure="atm_straddle",
+        earnings_date="2026-04-01",
+    ))
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 27),
+    )
+    ids = {row["recommendation_id"] for row in eligible}
+    assert ids == {"rec_call"}
+
+
+def test_pr_ae_list_pending_filters_by_earnings_date_cutoff(tmp_path: Path) -> None:
+    """A row whose earnings_date is too recent (within min_days_after_event
+    of now) is NOT eligible yet. The post-event chain may not exist or may
+    still be settling — better to wait than to fail.
+
+    Default ``min_days_after_event=3`` covers the common edge case of
+    Friday earnings: by Monday (3 calendar days later) the post-event
+    chain should have settled.
+    """
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    now = date(2026, 5, 27)
+    # 5 days ago — eligible
+    ledger.record(_forward_record(
+        recommendation_id="rec_old",
+        earnings_date="2026-05-22",
+    ))
+    # Same day as 'now' — NOT eligible (still inside the window)
+    ledger.record(_forward_record(
+        recommendation_id="rec_today",
+        earnings_date="2026-05-27",
+    ))
+    # 1 day ago — NOT eligible (default min_days_after_event=3)
+    ledger.record(_forward_record(
+        recommendation_id="rec_yesterday",
+        earnings_date="2026-05-26",
+    ))
+    # Future earnings — NOT eligible (defensive — should not happen
+    # since live forward rows are written before the event, but the
+    # filter guards against weird states)
+    ledger.record(_forward_record(
+        recommendation_id="rec_future",
+        earnings_date="2026-06-15",
+    ))
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(now=now)
+    ids = {row["recommendation_id"] for row in eligible}
+    assert ids == {"rec_old"}
+
+
+def test_pr_ae_list_pending_default_min_days_is_three_calendar_days(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (Codex C1 P2 audit): the default cutoff is 3 calendar
+    days, not 2. Bumped from 2 to 3 so a Friday-earnings row is
+    eligible no earlier than the following Monday — the day the
+    post-event chain typically settles. The resolver layer then applies
+    BDay-aware chain-date selection within the lookahead window.
+
+    Boundary test: earnings_date == now - 3 calendar days is the
+    smallest eligible gap; earnings_date == now - 2 calendar days is
+    NOT eligible.
+    """
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    now = date(2026, 5, 27)
+    # Exactly 3 days back — eligible at the boundary
+    ledger.record(_forward_record(
+        recommendation_id="rec_at_boundary",
+        earnings_date="2026-05-24",
+    ))
+    # 2 days back — NOT eligible (one day shy of cutoff)
+    ledger.record(_forward_record(
+        recommendation_id="rec_two_days",
+        earnings_date="2026-05-25",
+    ))
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(now=now)
+    ids = {row["recommendation_id"] for row in eligible}
+    assert ids == {"rec_at_boundary"}
+
+
+def test_pr_ae_list_pending_friday_earnings_eligible_by_monday(tmp_path: Path) -> None:
+    """The trading-day-aware rationale for default=3: Friday earnings
+    on 2026-05-22 become eligible by Monday 2026-05-25 (3 calendar days
+    later — covers the weekend). With the old default of 2, eligibility
+    would land on Sunday with no post-event chain yet.
+    """
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(
+        recommendation_id="rec_fri_earnings",
+        earnings_date="2026-05-22",  # Friday
+    ))
+    # Sunday: NOT yet eligible (would be at min_days=2; not at default=3)
+    eligible_sun = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 24),
+    )
+    assert all(row["recommendation_id"] != "rec_fri_earnings" for row in eligible_sun)
+    # Monday: eligible
+    eligible_mon = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 25),
+    )
+    assert any(row["recommendation_id"] == "rec_fri_earnings" for row in eligible_mon)
+
+
+def test_pr_ae_list_pending_filters_by_max_attempts(tmp_path: Path) -> None:
+    """A row whose counter has reached max_attempts is permanently
+    excluded. Tested with max_attempts=3 and a counter incremented to 3."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(
+        recommendation_id="rec_maxed",
+        earnings_date="2026-04-01",
+    ))
+    # Eligible row at 0 attempts
+    ledger.record(_forward_record(
+        recommendation_id="rec_fresh",
+        earnings_date="2026-04-01",
+    ))
+    # Burn three attempts on rec_maxed
+    ledger.increment_resolver_attempts("rec_maxed")
+    ledger.increment_resolver_attempts("rec_maxed")
+    ledger.increment_resolver_attempts("rec_maxed")
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 27),
+        max_attempts=3,
+    )
+    ids = {row["recommendation_id"] for row in eligible}
+    assert ids == {"rec_fresh"}
+
+
+def test_pr_ae_list_pending_excludes_rows_resolved_ok(tmp_path: Path) -> None:
+    """A row whose latest revision has candidate_shadow_outcome.status == 'ok'
+    is terminal — never re-resolved. (If a future PR-AF wants to
+    intentionally re-resolve on data drift, that's a separate code path
+    with an explicit override.)"""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(
+        recommendation_id="rec_pending",
+        earnings_date="2026-04-01",
+    ))
+    ledger.record(_forward_record(
+        recommendation_id="rec_resolved",
+        earnings_date="2026-04-01",
+    ))
+    # Resolve one with ok
+    ledger.record_resolution_payload(
+        recommendation_id="rec_resolved",
+        candidate_shadow_outcome=_sample_candidate_shadow_outcome(),
+    )
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 27),
+    )
+    ids = {row["recommendation_id"] for row in eligible}
+    assert ids == {"rec_pending"}
+
+
+def test_pr_ae_list_pending_excludes_permanently_failed_rows(tmp_path: Path) -> None:
+    """Any latest-revision status starting with 'permanently_failed:' is
+    terminal — excluded forever from re-resolution attempts."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(
+        recommendation_id="rec_active",
+        earnings_date="2026-04-01",
+    ))
+    ledger.record(_forward_record(
+        recommendation_id="rec_failed",
+        earnings_date="2026-04-01",
+    ))
+    # Mark one with permanently_failed status
+    failed_outcome = {
+        "status": "permanently_failed:no_post_event_chain",
+        "labels": {"research_mid": True, "shadow_only": True,
+                   "not_execution_grade": True},
+    }
+    ledger.record_resolution_payload(
+        recommendation_id="rec_failed",
+        candidate_shadow_outcome=failed_outcome,
+    )
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 27),
+    )
+    ids = {row["recommendation_id"] for row in eligible}
+    assert ids == {"rec_active"}
+
+
+def test_pr_ae_list_pending_includes_retrying_and_awaiting_rows(tmp_path: Path) -> None:
+    """retrying and awaiting_chain_data are NOT terminal — those rows
+    must remain eligible so the next resolver tick can try again."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(
+        recommendation_id="rec_retrying",
+        earnings_date="2026-04-01",
+    ))
+    ledger.record(_forward_record(
+        recommendation_id="rec_awaiting",
+        earnings_date="2026-04-01",
+    ))
+    ledger.record_resolution_payload(
+        recommendation_id="rec_retrying",
+        candidate_shadow_outcome={
+            "status": "retrying",
+            "labels": {"research_mid": True, "shadow_only": True,
+                       "not_execution_grade": True},
+        },
+    )
+    ledger.record_resolution_payload(
+        recommendation_id="rec_awaiting",
+        candidate_shadow_outcome={
+            "status": "awaiting_chain_data",
+            "labels": {"research_mid": True, "shadow_only": True,
+                       "not_execution_grade": True},
+        },
+    )
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 27),
+    )
+    ids = {row["recommendation_id"] for row in eligible}
+    assert ids == {"rec_retrying", "rec_awaiting"}
+
+
+def test_pr_ae_list_pending_orders_by_earnings_date_ascending(tmp_path: Path) -> None:
+    """Older earnings events get resolved first so the queue drains
+    chronologically. Operators reading the JSONL telemetry see a
+    natural progression."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(
+        recommendation_id="rec_mid",
+        earnings_date="2026-04-15",
+    ))
+    ledger.record(_forward_record(
+        recommendation_id="rec_old",
+        earnings_date="2026-03-15",
+    ))
+    ledger.record(_forward_record(
+        recommendation_id="rec_new",
+        earnings_date="2026-05-15",
+    ))
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 27),
+    )
+    ids = [row["recommendation_id"] for row in eligible]
+    assert ids == ["rec_old", "rec_mid", "rec_new"]
+
+
+def test_pr_ae_list_pending_returns_merged_view_not_v1(tmp_path: Path) -> None:
+    """The returned dicts must reflect the LATEST resolver state
+    (retrying / awaiting_chain_data), not v1's empty dict. Otherwise
+    the resolver would re-examine "fresh" rows that have actually
+    been touched."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(
+        recommendation_id="rec_partial",
+        earnings_date="2026-04-01",
+    ))
+    awaiting_outcome = {
+        "status": "awaiting_chain_data",
+        "labels": {"research_mid": True, "shadow_only": True,
+                   "not_execution_grade": True},
+    }
+    ledger.record_resolution_payload(
+        recommendation_id="rec_partial",
+        candidate_shadow_outcome=awaiting_outcome,
+    )
+
+    eligible = ledger.list_pending_candidate_exit_resolutions(
+        now=date(2026, 5, 27),
+    )
+    assert len(eligible) == 1
+    # Merged view surfaces the resolver-applied status, NOT v1's empty dict
+    assert eligible[0]["candidate_shadow_outcome_json"]["status"] == "awaiting_chain_data"
+
+
+def test_pr_ae_c5b_revisions_are_overlay_not_cumulative_merge(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (Codex C5 audit P3): record_resolution_and_attempt
+    rebuilds the revision payload from the IMMUTABLE v1 row and
+    overlays ONLY candidate_shadow_outcome. It does NOT cumulatively
+    merge intermediate revisions' changes to other fields.
+
+    This is the intentional PR-AE scope. The test guards against a
+    future refactor that silently changes this to a cumulative
+    merge — which would entangle the resolver with arbitrary other
+    enrichment paths and break the "v1 is the canonical source for
+    every non-candidate field" invariant.
+
+    Scenario:
+      1. Record a forward row with picker_provenance == A.
+      2. Plant a synthetic intermediate revision that ALSO changes
+         picker_provenance to A_PRIME (simulating some future
+         enrichment path's revision).
+      3. Run the resolver write (record_resolution_and_attempt).
+      4. The new resolver revision must carry picker_provenance ==
+         A (from v1), NOT A_PRIME (from the intermediate revision).
+         This proves the overlay is from v1, not cumulative.
+
+    If a future PR adds cumulative-merge semantics, it must do so in
+    a separately-named helper and leave this contract intact for
+    PR-AE.
+    """
+    from services.recommendation_ledger import build_record_from_analysis
+
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+
+    # Step 1: record v1 with picker_provenance carrying "A" marker.
+    # _forward_record's signature is fixed for the common case; this
+    # test needs to override picker_provenance, so we go through
+    # build_record_from_analysis directly.
+    pp_a = _sample_experimental_contract_selection()
+    pp_a["candidate_contracts"]["pickers_diverged"] = True  # v1 marker
+
+    analysis = SimpleNamespace(
+        symbol="AAPL",
+        recommendation="Candidate",
+        setup_score=0.72,
+        metrics={
+            "data_sources": {"options_source": "marketdata_app",
+                             "price_rv_source": "yfinance"},
+            "experimental_contract_selection": pp_a,
+        },
+        rationale=[],
+        selector_output={
+            "recommendation": "Candidate",
+            "best_structure": "call_calendar",
+            "earnings_date": "2026-05-01",
+            "primary_thesis": "thesis",
+            "primary_risks": [],
+            "why_this_structure": [],
+            "why_not_others": {},
+        },
+        structure_scorecards=[
+            {"structure": "call_calendar", "eligible": True,
+             "composite_structure_score": 0.81},
+        ],
+        vol_snapshot={
+            "symbol": "AAPL",
+            "as_of_date": "2026-04-23",
+            "earnings_date": "2026-05-01",
+            "earnings_source_primary": "alpha_vantage",
+            "earnings_source_confidence": 0.82,
+            "earnings_source_stale": False,
+            "option_source": "marketdata_app",
+            "underlying_source": "yfinance",
+            "data_quality_score": 0.77,
+        },
+        sample_provenance="forward_post_freeze",
+        candidate_shadow_outcome={},
+    )
+    rec = build_record_from_analysis(
+        analysis,
+        recommendation_id="rec_overlay_contract",
+        quote_payload={
+            "quote_source": "yfinance",
+            "quote_timestamp": "2026-04-23T12:00:00+00:00",
+            "quote_quality": "paper_research_mid_not_execution_grade",
+            "bid_ask_mid": {"legs": {"call": {"mid": 4.1}}},
+            "surface_quality": {"status": "valid_evidence", "warning_flags": []},
+        },
+    )
+    ledger.record(rec)
+
+    # Step 2: plant an intermediate revision that changes
+    # picker_provenance to "A_PRIME" (simulating some future
+    # enrichment path that we have not yet shipped — e.g. a
+    # post-recommendation picker-provenance correction PR).
+    import json
+    pp_a_prime = _sample_experimental_contract_selection()
+    pp_a_prime["candidate_contracts"]["pickers_diverged"] = False  # A_PRIME marker
+    enriched_payload = {
+        "recommendation_id": "rec_overlay_contract",
+        "picker_provenance": pp_a_prime,
+        "candidate_shadow_outcome": {},
+        "sample_provenance": "forward_post_freeze",
+    }
+    ledger._conn.execute(  # noqa: SLF001
+        """
+        INSERT INTO recommendation_revisions
+            (recommendation_id, revised_at, content_hash, record_json)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            "rec_overlay_contract",
+            "2026-05-26T00:00:00+00:00",
+            "synthetic_intermediate_hash",
+            json.dumps(enriched_payload, sort_keys=True),
+        ),
+    )
+    ledger._conn.commit()
+
+    # Step 3: run the resolver write — overlays only the outcome.
+    ledger.record_resolution_and_attempt(
+        recommendation_id="rec_overlay_contract",
+        candidate_shadow_outcome=_sample_candidate_shadow_outcome(),
+        increment_attempts=False,
+    )
+
+    # Step 4: the LATEST revision (= the one record_resolution_and_attempt
+    # just wrote) must carry v1's picker_provenance with pickers_diverged
+    # == True, NOT the intermediate revision's pickers_diverged == False.
+    revisions = ledger.get_revisions("rec_overlay_contract")
+    latest_payload = revisions[-1]["record"]
+    assert (
+        latest_payload["picker_provenance"]["candidate_contracts"]["pickers_diverged"]
+        is True
+    ), (
+        "record_resolution_and_attempt MUST overlay onto v1's "
+        "picker_provenance (pickers_diverged=True), NOT the "
+        "intermediate revision's (pickers_diverged=False). If this "
+        "fails, the resolver has silently been changed to do a "
+        "cumulative merge — which would entangle PR-AE with every "
+        "other future enrichment path. Move the cumulative-merge "
+        "behavior into a separately-named helper and restore the "
+        "v1-overlay contract here."
+    )
+
+
+def test_pr_ae_composite_index_exists(tmp_path: Path) -> None:
+    """The (sample_provenance, earnings_date) composite index must exist
+    so the daily eligibility query doesn't full-scan a growing
+    recommendations table."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    indexes = {
+        row[1]
+        for row in ledger._conn.execute(  # noqa: SLF001
+            "SELECT type, name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
+    assert "idx_recommendations_provenance_earnings" in indexes
+
+
+# ── PR-AE C1b: atomic combined helper (Codex P1 audit) ────────────────────────
+
+
+def test_pr_ae_atomic_helper_increments_counter_only_when_requested(
+    tmp_path: Path,
+) -> None:
+    """record_resolution_and_attempt(..., increment_attempts=True)
+    bumps the counter by exactly one. With increment_attempts=False,
+    the counter stays put. Both paths write the same kind of revision."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_inc_path"))
+    ledger.record(_forward_record(recommendation_id="rec_no_inc_path"))
+
+    # Path 1: increment_attempts=True (terminal-failure outcome)
+    ledger.record_resolution_and_attempt(
+        recommendation_id="rec_inc_path",
+        candidate_shadow_outcome={"status": "retrying",
+                                  "labels": {"research_mid": True,
+                                             "shadow_only": True,
+                                             "not_execution_grade": True}},
+        increment_attempts=True,
+    )
+    counter_inc = ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_inc_path",),
+    ).fetchone()[0]
+    assert int(counter_inc) == 1
+
+    # Path 2: increment_attempts=False (ok or awaiting_chain_data outcome)
+    ledger.record_resolution_and_attempt(
+        recommendation_id="rec_no_inc_path",
+        candidate_shadow_outcome={"status": "awaiting_chain_data",
+                                  "labels": {"research_mid": True,
+                                             "shadow_only": True,
+                                             "not_execution_grade": True}},
+        increment_attempts=False,
+    )
+    counter_no_inc = ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_no_inc_path",),
+    ).fetchone()[0]
+    assert int(counter_no_inc) == 0
+
+
+def test_pr_ae_record_resolution_payload_delegates_with_no_increment(
+    tmp_path: Path,
+) -> None:
+    """record_resolution_payload is the convenience wrapper for the
+    no-counter-increment path. Calling it must NOT bump the counter
+    even when the outcome looks like a terminal failure — the caller
+    has to use the atomic combined helper for that."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_wrapper"))
+
+    # Even with a terminal-failure outcome, the wrapper does not
+    # increment (callers must use record_resolution_and_attempt for
+    # that). This is a guardrail: nothing in the wrapper's name
+    # implies counter bookkeeping.
+    ledger.record_resolution_payload(
+        recommendation_id="rec_wrapper",
+        candidate_shadow_outcome={
+            "status": "permanently_failed:no_post_event_chain",
+            "labels": {"research_mid": True, "shadow_only": True,
+                       "not_execution_grade": True},
+        },
+    )
+    counter = ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_wrapper",),
+    ).fetchone()[0]
+    assert int(counter) == 0
+
+
+def test_pr_ae_atomic_helper_rolls_back_both_on_mid_tx_failure(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """The core P1 atomicity contract (Codex C1 audit):
+    record_resolution_and_attempt MUST commit both the revision row and
+    the counter UPDATE in the same transaction. If anything raises
+    mid-transaction, the _tx context manager rolls back BOTH — there
+    must be no partial state where the revision lands but the counter
+    stays stale (which would let retrying revisions never escalate to
+    permanently_failed).
+
+    This test forces a mid-transaction failure by patching
+    _write_record_within_tx to raise AFTER the revision insert would
+    have landed but BEFORE the counter UPDATE runs. After the raise,
+    the row must look unchanged: same revisions count, same counter.
+    """
+    import pytest
+
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_atomic"))
+
+    revisions_before = len(ledger.get_revisions("rec_atomic"))
+    counter_before = int(ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_atomic",),
+    ).fetchone()[0])
+
+    real = ledger._write_record_within_tx  # noqa: SLF001
+    crash_marker = RuntimeError("simulated crash between revision and counter update")
+
+    def patched_write(cur, record):
+        # Run the real write so the revision INSERT OR IGNORE
+        # statement executes (would have landed a row in the
+        # revisions table absent rollback), then crash.
+        real(cur, record)
+        raise crash_marker
+
+    monkeypatch.setattr(ledger, "_write_record_within_tx", patched_write)
+
+    with pytest.raises(RuntimeError):
+        ledger.record_resolution_and_attempt(
+            recommendation_id="rec_atomic",
+            candidate_shadow_outcome={
+                "status": "retrying",
+                "labels": {"research_mid": True, "shadow_only": True,
+                           "not_execution_grade": True},
+            },
+            increment_attempts=True,
+        )
+
+    # Counter unchanged: rollback undid the (not-yet-executed) UPDATE
+    counter_after = int(ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_atomic",),
+    ).fetchone()[0])
+    assert counter_after == counter_before
+
+    # No new revision row: rollback also undid the revision insert
+    assert len(ledger.get_revisions("rec_atomic")) == revisions_before
+
+
+def test_pr_ae_atomic_helper_writes_revision_and_counter_in_one_tx(
+    tmp_path: Path,
+) -> None:
+    """Positive companion to the rollback test: the happy path must
+    leave BOTH the revision row AND the counter increment visible
+    after a single call."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_happy"))
+
+    status = ledger.record_resolution_and_attempt(
+        recommendation_id="rec_happy",
+        candidate_shadow_outcome={
+            "status": "permanently_failed:no_post_event_chain",
+            "labels": {"research_mid": True, "shadow_only": True,
+                       "not_execution_grade": True},
+        },
+        increment_attempts=True,
+    )
+    assert status == "revision"
+
+    # Counter bumped
+    counter = int(ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_happy",),
+    ).fetchone()[0])
+    assert counter == 1
+
+    # Revision present and carries the terminal status
+    revisions = ledger.get_revisions("rec_happy")
+    assert revisions[-1]["record"]["candidate_shadow_outcome"]["status"] == \
+        "permanently_failed:no_post_event_chain"
+
+
+def test_pr_ae_atomic_helper_raises_for_unknown_id(tmp_path: Path) -> None:
+    """KeyError on unknown id; lock and tx context managers clean up."""
+    import pytest
+
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    with pytest.raises(KeyError):
+        ledger.record_resolution_and_attempt(
+            recommendation_id="rec_ghost",
+            candidate_shadow_outcome={"status": "ok",
+                                      "labels": {"research_mid": True,
+                                                 "shadow_only": True,
+                                                 "not_execution_grade": True}},
+            increment_attempts=False,
+        )
+
+
+def test_pr_ae_atomic_helper_duplicate_outcome_still_bumps_counter(
+    tmp_path: Path,
+) -> None:
+    """REGRESSION (Codex C1b audit clarification): on the
+    terminal-failure write path (increment_attempts=True), a duplicate
+    revision payload STILL increments the counter.
+
+    Subtle case: if a retry lands the EXACT same payload as the most
+    recent revision, the revisions UNIQUE constraint dedupes the new
+    row (record() returns "duplicate"). The counter still increments —
+    the resolver did do an attempt, even if its output happened to
+    match the prior state.
+
+    Rationale: if we did NOT increment on duplicate, a row stuck in
+    "retrying" with no upstream chain change would never escalate to
+    permanently_failed (each retry would be a duplicate). Incrementing
+    on duplicate preserves the retry-budget semantics.
+
+    Pairs with the rule table in the design doc:
+      - retrying  → increment_attempts=True  → counter bumps (always)
+      - permanently_failed:*  → same
+      - ok  → increment_attempts=False  → counter unchanged
+      - awaiting_chain_data  → increment_attempts=False  → counter unchanged
+    """
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    ledger.record(_forward_record(recommendation_id="rec_stuck"))
+
+    outcome = {
+        "status": "retrying",
+        "labels": {"research_mid": True, "shadow_only": True,
+                   "not_execution_grade": True},
+    }
+    s1 = ledger.record_resolution_and_attempt(
+        recommendation_id="rec_stuck",
+        candidate_shadow_outcome=outcome,
+        increment_attempts=True,
+    )
+    assert s1 == "revision"
+    s2 = ledger.record_resolution_and_attempt(
+        recommendation_id="rec_stuck",
+        candidate_shadow_outcome=outcome,
+        increment_attempts=True,
+    )
+    assert s2 == "duplicate"  # no new revision row (idempotent)
+
+    counter = int(ledger._conn.execute(  # noqa: SLF001
+        "SELECT candidate_exit_resolver_attempts FROM recommendations WHERE recommendation_id = ?",
+        ("rec_stuck",),
+    ).fetchone()[0])
+    # Counter bumped twice — retry budget burns down even when output
+    # repeats. The row escalates to permanently_failed after MAX_ATTEMPTS
+    # retries regardless of content drift.
+    assert counter == 2
