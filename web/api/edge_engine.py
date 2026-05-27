@@ -612,7 +612,9 @@ from services.candidate_shadow_provenance import (  # noqa: E402
     VALID_SAMPLE_PROVENANCES,
     _empty_candidate_shadow_outcome,
     _tag_live_forward_observation,
+    candidate_return_for_gate,
     is_promotion_eligible,
+    is_promotion_eligible_for_scenario,
     normalize_sample_provenance,
 )
 
@@ -1105,6 +1107,28 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
     # widen the filter.
     promotion_eligible_event_pnls: Dict[Any, List[float]] = {}
 
+    # PR #66: scenario-aware visibility infrastructure. These counters
+    # answer the operational question "what fraction of
+    # promotion-eligible events have execution-cost-aware evidence?"
+    # — the data needed to justify a future gate refactor to scenario-
+    # aware promotion criteria.
+    #
+    # The default gate scenario is the same baseline structure_scorecard
+    # uses for historical priors (cross_25), so the visibility metric
+    # answers a uniform question across the whole pipeline.
+    #
+    # CRITICAL: this aggregator NEVER substitutes mid for a missing
+    # scenario value. `allow_mid_fallback=False` is hardcoded below.
+    # PR #66 ships visibility, not policy — the `fallback_events`
+    # counter exists so a future PR that flips a caller to
+    # `allow_mid_fallback=True` automatically gets the substitution
+    # surface in the daily diagnostic output. Until then, the count
+    # stays at 0 by construction.
+    _GATE_SCENARIO_FOR_VISIBILITY = "cross_25"
+    scenario_priced_event_keys: set = set()
+    missing_scenario_event_keys: set = set()
+    scenario_missing_reason_counts: Dict[str, int] = {}
+
     # Event-level (deduplicated on (symbol, event_date))
     unique_events: set = set()
     unique_events_with_legacy: set = set()
@@ -1185,6 +1209,44 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
             promotion_eligible_event_pnls.setdefault(event_key, []).append(
                 float(outcome["mid_realized_return_pct"])
             )
+
+            # PR #66 visibility: among the promotion-eligible records,
+            # classify each by whether the gate-baseline scenario
+            # (cross_25 today) was actually priced. Fail-closed —
+            # `allow_mid_fallback=False` (the only mode this PR ships
+            # in any production call site). A missing cross_25 reduces
+            # `scenario_priced_events` and increments
+            # `missing_scenario_events`; it CANNOT be silently
+            # rescued by mid here. Event-level dedup (a single event
+            # at multiple offsets counts once) is consistent with how
+            # `promotion_eligible_event_pnls` dedups above.
+            _scenario_value, _scenario_meta = candidate_return_for_gate(
+                outcome,
+                _GATE_SCENARIO_FOR_VISIBILITY,
+                allow_mid_fallback=False,
+            )
+            if _scenario_value is not None:
+                scenario_priced_event_keys.add(event_key)
+            else:
+                missing_scenario_event_keys.add(event_key)
+                _reason = _scenario_meta.get("missing_reason") or "unknown"
+                scenario_missing_reason_counts[_reason] = (
+                    scenario_missing_reason_counts.get(_reason, 0) + 1
+                )
+            # `fallback_events` is intentionally NOT computed here.
+            # By construction every is_promotion_eligible(record)
+            # record carries a finite mid (check #5 of the existing
+            # gate), so `missing_scenario_events` would be identical
+            # to "events that would have been rescued by mid fallback."
+            # That makes a second `allow_mid_fallback=True` call
+            # redundant — and crucially, including such a call would
+            # violate the PR #66 invariant "no production call site
+            # passes allow_mid_fallback=True." A future gate-flip PR
+            # will bump `fallback_events` from its own code path
+            # (typically by recording fallback_used decisions through
+            # its own counter) at which point the field becomes
+            # non-zero through actual policy use, not aggregator
+            # speculation.
 
         # Outcome bucketing only applies when shadow logging actually ran.
         if status != "ok":
@@ -1422,6 +1484,58 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
                 "averaging step. Document this when reporting."
             ),
             **promotion_eligible_summary,
+        },
+        # PR #66 visibility infrastructure. ADDITIVE — does NOT replace
+        # `promotion_eligible_candidate_stats` above. Answers the
+        # operational question "what fraction of promotion-eligible
+        # events have execution-cost-aware evidence (cross_25 priced)?"
+        # — the data needed to justify a future scenario-aware gate
+        # refactor.
+        #
+        # CRITICAL INVARIANTS pinned by tests (see PR #66):
+        #   * `n_events` == promotion_eligible_candidate_stats.n_events
+        #     (the existing mid-based eligibility check is the
+        #     denominator).
+        #   * `scenario_priced_events + missing_scenario_events
+        #     == n_events`.
+        #   * Missing cross_25 values are NEVER counted as priced via
+        #     mid — `allow_mid_fallback=False` is hardcoded at this
+        #     call site.
+        #   * `fallback_events` stays 0 in PR #66 (no production
+        #     caller enables the flag). A future gate-flip PR that
+        #     opts into `allow_mid_fallback=True` will bump this from
+        #     its own code path, making the substitution visible.
+        "promotion_eligible_execution_scenario_stats": {
+            "note": (
+                "Visibility-only block (PR #66). Reports how many "
+                "promotion-eligible events have execution-cost-aware "
+                "evidence (cross_25 priced) versus mid-only. Fail-"
+                "closed: missing cross_25 reduces scenario_priced_events "
+                "and is NEVER rescued by mid here. The current "
+                "promotion-eligibility gate still routes through "
+                "is_promotion_eligible(record), which is mid-based; "
+                "this block exists so a future scenario-aware gate "
+                "refactor can be justified by data showing what "
+                "fraction of forward observations would qualify."
+            ),
+            "scenario": _GATE_SCENARIO_FOR_VISIBILITY,
+            "n_events": int(len(promotion_eligible_event_pnls)),
+            "scenario_priced_events": int(len(scenario_priced_event_keys)),
+            "missing_scenario_events": int(len(missing_scenario_event_keys)),
+            # Stays 0 in PR #66 by construction. A future PR that
+            # flips a real gate caller to `allow_mid_fallback=True`
+            # will increment this from that caller's own counter.
+            "fallback_events": 0,
+            # Per-reason breakdown of why cross_25 was missing —
+            # operationally most useful diagnostic for whether the
+            # gap is "outcome.status not ok" (no candidate selection
+            # was made), "scenario_value_absent" (bid/ask missing in
+            # the chain), or something else. Keys are the
+            # `missing_reason` codes documented on
+            # candidate_return_for_gate.
+            "missing_reason_counts": {
+                k: int(v) for k, v in sorted(scenario_missing_reason_counts.items())
+            },
         },
         "diverged_sample": diverged_sample,
     }

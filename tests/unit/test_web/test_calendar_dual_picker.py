@@ -1924,6 +1924,311 @@ class TestAggregatorNoMixingOfProvenance:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# PR #66 — scenario-aware visibility (additive, NOT policy change)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _forward_eligible_trade_with_scenario(
+    *, mid: float, cross_25: float | None, **overrides,
+) -> Dict[str, Any]:
+    """A forward-post-freeze trade with execution_scenario_returns_pct
+    populated. Passing cross_25=None simulates the missing-bid/ask
+    case where the simulator emits the block but cannot price the
+    cross_25 scenario.
+    """
+    trade = _forward_eligible_trade(mid_realized_return_pct=mid, **overrides)
+    # Overlay the new scenario block on top of the empty placeholder
+    # that _empty_candidate_shadow_outcome stamped during construction.
+    trade["candidate_shadow_outcome"]["execution_scenario_returns_pct"] = {
+        "mid": mid,
+        "cross_25": cross_25,
+        "cross_50": (cross_25 - 1.0) if cross_25 is not None else None,
+        "conservative": (cross_25 - 1.0) if cross_25 is not None else None,
+    }
+    return trade
+
+
+class TestPRSixtySixScenarioVisibilityBlock:
+    """PR #66 invariants pinned by Codex's review checklist:
+
+      * `n_events` matches `promotion_eligible_candidate_stats.n_events`
+        (same denominator).
+      * `scenario_priced_events + missing_scenario_events == n_events`.
+      * Missing cross_25 NEVER counted as priced via mid.
+      * `fallback_events` stays 0 in PR #66 (no production caller
+        enables `allow_mid_fallback=True`).
+      * `conservative` does not become a separate bucket.
+      * `_compute_rank_score` untouched (verified by import scope).
+    """
+
+    def test_block_present_with_canonical_shape_on_empty_input(self):
+        result = _aggregate_experimental_candidate_evidence([])
+        block = result["promotion_eligible_execution_scenario_stats"]
+        # Canonical key set — any drift here would mean a downstream
+        # reader can't depend on the shape.
+        expected_keys = {
+            "note", "scenario", "n_events", "scenario_priced_events",
+            "missing_scenario_events", "fallback_events",
+            "missing_reason_counts",
+        }
+        assert set(block.keys()) == expected_keys
+        assert block["scenario"] == "cross_25"
+        assert block["n_events"] == 0
+        assert block["scenario_priced_events"] == 0
+        assert block["missing_scenario_events"] == 0
+        assert block["fallback_events"] == 0
+
+    def test_n_events_matches_promotion_eligible_block(self):
+        """The visibility block reports on the same population the
+        existing promotion-eligible block reports on. Denominator
+        parity is the load-bearing invariant — if these drift, the
+        visibility metric becomes incomparable to the mid stats."""
+        trades = [
+            _forward_eligible_trade_with_scenario(
+                mid=12.5, cross_25=8.0,
+                symbol="AAPL", event_date="2026-06-01",
+                entry_date="2026-05-29",
+            ),
+            _forward_eligible_trade_with_scenario(
+                mid=5.0, cross_25=None,  # missing scenario
+                symbol="MSFT", event_date="2026-06-15",
+                entry_date="2026-06-12",
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        pe = result["promotion_eligible_candidate_stats"]
+        sc = result["promotion_eligible_execution_scenario_stats"]
+        assert sc["n_events"] == pe["n_events"] == 2
+
+    def test_split_priced_vs_missing_sums_to_total(self):
+        """scenario_priced_events + missing_scenario_events == n_events
+        on every input. Pinned because a future change that adds a
+        third bucket (e.g. partial pricing) must reconcile the math
+        explicitly rather than have the totals drift."""
+        trades = [
+            _forward_eligible_trade_with_scenario(
+                mid=10.0, cross_25=6.0,
+                symbol="AAPL", event_date="2026-01-01",
+                entry_date="2025-12-30",
+            ),
+            _forward_eligible_trade_with_scenario(
+                mid=20.0, cross_25=15.0,
+                symbol="MSFT", event_date="2026-02-01",
+                entry_date="2026-01-30",
+            ),
+            _forward_eligible_trade_with_scenario(
+                mid=-5.0, cross_25=None,
+                symbol="GOOG", event_date="2026-03-01",
+                entry_date="2026-02-26",
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        sc = result["promotion_eligible_execution_scenario_stats"]
+        assert sc["n_events"] == 3
+        assert sc["scenario_priced_events"] == 2
+        assert sc["missing_scenario_events"] == 1
+        assert (
+            sc["scenario_priced_events"] + sc["missing_scenario_events"]
+            == sc["n_events"]
+        )
+
+    def test_missing_scenario_never_counted_as_priced_via_mid(self):
+        """The load-bearing safety property. A record with finite mid
+        but missing cross_25 must NOT be reported as scenario_priced.
+        This is the exact failure mode Codex warned about: silent
+        mid-fallback re-injecting research-grade evidence into the
+        execution-aware bucket."""
+        trades = [
+            _forward_eligible_trade_with_scenario(
+                mid=12.5,            # finite mid
+                cross_25=None,       # MISSING execution evidence
+                symbol="AAPL", event_date="2026-06-01",
+                entry_date="2026-05-29",
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        sc = result["promotion_eligible_execution_scenario_stats"]
+        assert sc["scenario_priced_events"] == 0, (
+            "Missing cross_25 must NEVER be counted as priced via mid."
+        )
+        assert sc["missing_scenario_events"] == 1
+
+    def test_fallback_events_stays_zero_in_pr_66(self):
+        """Invariant: no production call site in PR #66 enables
+        allow_mid_fallback=True. The counter exists so a future PR
+        that flips a gate can populate it, but for now it MUST be 0
+        regardless of input shape."""
+        trades = [
+            _forward_eligible_trade_with_scenario(
+                mid=12.5, cross_25=None,
+                symbol="AAPL", event_date="2026-06-01",
+                entry_date="2026-05-29",
+            ),
+            _forward_eligible_trade_with_scenario(
+                mid=5.0, cross_25=3.0,
+                symbol="MSFT", event_date="2026-06-15",
+                entry_date="2026-06-12",
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        sc = result["promotion_eligible_execution_scenario_stats"]
+        assert sc["fallback_events"] == 0
+
+    def test_missing_reason_counts_breakdown(self):
+        """The per-reason breakdown helps an operator diagnose WHY
+        cross_25 is missing — bid/ask gap vs simulator skip vs
+        legacy outcome shape. Different causes have different
+        operational responses."""
+        # Three records: priced, scenario_value_not_finite (NaN),
+        # scenario_block_missing (legacy outcome without the block).
+        priced = _forward_eligible_trade_with_scenario(
+            mid=10.0, cross_25=6.0,
+            symbol="AAPL", event_date="2026-01-01",
+            entry_date="2025-12-30",
+        )
+        not_finite = _forward_eligible_trade_with_scenario(
+            mid=10.0, cross_25=None,
+            symbol="MSFT", event_date="2026-02-01",
+            entry_date="2026-01-30",
+        )
+        legacy = _forward_eligible_trade(
+            mid_realized_return_pct=10.0,
+            symbol="GOOG", event_date="2026-03-01",
+            entry_date="2026-02-26",
+        )
+        # Strip the empty-placeholder scenario block to simulate
+        # pre-PR-#64 outcome shape.
+        legacy["candidate_shadow_outcome"].pop(
+            "execution_scenario_returns_pct", None
+        )
+        result = _aggregate_experimental_candidate_evidence(
+            [priced, not_finite, legacy]
+        )
+        sc = result["promotion_eligible_execution_scenario_stats"]
+        assert sc["scenario_priced_events"] == 1
+        assert sc["missing_scenario_events"] == 2
+        # Reason breakdown distinguishes the two failure modes.
+        assert sc["missing_reason_counts"]["scenario_value_not_finite"] == 1
+        assert sc["missing_reason_counts"]["scenario_block_missing"] == 1
+
+    def test_conservative_not_a_separate_bucket(self):
+        """`conservative` resolves to `cross_50` (see the alias
+        contract in candidate_shadow_provenance._SCENARIO_ALIASES).
+        The visibility block reports on ONE baseline scenario
+        (cross_25 today). It must NOT have a parallel
+        "conservative" bucket — that would be the exact "fourth
+        independent dimension" Codex warned against."""
+        result = _aggregate_experimental_candidate_evidence([])
+        block = result["promotion_eligible_execution_scenario_stats"]
+        # The reported scenario is a single scalar, not a list/dict
+        # over scenarios. If a future refactor wants per-scenario
+        # multi-bucket reporting, it MUST be a deliberate scope
+        # expansion with its own review.
+        assert isinstance(block["scenario"], str)
+        # No "conservative" anywhere in the block keys or scenario
+        # value (since it's aliased to cross_50).
+        flat_repr = repr(block).lower()
+        assert "conservative" not in flat_repr, (
+            "`conservative` must not appear as a separate scenario "
+            "bucket — it's an alias of cross_50."
+        )
+
+    def test_promotion_eligible_candidate_stats_unchanged(self):
+        """The original mid-based block must be byte-for-byte
+        unchanged regardless of whether the new block is present.
+        PR #66 is additive, not a replacement."""
+        trades = [
+            _forward_eligible_trade_with_scenario(
+                mid=12.5, cross_25=8.0,
+                symbol="AAPL", event_date="2026-06-01",
+                entry_date="2026-05-29",
+            ),
+            _forward_eligible_trade_with_scenario(
+                mid=20.0, cross_25=None,
+                symbol="MSFT", event_date="2026-07-01",
+                entry_date="2026-06-28",
+            ),
+        ]
+        result = _aggregate_experimental_candidate_evidence(trades)
+        pe = result["promotion_eligible_candidate_stats"]
+        # Both events are promotion-eligible (mid is finite for both).
+        # The cross_25=None record IS in the denominator here.
+        assert pe["n_events"] == 2
+        assert pe["candidate_mid_realized_return_pct_mean"] == pytest.approx(
+            (12.5 + 20.0) / 2
+        )
+        # The new scenario block doesn't tighten the existing block's
+        # eligibility set.
+        sc = result["promotion_eligible_execution_scenario_stats"]
+        assert sc["n_events"] == pe["n_events"]
+
+
+class TestPRSixtySixCallSiteAuditing:
+    """Codex review checklist:
+      * `allow_mid_fallback` defaults to `False` everywhere.
+      * No production call site passes `allow_mid_fallback=True`.
+    """
+
+    def test_no_production_caller_passes_allow_mid_fallback_true(self):
+        """AST scan: walk every .py file under services/, web/,
+        scripts/ and look for actual function-call keyword arguments
+        of the form ``allow_mid_fallback=True``. Comments and
+        docstrings are ignored because the AST parses them as
+        non-Call nodes — only real call sites can match.
+
+        Rationale: PR #66 is visibility infrastructure. The opt-in
+        fallback flag exists for a FUTURE gate refactor. Until that
+        PR lands, no production code path may enable it. A
+        downstream contributor who forgets this could quietly
+        re-introduce mid-priced evidence into the execution-aware
+        gate — this test catches that at the call-site level
+        without false-positives on the doc comments that
+        legitimately mention the flag."""
+        import ast
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[3]
+        production_dirs = ("services", "web", "scripts")
+
+        offenders: list[str] = []
+        for d in production_dirs:
+            for py in (root / d).rglob("*.py"):
+                if "test_" in py.name or py.parent.name.startswith("tests"):
+                    continue
+                try:
+                    source = py.read_text(encoding="utf-8")
+                    tree = ast.parse(source, filename=str(py))
+                except (OSError, UnicodeDecodeError, SyntaxError):
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    for kw in node.keywords:
+                        if kw.arg != "allow_mid_fallback":
+                            continue
+                        # Match `allow_mid_fallback=True` literally;
+                        # variable references (e.g.
+                        # `allow_mid_fallback=some_flag`) are
+                        # acceptable because their truth value
+                        # depends on runtime config, not a hardcoded
+                        # opt-in.
+                        if (
+                            isinstance(kw.value, ast.Constant)
+                            and kw.value.value is True
+                        ):
+                            offenders.append(
+                                f"{py.relative_to(root)}:{node.lineno}"
+                            )
+        assert not offenders, (
+            "PR #66 invariant violated — production code passes "
+            "allow_mid_fallback=True at a real call site. PR #66 "
+            "ships visibility only; the fallback flag is reserved "
+            "for a future gate-flip PR.\nOffenders:\n  "
+            + "\n  ".join(offenders)
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # PR-AE C3 — live forward tagging wired into analyze_single_ticker
 # ──────────────────────────────────────────────────────────────────────────
 

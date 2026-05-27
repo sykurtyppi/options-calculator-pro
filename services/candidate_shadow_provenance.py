@@ -251,6 +251,227 @@ def is_promotion_eligible(record: Dict[str, Any]) -> bool:
     return True
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Scenario-aware gate helpers (PR #66 visibility infrastructure)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# These helpers exist so the upcoming gate refactor (separate future PR)
+# can consume execution-cost-aware evidence WITHOUT silently substituting
+# mid for missing scenario values. PR #66 ships these helpers + the
+# aggregator wiring that counts how often each scenario is actually
+# priced; no production call site enables `allow_mid_fallback=True` in
+# this PR. The flag exists so the future refactor can opt-in to a
+# loudly-flagged transition mode, with `fallback_used=True` metadata
+# making the substitution visible at every layer.
+#
+# Critical invariants enforced by tests:
+#   - `is_promotion_eligible()` default behavior is byte-equivalent to
+#     pre-PR-#66 (mid-only gate). Untouched.
+#   - `candidate_return_for_gate()` is fail-closed by default. Missing
+#     scenario → (None, metadata with missing_reason).
+#   - `allow_mid_fallback=True` produces (mid_value, {fallback_used:
+#     True, scenario_used: "mid"}) so any downstream aggregator can
+#     count fallbacks without re-inspecting the outcome block.
+#   - "conservative" is treated as an alias of "cross_50" throughout
+#     so it never becomes an independent fourth stress dimension.
+
+
+_SCENARIO_ALIASES = {
+    # `conservative` is defined in execution_scenarios.SCENARIO_LEVELS
+    # at distance=0.50 — exactly the same numerical contract as
+    # cross_50. Today the simulator emits both keys with identical
+    # values. Treating them as aliases at the gate-helper layer
+    # prevents any future call site from creating a fourth evidence
+    # bucket by querying both labels separately. If a future refactor
+    # repoints `conservative` at a stricter cross (e.g. 0.75), this
+    # alias mapping should be removed in the same commit and the
+    # aggregator's scenario test list updated together.
+    "conservative": "cross_50",
+}
+
+
+def _canonical_scenario_label(scenario: str) -> str:
+    """Map alias labels (e.g. 'conservative') to their canonical
+    counterpart (e.g. 'cross_50'). Unrecognized inputs pass through
+    unchanged — validation is the caller's responsibility, since
+    SCENARIO_LEVELS may change over time and we don't want this helper
+    to be the source of "unknown scenario" error messages."""
+    return _SCENARIO_ALIASES.get(scenario, scenario)
+
+
+def candidate_return_for_gate(
+    outcome: Optional[Dict[str, Any]],
+    scenario: str,
+    *,
+    allow_mid_fallback: bool = False,
+) -> tuple[Optional[float], Dict[str, Any]]:
+    """Resolve the per-scenario realized return for promotion gating.
+
+    Returns ``(value, metadata)`` where:
+
+      * ``value`` is the finite per-scenario realized return (in
+        percent) or ``None`` when the scenario could not be resolved
+        and fallback was not opted in.
+
+      * ``metadata`` is a stable-shape dict::
+
+          {
+            "scenario_requested": str,    # always the caller's input
+            "scenario_used": str | None,  # what actually produced the
+                                          # value: a canonical scenario
+                                          # label, or "mid" on fallback,
+                                          # or None on failure.
+            "fallback_used": bool,        # True iff allow_mid_fallback
+                                          # rescued an otherwise-missing
+                                          # scenario value.
+            "missing_reason": str | None, # None on success; one of the
+                                          # codes below on failure.
+          }
+
+        Missing reasons (failure-only):
+
+          - ``outcome_not_dict``      outcome arg was not a dict
+          - ``outcome_status_not_ok`` outcome.status != "ok"
+          - ``scenario_block_missing`` execution_scenario_returns_pct
+                                      key absent from the outcome
+          - ``scenario_value_absent`` requested scenario not in the
+                                      block (caller used a label not
+                                      in SCENARIO_LEVELS)
+          - ``scenario_value_not_finite`` value present but NaN / inf
+                                          / non-numeric / bool
+
+    Fail-closed by default. ``allow_mid_fallback=False`` is the only
+    behavior any current production caller uses (PR #66 ships no
+    call site that flips this).
+
+    When ``allow_mid_fallback=True`` and the requested scenario is
+    missing-but-the-outcome-is-ok, this falls back to
+    ``mid_realized_return_pct`` on the outcome and stamps
+    ``fallback_used=True`` + ``scenario_used="mid"`` so downstream
+    aggregators can count the substitution. This is the contract
+    that lets a future gate refactor flip to scenario-aware gating
+    while keeping a visible audit trail of how often missing-quote
+    coverage drives the fallback path.
+    """
+    canonical = _canonical_scenario_label(scenario)
+
+    meta: Dict[str, Any] = {
+        "scenario_requested": scenario,
+        "scenario_used": None,
+        "fallback_used": False,
+        "missing_reason": None,
+    }
+
+    if not isinstance(outcome, dict):
+        meta["missing_reason"] = "outcome_not_dict"
+        return None, meta
+    if outcome.get("status") != "ok":
+        meta["missing_reason"] = "outcome_status_not_ok"
+        return None, meta
+
+    scenario_block = outcome.get("execution_scenario_returns_pct")
+    if not isinstance(scenario_block, dict):
+        meta["missing_reason"] = "scenario_block_missing"
+        return _maybe_mid_fallback(
+            outcome, meta, allow_mid_fallback=allow_mid_fallback
+        )
+
+    if canonical not in scenario_block:
+        meta["missing_reason"] = "scenario_value_absent"
+        return _maybe_mid_fallback(
+            outcome, meta, allow_mid_fallback=allow_mid_fallback
+        )
+
+    value = scenario_block.get(canonical)
+    if (
+        value is None
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not np.isfinite(value)
+    ):
+        meta["missing_reason"] = "scenario_value_not_finite"
+        return _maybe_mid_fallback(
+            outcome, meta, allow_mid_fallback=allow_mid_fallback
+        )
+
+    meta["scenario_used"] = canonical
+    return float(value), meta
+
+
+def _maybe_mid_fallback(
+    outcome: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    allow_mid_fallback: bool,
+) -> tuple[Optional[float], Dict[str, Any]]:
+    """Internal helper: route the failure path through mid-fallback
+    when the caller opted in.
+
+    The metadata dict is mutated in place — caller already populated
+    `scenario_requested`, `missing_reason`. We add `scenario_used`
+    and `fallback_used` only when the fallback successfully produces
+    a finite mid value. Otherwise we return the failure as-is, so
+    downstream observability sees the original missing_reason
+    rather than a misleading "fallback also failed" cascade.
+    """
+    if not allow_mid_fallback:
+        return None, meta
+
+    mid_value = outcome.get("mid_realized_return_pct")
+    if (
+        mid_value is None
+        or isinstance(mid_value, bool)
+        or not isinstance(mid_value, (int, float))
+        or not np.isfinite(mid_value)
+    ):
+        # Fallback requested but mid itself is unusable. Leave the
+        # original missing_reason in place — it's more informative
+        # than overwriting with "mid_also_missing".
+        return None, meta
+
+    meta["scenario_used"] = "mid"
+    meta["fallback_used"] = True
+    return float(mid_value), meta
+
+
+def is_promotion_eligible_for_scenario(
+    record: Dict[str, Any],
+    scenario: str,
+    *,
+    allow_mid_fallback: bool = False,
+) -> bool:
+    """Scenario-aware variant of :py:func:`is_promotion_eligible`.
+
+    Returns True iff BOTH:
+
+      1. ``is_promotion_eligible(record)`` passes — i.e. the record
+         already satisfies every existing strict criterion
+         (provenance, outcome status, finite mid PnL, intact research
+         labels). This dependency is deliberate so the new helper
+         cannot accept a record the existing gate rejects.
+
+      2. ``candidate_return_for_gate(outcome, scenario, ...)`` returns
+         a finite value. With ``allow_mid_fallback=False`` (default)
+         that means the scenario value itself must be priced;
+         missing-bid/ask events fail this gate even if their mid
+         path is fine.
+
+    The new gate is strictly tighter than the old one when
+    ``allow_mid_fallback=False`` and equivalent when
+    ``allow_mid_fallback=True`` (modulo mid-priced events that pass
+    the existing gate). It exists as a building block for a future
+    promotion-policy change; PR #66 ships it as visibility plumbing
+    only.
+    """
+    if not is_promotion_eligible(record):
+        return False
+    outcome = record.get("candidate_shadow_outcome")
+    value, _meta = candidate_return_for_gate(
+        outcome, scenario, allow_mid_fallback=allow_mid_fallback,
+    )
+    return value is not None
+
+
 def _tag_live_forward_observation(record: Dict[str, Any]) -> Dict[str, Any]:
     """Tag *record* in-place with SAMPLE_PROVENANCE_FORWARD_POST_FREEZE.
 
