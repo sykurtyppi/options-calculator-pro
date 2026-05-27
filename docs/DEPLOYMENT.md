@@ -26,6 +26,7 @@ exposure without additional review.
 - [Day-to-day operations](#day-to-day-operations)
 - [Alerts and what they mean](#alerts-and-what-they-mean)
 - [Troubleshooting matrix](#troubleshooting-matrix)
+- [Backup and restore](#backup-and-restore)
 - [Uninstall](#uninstall)
 
 ---
@@ -577,6 +578,120 @@ rm ~/.options_calculator_pro/state/daily_evidence_watchdog_alerts.json
 # 3. Dry-run the watchdog to make sure it agrees nothing is wrong.
 .venv311/bin/python scripts/watch_daily_evidence_cycle.py --dry-run-alert
 ```
+
+---
+
+## Backup and restore
+
+The operational state lives entirely under `~/.options_calculator_pro/`
+(see the [file layout section](#file-layout-under-optionscalculatorpro)
+for what's where). On a long-running deployment that directory holds
+the recommendation ledger, the candidate exit resolver telemetry,
+the alert dedup state, and accumulated logs — collectively, the data
+needed to reconstruct what the system has been doing.
+
+`scripts/backup_state.py` produces a hot, consistent snapshot of
+that directory. SQLite files are copied via the [Online Backup
+API](https://www.sqlite.org/backup.html) so the snapshot is
+transaction-consistent even when wrapper jobs are actively writing.
+
+### Manual backup
+
+```sh
+./.venv311/bin/python scripts/backup_state.py
+```
+
+Default behavior:
+
+- Snapshot the entire `~/.options_calculator_pro/` tree (excluding
+  `state/*.lock` directories and the `backups/` subdir itself).
+- Write a timestamped `.tar.gz` to
+  `~/.options_calculator_pro/backups/`.
+- Prune all but the newest 14 archives.
+
+For real disaster recovery, the default location is **not safe** —
+a disk failure that destroys the state dir also destroys the
+backups alongside it. Point the output at an external sync folder:
+
+```sh
+./.venv311/bin/python scripts/backup_state.py \
+    --output-dir ~/Dropbox/options_calculator_pro_backups/
+```
+
+Override retention via `--retention=N`. Set `--retention=0` to
+disable pruning (useful if your sync folder has its own versioning).
+
+### Scheduled daily backup (recommended)
+
+Add to your crontab or LaunchAgent. The schedule is 04:00 local —
+offset from the 03:00 log rotation so the two jobs don't contend
+for the SQLite files:
+
+```cron
+0 4 * * * /path/to/options_calculator_pro/.venv311/bin/python \
+    /path/to/options_calculator_pro/scripts/backup_state.py \
+    --output-dir "$HOME/Dropbox/options_calculator_pro_backups" \
+    >> "$HOME/.options_calculator_pro/logs/backup_state.log" 2>&1
+```
+
+The backup is safe to run while every other launchd job is also
+executing — the Online Backup API holds a shared read lock on
+each SQLite file rather than an exclusive one, so concurrent
+writers see brief `SQLITE_BUSY` retries (handled by the
+existing `busy_timeout` config) rather than deadlocks.
+
+### Restore
+
+```sh
+./.venv311/bin/python scripts/restore_state.py \
+    ~/Dropbox/options_calculator_pro_backups/options_calculator_pro-state-20260527T040000Z-v1.tar.gz
+```
+
+Restore refuses to overwrite a non-empty target without `--force`:
+
+```sh
+./.venv311/bin/python scripts/restore_state.py \
+    <archive.tar.gz> --force
+```
+
+When `--force` is used, the current contents of the target dir are
+moved aside to a sibling `<target>.pre-restore-<timestamp>/`
+directory **before** extraction begins. So if you realize you
+picked the wrong archive, your previous state is still recoverable
+at that sibling path until you delete it.
+
+After extraction, the script runs `PRAGMA integrity_check` on
+every restored `*.sqlite` file. A failure here exits with code 2
+(distinct from the exit-1 "couldn't start" errors); the restored
+state is left in place so you can inspect what survived.
+
+### Restoring into a non-default location (verification)
+
+Before committing to a real restore, you can extract an archive
+into a scratch directory to verify its contents:
+
+```sh
+./.venv311/bin/python scripts/restore_state.py \
+    <archive.tar.gz> --target-dir /tmp/verify_restore/
+
+# Inspect:
+ls /tmp/verify_restore/
+sqlite3 /tmp/verify_restore/recommendations/recommendation_ledger.sqlite \
+    "SELECT COUNT(*) FROM recommendations;"
+
+# Cleanup:
+rm -rf /tmp/verify_restore/
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Backup written / restore successful, integrity_check passed |
+| 1 | Backup: state dir missing or empty. Restore: archive missing, schema-version mismatch, or non-empty target without `--force` |
+| 2 | Backup: fatal error during snapshot. Restore: extraction completed but `PRAGMA integrity_check` failed on at least one SQLite file |
+
+Exit code 2 on a restore is the "you got most of your data back but a DB is corrupt" path. The restored state is left in place; investigate which DB failed (the error message names the file), and consider falling back to an older archive.
 
 ---
 
