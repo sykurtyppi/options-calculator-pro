@@ -104,10 +104,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node 20
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Node 22 (LTS) is required, not 20: package.json's test
+          # script is `node --test 'src/**/*.test.js'`, and native
+          # glob expansion inside `node --test` only landed in
+          # Node 22. On Node 20 the quoted glob arrives as a
+          # literal string because Ubuntu bash doesn't expand `**`
+          # without `shopt -s globstar`, and the runner exits with
+          # "Could not find 'src/**/*.test.js'". macOS shells +
+          # Node 22+ both handle the glob, so this matches the
+          # local dev environment without touching the package.json
+          # test script.
+          node-version: "22"
           # Cache npm ~/.npm keyed on package-lock.json so repeated
           # runs skip the 30s download phase.
           cache: npm
