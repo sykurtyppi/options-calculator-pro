@@ -478,6 +478,94 @@ def _select_pre_earnings_calendar_contracts(
     }
 
 
+def _dual_picker_calendar_selection(
+    chain_df: pd.DataFrame,
+    event_date: pd.Timestamp,
+    *,
+    side: str = "call",
+) -> Dict[str, Any]:
+    """Run the calendar_leg_picker module with BOTH variants (legacy +
+    candidate) and report what each would have selected on this chain.
+
+    This is shadow-mode logging. It does NOT replace the existing
+    `_select_pre_earnings_calendar_contracts` path — that function
+    remains the canonical selector for the historical simulation. The
+    output here is for forward-validation evidence only: which picker
+    rule would have chosen which contracts on each event.
+
+    The candidate variant uses ``CANDIDATE_FRONT_MIN_DTE_DAYS = 14``
+    (PR-AB finding, in-sample, NOT out-of-sample validated). Treat the
+    `candidate_selection` field as experimental. The promotion criteria
+    that would let the candidate become canonical are forthcoming in
+    PR-AC commit 5; until then, see the PR-AC pull request description.
+
+    NOTE: this helper is parameterized by ``side`` but the calling
+    simulation currently only queries the calls chain (a known call/put
+    correctness gap flagged in the PR-AC review). Wiring put-side
+    dual-pick requires also pulling the put chain from the feature
+    store; that is deferred to a later commit on this same PR.
+
+    Returns a JSON-safe dict with stable shape — both selection slots are
+    always present (None when the picker returned nothing), plus the
+    `pickers_diverged` boolean and a labeled experimental note.
+    """
+    from services.calendar_leg_picker import (
+        CANDIDATE_FRONT_MIN_DTE_DAYS,
+        PICKER_CANDIDATE,
+        PICKER_LEGACY,
+        select_calendar_contracts,
+    )
+
+    ev = pd.Timestamp(event_date).date() if event_date is not None else None
+    try:
+        legacy = select_calendar_contracts(
+            chain_df,
+            event_date=ev,
+            side=side,
+            picker_variant=PICKER_LEGACY,
+        )
+        candidate = select_calendar_contracts(
+            chain_df,
+            event_date=ev,
+            side=side,
+            picker_variant=PICKER_CANDIDATE,
+        )
+    except Exception as exc:  # defensive: shadow logging must never break sim
+        logger.debug("dual-picker shadow logging failed: %s", exc)
+        return {
+            "legacy_selection": None,
+            "candidate_selection": None,
+            "pickers_diverged": False,
+            "shadow_status": f"error:{type(exc).__name__}",
+            "experimental_note": (
+                "candidate_selection uses an in-sample +14d-min-front-DTE "
+                "rule (PR-AB). Not out-of-sample validated. Do not execute "
+                "against candidate_selection without independent review."
+            ),
+        }
+
+    diverged = False
+    if legacy is not None and candidate is not None:
+        diverged = (
+            legacy.front_expiry != candidate.front_expiry
+            or legacy.back_expiry != candidate.back_expiry
+            or float(legacy.strike) != float(candidate.strike)
+        )
+
+    return {
+        "legacy_selection": legacy.to_metadata_dict() if legacy is not None else None,
+        "candidate_selection": candidate.to_metadata_dict() if candidate is not None else None,
+        "pickers_diverged": bool(diverged),
+        "shadow_status": "ok",
+        "candidate_min_front_dte_days": int(CANDIDATE_FRONT_MIN_DTE_DAYS),
+        "experimental_note": (
+            "candidate_selection uses an in-sample +14d-min-front-DTE rule "
+            "(PR-AB). Not out-of-sample validated. Do not execute against "
+            "candidate_selection without independent review."
+        ),
+    }
+
+
 def _lookup_exact_contract_row(
     chain_df: pd.DataFrame,
     *,
@@ -513,7 +601,27 @@ def _simulate_pre_earnings_calendar_trade(
     try:
         entry_chain = store.query_chain(symbol, trade_date=base["entry_date"], call_put="C", limit=5000)
     except Exception as exc:
-        return {**base, "status": "missing_entry_chain", "reason": str(exc)}
+        # No entry chain → no dual-picker possible. Stable shape.
+        return {
+            **base,
+            "status": "missing_entry_chain",
+            "reason": str(exc),
+            "dual_picker": {
+                "legacy_selection": None,
+                "candidate_selection": None,
+                "pickers_diverged": False,
+                "shadow_status": "skipped:missing_entry_chain",
+            },
+        }
+
+    # Shadow-mode dual-picker logging. Computed ONCE from the entry chain,
+    # attached to every subsequent return so per-event records have a
+    # uniform shape. The existing simulation below continues to use the
+    # legacy `_select_pre_earnings_calendar_contracts` selector — this is
+    # comparison data, NOT a behavior change.
+    base["dual_picker"] = _dual_picker_calendar_selection(
+        entry_chain, event_date=event_date, side="call",
+    )
 
     selection = _select_pre_earnings_calendar_contracts(entry_chain, event_date=pd.Timestamp(event_date))
     if selection is None:
@@ -660,6 +768,9 @@ def _summarize_pre_earnings_expansion(
         return summary
 
     offset_summaries: List[Dict[str, Any]] = []
+    # Flat collection across all offsets — used by the experimental
+    # candidate evidence aggregator after the main offset loop.
+    all_trades: List[Dict[str, Any]] = []
     for offset in entry_offsets:
         trades: List[Dict[str, Any]] = []
         for event_ts in parsed_events:
@@ -667,16 +778,16 @@ def _summarize_pre_earnings_expansion(
             exit_date = _business_days_before(sessions, event_ts, exit_offset)
             if entry_date is None or exit_date is None or entry_date >= exit_date:
                 continue
-            trades.append(
-                _simulate_pre_earnings_calendar_trade(
-                    symbol,
-                    feature_store,
-                    event_date=event_ts,
-                    entry_date=entry_date,
-                    exit_date=exit_date,
-                    entry_offset=offset,
-                )
+            simulated = _simulate_pre_earnings_calendar_trade(
+                symbol,
+                feature_store,
+                event_date=event_ts,
+                entry_date=entry_date,
+                exit_date=exit_date,
+                entry_offset=offset,
             )
+            trades.append(simulated)
+            all_trades.append(simulated)
 
         if not trades:
             continue
@@ -730,6 +841,9 @@ def _summarize_pre_earnings_expansion(
 
     if not offset_summaries:
         summary["status"] = "no_simulations"
+        # Even with no canonical simulations, attach an empty experimental
+        # evidence block for stable response shape.
+        summary["experimental_candidate_evidence"] = _aggregate_experimental_candidate_evidence([])
         return summary
 
     best = max(
@@ -744,7 +858,104 @@ def _summarize_pre_earnings_expansion(
     summary["selected_entry_offset_days"] = best["entry_offset_days"]
     summary["available"] = bool(best["priceable_trades"] > 0)
     summary["status"] = "ok" if summary["available"] else "insufficient_priceable_trades"
+
+    # Shadow-mode evidence aggregation. Collected from every simulated
+    # trade across every offset, attached as a SEPARATE top-level field
+    # so it cannot be confused with the canonical legacy expectation
+    # numbers. This is forward-validation evidence — diverged-event
+    # counts, not promotion-ready performance claims.
+    summary["experimental_candidate_evidence"] = _aggregate_experimental_candidate_evidence(
+        all_trades
+    )
+
     return summary
+
+
+def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate the dual-picker shadow logs across a set of simulated
+    trades into a single ``experimental_candidate_evidence`` block.
+
+    Each input trade dict is expected to carry a ``dual_picker`` field
+    populated by ``_dual_picker_calendar_selection`` (a stable-shape
+    dict). Counts are emitted regardless of trade status — i.e. trades
+    that failed for reasons unrelated to the picker (missing_exit_quote,
+    negative_debit, etc.) still contribute their dual_picker evidence.
+
+    The summary is intentionally count-only. Promotion-ready performance
+    comparison (mean PnL under each picker) requires *also* simulating
+    the candidate path through entry+exit pricing — that is a separate
+    commit, NOT part of commit 2's shadow-logging scope."""
+    n_total = 0
+    n_legacy = 0
+    n_candidate = 0
+    n_both = 0
+    n_both_failed = 0
+    n_legacy_only = 0
+    n_candidate_only = 0
+    n_diverged = 0
+    diverged_sample: List[Dict[str, Any]] = []
+    for trade in trades:
+        dp = trade.get("dual_picker") or {}
+        # Only count trades where shadow logging actually ran.
+        if dp.get("shadow_status") not in ("ok", "skipped:missing_entry_chain"):
+            continue
+        n_total += 1
+        legacy_sel = dp.get("legacy_selection")
+        candidate_sel = dp.get("candidate_selection")
+        legacy_present = legacy_sel is not None
+        candidate_present = candidate_sel is not None
+        if legacy_present:
+            n_legacy += 1
+        if candidate_present:
+            n_candidate += 1
+        if legacy_present and candidate_present:
+            n_both += 1
+        elif legacy_present:
+            n_legacy_only += 1
+        elif candidate_present:
+            n_candidate_only += 1
+        else:
+            n_both_failed += 1
+        if dp.get("pickers_diverged"):
+            n_diverged += 1
+            if len(diverged_sample) < 5:
+                diverged_sample.append(
+                    {
+                        "event_date": trade.get("event_date"),
+                        "entry_date": trade.get("entry_date"),
+                        "legacy_front_expiry": (legacy_sel or {}).get("front_expiry"),
+                        "candidate_front_expiry": (candidate_sel or {}).get("front_expiry"),
+                        "legacy_back_expiry": (legacy_sel or {}).get("back_expiry"),
+                        "candidate_back_expiry": (candidate_sel or {}).get("back_expiry"),
+                        "legacy_strike": (legacy_sel or {}).get("strike"),
+                        "candidate_strike": (candidate_sel or {}).get("strike"),
+                        "legacy_front_dte": (legacy_sel or {}).get("front_dte_days"),
+                        "candidate_front_dte": (candidate_sel or {}).get("front_dte_days"),
+                    }
+                )
+    return {
+        "note": (
+            "Shadow comparison of two calendar leg-picker rules. The "
+            "candidate rule (candidate_min_dte, +14d min front DTE) is "
+            "in-sample on PR-AB's 10-symbol/139-event dataset and NOT "
+            "out-of-sample validated. Do not interpret divergence counts "
+            "as performance claims; promotion criteria are defined in the "
+            "PR-AC pull request description."
+        ),
+        "picker_legacy": "legacy_first_expiry",
+        "picker_candidate": "candidate_min_dte",
+        "trade_counts": {
+            "total": int(n_total),
+            "legacy_succeeded": int(n_legacy),
+            "candidate_succeeded": int(n_candidate),
+            "both_succeeded": int(n_both),
+            "legacy_only": int(n_legacy_only),
+            "candidate_only": int(n_candidate_only),
+            "both_failed": int(n_both_failed),
+            "pickers_diverged": int(n_diverged),
+        },
+        "diverged_sample": diverged_sample,
+    }
 
 
 def _classify_move_risk(
