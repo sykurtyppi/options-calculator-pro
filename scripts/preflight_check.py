@@ -60,7 +60,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
@@ -554,10 +554,27 @@ def check_backend_health(
                 message=f"Backend at {url} returned HTTP {resp.status}.",
                 details={"url": url, "status_code": resp.status},
             )
+    except HTTPError as exc:
+        # Codex P1 (PR #63 follow-up): HTTPError is a subclass of
+        # URLError. Without this explicit branch, a backend that's
+        # UP but returning 4xx/5xx (auth misconfig → 401, app crash
+        # → 500) would have been swallowed by the URLError block
+        # below as "no backend reachable / SKIP" — green-lighting a
+        # broken deployment. A reachable backend that refuses must
+        # FAIL, not SKIP.
+        return CheckResult(
+            name="backend_health",
+            status=Status.FAIL,
+            message=(
+                f"Backend at {url} is up but returned HTTP {exc.code} "
+                f"({exc.reason})."
+            ),
+            details={"url": url, "status_code": exc.code, "reason": str(exc.reason)},
+        )
     except URLError as exc:
-        # Connection refused / DNS fail → SKIP. Preflight isn't
-        # responsible for *starting* the backend; it's checking that
-        # IF you have one running, it's healthy.
+        # Connection refused / DNS fail / TLS handshake error → SKIP.
+        # Preflight isn't responsible for *starting* the backend;
+        # it's checking that IF you have one running, it's healthy.
         return CheckResult(
             name="backend_health",
             status=Status.SKIP,

@@ -359,6 +359,52 @@ def test_backend_health_fail_on_wrong_body_shape() -> None:
     assert r.status == Status.FAIL
 
 
+def test_backend_health_fail_on_http_500() -> None:
+    """Codex P1 (PR #63 follow-up): HTTPError is a subclass of URLError.
+    The original code's `except URLError` block would have caught
+    HTTPError and reported it as "no backend reachable / SKIP" — but
+    a 500 means the backend IS up and broken. Must FAIL, not SKIP.
+    """
+    from urllib.error import HTTPError
+
+    err = HTTPError(
+        url="http://127.0.0.1:8000/api/health",
+        code=500,
+        msg="Internal Server Error",
+        hdrs=None,  # type: ignore[arg-type]
+        fp=None,
+    )
+    with patch("scripts.preflight_check.urlopen", side_effect=err):
+        r = pf.check_backend_health()
+    assert r.status == Status.FAIL, (
+        f"500 must FAIL (regression for the original HTTPError-as-SKIP bug); "
+        f"got {r.status}: {r.message}"
+    )
+    assert r.details.get("status_code") == 500
+    assert "up but returned" in r.message
+
+
+def test_backend_health_fail_on_http_401() -> None:
+    """The other realistic 4xx/5xx case: auth misconfigured →
+    backend returns 401 on /api/health. (In practice /api/health is
+    in _PUBLIC_PATHS and should be 200, but if someone breaks the
+    public-paths allowlist or fronts the app with a stricter proxy,
+    401 is what surfaces.) Must FAIL so the operator sees it."""
+    from urllib.error import HTTPError
+
+    err = HTTPError(
+        url="http://127.0.0.1:8000/api/health",
+        code=401,
+        msg="Unauthorized",
+        hdrs=None,  # type: ignore[arg-type]
+        fp=None,
+    )
+    with patch("scripts.preflight_check.urlopen", side_effect=err):
+        r = pf.check_backend_health()
+    assert r.status == Status.FAIL
+    assert r.details.get("status_code") == 401
+
+
 # ── aggregation + exit code ───────────────────────────────────────────────
 
 
