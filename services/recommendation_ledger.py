@@ -38,6 +38,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Literal, Optional
 
+from services.candidate_shadow_provenance import normalize_sample_provenance
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2  # Bumped: introduces recommendation_revisions
@@ -609,19 +611,17 @@ def build_record_from_analysis(
     candidate_shadow_outcome = _as_dict(
         _get(analysis, "candidate_shadow_outcome", {}) or {}
     )
-    sample_provenance = _get(analysis, "sample_provenance", None)
-    # Fail-closed: only accept canonical sample_provenance values.
-    # Any other value (typo, drift, casual override) collapses to None
-    # so is_promotion_eligible can reject the row. The canonical set
-    # is imported lazily from web.api.edge_engine — this avoids
-    # duplicating the string literals here (which would also trip the
-    # TestForwardProvenanceAssignmentBoundary source-grep regression
-    # by appearing to "assign" forward_post_freeze outside edge_engine)
-    # and keeps the single source of truth in the edge_engine module.
-    if sample_provenance is not None:
-        from web.api.edge_engine import VALID_SAMPLE_PROVENANCES
-        if sample_provenance not in VALID_SAMPLE_PROVENANCES:
-            sample_provenance = None
+    raw_sample_provenance = _get(analysis, "sample_provenance", None)
+    # Codex round-4 review fix: normalize to "unknown" (observable in
+    # diagnostics) rather than silently dropping to None. Invalid /
+    # typo / non-canonical values become SAMPLE_PROVENANCE_UNKNOWN so
+    # they appear in provenance_counts under the unknown bucket
+    # instead of disappearing as missing keys. Routes through the
+    # neutral service module — no inverted dependency on web/api.
+    if raw_sample_provenance is None:
+        sample_provenance = None
+    else:
+        sample_provenance = normalize_sample_provenance(raw_sample_provenance)
 
     return RecommendationRecord(
         recommendation_id=recommendation_id,

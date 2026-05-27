@@ -1355,43 +1355,56 @@ class TestForwardProvenanceAssignmentBoundary:
                         if pattern_obj.search(line):
                             yield py_file.relative_to(repo_root), lineno, line.strip()
 
-    def test_forward_post_freeze_string_only_in_edge_engine(self):
-        """The string literal "forward_post_freeze" must only appear
-        in web/api/edge_engine.py."""
+    # Allowlist for both grep regressions below. After PR-AD commit 4,
+    # the canonical assignment site moved out of edge_engine.py into
+    # services/candidate_shadow_provenance.py — the underscore-prefixed
+    # _tag_live_forward_observation now lives in the neutral service
+    # module, and edge_engine.py re-imports it for use by the live API
+    # path. Both files are legitimate references; anywhere else is a
+    # research-leakage hazard.
+    _ALLOWED_PROVENANCE_FILES = (
+        "services/candidate_shadow_provenance.py",
+        "web/api/edge_engine.py",
+    )
+
+    def test_forward_post_freeze_string_only_in_allowed_modules(self):
+        """The string literal "forward_post_freeze" must only appear in
+        the allowed provenance-owning modules — services/
+        candidate_shadow_provenance.py (canonical definition) and
+        web/api/edge_engine.py (re-import + usage). Anywhere else is
+        the research-leakage hazard Codex round-1 flagged."""
         import re
         pattern = re.compile(r'"forward_post_freeze"|\'forward_post_freeze\'')
         suspects = [
             f"{rel}:{lineno}: {line}"
             for rel, lineno, line in self._grep_prod_sources(pattern)
-            if "web/api/edge_engine.py" not in str(rel)
+            if not any(allowed in str(rel) for allowed in self._ALLOWED_PROVENANCE_FILES)
         ]
         assert suspects == [], (
             "forward_post_freeze string assignment leaked outside the "
-            "edge_engine.py file. Only _tag_live_forward_observation is "
-            "authorized to assign this value. Found:\n  "
-            + "\n  ".join(suspects)
+            "allowed modules. Only _tag_live_forward_observation in "
+            "services/candidate_shadow_provenance.py may assign this "
+            "value. Found:\n  " + "\n  ".join(suspects)
         )
 
-    def test_tag_helper_only_referenced_in_edge_engine(self):
-        """REGRESSION (Codex round 3): the function NAME must also only
-        appear in edge_engine.py. A script could call
+    def test_tag_helper_only_referenced_in_allowed_modules(self):
+        """REGRESSION (Codex rounds 3+4): the function NAME must also
+        only appear in the allowed modules. A script could call
         `_tag_live_forward_observation(record)` without ever writing
-        the forbidden string literal — this grep catches that."""
+        the forbidden string literal — this grep catches that. The
+        underscore-prefix convention signals module-private."""
         import re
-        # Match both the underscore-prefixed canonical name and any
-        # accidental import without the underscore.
         pattern = re.compile(r'\b_?tag_live_forward_observation\b')
         suspects = [
             f"{rel}:{lineno}: {line}"
             for rel, lineno, line in self._grep_prod_sources(pattern)
-            if "web/api/edge_engine.py" not in str(rel)
+            if not any(allowed in str(rel) for allowed in self._ALLOWED_PROVENANCE_FILES)
         ]
         assert suspects == [], (
             "_tag_live_forward_observation referenced outside the "
-            "edge_engine.py file. The function is module-private; "
-            "calling it from another module bypasses the assignment "
-            "boundary. Found:\n  "
-            + "\n  ".join(suspects)
+            "allowed modules. The function is module-private; calling "
+            "it from another module bypasses the assignment boundary. "
+            "Found:\n  " + "\n  ".join(suspects)
         )
 
 

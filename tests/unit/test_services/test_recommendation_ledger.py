@@ -749,10 +749,15 @@ def test_candidate_shadow_outcome_empty_when_absent_from_analysis(tmp_path: Path
     assert row["sample_provenance"] is None
 
 
-def test_sample_provenance_invalid_value_collapses_to_none(tmp_path: Path) -> None:
-    """Fail-closed: a sample_provenance value not in the canonical set
-    (e.g. a typo like 'forward_post_pr_ad') gets persisted as None so
-    is_promotion_eligible can reject the row."""
+def test_sample_provenance_invalid_value_normalizes_to_unknown(tmp_path: Path) -> None:
+    """REGRESSION (Codex round-4 P2): invalid / typo / non-canonical
+    sample_provenance values get normalized to "unknown" — NOT None.
+    "unknown" is observable in downstream aggregator
+    provenance_counts (it surfaces under the unknown bucket), so
+    operators can see how many rows were rejected for invalid tags.
+    None would silently disappear as a missing key, hurting
+    observability. is_promotion_eligible still rejects "unknown"
+    because it isn't in PROMOTION_ELIGIBLE_PROVENANCES."""
     ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
     analysis = _analysis()
     analysis.sample_provenance = "forward_post_pr_ad"  # non-canonical typo
@@ -763,7 +768,59 @@ def test_sample_provenance_invalid_value_collapses_to_none(tmp_path: Path) -> No
         salt="invalid-provenance",
     )
     record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
-    assert ledger.get(rec_id)["sample_provenance"] is None
+    persisted = ledger.get(rec_id)["sample_provenance"]
+    assert persisted == "unknown", (
+        f"Invalid provenance should normalize to observable 'unknown', "
+        f"got {persisted!r}"
+    )
+
+    # When the analysis has NO sample_provenance at all, the column
+    # stays None (different signal — "caller didn't tag" rather than
+    # "caller tagged with an invalid value").
+    analysis2 = _analysis()
+    rec_id2 = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="missing-provenance",
+    )
+    record_recommendation(analysis2, ledger=ledger, recommendation_id=rec_id2)
+    assert ledger.get(rec_id2)["sample_provenance"] is None
+
+
+def test_top_level_provenance_is_canonical_nested_does_not_override(tmp_path: Path) -> None:
+    """REGRESSION (Codex round-4 P1#2): if a future shape change ever
+    puts a `sample_provenance` field INSIDE the candidate_shadow_outcome
+    dict, the ledger must treat the TOP-LEVEL record.sample_provenance
+    as canonical. The nested duplicate is preserved verbatim in the
+    candidate_shadow_outcome_json blob (for audit) but does NOT
+    override the persisted top-level column.
+
+    This policy means: if the two ever disagree, the analyst can see
+    BOTH in the row (top-level column + nested JSON field), but
+    is_promotion_eligible reads only the top-level column."""
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    outcome = _sample_candidate_shadow_outcome()
+    # Inject a divergent sample_provenance nested INSIDE the outcome.
+    # This isn't a shape we ship today — but if a future refactor
+    # adds it, the policy must be unambiguous.
+    outcome["sample_provenance"] = "forward_post_pr_ad"  # bad / divergent
+    analysis.candidate_shadow_outcome = outcome
+    analysis.sample_provenance = "historical_replay_in_sample_or_research"  # canonical
+
+    rec_id = make_recommendation_id(
+        symbol="AAPL", as_of_date="2026-04-23",
+        earnings_date="2026-05-01", selected_structure="call_calendar",
+        salt="provenance-mismatch",
+    )
+    record_recommendation(analysis, ledger=ledger, recommendation_id=rec_id)
+    row = ledger.get(rec_id)
+
+    # Top-level column wins for filtering / promotion eligibility
+    assert row["sample_provenance"] == "historical_replay_in_sample_or_research"
+    # Nested duplicate is preserved verbatim in the JSON blob for audit
+    # (the storage layer doesn't mutate the outcome shape)
+    assert row["candidate_shadow_outcome_json"]["sample_provenance"] == "forward_post_pr_ad"
 
 
 def test_candidate_shadow_outcome_column_added_by_migration(tmp_path: Path) -> None:
