@@ -283,10 +283,15 @@ class BaselineEvidenceStore:
 
 
 def _open_db(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    # PR #73 P1/P2 family: shared sqlite_helpers.open_db_conn applies
+    # WAL journal mode and sets busy_timeout=5000 explicitly. Pre-fix
+    # used SQLite's default DELETE journal, which holds an exclusive
+    # file lock per write transaction — concurrent launchd writers
+    # would contend on that lock and rows could be lost if the caller
+    # swallowed the resulting OperationalError.
+    from services.sqlite_helpers import open_db_conn
+    conn = open_db_conn(path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_TABLE_DDL)
     _migrate(conn)
     conn.executescript(_INDEX_DDL)

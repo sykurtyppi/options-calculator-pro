@@ -178,10 +178,13 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
 
 
 def _open_db(store_path: Path) -> sqlite3.Connection:
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(store_path), check_same_thread=False)
+    # PR #73 P1/P2 family: route through sqlite_helpers.open_db_conn
+    # to pick up busy_timeout=5000 alongside WAL. foreign_keys=ON
+    # stays applied locally since the helper deliberately doesn't
+    # opinionate on per-DB pragmas beyond the contention-safety set.
+    from services.sqlite_helpers import open_db_conn
+    conn = open_db_conn(store_path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_TABLE_DDL)
     _migrate_schema(conn)

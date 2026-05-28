@@ -22,7 +22,6 @@ import argparse
 import sys
 import os
 import json
-import sqlite3
 import threading
 import pandas as pd
 import numpy as np
@@ -42,6 +41,7 @@ except Exception:
     pass
 
 from services.institutional_ml_db import InstitutionalMLDatabase, INSTITUTIONAL_UNIVERSE
+from services.sqlite_helpers import open_db_conn
 from utils.logger import setup_logger
 from services.market_data_client import MarketDataClient
 
@@ -196,13 +196,11 @@ class InstitutionalDataCollector:
     async def _engineer_ml_features(self, symbols: List[str]) -> bool:
         """Engineering additional ML features"""
         try:
-            import sqlite3
-
             rebuilt_symbols = 0
             skipped_symbols = 0
             missing_price_history: List[str] = []
 
-            with sqlite3.connect(self.db.db_path) as conn:
+            with open_db_conn(self.db.db_path) as conn:
                 for symbol in symbols:
                     cursor = conn.cursor()
                     cursor.execute(
@@ -286,9 +284,7 @@ class InstitutionalDataCollector:
         validation_results = {}
 
         try:
-            import sqlite3
-
-            with sqlite3.connect(self.db.db_path) as conn:
+            with open_db_conn(self.db.db_path) as conn:
                 for symbol in symbols:
                     # Check data completeness
                     cursor = conn.cursor()
@@ -758,7 +754,7 @@ class InstitutionalDataCollector:
         query += " ORDER BY t.trade_date, t.symbol"
 
         try:
-            with sqlite3.connect(self.db.db_path) as conn:
+            with open_db_conn(self.db.db_path) as conn:
                 df = pd.read_sql_query(query, conn, params=params)
         except Exception as exc:
             self.logger.warning("⚠️ Forward tracker query failed: %s", exc)
@@ -1802,7 +1798,7 @@ class InstitutionalDataCollector:
 
         if use_all_sessions:
             try:
-                with sqlite3.connect(self.db.db_path) as conn:
+                with open_db_conn(self.db.db_path) as conn:
                     trades_df = pd.read_sql_query(
                         "SELECT * FROM backtest_trades",
                         conn,

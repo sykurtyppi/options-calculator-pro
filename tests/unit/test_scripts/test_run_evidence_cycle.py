@@ -137,25 +137,40 @@ def test_append_structured_run_log_emits_stderr_on_oserror(
 ) -> None:
     """Hardening P0-2: a disk-full / perms failure on the structured
     run log must surface via stderr (which launchd captures) so the
-    operator can see the cycle's audit trail is broken."""
-    target = tmp_path / "logs" / "evidence_cycle_runs.jsonl"
-    target.parent.mkdir(parents=True, exist_ok=True)
+    operator can see the cycle's audit trail is broken.
 
-    class FailingPath:
-        """Stand-in that explodes when opened for append."""
-
-        @property
-        def parent(self):  # noqa: ANN001
-            return target.parent
-
-        def open(self, *args, **kwargs):  # noqa: ANN001
-            raise PermissionError("simulated chmod regression")
+    Updated for PR #73: the helper now routes through
+    ``services.jsonl_helpers.append_jsonl_locked``, which coerces
+    its path argument through ``Path(...)``. The old test used a
+    custom ``FailingPath`` mock that doesn't survive that
+    coercion; this version uses a real path whose parent is a
+    pre-existing FILE (not a directory), so ``Path.parent.mkdir(...)``
+    raises ``NotADirectoryError`` (an ``OSError`` subclass)
+    inside the helper. That triggers the same code path the test
+    is meant to verify: the WARNING goes to stderr instead of
+    silently swallowing the failure.
+    """
+    # Pre-create a regular FILE where the parent directory would
+    # need to live. The helper's
+    # ``path.parent.mkdir(parents=True, exist_ok=True)`` then fails
+    # because the path collides with a non-directory entry.
+    obstructing_file = tmp_path / "logs"
+    obstructing_file.write_text("not a directory", encoding="utf-8")
+    target = obstructing_file / "evidence_cycle_runs.jsonl"
 
     evidence_cycle._append_structured_run_log(
-        FailingPath(),  # type: ignore[arg-type]
+        target,
         {"event_type": "evidence_cycle_run", "status": "success", "dry_run": False},
     )
     captured = capsys.readouterr()
-    assert "WARNING" in captured.err
-    assert "PermissionError" in captured.err
+    assert "WARNING" in captured.err, (
+        f"expected WARNING on stderr; got: {captured.err!r}"
+    )
+    # Either NotADirectoryError or FileExistsError is acceptable —
+    # both are OSError subclasses and both signal the same class of
+    # disk/perms regression the operator needs to see.
+    assert (
+        "NotADirectoryError" in captured.err
+        or "FileExistsError" in captured.err
+    ), f"expected an OSError subclass name on stderr; got: {captured.err!r}"
     assert "run_evidence_cycle" in captured.err

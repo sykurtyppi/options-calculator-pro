@@ -305,10 +305,45 @@ class InstitutionalMLDatabase:
         self._init_institutional_schema()
         self._populate_ticker_universe()
 
+    def _open_conn(self) -> sqlite3.Connection:
+        """Open a SQLite connection with project-standard pragmas.
+
+        PR #73 P2 fix: pre-fix, the ~24 bare connection sites in
+        this module called ``sqlite3.connect(path)`` directly with
+        no WAL journal mode configured. The institutional_ml DB is
+        shared by:
+
+          * Live recommendation pipeline (reads/writes during
+            analyze_single_ticker)
+          * Forward-loop replay (writes during the daily learning
+            cycle)
+          * Backtest scripts (writes during manual backfill runs)
+
+        SQLite's default DELETE journal holds an exclusive file lock
+        for each write transaction, blocking concurrent readers and
+        serializing writers. When two of these processes overlapped,
+        the second writer had to wait for the first to finish — and
+        many call sites caught + swallowed the resulting
+        OperationalError without retrying, so rows went silently
+        missing. WAL removes the exclusive hold: readers are never
+        blocked, and writers contend only during the short commit
+        phase.
+
+        Routing every connection through this helper applies WAL and
+        sets busy_timeout=5000 explicitly (Python's sqlite3.connect()
+        already defaults to 5 s via timeout=5.0, but being explicit
+        keeps the policy visible). The shared
+        ``services.sqlite_helpers.open_db_conn`` centralizes the
+        pragma definitions so a future tweak lands across all
+        consumers at once.
+        """
+        from services.sqlite_helpers import open_db_conn
+        return open_db_conn(self.db_path)
+
     def _init_institutional_schema(self):
         """Create institutional-grade database schema"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 cursor = conn.cursor()
 
                 # Enable foreign keys
@@ -665,7 +700,7 @@ class InstitutionalMLDatabase:
     def _populate_ticker_universe(self):
         """Populate initial ticker universe with institutional stocks"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 cursor = conn.cursor()
 
                 # Check if already populated
@@ -800,7 +835,7 @@ class InstitutionalMLDatabase:
             if "RSI_14" not in hist_data.columns or "RealizedVol_30" not in hist_data.columns:
                 hist_data = self._add_technical_indicators(hist_data)
 
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 cursor = conn.cursor()
 
                 for date, row in hist_data.iterrows():
@@ -889,7 +924,7 @@ class InstitutionalMLDatabase:
             vix_proxy = (12.0 + 70.0 * rv30).clip(lower=10.0, upper=45.0)
             forward_vol_21d = (data['Returns'].rolling(window=21).std() * np.sqrt(252)).shift(-21)
 
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 cursor = conn.cursor()
 
                 for i, (date, row) in enumerate(data.iterrows()):
@@ -1300,7 +1335,7 @@ class InstitutionalMLDatabase:
             end_date.strftime('%Y-%m-%d'),
         ]
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._open_conn() as conn:
             df = pd.read_sql_query(query, conn, params=params)
 
         if df.empty:
@@ -1469,7 +1504,7 @@ class InstitutionalMLDatabase:
                                  window_end: datetime) -> List[Tuple[datetime, str, str]]:
         """Read cached earnings dates for the given symbol and time window."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 query = """
                     SELECT event_date, source, release_timing
                     FROM earnings_events
@@ -1507,7 +1542,7 @@ class InstitutionalMLDatabase:
         if not event_dates:
             return
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO earnings_events (symbol, event_date, source, release_timing)
@@ -1753,7 +1788,7 @@ class InstitutionalMLDatabase:
         events_outside_window = 0
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 cursor = conn.cursor()
 
                 for symbol in symbols:
@@ -1971,7 +2006,7 @@ class InstitutionalMLDatabase:
         no_underlying = 0
         no_iv_values = 0
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._open_conn() as conn:
             cursor = conn.cursor()
 
             for symbol in symbols:
@@ -2604,7 +2639,7 @@ class InstitutionalMLDatabase:
             ORDER BY capture_date
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 df = pd.read_sql_query(query, conn, params=[str(symbol).upper(), event_date_str])
         except Exception as exc:
             self.logger.debug("Failed to load replay snapshot pair for %s @ %s: %s", symbol, event_date_str, exc)
@@ -2856,7 +2891,7 @@ class InstitutionalMLDatabase:
             ORDER BY symbol, event_date, capture_date
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 snapshots = pd.read_sql_query(query, conn)
         except Exception as e:
             self.logger.error(f"❌ Failed to read snapshots for calibration: {e}")
@@ -2968,7 +3003,7 @@ class InstitutionalMLDatabase:
 
         labels_df = pd.DataFrame(label_rows)
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO earnings_iv_decay_labels
@@ -3023,7 +3058,7 @@ class InstitutionalMLDatabase:
             ORDER BY symbol, event_date, capture_date
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 snapshots = pd.read_sql_query(query, conn)
         except Exception as e:
             self.logger.error(f"❌ Failed to summarize snapshot pairing progress: {e}")
@@ -3423,7 +3458,7 @@ class InstitutionalMLDatabase:
     def _store_backtest_session(self, session: BacktestSession):
         """Store backtest session metadata"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 cursor = conn.cursor()
 
                 cursor.execute("""
@@ -3457,7 +3492,7 @@ class InstitutionalMLDatabase:
             return
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM backtest_trades WHERE session_id = ?", (session_id,))
                 cursor.executemany("""
@@ -3515,7 +3550,7 @@ class InstitutionalMLDatabase:
             accidental leakage in downstream modeling code.
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 feature_columns = [
                     "symbol",
                     "date",
@@ -3578,7 +3613,7 @@ class InstitutionalMLDatabase:
     def get_backtest_results(self, session_id: str = None) -> pd.DataFrame:
         """Get backtest results summary"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 if session_id:
                     query = "SELECT * FROM backtest_sessions WHERE session_id = ?"
                     df = pd.read_sql_query(query, conn, params=[session_id])
@@ -3595,7 +3630,7 @@ class InstitutionalMLDatabase:
     def get_backtest_trades(self, session_id: str, limit: Optional[int] = None) -> pd.DataFrame:
         """Get trade-level records for a backtest session."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 query = """
                     SELECT *
                     FROM backtest_trades
@@ -3671,7 +3706,7 @@ class InstitutionalMLDatabase:
             ))
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 rows = conn.execute(query, symbol_params).fetchall()
                 global_query = """
                     SELECT COUNT(*) as sample_size,
@@ -3765,7 +3800,7 @@ class InstitutionalMLDatabase:
             WHERE t.session_id = ?
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 row = conn.execute(query, [session_id]).fetchone()
             if not row:
                 return {
@@ -3838,7 +3873,7 @@ class InstitutionalMLDatabase:
         query += " ORDER BY t.trade_date, t.symbol"
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 df = pd.read_sql_query(query, conn, params=params)
         except Exception as e:
             self.logger.error(f"❌ Failed to build crush scorecard: {e}")
@@ -3993,7 +4028,7 @@ class InstitutionalMLDatabase:
         query += " ORDER BY t.trade_date, t.symbol"
 
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 df = pd.read_sql_query(query, conn, params=params)
         except Exception as e:
             self.logger.error(f"❌ Failed to load trade diagnostics frame: {e}")
@@ -4536,7 +4571,7 @@ class InstitutionalMLDatabase:
             WHERE symbol IN ({placeholders})
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 row = conn.execute(query, universe).fetchone()
             if not row or not row[0] or not row[1]:
                 return None
@@ -5106,7 +5141,7 @@ class InstitutionalMLDatabase:
             WHERE realized_vol_30d IS NOT NULL AND realized_vol_30d > 0
         """
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._open_conn() as conn:
                 df_labels = pd.read_sql_query(labels_query, conn)
                 df_prices = pd.read_sql_query(prices_query, conn)
         except Exception as exc:

@@ -97,10 +97,16 @@ def _parse_date(value: Any) -> Optional[date]:
 def _append_learning_log(log_path: Path, payload: Dict[str, Any], *, dry_run: bool) -> None:
     if dry_run:
         return
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     record = {"timestamp": datetime.now(timezone.utc).isoformat(), **payload}
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+    # PR #73 P3: route through the shared fcntl.LOCK_EX-protected
+    # appender. Pre-fix this opened the file in append mode without a
+    # writer lock, so two daily forward-loop invocations (or an
+    # operator running this script manually while launchd fires)
+    # could interleave a partial line. The resolver had this fix
+    # under Hardening P1-3; PR #73 lifted the pattern into
+    # services.jsonl_helpers for shared use.
+    from services.jsonl_helpers import append_jsonl_locked
+    append_jsonl_locked(log_path, [record])
 
 
 def _record_skip(summary: Dict[str, Any], reason: str) -> None:
