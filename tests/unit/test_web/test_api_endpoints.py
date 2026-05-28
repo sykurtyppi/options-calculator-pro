@@ -360,6 +360,11 @@ class TestApiEndpoints(unittest.TestCase):
             "the browser can read the response body and the frontend can redirect "
             "to /login. If this is empty, CORSMiddleware is not outermost.",
         )
+        # PR #69's frontend uses credentialed fetches (credentials: "include").
+        # allow-credentials must be true on the 401 or the browser rejects the
+        # response entirely, even though allow-origin is correct.
+        acac = response.headers.get("access-control-allow-credentials", "")
+        self.assertEqual(acac, "true", "401 must carry allow-credentials: true for credentialed fetches")
 
     def test_hosted_auth_config_fails_fast_without_auth(self):
         with patch.object(app_module, "_HOSTED_MODE", True):
