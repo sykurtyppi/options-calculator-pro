@@ -31,22 +31,24 @@ export default function ProviderTelemetryPanel({ apiBase }) {
     offset,
   }), [apiBase, provider, endpointType, symbol, success, failuresOnly, limit, offset])
 
-  async function loadTelemetry() {
+  async function loadTelemetry(signal) {
     setLoading(true)
     setError('')
     try {
-      const response = await apiFetch(endpoint)
+      const response = await apiFetch(endpoint, { signal })
       if (!response.ok) throw new Error(`Provider telemetry failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {
-      setError(err.message || String(err))
+      if (err.name !== 'AbortError') setError(err.message || String(err))
     } finally {
-      setLoading(false)
+      if (!signal?.aborted) setLoading(false)
     }
   }
 
   useEffect(() => {
-    loadTelemetry()
+    const controller = new AbortController()
+    loadTelemetry(controller.signal)
+    return () => controller.abort()
   }, [endpoint])
 
   const summary = useMemo(() => buildTelemetrySummary(payload || {}), [payload])
@@ -69,7 +71,7 @@ export default function ProviderTelemetryPanel({ apiBase }) {
           <p className="oos-help">Direct request-health logs for market data, earnings, quotes, fallback usage, stale cache usage, and latency. Telemetry is best-effort and read-only.</p>
         </div>
         <div className="oos-actions">
-          <button type="button" onClick={loadTelemetry} disabled={loading}>
+          <button type="button" onClick={() => loadTelemetry()} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>

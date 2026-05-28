@@ -125,6 +125,9 @@ export default function App() {
   const [oosElapsedSec, setOosElapsedSec] = useState(0)
   // Polling interval ref — cleared when job completes, errors, or user cancels.
   const oosIntervalRef = useRef(null)
+  // Set to false on unmount so runOos doesn't create an interval or set state
+  // after the component is gone (covers unmount mid-submit and mid-poll).
+  const mountedRef = useRef(true)
   // AbortController for the in-flight /api/edge/analyze fetch. A fresh
   // analysis request aborts whatever was previously in-flight so a slow
   // older response can't land last and clobber the newer result.
@@ -151,10 +154,14 @@ export default function App() {
     return () => clearInterval(t)
   }, [oosLoading])
 
-  // Clear the OOS poll interval on unmount so it doesn't fire after the
-  // component is gone (e.g. during HMR or test teardown).
+  // On unmount: mark as unmounted and clear any live poll interval.
+  // mountedRef guards runOos against creating a new interval or setting state
+  // if the component tears down while /api/oos/submit is still in flight.
   useEffect(() => {
-    return () => { if (oosIntervalRef.current) clearInterval(oosIntervalRef.current) }
+    return () => {
+      mountedRef.current = false
+      if (oosIntervalRef.current) clearInterval(oosIntervalRef.current)
+    }
   }, [])
 
   useEffect(() => {
@@ -356,12 +363,23 @@ export default function App() {
       const { job_id } = await submitRes.json()
       jobId = job_id
 
+      // Guard: if component unmounted while submit was in flight, don't
+      // create an interval or set any state — the interval would fire into
+      // a gone component and React would warn about state on unmounted nodes.
+      if (!mountedRef.current) return
+
       // Poll every 2 s until done, error, or user cancels.
       oosIntervalRef.current = setInterval(async () => {
+        if (!mountedRef.current) {
+          clearInterval(oosIntervalRef.current)
+          oosIntervalRef.current = null
+          return
+        }
         try {
           const statusRes = await apiFetch(`${API_BASE}/api/oos/status/${jobId}`)
           if (!statusRes.ok) return  // transient error — keep polling
           const statusData = await statusRes.json()
+          if (!mountedRef.current) return  // unmounted while status fetch was in flight
 
           if (statusData.status === 'complete') {
             clearInterval(oosIntervalRef.current)
@@ -384,8 +402,10 @@ export default function App() {
         clearInterval(oosIntervalRef.current)
         oosIntervalRef.current = null
       }
-      setOosLoading(false)
-      setOosError(String(err.message || err))
+      if (mountedRef.current) {
+        setOosLoading(false)
+        setOosError(String(err.message || err))
+      }
     }
   }
 

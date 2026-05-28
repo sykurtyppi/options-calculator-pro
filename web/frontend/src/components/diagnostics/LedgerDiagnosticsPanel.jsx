@@ -239,6 +239,10 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
     return () => controller.abort()
   }, [endpoint])
 
+  useEffect(() => {
+    return () => { if (detailAbortRef.current) detailAbortRef.current.abort() }
+  }, [])
+
   function updateSymbol(value) {
     setSymbol(value.toUpperCase())
     setOffset(0)
