@@ -3,11 +3,13 @@
 
 Two related classes of bug, two shared helpers:
 
-  1. Many SQLite call sites opened with no WAL and no busy_timeout.
-     Concurrent writers raced on the writer lock; the loser raised
-     SQLITE_BUSY and (because many call sites only logged + swallowed)
-     silently dropped its row. `open_db_conn` centralizes the
-     WAL + busy_timeout=5000 convention.
+  1. Many SQLite call sites opened with no WAL journal mode. SQLite's
+     default DELETE journal mode holds an exclusive file lock for each
+     write transaction, blocking concurrent readers and writers.
+     `open_db_conn` applies WAL mode (which removes reader blocks) and
+     sets busy_timeout=5000 explicitly (Python's sqlite3.connect() also
+     defaults to 5 s via timeout=5.0, but making it explicit keeps the
+     policy visible and stable across Python versions).
 
   2. Two JSONL appenders (run_evidence_cycle, run_forward_loop) wrote
      without fcntl.LOCK_EX. Two concurrent processes could interleave
@@ -103,17 +105,20 @@ def test_open_db_conn_with_wal_disabled(tmp_path: Path) -> None:
 
 
 def test_concurrent_writers_do_not_lose_rows(tmp_path: Path) -> None:
-    """The load-bearing PR #73 SQLite regression. Pre-fix, two
-    concurrent threads INSERTing rows would race on the writer
-    lock and one would hit SQLITE_BUSY immediately, losing its row.
-    With WAL + busy_timeout=5000, the second writer waits up to 5s
-    for the first to finish — plenty of time for a single-row
-    INSERT.
+    """The load-bearing PR #73 SQLite regression. Pre-fix, raw
+    ``sqlite3.connect()`` calls used SQLite's default DELETE journal
+    mode (not WAL). DELETE mode holds an exclusive file lock for the
+    full duration of each write transaction, blocking both readers
+    and concurrent writers. Under concurrent writers, the second
+    writer's transaction hits a locked file and must retry until the
+    busy_timeout expires. WAL removes that exclusive hold: readers
+    are never blocked, and writers contend only during the short
+    commit phase.
 
     Setup: open one connection per thread (each gets its own
     file-handle lock), fire N threads each doing M INSERTs, then
-    count rows. Pre-fix this test would fail with row_count < N*M
-    due to SQLITE_BUSY exceptions. Post-fix the count is exact.
+    count rows. This test verifies WAL is applied (PRAGMA confirms
+    it) and that all rows survive concurrent insertion.
     """
     db = tmp_path / "test.db"
     # Initialize schema with one connection, then close.
@@ -153,7 +158,7 @@ def test_concurrent_writers_do_not_lose_rows(tmp_path: Path) -> None:
     assert not errors, (
         f"Concurrent writers must not raise. Got {len(errors)} "
         f"errors, first: {errors[0]!r}. If SQLITE_BUSY appears, "
-        f"the busy_timeout pragma was reverted."
+        f"WAL mode may not be applied or the busy_timeout is too low."
     )
 
     rconn = open_db_conn(db)
@@ -165,8 +170,8 @@ def test_concurrent_writers_do_not_lose_rows(tmp_path: Path) -> None:
     assert n == expected, (
         f"Expected {expected} rows from {n_threads} writers × "
         f"{rows_per_thread} rows each; got {n}. Missing rows mean "
-        f"writers hit SQLITE_BUSY without retrying — i.e. the "
-        f"busy_timeout pragma isn't being applied."
+        f"the writer lock contention was not resolved — check that "
+        f"WAL mode is applied (PRAGMA journal_mode=WAL)."
     )
 
 

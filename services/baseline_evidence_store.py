@@ -283,10 +283,12 @@ class BaselineEvidenceStore:
 
 
 def _open_db(path: Path) -> sqlite3.Connection:
-    # PR #73 P1/P2 family: shared sqlite_helpers.open_db_conn adds
-    # busy_timeout=5000 on top of WAL. Pre-fix had WAL but no busy
-    # timeout — concurrent writers across launchd jobs would race
-    # and the loser silently dropped its row with SQLITE_BUSY.
+    # PR #73 P1/P2 family: shared sqlite_helpers.open_db_conn applies
+    # WAL journal mode and sets busy_timeout=5000 explicitly. Pre-fix
+    # used SQLite's default DELETE journal, which holds an exclusive
+    # file lock per write transaction — concurrent launchd writers
+    # would contend on that lock and rows could be lost if the caller
+    # swallowed the resulting OperationalError.
     from services.sqlite_helpers import open_db_conn
     conn = open_db_conn(path)
     conn.row_factory = sqlite3.Row

@@ -310,7 +310,7 @@ class InstitutionalMLDatabase:
 
         PR #73 P2 fix: pre-fix, the ~24 bare connection sites in
         this module called ``sqlite3.connect(path)`` directly with
-        no WAL and no busy_timeout. The institutional_ml DB is
+        no WAL journal mode configured. The institutional_ml DB is
         shared by:
 
           * Live recommendation pipeline (reads/writes during
@@ -319,17 +319,23 @@ class InstitutionalMLDatabase:
             cycle)
           * Backtest scripts (writes during manual backfill runs)
 
-        Without busy_timeout, when two of those processes overlapped
-        on a single-row INSERT, SQLite raised SQLITE_BUSY
-        immediately. Many call sites caught + logged the exception
-        but didn't retry, so rows went silently missing.
+        SQLite's default DELETE journal holds an exclusive file lock
+        for each write transaction, blocking concurrent readers and
+        serializing writers. When two of these processes overlapped,
+        the second writer had to wait for the first to finish — and
+        many call sites caught + swallowed the resulting
+        OperationalError without retrying, so rows went silently
+        missing. WAL removes the exclusive hold: readers are never
+        blocked, and writers contend only during the short commit
+        phase.
 
-        Routing every connection through this helper applies the
-        same WAL + busy_timeout=5000 convention the recommendation
-        ledger uses (Hardening P1-5). The shared
+        Routing every connection through this helper applies WAL and
+        sets busy_timeout=5000 explicitly (Python's sqlite3.connect()
+        already defaults to 5 s via timeout=5.0, but being explicit
+        keeps the policy visible). The shared
         ``services.sqlite_helpers.open_db_conn`` centralizes the
-        pragma definitions so a future tweak (e.g. raising the busy
-        timeout) lands across all consumers at once.
+        pragma definitions so a future tweak lands across all
+        consumers at once.
         """
         from services.sqlite_helpers import open_db_conn
         return open_db_conn(self.db_path)

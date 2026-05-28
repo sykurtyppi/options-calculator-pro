@@ -3,27 +3,31 @@
 Why this module exists
 ----------------------
 Across the codebase, many sites called ``sqlite3.connect(path)``
-with no PRAGMA configuration. That default produces TWO related
-silent-data-loss failure modes under concurrent writers:
+with no WAL journal mode configured. That default produces a
+silent-data-loss failure mode under concurrent writers:
 
-  1. **No WAL mode.** SQLite's default ``rollback`` journal
-     serializes all writers AND blocks readers during write
-     transactions. Two writers contending for the same DB file
-     can stack up arbitrarily — including across processes
-     (launchd jobs that share the institutional_ml or telemetry
-     DBs).
-
-  2. **No busy_timeout.** SQLite's default is ~0ms. When a writer
-     hits a lock held by another writer, the call IMMEDIATELY
-     raises ``sqlite3.OperationalError: database is locked`` —
-     and many call sites just propagate that exception, which
-     means the second writer's data is silently dropped on the
-     floor.
+  **No WAL mode.** SQLite's default ``delete`` (rollback) journal
+  mode serializes all writers AND blocks readers during write
+  transactions. Two writers contending for the same DB file can
+  stack up arbitrarily — including across processes (launchd jobs
+  that share the institutional_ml or telemetry DBs). WAL removes
+  the reader block and allows one concurrent writer to proceed
+  while readers are active, eliminating the reader-blocks and
+  dramatically reducing SQLITE_BUSY collisions between writers.
 
 For the launchd jobs sharing ``telemetry.sqlite`` and
 ``institutional_ml.db``, the overlap windows on the 12:30 /
 21:30 / 22:15 cycle make this concrete: rows go missing whenever
 two jobs land in the same write window.
+
+Note on busy_timeout: Python's ``sqlite3.connect()`` already
+applies a 5-second busy timeout by default via its ``timeout=5.0``
+keyword argument (which calls ``sqlite3_busy_timeout(db, 5000)``
+internally). This helper's explicit ``PRAGMA busy_timeout``
+makes that policy visible in code, insulates call sites from a
+future change to the Python-level default, and standardizes the
+timeout value consistently with the recommendation_ledger
+convention that was set up separately under Hardening P1-5.
 
 This helper provides ``open_db_conn`` which centralizes the
 WAL + busy_timeout configuration used by ``recommendation_ledger``
@@ -106,9 +110,9 @@ def open_db_conn(
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), check_same_thread=check_same_thread)
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
     if enable_wal:
         conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
     return conn
 
 

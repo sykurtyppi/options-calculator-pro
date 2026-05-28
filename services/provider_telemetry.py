@@ -65,18 +65,19 @@ class ProviderTelemetryEvent:
 
 
 def _open_db(path: Path) -> sqlite3.Connection:
-    # PR #73 P1: route through the shared sqlite_helpers helper
-    # that adds busy_timeout=5000. Pre-fix this had WAL but NO
-    # busy_timeout — so two concurrent writers (two launchd jobs
-    # both calling record_provider_telemetry within the same write
-    # window) would race on the WAL writer lock and the loser
-    # silently dropped its row with SQLITE_BUSY. The caller's
-    # exception handling swallowed the failure (telemetry is
-    # best-effort by design), but the rows were gone.
+    # PR #73 P1: route through the shared sqlite_helpers helper so
+    # this DB gets WAL journal mode. Pre-fix used SQLite's default
+    # DELETE journal, which holds an exclusive file lock for each
+    # write transaction — two concurrent launchd jobs calling
+    # record_provider_telemetry in the same write window would
+    # contend on that lock. WAL removes the exclusive hold and allows
+    # one writer to proceed while the other waits on the short commit
+    # phase. The caller's exception handling swallows failures
+    # (telemetry is best-effort by design), so lost rows from lock
+    # contention were invisible without this fix.
     #
-    # With busy_timeout=5000 the second writer waits up to 5s for
-    # the first to finish, which is more than enough for a
-    # single-row INSERT.
+    # busy_timeout is set explicitly (5000 ms) for clarity; Python's
+    # sqlite3.connect() already defaults to timeout=5.0 s.
     from services.sqlite_helpers import open_db_conn
     conn = open_db_conn(path)
     conn.row_factory = sqlite3.Row
