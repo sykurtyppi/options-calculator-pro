@@ -38,6 +38,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from services.earnings_vol_snapshot import _event_contaminated_session_dates
 from services.event_vol_decomposition import decompose_event_vol
+from services.iv_term_structure import bounded_interp
 from services.realized_vol import rs_trailing_mean_forecast as _rs_trailing_mean_forecast
 from utils.logger import setup_logger
 from web.api.edge_engine import (
@@ -794,8 +795,25 @@ def build_signal_snapshot(
     expiry_rows.sort(key=lambda item: item[0])
     days = np.array([row[0] for row in expiry_rows], dtype=float)
     ivs = np.array([row[1] for row in expiry_rows], dtype=float)
-    iv30 = float(np.interp(30.0, days, ivs))
-    iv45 = float(np.interp(45.0, days, ivs))
+    # PR #72: bounded interpolation — refuse to extrapolate. When
+    # the target tenor isn't bracketed by real expiries (e.g., the
+    # nearest expiry is 31D and we want iv30), return a signal-fail
+    # row rather than silently fabricating a value clamped to the
+    # endpoint. The np.interp pre-fix produced exactly this kind of
+    # fabrication, which then propagated into the prior the
+    # selector consumes.
+    _iv30_value, _iv30_status = bounded_interp(30.0, days, ivs)
+    _iv45_value, _iv45_status = bounded_interp(45.0, days, ivs)
+    if _iv30_value is None or _iv45_value is None:
+        _fail_reason = (
+            _iv30_status if _iv30_value is None else _iv45_status
+        )
+        return {
+            "signal_ready": False,
+            "signal_fail_reasons": [_fail_reason],
+        }
+    iv30 = float(_iv30_value)
+    iv45 = float(_iv45_value)
     near_dte = float(days[0])
     far_idx = int(np.argmin(np.abs(days - 45.0)))
     far_dte = float(days[far_idx])

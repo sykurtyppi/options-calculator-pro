@@ -10,6 +10,13 @@ import numpy as np
 import pandas as pd
 
 from services.event_vol_decomposition import decompose_event_vol
+from services.iv_term_structure import (
+    INTERP_INSUFFICIENT_POINTS,
+    INTERP_NO_DATA,
+    INTERP_OK,
+    STATUS_TO_NULL_REASON,
+    bounded_interp,
+)
 from services.option_surface_quality import diagnose_option_surface_quality
 from services.realized_vol import (
     HAR_MIN_OBS as _HAR_MIN_OBS,
@@ -189,6 +196,17 @@ class _TermStructureSnapshot:
     atm_total_open_interest: Optional[float]
     atm_total_volume: Optional[float]
     point_count: int
+    # PR #72: bounded-interpolation status codes. INTERP_OK on the
+    # happy path; one of the INTERP_TARGET_BELOW_RANGE /
+    # _ABOVE_RANGE / _INSUFFICIENT_POINTS / _NO_DATA / _NON_FINITE_INPUT
+    # codes when iv30 / iv45 is None because the target tenor wasn't
+    # bracketed by real expiries. The caller in build_vol_snapshot
+    # routes these through STATUS_TO_NULL_REASON so the null_reasons
+    # dict shows the specific gap (e.g. "target_above_listed_expiries"
+    # on a Monday after the monthly cycle when the nearest expiry is
+    # 31D and 30D isn't bracketed).
+    iv30_status: str = "no_term_structure_data"
+    iv45_status: str = "no_term_structure_data"
 
 
 def build_vol_snapshot(
@@ -305,10 +323,19 @@ def build_vol_snapshot(
         null_reasons["rv_percentile_rank"] = "missing_ohlc_price_data"
 
     term = _build_term_structure_snapshot(chain_frame, underlying_price, as_of_date, cfg)
+    # PR #72: route the specific bounded-interpolation status into
+    # null_reasons so operators can distinguish "no term structure at
+    # all" from "target 30D tenor lies above the bracket" (the
+    # Monday-post-monthly-expiry case that previously produced a
+    # silently fabricated iv30 = nearest-expiry IV).
     if term.iv30 is None:
-        null_reasons["iv30"] = "insufficient_term_structure_points"
+        null_reasons["iv30"] = STATUS_TO_NULL_REASON.get(
+            term.iv30_status, "insufficient_term_structure_points",
+        )
     if term.iv45 is None:
-        null_reasons["iv45"] = "insufficient_term_structure_points"
+        null_reasons["iv45"] = STATUS_TO_NULL_REASON.get(
+            term.iv45_status, "insufficient_term_structure_points",
+        )
     if term.term_structure_slope is None:
         null_reasons["term_structure_slope"] = "insufficient_term_structure_points"
     if term.near_back_iv_ratio is None:
@@ -846,6 +873,8 @@ def _build_term_structure_snapshot(
         atm_total_open_interest=None,
         atm_total_volume=None,
         point_count=0,
+        iv30_status=INTERP_NO_DATA,
+        iv45_status=INTERP_NO_DATA,
     )
     if chain_frame.empty or underlying_price is None or not np.isfinite(underlying_price):
         return empty
@@ -880,6 +909,8 @@ def _build_term_structure_snapshot(
             atm_total_open_interest=near.total_open_interest,
             atm_total_volume=near.total_volume,
             point_count=1,
+            iv30_status=INTERP_INSUFFICIENT_POINTS,
+            iv45_status=INTERP_INSUFFICIENT_POINTS,
         )
 
     days_arr = np.array([float(row.dte) for row in expiry_stats], dtype=float)
@@ -889,8 +920,16 @@ def _build_term_structure_snapshot(
     ivs_arr = ivs_arr[order]
     ordered_stats = [expiry_stats[idx] for idx in order]
 
-    iv30 = float(np.interp(30.0, days_arr, ivs_arr))
-    iv45 = float(np.interp(45.0, days_arr, ivs_arr))
+    # PR #72: bounded interpolation refuses to extrapolate. If the
+    # target tenor (30D, 45D) lies outside [min(days), max(days)],
+    # the returned value is None and the status code carries the
+    # reason; the caller in build_vol_snapshot routes the code into
+    # null_reasons["iv30"] / null_reasons["iv45"] for visibility.
+    # Pre-fix this was `float(np.interp(30.0, ...))` which silently
+    # clamps — fabricating an "iv30" equal to the nearest expiry's
+    # IV (e.g., 31D or 45D on Monday-post-monthly-expiry).
+    iv30, iv30_status = bounded_interp(30.0, days_arr, ivs_arr)
+    iv45, iv45_status = bounded_interp(45.0, days_arr, ivs_arr)
     near = ordered_stats[0]
     back = ordered_stats[1]
     far_idx = int(np.argmin(np.abs(days_arr - 45.0)))
@@ -915,6 +954,8 @@ def _build_term_structure_snapshot(
         atm_total_open_interest=near.total_open_interest,
         atm_total_volume=near.total_volume,
         point_count=len(ordered_stats),
+        iv30_status=iv30_status,
+        iv45_status=iv45_status,
     )
 
 
