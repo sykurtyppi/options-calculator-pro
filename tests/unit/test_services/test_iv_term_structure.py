@@ -231,28 +231,204 @@ def test_status_to_null_reason_values_are_diagnostic_strings() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Snapshot integration smoke
+# Real call-chain integration tests (Codex P2 on PR #72 first review)
+#
+# Codex caught that the prior "snapshot integration smoke" only
+# called bounded_interp again — it never actually invoked
+# build_vol_snapshot. A future refactor that accidentally dropped
+# the call-site rewiring would not be caught. These tests close
+# that gap by exercising the real call chain end-to-end with
+# synthetic-but-realistic fixtures.
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def test_snapshot_iv30_none_when_target_below_bracket() -> None:
-    """End-to-end: when the term structure has no expiry <= 30D,
-    the snapshot's iv30 must be None AND null_reasons['iv30'] must
-    carry the specific target_below_listed_expiries diagnostic
-    (not the generic insufficient_term_structure_points)."""
-    # We can't easily construct a full VolSnapshot without a heavy
-    # fixture; instead, exercise the internal _TermStructureSnapshot
-    # builder path indirectly by constructing the inputs that drive
-    # it.
-    # The simplest direct check is: confirm the helper produces the
-    # expected status on a Codex-style 31D-min chain, AND that the
-    # mapping table contains that status. The full integration test
-    # would require a synthetic chain DataFrame; covered by the
-    # broader test_edge_engine_research_signals harness already
-    # exercising build_vol_snapshot with mocks.
-    days = np.array([31.0, 45.0, 60.0])
-    ivs = np.array([0.30, 0.32, 0.34])
-    value, status = bounded_interp(30.0, days, ivs)
-    assert value is None
-    null_reason = STATUS_TO_NULL_REASON[status]
-    assert null_reason == "target_below_listed_expiries"
+def test_build_vol_snapshot_iv30_none_with_specific_null_reason() -> None:
+    """End-to-end call-chain pin for the production snapshot path.
+
+    Constructs a chain with expiries 31D and 45D from the as_of
+    date, calls the REAL ``build_vol_snapshot`` (not the helper),
+    and asserts:
+
+      1. ``snapshot.iv30 is None`` — the target 30D tenor falls
+         BELOW the listed bracket [31D, 45D], so bounded_interp
+         refused to extrapolate.
+      2. ``snapshot.null_reasons["iv30"] == "target_below_listed_expiries"``
+         — the SPECIFIC bounded-interp status, not the generic
+         insufficient_term_structure_points catch-all. This proves
+         the status code threads correctly from helper → snapshot
+         dataclass → null_reasons dict.
+      3. ``snapshot.iv45 is not None`` — the target 45D tenor IS
+         bracketed (45 == max(days)) so it should still interpolate.
+
+    A future refactor that dropped the bounded_interp call from
+    earnings_vol_snapshot.py:892 would silently restore the
+    np.interp clamping behavior; this test fires immediately.
+    """
+    from datetime import datetime, timedelta
+
+    import pandas as pd
+
+    from services.earnings_vol_snapshot import build_vol_snapshot
+
+    as_of = datetime(2024, 7, 1)
+    # 140 days of price history so RV calculations have data
+    dates = pd.bdate_range("2024-01-02", periods=140)
+    prices = pd.Series(100.0 + np.linspace(0, 1.0, len(dates)), index=dates)
+    price_df = pd.DataFrame({
+        "trade_date": dates,
+        "open": prices.shift(1).fillna(prices.iloc[0] / 1.001).values,
+        "high": (prices * 1.01).values,
+        "low": (prices * 0.99).values,
+        "close": prices.values,
+    })
+
+    # Chain: nearest expiry is 31D out (2024-08-01), next is 45D
+    # out (2024-08-15). target=30D for iv30 lies BELOW [31, 45].
+    expiry_31d = (as_of + timedelta(days=31)).strftime("%Y-%m-%d")
+    expiry_45d = (as_of + timedelta(days=45)).strftime("%Y-%m-%d")
+    as_of_str = as_of.strftime("%Y-%m-%d")
+    chain_df = pd.DataFrame([
+        {"trade_date": as_of_str, "expiry": expiry_31d, "call_put": "C",
+         "strike": 100.0, "bid": 3.4, "ask": 3.6, "mid": 3.5, "iv": 0.28,
+         "open_interest": 1000, "volume": 500, "underlying_price": 100.0},
+        {"trade_date": as_of_str, "expiry": expiry_31d, "call_put": "P",
+         "strike": 100.0, "bid": 3.3, "ask": 3.5, "mid": 3.4, "iv": 0.28,
+         "open_interest": 1000, "volume": 500, "underlying_price": 100.0},
+        {"trade_date": as_of_str, "expiry": expiry_45d, "call_put": "C",
+         "strike": 100.0, "bid": 4.0, "ask": 4.2, "mid": 4.1, "iv": 0.32,
+         "open_interest": 1000, "volume": 500, "underlying_price": 100.0},
+        {"trade_date": as_of_str, "expiry": expiry_45d, "call_put": "P",
+         "strike": 100.0, "bid": 3.9, "ask": 4.1, "mid": 4.0, "iv": 0.32,
+         "open_interest": 1000, "volume": 500, "underlying_price": 100.0},
+    ])
+
+    snapshot = build_vol_snapshot(
+        "TEST",
+        as_of,
+        option_chain_data=chain_df,
+        earnings_metadata={
+            "earnings_date": "2024-07-25",
+            "release_timing": "after market close",
+            "prior_events": [],
+        },
+        price_data=price_df,
+    )
+
+    # The load-bearing assertions.
+    assert snapshot.iv30 is None, (
+        f"Snapshot iv30 must be None when chain has no expiry "
+        f"<= 30D. Got {snapshot.iv30!r}. If this returns a float, "
+        f"the bounded_interp call at earnings_vol_snapshot.py was "
+        f"reverted to np.interp."
+    )
+    assert snapshot.null_reasons.get("iv30") == "target_below_listed_expiries", (
+        f"Snapshot null_reasons['iv30'] must carry the specific "
+        f"bounded-interp status, not the generic "
+        f"'insufficient_term_structure_points'. Got "
+        f"{snapshot.null_reasons.get('iv30')!r}. If this is the "
+        f"generic string, the STATUS_TO_NULL_REASON routing in "
+        f"build_vol_snapshot was reverted."
+    )
+    # And iv45 IS bracketed (45 == max(days)) so it interpolates.
+    assert snapshot.iv45 is not None, (
+        f"Snapshot iv45 must interpolate when 45D is at the bracket "
+        f"endpoint. Got {snapshot.iv45!r}."
+    )
+
+
+def test_backtest_signal_snapshot_signal_ready_false_when_iv30_unbracketed() -> None:
+    """End-to-end call-chain pin for the backtest study path.
+
+    Pre-PR-#72, ``build_signal_snapshot`` in
+    scripts/backtest_iv_expansion_study.py used the same np.interp
+    pattern, fabricating an iv30 that propagated into the candidate
+    calendar prior the selector consumes.
+
+    Post-PR-#72, the function returns
+    ``{"signal_ready": False, "signal_fail_reasons": ["target_below_listed_expiries"]}``
+    when the chain doesn't bracket the target tenor. This test
+    constructs that exact scenario and asserts the signal_fail
+    short-circuit fires.
+
+    A future refactor that dropped the bounded-interp guard from
+    backtest_iv_expansion_study.py:797 would silently re-introduce
+    contaminated rows into the prior; this test fires immediately.
+    """
+    from datetime import timedelta
+
+    import pandas as pd
+
+    from scripts.backtest_iv_expansion_study import build_signal_snapshot
+
+    entry_date = pd.Timestamp("2024-07-01")
+    exit_date = pd.Timestamp("2024-07-26")
+    event_date = pd.Timestamp("2024-07-25")
+
+    # Price history sufficient for RV calculation.
+    history_dates = pd.bdate_range("2024-01-02", periods=140)
+    history_close = 100.0 + np.linspace(0, 1.0, len(history_dates))
+    price_history = pd.DataFrame({
+        "trade_date": history_dates,
+        "open": history_close,
+        "high": history_close * 1.01,
+        "low": history_close * 0.99,
+        "close": history_close,
+        "volume": [5_000_000.0] * len(history_dates),
+    })
+    # Make sure entry_date is in the history.
+    if entry_date not in set(price_history["trade_date"]):
+        # Append the entry date row to the end with the last close.
+        last_close = float(price_history["close"].iloc[-1])
+        price_history = pd.concat([
+            price_history,
+            pd.DataFrame([{
+                "trade_date": entry_date,
+                "open": last_close, "high": last_close,
+                "low": last_close, "close": last_close,
+                "volume": 5_000_000.0,
+            }]),
+        ], ignore_index=True)
+
+    # Day chain: expiries at 31D and 45D from entry_date — target
+    # 30D is BELOW the bracket.
+    expiry_31d = entry_date + timedelta(days=31)
+    expiry_45d = entry_date + timedelta(days=45)
+    day_chain = pd.DataFrame([
+        {"expiry": expiry_31d, "call_put": "C", "strike": 100.0,
+         "bid": 3.4, "ask": 3.6, "mid": 3.5, "iv": 0.28,
+         "open_interest": 1000, "volume": 500, "spread_pct": 3.0},
+        {"expiry": expiry_31d, "call_put": "P", "strike": 100.0,
+         "bid": 3.3, "ask": 3.5, "mid": 3.4, "iv": 0.28,
+         "open_interest": 1000, "volume": 500, "spread_pct": 3.0},
+        {"expiry": expiry_45d, "call_put": "C", "strike": 100.0,
+         "bid": 4.0, "ask": 4.2, "mid": 4.1, "iv": 0.32,
+         "open_interest": 1000, "volume": 500, "spread_pct": 3.0},
+        {"expiry": expiry_45d, "call_put": "P", "strike": 100.0,
+         "bid": 3.9, "ask": 4.1, "mid": 4.0, "iv": 0.32,
+         "open_interest": 1000, "volume": 500, "spread_pct": 3.0},
+    ])
+
+    event = pd.Series({"event_date": event_date, "release_timing": "AMC"})
+
+    result = build_signal_snapshot(
+        symbol="TEST",
+        event=event,
+        entry_date=entry_date,
+        exit_date=exit_date,
+        day_chain=day_chain,
+        price_history=price_history,
+    )
+
+    assert result.get("signal_ready") is False, (
+        f"Backtest signal_snapshot must return signal_ready=False "
+        f"when target 30D tenor isn't bracketed. Got "
+        f"signal_ready={result.get('signal_ready')!r}, "
+        f"keys={list(result.keys())}. If True, the bounded-interp "
+        f"short-circuit at backtest_iv_expansion_study.py:797 was "
+        f"reverted, allowing fabricated iv30 to flow into the prior."
+    )
+    fail_reasons = result.get("signal_fail_reasons") or []
+    assert "target_below_listed_expiries" in fail_reasons, (
+        f"Expected 'target_below_listed_expiries' in "
+        f"signal_fail_reasons; got {fail_reasons!r}."
+    )
