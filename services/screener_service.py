@@ -557,11 +557,14 @@ def build_ranked_screener(
             continue
         filtered.append(row)
 
-    # Sort: valid rows by ranking_score desc, then by DTE asc; errors at tail
+    # Sort: valid rows by ranking_score desc, then DTE asc, then symbol asc
+    # as a deterministic tie-breaker. Without symbol, two rows with identical
+    # ranking_score and DTE sort by thread-completion order, which varies
+    # across runs and makes screener output non-reproducible.
     valid = [r for r in filtered if not r.get("error")]
     errored = [r for r in filtered if r.get("error")]
 
-    valid.sort(key=lambda r: (-r.get("ranking_score", 0.0), r.get("days_to_earnings", 9999)))
+    valid.sort(key=lambda r: (-r.get("ranking_score", 0.0), r.get("days_to_earnings", 9999), r.get("symbol", "")))
     errored.sort(key=lambda r: str(r.get("symbol", "")))
 
     rows = valid + errored

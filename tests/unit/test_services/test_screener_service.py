@@ -15,6 +15,7 @@ from services.screener_service import (
     _sample_score,
     _ts_score,
     _screen_one_symbol_ranked,
+    build_ranked_screener,
     compute_ranking_score,
 )
 from services.earnings_vol_snapshot import VolSnapshot
@@ -371,3 +372,73 @@ class TestSnapshotBackedRankedScreener:
         assert row["earnings_source_confirmed"] is None
         assert row["earnings_source_confidence"] == pytest.approx(0.72, abs=1e-6)
         assert row["error"] is None
+
+
+# ── M1: sort determinism ──────────────────────────────────────────────────────
+
+
+class TestScreenerSortDeterminism:
+    """Regression for the non-deterministic sort that occurred when two symbols
+    tied on both ranking_score and days_to_earnings. Without a symbol tie-breaker
+    the output order depended on which ThreadPoolExecutor future happened to
+    complete first, making screener results differ across runs."""
+
+    def _make_row(self, symbol: str, ranking_score: float, dte: int) -> dict:
+        return {
+            "symbol": symbol,
+            "ranking_score": ranking_score,
+            "days_to_earnings": dte,
+            "error": None,
+        }
+
+    def test_tied_rows_sort_alphabetically_by_symbol(self):
+        """Two rows with identical ranking_score and DTE must emerge in
+        alphabetical symbol order, not in thread-completion order."""
+        # Patch _screen_one_symbol_ranked so build_ranked_screener returns
+        # our controlled rows without hitting the network.
+        tied_score = 0.6500
+        tied_dte = 7
+        symbols = ["NVDA", "AAPL", "MSFT"]  # deliberately non-alphabetical
+        rows_by_symbol = {
+            s: self._make_row(s, tied_score, tied_dte) for s in symbols
+        }
+
+        def fake_screen(sym, today, cutoff):
+            return rows_by_symbol[sym]
+
+        with patch("services.screener_service._screen_one_symbol_ranked", side_effect=fake_screen):
+            result = build_ranked_screener(
+                symbols=symbols,
+                today=date(2026, 5, 28),
+            )
+
+        returned_symbols = [r["symbol"] for r in result["rows"] if not r.get("error")]
+        assert returned_symbols == sorted(symbols), (
+            f"Tied rows must be alphabetical by symbol; got {returned_symbols}. "
+            "Pre-fix, thread-completion order made this nondeterministic."
+        )
+
+    def test_higher_score_still_sorts_first_despite_tiebreaker(self):
+        """Symbol tie-breaker must not disrupt primary ranking_score ordering."""
+        rows_by_symbol = {
+            "ZZZ": self._make_row("ZZZY", 0.80, 5),  # high score, late alphabet
+            "AAAA": self._make_row("AAAA", 0.50, 5),  # low score, early alphabet
+        }
+        rows_by_symbol["ZZZY"] = self._make_row("ZZZY", 0.80, 5)
+        rows_by_symbol["AAAA"] = self._make_row("AAAA", 0.50, 5)
+
+        symbols = ["AAAA", "ZZZY"]
+
+        def fake_screen(sym, today, cutoff):
+            return rows_by_symbol[sym]
+
+        with patch("services.screener_service._screen_one_symbol_ranked", side_effect=fake_screen):
+            result = build_ranked_screener(
+                symbols=symbols,
+                today=date(2026, 5, 28),
+            )
+
+        returned_symbols = [r["symbol"] for r in result["rows"] if not r.get("error")]
+        assert returned_symbols == ["ZZZY", "AAAA"], (
+            f"Higher ranking_score must still sort first; got {returned_symbols}"
+        )
