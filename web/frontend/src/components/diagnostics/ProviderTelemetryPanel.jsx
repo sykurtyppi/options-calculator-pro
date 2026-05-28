@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { apiFetch } from '../../lib/api'
 import { SectionTitle } from '../common/DisplayAtoms'
 import {
@@ -20,6 +20,8 @@ export default function ProviderTelemetryPanel({ apiBase }) {
   const [offset, setOffset] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  // Shared across both the filter-change effect and the Refresh button.
+  const telemetryFetchRef = useRef(null)
 
   const endpoint = useMemo(() => buildTelemetryEndpoint(apiBase, {
     provider,
@@ -45,10 +47,16 @@ export default function ProviderTelemetryPanel({ apiBase }) {
     }
   }
 
-  useEffect(() => {
+  function startTelemetryFetch() {
+    if (telemetryFetchRef.current) telemetryFetchRef.current.abort()
     const controller = new AbortController()
+    telemetryFetchRef.current = controller
     loadTelemetry(controller.signal)
-    return () => controller.abort()
+  }
+
+  useEffect(() => {
+    startTelemetryFetch()
+    return () => { if (telemetryFetchRef.current) telemetryFetchRef.current.abort() }
   }, [endpoint])
 
   const summary = useMemo(() => buildTelemetrySummary(payload || {}), [payload])
@@ -71,7 +79,7 @@ export default function ProviderTelemetryPanel({ apiBase }) {
           <p className="oos-help">Direct request-health logs for market data, earnings, quotes, fallback usage, stale cache usage, and latency. Telemetry is best-effort and read-only.</p>
         </div>
         <div className="oos-actions">
-          <button type="button" onClick={() => loadTelemetry()} disabled={loading}>
+          <button type="button" onClick={() => startTelemetryFetch()} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>

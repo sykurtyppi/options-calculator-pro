@@ -37,7 +37,7 @@ export default function OosSplitChart({ splitsDetail }) {
       cumPnl: Number(cumPnl.toFixed(2)),
       label: typeof s?.test_start === 'string' ? s.test_start.slice(0, 7) : `S${i + 1}`,
       sharpe: Number(sharpeVal.toFixed(2)),
-      winRate: s?.win_rate != null ? `${(s.win_rate * 100).toFixed(0)}%` : 'n/a',
+      winRate: (s?.win_rate != null && isFinite(Number(s?.win_rate))) ? `${(Number(s?.win_rate) * 100).toFixed(0)}%` : 'n/a',
       trades: s?.trades,
     }
   })

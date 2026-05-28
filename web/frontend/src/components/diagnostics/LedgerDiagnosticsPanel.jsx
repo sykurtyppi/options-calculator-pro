@@ -176,6 +176,9 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
   const [detailLoading, setDetailLoading] = useState(false)
   const [error, setError] = useState('')
   const detailAbortRef = useRef(null)
+  // Shared across both the filter-change effect and the Refresh button so
+  // either path can abort the other's in-flight request.
+  const rowsFetchRef = useRef(null)
 
   const endpoint = useMemo(() => {
     return buildLedgerEndpoint(apiBase, { symbol, limit, offset })
@@ -233,10 +236,16 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
     }
   }
 
-  useEffect(() => {
+  function startRowsFetch() {
+    if (rowsFetchRef.current) rowsFetchRef.current.abort()
     const controller = new AbortController()
+    rowsFetchRef.current = controller
     loadRows(controller.signal)
-    return () => controller.abort()
+  }
+
+  useEffect(() => {
+    startRowsFetch()
+    return () => { if (rowsFetchRef.current) rowsFetchRef.current.abort() }
   }, [endpoint])
 
   useEffect(() => {
@@ -267,7 +276,7 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
           <a className="secondary-button" href={exportUrls.recommendationCsv}>Export CSV</a>
           <a className="secondary-button" href={exportUrls.recommendationJson}>Export JSON</a>
           <a className="secondary-button" href={exportUrls.linkageCsv}>Export Linkage CSV</a>
-          <button type="button" onClick={() => loadRows()} disabled={loading}>
+          <button type="button" onClick={() => startRowsFetch()} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>

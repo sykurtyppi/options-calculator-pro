@@ -33,7 +33,7 @@ function mapSplits(splitsDetail) {
       cumPnl: Number(cumPnl.toFixed(2)),
       label: typeof s?.test_start === 'string' ? s.test_start.slice(0, 7) : `S${i + 1}`,
       sharpe: Number(sharpeVal.toFixed(2)),
-      winRate: s?.win_rate != null ? `${(s.win_rate * 100).toFixed(0)}%` : 'n/a',
+      winRate: (s?.win_rate != null && isFinite(Number(s?.win_rate))) ? `${(Number(s?.win_rate) * 100).toFixed(0)}%` : 'n/a',
       trades: s?.trades,
     }
   })
@@ -134,6 +134,31 @@ test('OosSplitChart: non-string test_start (number) falls back to S-index label'
 test('OosSplitChart: null test_start falls back to S-index label', () => {
   const data = mapSplits([{ pnl: 0, sharpe: 0, test_start: null }])
   assert.equal(data[0].label, 'S1')
+})
+
+
+// ── win_rate guard ───────────────────────────────────────────────────────
+
+test('OosSplitChart: non-numeric win_rate ("n/a") shows n/a, not NaN%', () => {
+  // Number("n/a") = NaN; !isFinite(NaN) → fall back to 'n/a'.
+  const data = mapSplits([{ pnl: 0, sharpe: 0, win_rate: 'n/a', test_start: '2024-01-01' }])
+  assert.equal(data[0].winRate, 'n/a')
+})
+
+test('OosSplitChart: null win_rate shows n/a', () => {
+  const data = mapSplits([{ pnl: 0, sharpe: 0, win_rate: null, test_start: '2024-01-01' }])
+  assert.equal(data[0].winRate, 'n/a')
+})
+
+test('OosSplitChart: numeric win_rate renders as percentage', () => {
+  const data = mapSplits([{ pnl: 0, sharpe: 0, win_rate: 0.6, test_start: '2024-01-01' }])
+  assert.equal(data[0].winRate, '60%')
+})
+
+test('OosSplitChart: win_rate=0 renders as 0%, not n/a', () => {
+  // 0 is a valid (legitimate) zero-percent win rate.
+  const data = mapSplits([{ pnl: 0, sharpe: 0, win_rate: 0, test_start: '2024-01-01' }])
+  assert.equal(data[0].winRate, '0%')
 })
 
 
