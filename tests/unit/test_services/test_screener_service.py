@@ -421,11 +421,9 @@ class TestScreenerSortDeterminism:
     def test_higher_score_still_sorts_first_despite_tiebreaker(self):
         """Symbol tie-breaker must not disrupt primary ranking_score ordering."""
         rows_by_symbol = {
-            "ZZZ": self._make_row("ZZZY", 0.80, 5),  # high score, late alphabet
+            "ZZZY": self._make_row("ZZZY", 0.80, 5),  # high score, late alphabet
             "AAAA": self._make_row("AAAA", 0.50, 5),  # low score, early alphabet
         }
-        rows_by_symbol["ZZZY"] = self._make_row("ZZZY", 0.80, 5)
-        rows_by_symbol["AAAA"] = self._make_row("AAAA", 0.50, 5)
 
         symbols = ["AAAA", "ZZZY"]
 
