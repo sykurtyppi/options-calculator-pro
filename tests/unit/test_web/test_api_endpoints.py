@@ -329,6 +329,38 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertIn("Unauthorized", response.text)
 
+    def test_auth_401_includes_cors_header_for_cross_origin_request(self):
+        """F1 regression: CORSMiddleware must be the outermost layer (added
+        last in Starlette's LIFO stack) so that 401 responses from
+        _AuthMiddleware carry CORS headers back to the browser.
+
+        Pre-fix, _AuthMiddleware was outermost and returned 401 directly,
+        bypassing CORSMiddleware entirely. The browser surfaced a CORS error
+        instead of the 401, so the frontend's /login redirect never fired.
+
+        The CORS middleware is registered at import time with
+        _LOCALHOST_DEV_ORIGINS (which includes http://localhost:5173).
+        Patching _SHARE_AUTH_ENABLED=True at dispatch time is sufficient to
+        make _AuthMiddleware reject the unauthenticated request.
+        """
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
+            with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+                response = self.client.post(
+                    "/api/edge/analyze",
+                    json={"symbol": "AAPL"},
+                    headers={"Origin": "http://localhost:5173"},
+                )
+
+        self.assertEqual(response.status_code, 401)
+        acao = response.headers.get("access-control-allow-origin", "")
+        self.assertEqual(
+            acao,
+            "http://localhost:5173",
+            "401 from auth middleware must carry Access-Control-Allow-Origin so "
+            "the browser can read the response body and the frontend can redirect "
+            "to /login. If this is empty, CORSMiddleware is not outermost.",
+        )
+
     def test_hosted_auth_config_fails_fast_without_auth(self):
         with patch.object(app_module, "_HOSTED_MODE", True):
             with patch.object(app_module, "_SHARE_AUTH_ENABLED", False):

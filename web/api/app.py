@@ -579,6 +579,14 @@ def _compute_allowed_origins(share_auth_enabled: bool, origins_env: str) -> List
 origins_env = os.getenv("OPTIONS_CALCULATOR_ALLOWED_ORIGINS", "")
 allowed_origins = _compute_allowed_origins(_SHARE_AUTH_ENABLED, origins_env)
 
+# Starlette applies middleware in LIFO order: the last add_middleware() call
+# becomes the outermost layer (first to see requests, last to see responses).
+# _AuthMiddleware must be INNER so its 401 responses flow back through
+# CORSMiddleware before reaching the client. If auth were outer, 401s would
+# bypass CORS entirely and the browser would surface a CORS error instead of
+# the 401, breaking the frontend's /login redirect.
+app.add_middleware(_AuthMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -586,9 +594,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Auth middleware — must be added AFTER CORS so CORS headers are present on 401s
-app.add_middleware(_AuthMiddleware)
 
 
 # ── Login routes ──────────────────────────────────────────────────────────────
