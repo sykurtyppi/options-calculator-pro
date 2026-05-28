@@ -151,6 +151,12 @@ export default function App() {
     return () => clearInterval(t)
   }, [oosLoading])
 
+  // Clear the OOS poll interval on unmount so it doesn't fire after the
+  // component is gone (e.g. during HMR or test teardown).
+  useEffect(() => {
+    return () => { if (oosIntervalRef.current) clearInterval(oosIntervalRef.current) }
+  }, [])
+
   useEffect(() => {
     loadWarehouseSymbols()
   }, [])

@@ -15,22 +15,24 @@ export default function DataQualityDiagnosticsPanel({ apiBase }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  async function loadDiagnostics() {
+  async function loadDiagnostics(signal) {
     setLoading(true)
     setError('')
     try {
-      const response = await apiFetch(`${apiBase}/api/diagnostics/data-quality`)
+      const response = await apiFetch(`${apiBase}/api/diagnostics/data-quality`, { signal })
       if (!response.ok) throw new Error(`Data-quality diagnostics failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {
-      setError(err.message || String(err))
+      if (err.name !== 'AbortError') setError(err.message || String(err))
     } finally {
-      setLoading(false)
+      if (!signal?.aborted) setLoading(false)
     }
   }
 
   useEffect(() => {
-    loadDiagnostics()
+    const controller = new AbortController()
+    loadDiagnostics(controller.signal)
+    return () => controller.abort()
   }, [apiBase])
 
   const summary = useMemo(() => buildQualitySummary(payload || {}), [payload])
@@ -48,7 +50,7 @@ export default function DataQualityDiagnosticsPanel({ apiBase }) {
           <p className="oos-help">Read-only observability for stale sources, missing option-chain evidence, provider coverage, and low-quality recommendation records.</p>
         </div>
         <div className="oos-actions">
-          <button type="button" onClick={loadDiagnostics} disabled={loading}>
+          <button type="button" onClick={() => loadDiagnostics()} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>

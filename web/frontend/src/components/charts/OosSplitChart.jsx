@@ -21,13 +21,14 @@ export default function OosSplitChart({ splitsDetail }) {
 
   let cumPnl = 0
   const data = splitsDetail.map((s, i) => {
-    cumPnl += s.pnl
+    const pnlVal = Number(s.pnl ?? 0)
+    cumPnl += pnlVal
     return {
       split: i + 1,
-      pnl: Number(s.pnl.toFixed(2)),
+      pnl: Number(pnlVal.toFixed(2)),
       cumPnl: Number(cumPnl.toFixed(2)),
       label: s.test_start ? s.test_start.slice(0, 7) : `S${i + 1}`,
-      sharpe: Number((s.sharpe || 0).toFixed(2)),
+      sharpe: Number((s.sharpe ?? 0).toFixed(2)),
       winRate: s.win_rate != null ? `${(s.win_rate * 100).toFixed(0)}%` : 'n/a',
       trades: s.trades,
     }
