@@ -157,7 +157,14 @@ export default function App() {
   // On unmount: mark as unmounted and clear any live poll interval.
   // mountedRef guards runOos against creating a new interval or setting state
   // if the component tears down while /api/oos/submit is still in flight.
+  //
+  // IMPORTANT: set mountedRef.current = true in the effect body, not just via
+  // useRef(true). React StrictMode (active in dev via main.jsx) runs
+  // setup → cleanup → setup on every mount. Without the reset in the body,
+  // the second setup leaves mountedRef false, so runOos() would return early
+  // after every submit and leave oosLoading stuck true.
   useEffect(() => {
+    mountedRef.current = true
     return () => {
       mountedRef.current = false
       if (oosIntervalRef.current) clearInterval(oosIntervalRef.current)

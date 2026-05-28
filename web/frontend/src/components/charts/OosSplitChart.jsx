@@ -12,6 +12,13 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 
+// Coerce any value to a finite number, falling back to 0 for null, undefined,
+// NaN, Infinity, and non-numeric strings like "n/a".
+function safeFinite(v) {
+  const n = Number(v ?? 0)
+  return isFinite(n) ? n : 0
+}
+
 /**
  * Per-split P&L bars with a cumulative-P&L overlay line.
  * Returns null when fewer than two splits are available.
@@ -21,15 +28,14 @@ export default function OosSplitChart({ splitsDetail }) {
 
   let cumPnl = 0
   const data = splitsDetail.map((s, i) => {
-    const pnlVal = Number(s?.pnl ?? 0)
-    // sharpe may be non-numeric ("n/a") — coerce then fall back to 0
-    const sharpeVal = Number(s?.sharpe) || 0
+    const pnlVal = safeFinite(s?.pnl)
+    const sharpeVal = safeFinite(s?.sharpe)
     cumPnl += pnlVal
     return {
       split: i + 1,
       pnl: Number(pnlVal.toFixed(2)),
       cumPnl: Number(cumPnl.toFixed(2)),
-      label: s?.test_start ? s.test_start.slice(0, 7) : `S${i + 1}`,
+      label: typeof s?.test_start === 'string' ? s.test_start.slice(0, 7) : `S${i + 1}`,
       sharpe: Number(sharpeVal.toFixed(2)),
       winRate: s?.win_rate != null ? `${(s.win_rate * 100).toFixed(0)}%` : 'n/a',
       trades: s?.trades,
