@@ -17,22 +17,24 @@ export default function EvidenceReportPanel({ apiBase }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  async function loadReport() {
+  async function loadReport(signal) {
     setLoading(true)
     setError('')
     try {
-      const response = await apiFetch(`${apiBase}/api/diagnostics/evidence-report`)
+      const response = await apiFetch(`${apiBase}/api/diagnostics/evidence-report`, { signal })
       if (!response.ok) throw new Error(`Evidence report failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {
-      setError(err.message || String(err))
+      if (err.name !== 'AbortError') setError(err.message || String(err))
     } finally {
-      setLoading(false)
+      if (!signal?.aborted) setLoading(false)
     }
   }
 
   useEffect(() => {
-    loadReport()
+    const controller = new AbortController()
+    loadReport(controller.signal)
+    return () => controller.abort()
   }, [apiBase])
 
   const summary = useMemo(() => buildEvidenceReportSummary(payload || {}), [payload])
@@ -52,7 +54,7 @@ export default function EvidenceReportPanel({ apiBase }) {
           <p className="oos-help">Automated paper/research evidence comparing selector outcomes with simple baselines. Not execution-grade performance.</p>
         </div>
         <div className="oos-actions">
-          <button type="button" onClick={loadReport} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
+          <button type="button" onClick={() => loadReport()} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
         </div>
       </div>
 

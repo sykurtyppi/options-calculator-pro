@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { apiFetch } from '../../lib/api'
 import { Badge, SectionTitle } from '../common/DisplayAtoms'
 import {
@@ -175,6 +175,10 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
   const [loading, setLoading] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
   const [error, setError] = useState('')
+  const detailAbortRef = useRef(null)
+  // Shared across both the filter-change effect and the Refresh button so
+  // either path can abort the other's in-flight request.
+  const rowsFetchRef = useRef(null)
 
   const endpoint = useMemo(() => {
     return buildLedgerEndpoint(apiBase, { symbol, limit, offset })
@@ -184,13 +188,13 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
     return buildLedgerExportUrls(apiBase, { symbol, limit, offset })
   }, [apiBase, symbol, limit, offset])
 
-  async function loadRows() {
+  async function loadRows(signal) {
     setLoading(true)
     setError('')
     try {
       const [recentResponse, summaryResponse] = await Promise.all([
-        apiFetch(endpoint),
-        apiFetch(`${apiBase}/api/diagnostics/recommendations/summary`),
+        apiFetch(endpoint, { signal }),
+        apiFetch(`${apiBase}/api/diagnostics/recommendations/summary`, { signal }),
       ])
       if (!recentResponse.ok) throw new Error(`Ledger query failed (${recentResponse.status})`)
       if (!summaryResponse.ok) throw new Error(`Ledger summary failed (${summaryResponse.status})`)
@@ -201,36 +205,52 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
       setTotal(Number(recentPayload.total || 0))
       setHasMore(Boolean(recentPayload.has_more))
     } catch (err) {
-      setError(err.message || String(err))
+      if (err.name !== 'AbortError') setError(err.message || String(err))
     } finally {
-      setLoading(false)
+      if (!signal?.aborted) setLoading(false)
     }
   }
 
   async function loadDetail(recommendationId) {
     if (!recommendationId) return
+    if (detailAbortRef.current) detailAbortRef.current.abort()
+    const controller = new AbortController()
+    detailAbortRef.current = controller
+    const { signal } = controller
     setSelectedId(recommendationId)
     setDetailLoading(true)
     setError('')
     try {
       const [detailResponse, linkageResponse] = await Promise.all([
-        apiFetch(`${apiBase}/api/diagnostics/recommendations/${encodeURIComponent(recommendationId)}`),
-        apiFetch(`${apiBase}/api/diagnostics/recommendations/${encodeURIComponent(recommendationId)}/linkage`),
+        apiFetch(`${apiBase}/api/diagnostics/recommendations/${encodeURIComponent(recommendationId)}`, { signal }),
+        apiFetch(`${apiBase}/api/diagnostics/recommendations/${encodeURIComponent(recommendationId)}/linkage`, { signal }),
       ])
       if (!detailResponse.ok) throw new Error(`Ledger detail failed (${detailResponse.status})`)
       if (!linkageResponse.ok) throw new Error(`Ledger linkage failed (${linkageResponse.status})`)
       setDetail(await detailResponse.json())
       setLinkage(await linkageResponse.json())
     } catch (err) {
-      setError(err.message || String(err))
+      if (err.name !== 'AbortError') setError(err.message || String(err))
     } finally {
-      setDetailLoading(false)
+      if (!signal.aborted) setDetailLoading(false)
     }
   }
 
+  function startRowsFetch() {
+    if (rowsFetchRef.current) rowsFetchRef.current.abort()
+    const controller = new AbortController()
+    rowsFetchRef.current = controller
+    loadRows(controller.signal)
+  }
+
   useEffect(() => {
-    loadRows()
+    startRowsFetch()
+    return () => { if (rowsFetchRef.current) rowsFetchRef.current.abort() }
   }, [endpoint])
+
+  useEffect(() => {
+    return () => { if (detailAbortRef.current) detailAbortRef.current.abort() }
+  }, [])
 
   function updateSymbol(value) {
     setSymbol(value.toUpperCase())
@@ -256,7 +276,7 @@ export default function LedgerDiagnosticsPanel({ apiBase }) {
           <a className="secondary-button" href={exportUrls.recommendationCsv}>Export CSV</a>
           <a className="secondary-button" href={exportUrls.recommendationJson}>Export JSON</a>
           <a className="secondary-button" href={exportUrls.linkageCsv}>Export Linkage CSV</a>
-          <button type="button" onClick={loadRows} disabled={loading}>
+          <button type="button" onClick={() => startRowsFetch()} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>

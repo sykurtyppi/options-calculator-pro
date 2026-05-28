@@ -18,22 +18,24 @@ export default function ForwardPerformancePanel({ apiBase }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  async function loadPerformance() {
+  async function loadPerformance(signal) {
     setLoading(true)
     setError('')
     try {
-      const response = await apiFetch(`${apiBase}/api/diagnostics/forward-performance`)
+      const response = await apiFetch(`${apiBase}/api/diagnostics/forward-performance`, { signal })
       if (!response.ok) throw new Error(`Forward-performance diagnostics failed (${response.status})`)
       setPayload(await response.json())
     } catch (err) {
-      setError(err.message || String(err))
+      if (err.name !== 'AbortError') setError(err.message || String(err))
     } finally {
-      setLoading(false)
+      if (!signal?.aborted) setLoading(false)
     }
   }
 
   useEffect(() => {
-    loadPerformance()
+    const controller = new AbortController()
+    loadPerformance(controller.signal)
+    return () => controller.abort()
   }, [apiBase])
 
   const summary = useMemo(() => buildForwardPerformanceSummary(payload || {}), [payload])
@@ -54,7 +56,7 @@ export default function ForwardPerformancePanel({ apiBase }) {
           <p className="oos-help">Read-only paper/research outcome diagnostics for selector recommendations. These are not execution-grade live performance claims.</p>
         </div>
         <div className="oos-actions">
-          <button type="button" onClick={loadPerformance} disabled={loading}>
+          <button type="button" onClick={() => loadPerformance()} disabled={loading}>
             {loading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
