@@ -283,10 +283,13 @@ class BaselineEvidenceStore:
 
 
 def _open_db(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    # PR #73 P1/P2 family: shared sqlite_helpers.open_db_conn adds
+    # busy_timeout=5000 on top of WAL. Pre-fix had WAL but no busy
+    # timeout — concurrent writers across launchd jobs would race
+    # and the loser silently dropped its row with SQLITE_BUSY.
+    from services.sqlite_helpers import open_db_conn
+    conn = open_db_conn(path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_TABLE_DDL)
     _migrate(conn)
     conn.executescript(_INDEX_DDL)

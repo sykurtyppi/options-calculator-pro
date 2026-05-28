@@ -238,9 +238,16 @@ def _append_structured_run_log(path: Path, event: dict) -> None:
     if bool(event.get("dry_run")):
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+        # PR #73 P3: route through the shared fcntl.LOCK_EX-protected
+        # appender. Pre-fix this opened the file in append mode
+        # without a writer lock, so a concurrent launchd job (or an
+        # operator running the same script manually) could interleave
+        # a partial line and corrupt the JSONL stream that
+        # services/evidence_health.py parses. The resolver had this
+        # fix under Hardening P1-3; PR #73 lifted the pattern into
+        # services.jsonl_helpers for shared use.
+        from services.jsonl_helpers import append_jsonl_locked
+        append_jsonl_locked(path, [event])
     except (OSError, ValueError) as exc:
         # Hardening P0-2: narrow the exception and surface the failure
         # via stderr (launchd captures it into the wrapper's log file).
