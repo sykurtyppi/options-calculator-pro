@@ -1115,14 +1115,36 @@ class TestApiEndpoints(unittest.TestCase):
 
     # ── F3: sync OOS concurrency cap (web-hardening audit) ────────────────
 
-    def test_sync_oos_rejects_when_semaphore_exhausted(self):
-        """When _oos_sync_semaphore.acquire returns False (another sync OOS job
-        is already in flight), /api/oos/report-card must return 429 before
-        dispatching _execute_oos_logic."""
+    def test_sync_oos_rejects_when_at_capacity(self):
+        """When _active_job_count_locked already equals _MAX_OOS_RUNNING_JOBS,
+        /api/oos/report-card must return 429 before dispatching _execute_oos_logic."""
         app_module._reset_rate_limits()
-        with patch.object(app_module._oos_sync_semaphore, "acquire", return_value=False), \
+        with patch.object(app_module, "_active_job_count_locked",
+                          return_value=app_module._MAX_OOS_RUNNING_JOBS), \
              patch.object(app_module, "_execute_oos_logic") as exec_mock:
             response = self.client.post("/api/oos/report-card", json={})
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("capacity", response.json()["detail"].lower())
+        exec_mock.assert_not_called()
+
+    def test_sync_oos_rejects_when_async_job_active(self):
+        """Regression: an active async /api/oos/submit job must block a concurrent
+        sync /api/oos/report-card call (the P1 bug: separate semaphore let both run)."""
+        app_module._reset_rate_limits()
+        running_job = {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "data": None,
+            "error": None,
+        }
+        saved = dict(app_module._oos_jobs)
+        app_module._oos_jobs["async-test-job"] = running_job
+        try:
+            with patch.object(app_module, "_execute_oos_logic") as exec_mock:
+                response = self.client.post("/api/oos/report-card", json={})
+        finally:
+            app_module._oos_jobs.clear()
+            app_module._oos_jobs.update(saved)
         self.assertEqual(response.status_code, 429)
         self.assertIn("capacity", response.json()["detail"].lower())
         exec_mock.assert_not_called()

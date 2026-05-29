@@ -113,11 +113,6 @@ _SCREENER_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_SCREENER_RATE_LIMI
 _rate_limit_buckets: Dict[Tuple[str, str], List[float]] = {}
 _rate_limit_lock = threading.Lock()
 
-# F3: concurrency guard for the legacy synchronous OOS endpoint. The async
-# /api/oos/submit checks _MAX_OOS_RUNNING_JOBS against the _oos_jobs dict;
-# /api/oos/report-card has no such guard — multiple concurrent callers each
-# block a request thread for up to _OOS_VALIDATION_TIMEOUT_SECONDS.
-_oos_sync_semaphore = threading.Semaphore(_MAX_OOS_RUNNING_JOBS)
 
 # Web-audit P1-2: session-nonce revocation set. POST /logout records the
 # nonce here so _valid_session rejects the cookie even before its 7-day TTL
@@ -1462,14 +1457,24 @@ def run_oos_report_card(
             status_code=429,
             detail="OOS submission rate limit exceeded. Wait a minute and try again.",
         )
-    # F3: concurrency guard. The async /api/oos/submit caps simultaneous jobs
-    # via _oos_jobs; this sync variant has no such check, so multiple concurrent
-    # callers each block a request thread for up to _OOS_VALIDATION_TIMEOUT_SECONDS.
-    if not _oos_sync_semaphore.acquire(blocking=False):
-        raise HTTPException(
-            status_code=429,
-            detail="OOS job capacity reached. Wait for the current job to finish before submitting another.",
-        )
+    # F3: shared concurrency guard. Register this sync job in _oos_jobs so
+    # _active_job_count_locked counts it alongside async submit jobs. Both
+    # paths then see the same cap, preventing a running async job from being
+    # bypassed by a simultaneous sync call (or vice-versa).
+    sync_job_id = f"sync-{uuid.uuid4()}"
+    with _oos_jobs_lock:
+        _purge_jobs_locked(_oos_jobs, ttl_seconds=_OOS_JOB_TTL_SECONDS)
+        if _active_job_count_locked(_oos_jobs) >= _MAX_OOS_RUNNING_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail="OOS job capacity reached. Wait for the current job to finish before submitting another.",
+            )
+        _oos_jobs[sync_job_id] = {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "data": None,
+            "error": None,
+        }
     try:
         data = _execute_oos_logic(request)
         return OOSReportResponse(
@@ -1482,7 +1487,9 @@ def run_oos_report_card(
     except Exception as exc:
         _raise_public_error(500, "OOS report generation failed.", exc)
     finally:
-        _oos_sync_semaphore.release()
+        with _oos_jobs_lock:
+            if sync_job_id in _oos_jobs:
+                _oos_jobs[sync_job_id]["status"] = "complete"
 
 
 # ── Async OOS job store ───────────────────────────────────────────────────────
