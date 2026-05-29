@@ -1151,6 +1151,28 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertIn("capacity", response.json()["detail"].lower())
         exec_mock.assert_not_called()
 
+    def test_async_oos_rejects_when_sync_sentinel_active(self):
+        """Reverse of the P1 regression: an active sync sentinel must block
+        /api/oos/submit with 429, confirming capacity is shared in both directions."""
+        app_module._reset_rate_limits()
+        sync_sentinel = {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "data": None,
+            "error": None,
+        }
+        with app_module._oos_jobs_lock:
+            saved = dict(app_module._oos_jobs)
+            app_module._oos_jobs["sync-sentinel-test"] = sync_sentinel
+        try:
+            response = self.client.post("/api/oos/submit", json={})
+        finally:
+            with app_module._oos_jobs_lock:
+                app_module._oos_jobs.clear()
+                app_module._oos_jobs.update(saved)
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("capacity", response.json()["detail"].lower())
+
     # ── F4: export endpoint bounds enforced before DB query ───────────────
 
     def test_recommendations_export_rejects_limit_above_maximum(self):
