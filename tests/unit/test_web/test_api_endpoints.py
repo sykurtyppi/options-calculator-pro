@@ -1137,14 +1137,16 @@ class TestApiEndpoints(unittest.TestCase):
             "data": None,
             "error": None,
         }
-        saved = dict(app_module._oos_jobs)
-        app_module._oos_jobs["async-test-job"] = running_job
+        with app_module._oos_jobs_lock:
+            saved = dict(app_module._oos_jobs)
+            app_module._oos_jobs["async-test-job"] = running_job
         try:
             with patch.object(app_module, "_execute_oos_logic") as exec_mock:
                 response = self.client.post("/api/oos/report-card", json={})
         finally:
-            app_module._oos_jobs.clear()
-            app_module._oos_jobs.update(saved)
+            with app_module._oos_jobs_lock:
+                app_module._oos_jobs.clear()
+                app_module._oos_jobs.update(saved)
         self.assertEqual(response.status_code, 429)
         self.assertIn("capacity", response.json()["detail"].lower())
         exec_mock.assert_not_called()

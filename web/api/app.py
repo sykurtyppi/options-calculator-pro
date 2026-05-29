@@ -1488,8 +1488,7 @@ def run_oos_report_card(
         _raise_public_error(500, "OOS report generation failed.", exc)
     finally:
         with _oos_jobs_lock:
-            if sync_job_id in _oos_jobs:
-                _oos_jobs[sync_job_id]["status"] = "complete"
+            _oos_jobs.pop(sync_job_id, None)
 
 
 # ── Async OOS job store ───────────────────────────────────────────────────────
