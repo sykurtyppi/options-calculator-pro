@@ -440,3 +440,114 @@ class TestScreenerSortDeterminism:
         assert returned_symbols == ["ZZZY", "AAAA"], (
             f"Higher ranking_score must still sort first; got {returned_symbols}"
         )
+
+
+# ── M3: cross-run determinism closure ─────────────────────────────────────────
+
+
+class TestScreenerDeterminismM3:
+    """M3 verification: the ranked screener is deterministic and arrival-order
+    independent for a fixed input set. The 'floating-point accumulation across
+    fetches' hypothesis did not hold under audit — compute_ranking_score is a
+    pure per-symbol weighted sum (no cross-symbol accumulation), the sort key
+    (-score, dte, symbol) is a total order, and round(4) absorbs sub-threshold
+    input jitter. The only residual cross-run variance is live input crossing
+    the rounding boundary at a genuine near-tie, which is inherent to ranking
+    noisy data, not an algorithm defect. These tests pin those properties so a
+    future sort/scoring refactor cannot silently reintroduce non-determinism."""
+
+    # Realistic mixed universe; scores come from the REAL scoring function so the
+    # full score→round→sort pipeline is exercised, not hand-set values.
+    _FIXTURES = {
+        # symbol: (iv_rv, ts, median_move, sample, dte, spread)
+        "AAPL": (1.35, 0.88, 7.4, 12, 9, 2.4),
+        "MSFT": (1.22, 0.91, 5.1, 10, 14, 1.8),
+        "NVDA": (1.61, 0.82, 9.8, 16, 6, 3.1),
+        "TSLA": (1.05, 0.95, 11.2, 8, 21, 4.2),
+        "AMZN": (1.28, 0.89, 6.7, 11, 12, 2.0),
+        "GOOG": (1.31, 0.87, 6.9, 11, 12, 2.1),
+        "META": (1.44, 0.85, 8.2, 14, 8, 2.6),
+        "AMD": (1.18, 0.92, 7.0, 9, 18, 3.5),
+    }
+
+    def _row_for(self, sym: str) -> dict:
+        iv_rv, ts, move, n, dte, spread = self._FIXTURES[sym]
+        return {
+            "symbol": sym,
+            "ranking_score": round(
+                compute_ranking_score(iv_rv, ts, move, n, dte, spread), 4
+            ),
+            "days_to_earnings": dte,
+            "error": None,
+        }
+
+    def _run_order(self, symbols):
+        rows_by_symbol = {s: self._row_for(s) for s in symbols}
+
+        def fake_screen(sym, today, cutoff):
+            return rows_by_symbol[sym]
+
+        with patch(
+            "services.screener_service._screen_one_symbol_ranked",
+            side_effect=fake_screen,
+        ):
+            result = build_ranked_screener(symbols=symbols, today=date(2026, 5, 28))
+        return [r["symbol"] for r in result["rows"] if not r.get("error")]
+
+    def test_repeated_runs_produce_identical_order(self):
+        """30 runs over the full pipeline (incl. ThreadPoolExecutor) → identical order."""
+        symbols = list(self._FIXTURES)
+        baseline = self._run_order(symbols)
+        for _ in range(30):
+            assert self._run_order(symbols) == baseline, (
+                "ranked screener order must be identical across runs"
+            )
+
+    def test_input_order_does_not_affect_output(self):
+        """Permuting the input symbol order (proxy for thread-completion order)
+        must not change the ranked output — the total-order sort key absorbs it."""
+        baseline = self._run_order(list(self._FIXTURES))
+        permutations = [
+            list(reversed(list(self._FIXTURES))),
+            ["NVDA", "AMD", "AAPL", "TSLA", "META", "MSFT", "GOOG", "AMZN"],
+            sorted(self._FIXTURES),
+        ]
+        for perm in permutations:
+            assert self._run_order(perm) == baseline, (
+                f"input order {perm} changed the ranked output"
+            )
+
+    def test_secondary_dte_key_breaks_score_ties_before_symbol(self):
+        """When ranking_score ties, the earlier earnings (lower dte) ranks first,
+        ahead of the symbol tie-breaker."""
+        rows = {
+            "ZZZZ": {"symbol": "ZZZZ", "ranking_score": 0.7000,
+                     "days_to_earnings": 5, "error": None},   # later alpha, earlier dte
+            "AAAA": {"symbol": "AAAA", "ranking_score": 0.7000,
+                     "days_to_earnings": 9, "error": None},   # earlier alpha, later dte
+        }
+
+        def fake_screen(sym, today, cutoff):
+            return rows[sym]
+
+        with patch(
+            "services.screener_service._screen_one_symbol_ranked",
+            side_effect=fake_screen,
+        ):
+            result = build_ranked_screener(symbols=["AAAA", "ZZZZ"],
+                                           today=date(2026, 5, 28))
+        order = [r["symbol"] for r in result["rows"] if not r.get("error")]
+        assert order == ["ZZZZ", "AAAA"], (
+            f"lower dte must break a score tie before symbol; got {order}"
+        )
+
+    def test_subthreshold_input_jitter_absorbed_by_rounding(self):
+        """round(4) on the score absorbs sub-threshold input jitter, so a genuine
+        near-tie keeps a stable rounded score (the only place cross-run drift could
+        originate is live input crossing this boundary — not the algorithm)."""
+        base = compute_ranking_score(1.28, 0.89, 6.7, 11, 12, 2.0)
+        for delta in (1e-6, 1e-5, 1e-4):
+            jittered = compute_ranking_score(1.28, 0.89, 6.7 + delta, 11, 12, 2.0)
+            assert round(base, 4) == round(jittered, 4), (
+                f"jitter {delta:.0e} on an input must not change round(4) score"
+            )
