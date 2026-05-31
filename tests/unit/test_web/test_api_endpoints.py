@@ -1090,6 +1090,114 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         build_mock.assert_not_called()
 
+    # ── F2: screener rate-limit (web-hardening audit) ─────────────────────
+
+    def test_edge_screener_rate_limited_returns_429(self):
+        """When _check_rate_limit returns False for the 'screener' bucket,
+        /api/edge/screener must return 429 before touching the provider."""
+        app_module._reset_rate_limits()
+        with patch.object(app_module, "_check_rate_limit", return_value=False), \
+             patch("web.api.app.build_edge_screener") as build_mock:
+            response = self.client.get("/api/edge/screener")
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("rate limit", response.json()["detail"].lower())
+        build_mock.assert_not_called()
+
+    def test_ranked_screener_rate_limited_returns_429(self):
+        """Same contract for /api/screener/ranked."""
+        app_module._reset_rate_limits()
+        with patch.object(app_module, "_check_rate_limit", return_value=False), \
+             patch("services.screener_service.build_ranked_screener") as build_mock:
+            response = self.client.get("/api/screener/ranked")
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("rate limit", response.json()["detail"].lower())
+        build_mock.assert_not_called()
+
+    # ── F3: sync OOS concurrency cap (web-hardening audit) ────────────────
+
+    def test_sync_oos_rejects_when_at_capacity(self):
+        """When _active_job_count_locked already equals _MAX_OOS_RUNNING_JOBS,
+        /api/oos/report-card must return 429 before dispatching _execute_oos_logic."""
+        app_module._reset_rate_limits()
+        with patch.object(app_module, "_active_job_count_locked",
+                          return_value=app_module._MAX_OOS_RUNNING_JOBS), \
+             patch.object(app_module, "_execute_oos_logic") as exec_mock:
+            response = self.client.post("/api/oos/report-card", json={})
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("capacity", response.json()["detail"].lower())
+        exec_mock.assert_not_called()
+
+    def test_sync_oos_rejects_when_async_job_active(self):
+        """Regression: an active async /api/oos/submit job must block a concurrent
+        sync /api/oos/report-card call (the P1 bug: separate semaphore let both run)."""
+        app_module._reset_rate_limits()
+        running_job = {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "data": None,
+            "error": None,
+        }
+        with app_module._oos_jobs_lock:
+            saved = dict(app_module._oos_jobs)
+            app_module._oos_jobs["async-test-job"] = running_job
+        try:
+            with patch.object(app_module, "_execute_oos_logic") as exec_mock:
+                response = self.client.post("/api/oos/report-card", json={})
+        finally:
+            with app_module._oos_jobs_lock:
+                app_module._oos_jobs.clear()
+                app_module._oos_jobs.update(saved)
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("capacity", response.json()["detail"].lower())
+        exec_mock.assert_not_called()
+
+    def test_async_oos_rejects_when_sync_sentinel_active(self):
+        """Reverse of the P1 regression: an active sync sentinel must block
+        /api/oos/submit with 429, confirming capacity is shared in both directions."""
+        app_module._reset_rate_limits()
+        sync_sentinel = {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "data": None,
+            "error": None,
+        }
+        with app_module._oos_jobs_lock:
+            saved = dict(app_module._oos_jobs)
+            app_module._oos_jobs["sync-sentinel-test"] = sync_sentinel
+        try:
+            response = self.client.post("/api/oos/submit", json={})
+        finally:
+            with app_module._oos_jobs_lock:
+                app_module._oos_jobs.clear()
+                app_module._oos_jobs.update(saved)
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("capacity", response.json()["detail"].lower())
+
+    # ── F4: export endpoint bounds enforced before DB query ───────────────
+
+    def test_recommendations_export_rejects_limit_above_maximum(self):
+        """limit > 500 must be rejected by FastAPI validation (422) before
+        the DB query runs — pre-fix the cap was applied only to the response
+        body field, not the query argument."""
+        response = self.client.get("/api/diagnostics/recommendations/export?limit=9999")
+        self.assertEqual(response.status_code, 422)
+
+    def test_recommendations_export_rejects_limit_zero(self):
+        response = self.client.get("/api/diagnostics/recommendations/export?limit=0")
+        self.assertEqual(response.status_code, 422)
+
+    def test_recommendations_export_rejects_negative_offset(self):
+        response = self.client.get("/api/diagnostics/recommendations/export?offset=-1")
+        self.assertEqual(response.status_code, 422)
+
+    def test_linkage_export_rejects_limit_above_maximum(self):
+        response = self.client.get("/api/diagnostics/recommendations/linkage/export?limit=9999")
+        self.assertEqual(response.status_code, 422)
+
+    def test_linkage_export_rejects_negative_offset(self):
+        response = self.client.get("/api/diagnostics/recommendations/linkage/export?offset=-1")
+        self.assertEqual(response.status_code, 422)
+
     def test_calibration_curve_endpoint_returns_ten_buckets(self):
         """GET /api/calibration/curve should return 10 score buckets."""
         from services.calibration_service import IVExpansionCalibration

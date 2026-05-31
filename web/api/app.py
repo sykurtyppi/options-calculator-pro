@@ -101,12 +101,18 @@ _ML_TRAIN_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_ML_TRAIN_RATE_LIMIT
 _ML_TRAIN_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_ML_TRAIN_RATE_LIMIT_PER_HOUR", "10")))
 _OOS_SUBMIT_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_OOS_SUBMIT_RATE_LIMIT_PER_MIN", "3")))
 _OOS_SUBMIT_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_OOS_SUBMIT_RATE_LIMIT_PER_HOUR", "20")))
+# F2: screener endpoints fan out to the external MDA provider (one API call per
+# symbol). A tight loop by an auth'd client burns provider quota fast.
+# Defaults: 6/min, 40/hour per IP. Both screener variants share one bucket.
+_SCREENER_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_SCREENER_RATE_LIMIT_PER_MIN", "6")))
+_SCREENER_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_SCREENER_RATE_LIMIT_PER_HOUR", "40")))
 
 # (bucket_name, ip) -> list of recent attempt timestamps. Same shape used for
 # all rate-limited endpoints; keyed by bucket so /login attempts can't be
 # counted against /api/ml/train, etc.
 _rate_limit_buckets: Dict[Tuple[str, str], List[float]] = {}
 _rate_limit_lock = threading.Lock()
+
 
 # Web-audit P1-2: session-nonce revocation set. POST /logout records the
 # nonce here so _valid_session rejects the cookie even before its 7-day TTL
@@ -1093,7 +1099,16 @@ def analyze_edge(request: EdgeAnalyzeRequest) -> EdgeAnalyzeResponse:
 def edge_screener(
     expiry_mode: Literal["front_after_earnings", "next_monthly_opex"] = "front_after_earnings",
     weeks: int = Query(6, ge=1, le=26),
+    http_request: Request = None,
 ) -> EdgeScreenerResponse:
+    if not _check_rate_limit(
+        "screener", _client_ip(http_request),
+        _SCREENER_RATE_LIMIT_PER_MIN, _SCREENER_RATE_LIMIT_PER_HOUR,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Screener rate limit exceeded. Try again shortly.",
+        )
     try:
         payload = build_edge_screener(
             expiry_mode=expiry_mode,
@@ -1442,6 +1457,24 @@ def run_oos_report_card(
             status_code=429,
             detail="OOS submission rate limit exceeded. Wait a minute and try again.",
         )
+    # F3: shared concurrency guard. Register this sync job in _oos_jobs so
+    # _active_job_count_locked counts it alongside async submit jobs. Both
+    # paths then see the same cap, preventing a running async job from being
+    # bypassed by a simultaneous sync call (or vice-versa).
+    sync_job_id = f"sync-{uuid.uuid4()}"
+    with _oos_jobs_lock:
+        _purge_jobs_locked(_oos_jobs, ttl_seconds=_OOS_JOB_TTL_SECONDS)
+        if _active_job_count_locked(_oos_jobs) >= _MAX_OOS_RUNNING_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail="OOS job capacity reached. Wait for the current job to finish before submitting another.",
+            )
+        _oos_jobs[sync_job_id] = {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "data": None,
+            "error": None,
+        }
     try:
         data = _execute_oos_logic(request)
         return OOSReportResponse(
@@ -1453,6 +1486,9 @@ def run_oos_report_card(
         raise
     except Exception as exc:
         _raise_public_error(500, "OOS report generation failed.", exc)
+    finally:
+        with _oos_jobs_lock:
+            _oos_jobs.pop(sync_job_id, None)
 
 
 # ── Async OOS job store ───────────────────────────────────────────────────────
@@ -1710,6 +1746,7 @@ def ranked_screener(
     release_filter: str = Query("all", pattern="^(all|bmo|amc|dmh|unknown)$"),
     weeks: int = Query(4, ge=1, le=26),
     symbols: Optional[str] = Query(None, max_length=2000),
+    http_request: Request = None,
 ) -> RankedScreenerResponse:
     """
     Rank upcoming earnings candidates by pre-earnings long-vega setup quality.
@@ -1722,6 +1759,14 @@ def ranked_screener(
     weeks              : Look-ahead window in weeks (default 4)
     symbols            : Comma-separated override universe (default: DEFAULT_UNIVERSE)
     """
+    if not _check_rate_limit(
+        "screener", _client_ip(http_request),
+        _SCREENER_RATE_LIMIT_PER_MIN, _SCREENER_RATE_LIMIT_PER_HOUR,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Screener rate limit exceeded. Try again shortly.",
+        )
     from services.screener_service import build_ranked_screener, DEFAULT_UNIVERSE
     from datetime import date as _date
 
@@ -1967,8 +2012,8 @@ def recommendation_ledger_search_by_symbol(symbol: str, limit: int = 50, offset:
 @app.get("/api/diagnostics/recommendations/export")
 def recommendation_ledger_export(
     format: Literal["json", "csv"] = "json",
-    limit: int = 500,
-    offset: int = 0,
+    limit: int = Query(500, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     symbol: Optional[str] = None,
 ) -> Any:
     from services.recommendation_ledger import get_recommendation_ledger
@@ -1983,8 +2028,8 @@ def recommendation_ledger_export(
             "export_type": "recommendations",
             "count": len(rows),
             "total": ledger.count(symbol=symbol),
-            "limit": max(1, min(int(limit or 500), 500)),
-            "offset": max(0, int(offset or 0)),
+            "limit": limit,
+            "offset": offset,
             "symbol": symbol.upper() if symbol else None,
             "rows": rows,
         }
@@ -1995,8 +2040,8 @@ def recommendation_ledger_export(
 @app.get("/api/diagnostics/recommendations/linkage/export")
 def recommendation_ledger_linkage_export(
     format: Literal["json", "csv"] = "json",
-    limit: int = 500,
-    offset: int = 0,
+    limit: int = Query(500, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     symbol: Optional[str] = None,
 ) -> Any:
     from services.outcome_recorder import get_outcome_store
@@ -2028,8 +2073,8 @@ def recommendation_ledger_linkage_export(
             "export_type": "recommendation_linkages",
             "count": len(linkages),
             "total": ledger.count(symbol=symbol),
-            "limit": max(1, min(int(limit or 500), 500)),
-            "offset": max(0, int(offset or 0)),
+            "limit": limit,
+            "offset": offset,
             "symbol": symbol.upper() if symbol else None,
             "rows": linkages,
         }
