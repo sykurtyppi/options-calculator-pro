@@ -4,6 +4,11 @@ from datetime import date
 from services.earnings_vol_snapshot import VolSnapshot
 from services.structure_scorecard import StructureScorecard
 from services.structure_selector import (
+    DOMINANT_SCORE_GAP,
+    EXECUTION_COST_DOMINATES_EDGE_RATIO,
+    HIGH_EXECUTION_PENALTY_THRESHOLD,
+    MIN_DATA_QUALITY_FOR_ANY_TRADE,
+    MIN_WALK_FORWARD_HISTORY,
     RECOMMENDATION_BEST,
     RECOMMENDATION_NO_TRADE,
     RECOMMENDATION_WATCH,
@@ -214,6 +219,99 @@ class TestStructureSelector(unittest.TestCase):
         first = select_best_structure(snapshot, cards).to_dict()
         second = select_best_structure(snapshot, cards).to_dict()
         self.assertEqual(first, second)
+
+    # ── Phase 2.4 — no-trade gate property tests ──────────────────────────────
+    # Each test toggles one gate condition across the threshold and confirms the
+    # recommendation flips.  Three conditions had no existing test:
+    #   (a) data_quality_score < MIN_DATA_QUALITY_FOR_ANY_TRADE
+    #   (b) weak_history (walk_forward_history_count < MIN_WALK_FORWARD_HISTORY
+    #         and gap < DOMINANT_SCORE_GAP)
+    #   (c) execution cost dominates edge (exec_cost / gross_return >= 0.50)
+
+    def test_low_data_quality_forces_no_trade(self):
+        """data_quality_score below MIN_DATA_QUALITY_FOR_ANY_TRADE triggers NO_TRADE."""
+        snap_low = _snapshot(data_quality_score=MIN_DATA_QUALITY_FOR_ANY_TRADE - 0.01)
+        snap_ok = _snapshot(data_quality_score=MIN_DATA_QUALITY_FOR_ANY_TRADE + 0.10)
+        cards = [
+            _scorecard("atm_straddle", expected_edge_pct=5.0,
+                       composite_structure_score=0.82, execution_penalty=0.02),
+            _scorecard("otm_strangle", expected_edge_pct=2.5, composite_structure_score=0.58),
+            _scorecard("call_calendar", expected_edge_pct=1.8, composite_structure_score=0.50),
+            _scorecard("put_calendar", expected_edge_pct=1.2, composite_structure_score=0.42),
+        ]
+        self.assertEqual(
+            select_best_structure(snap_low, cards).recommendation,
+            RECOMMENDATION_NO_TRADE,
+        )
+        self.assertNotEqual(
+            select_best_structure(snap_ok, cards).recommendation,
+            RECOMMENDATION_NO_TRADE,
+        )
+
+    def test_weak_history_with_small_gap_forces_no_trade(self):
+        """walk_forward_history_count below MIN_WALK_FORWARD_HISTORY and small gap → NO_TRADE."""
+        gap = DOMINANT_SCORE_GAP / 2
+        cards_thin = [
+            _scorecard("atm_straddle", expected_edge_pct=3.5,
+                       composite_structure_score=0.70,
+                       walk_forward_history_count=MIN_WALK_FORWARD_HISTORY - 1),
+            _scorecard("otm_strangle", expected_edge_pct=2.5,
+                       composite_structure_score=0.70 - gap),
+            _scorecard("call_calendar", expected_edge_pct=1.5, composite_structure_score=0.50),
+            _scorecard("put_calendar", expected_edge_pct=1.0, composite_structure_score=0.40),
+        ]
+        cards_thick = [
+            _scorecard("atm_straddle", expected_edge_pct=3.5,
+                       composite_structure_score=0.70,
+                       walk_forward_history_count=MIN_WALK_FORWARD_HISTORY),
+            _scorecard("otm_strangle", expected_edge_pct=2.5,
+                       composite_structure_score=0.70 - gap),
+            _scorecard("call_calendar", expected_edge_pct=1.5, composite_structure_score=0.50),
+            _scorecard("put_calendar", expected_edge_pct=1.0, composite_structure_score=0.40),
+        ]
+        snap = _snapshot()
+        self.assertEqual(
+            select_best_structure(snap, cards_thin).recommendation,
+            RECOMMENDATION_NO_TRADE,
+        )
+        self.assertNotEqual(
+            select_best_structure(snap, cards_thick).recommendation,
+            RECOMMENDATION_NO_TRADE,
+        )
+
+    def test_execution_cost_dominates_edge_forces_no_trade(self):
+        """When execution cost >= EXECUTION_COST_DOMINATES_EDGE_RATIO * gross return → NO_TRADE."""
+        # gross_return = expected_edge_pct + exec_cost_pct; exec_cost_pct = 26 * execution_penalty
+        # To trigger the veto: exec_cost >= 0.50 * gross_return
+        # Choose execution_penalty so that 26 * penalty / (edge + 26 * penalty) >= 0.50
+        # → 26 * penalty >= edge → penalty >= edge / 26
+        edge_pct = 2.0
+        penalty_triggers = (edge_pct / 26.0) + 0.01   # just above the ratio boundary
+        penalty_safe = (edge_pct / 26.0) * 0.5         # well below
+
+        snap = _snapshot()
+        cards_veto = [
+            _scorecard("atm_straddle", expected_edge_pct=edge_pct,
+                       composite_structure_score=0.72, execution_penalty=penalty_triggers),
+            _scorecard("otm_strangle", expected_edge_pct=1.0, composite_structure_score=0.55),
+            _scorecard("call_calendar", expected_edge_pct=0.8, composite_structure_score=0.48),
+            _scorecard("put_calendar", expected_edge_pct=0.5, composite_structure_score=0.40),
+        ]
+        cards_safe = [
+            _scorecard("atm_straddle", expected_edge_pct=edge_pct,
+                       composite_structure_score=0.72, execution_penalty=penalty_safe),
+            _scorecard("otm_strangle", expected_edge_pct=1.0, composite_structure_score=0.55),
+            _scorecard("call_calendar", expected_edge_pct=0.8, composite_structure_score=0.48),
+            _scorecard("put_calendar", expected_edge_pct=0.5, composite_structure_score=0.40),
+        ]
+        self.assertEqual(
+            select_best_structure(snap, cards_veto).recommendation,
+            RECOMMENDATION_NO_TRADE,
+        )
+        self.assertNotEqual(
+            select_best_structure(snap, cards_safe).recommendation,
+            RECOMMENDATION_NO_TRADE,
+        )
 
 
 if __name__ == "__main__":
