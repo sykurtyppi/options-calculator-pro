@@ -4104,6 +4104,7 @@ class InstitutionalMLDatabase:
         rows: List[Dict[str, Any]] = []
         for (vix_regime, dte_bucket, ivrv_bucket), group in df.groupby(
             ['vix_regime', 'dte_bucket', 'ivrv_bucket'],
+            observed=False,
             dropna=False
         ):
             trade_count = int(len(group))
