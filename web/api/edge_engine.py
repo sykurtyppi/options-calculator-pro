@@ -2929,7 +2929,8 @@ def analyze_single_ticker(
         if lead_scorecard is not None
         else np.clip(0.60 * setup_score + 0.40 * expectancy_score, 0.0, 1.0)
     )
-    confidence_pct_raw = float(getattr(selector_output, "confidence_pct", np.clip(30.0 + 70.0 * composite_score, 0.0, 100.0)))
+    # SelectorOutput.confidence_pct is a required float field — the getattr fallback was dead code.
+    confidence_pct_raw = float(selector_output.confidence_pct)
 
     # ── Move-risk level: soft advisory — how dangerous is the tail relative to the priced-in move? ──
     # Ratio = p90 historical move / event-implied move.
@@ -2943,7 +2944,7 @@ def analyze_single_ticker(
         sample_size=move_sample_size,
     )
 
-    # ── Grading refinements: apply calibration multipliers to confidence_pct ──
+    # ── Grading refinements: compute calibration multipliers (informational; selector owns confidence_pct) ──
 
     # Fix 2: kurtosis penalty — fat-tailed movers lose confidence
     _raw_moves: List[float] = move_profile.get("raw_moves_pct") or []
@@ -2965,12 +2966,14 @@ def analyze_single_ticker(
         near_back_ratio=_safe_float(near_back_iv_ratio, 1.10),
         iv_rv=_safe_float(iv_rv, 1.10),
     )
-    # Combined calibration factor — include ML multiplier when model is loaded
+    # Combined calibration factor — informational only; selector owns the final confidence value.
+    # Exposed as "confidence_calibration_mult" in metrics so the components can be audited,
+    # but NOT applied to confidence_pct (selector_output.confidence_pct is the authoritative output).
     _calibration_mult = float(np.clip(
         ticker_tier_mult * kurtosis_conf_mult * crush_calibration_mult * _ml_mult,
         0.40, 1.15,
     ))
-    confidence_pct = float(getattr(selector_output, "confidence_pct", np.clip(confidence_pct_raw * _calibration_mult, 0.0, 100.0)))
+    confidence_pct = float(selector_output.confidence_pct)
 
     # Calendar spread P&L diagram (ATM call calendar — short near, long back+28d)
     _cal_iv_back = (
@@ -3209,7 +3212,7 @@ def analyze_single_ticker(
         recommendation = "No Trade"
         analysis_mode = "post_earnings_crush"
 
-    confidence_pct = float(getattr(selector_output, "confidence_pct", confidence_pct_uncapped))
+    # confidence_pct already equals selector_output.confidence_pct (set above). No reassignment needed.
     _confidence_cap_reason: Optional[str] = None
     # Entries collected here are spliced into rationale[] once it is built below.
     _deferred_rationale: List[str] = []
