@@ -2496,18 +2496,39 @@ def _attach_live_forward_provenance(edge_snapshot: "EdgeSnapshot") -> None:
         )
 
 
-def analyze_single_ticker(
-    symbol: str,
-    mda_client: Any = None,  # MarketDataClient | None
-    record_to_ledger: bool = True,
-) -> EdgeSnapshot:
-    """
-    Full single-ticker IV crush edge analysis.
+@dataclass(frozen=True)
+class AnalysisInputs:
+    """Frozen bundle of non-derivable inputs for a single-ticker analysis (Phase 4.1).
 
-    Data strategy:
-      - yfinance  : 6-month OHLCV for RV + 5-year close history for earnings-move anchors
-      - MDApp     : live option chains (IV, Greeks, spread), earnings dates + BMO/AMC timing
-      - Fallback  : if MDApp unavailable or returns empty, yfinance used for options/earnings too
+    Produced by build_analysis_inputs() — the gathering phase of analyze_single_ticker.
+    Snapshot-derived scalars (iv30, smile_curvature, …) are intentionally NOT duplicated
+    here; the orchestrator unpacks them from vol_snapshot via _snapshot_to_edge_inputs.
+    """
+    clean_symbol: str
+    ticker: Any
+    close: Any
+    market_cap: Optional[float]
+    ticker_tier: str
+    ticker_tier_mult: float
+    current_price: float
+    close_for_profile: Any
+    chain_df: Any
+    data_source: str
+    dte: Optional[int]
+    earnings_release_time: Optional[str]
+    resolved_earnings_event: Any
+    earnings_events_for_profile: List[Dict[str, Any]]
+    vol_snapshot: Any
+    structure_scorecards: Any
+    selector_output: Any
+
+
+def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs:
+    """Gather all non-derivable inputs for analyze_single_ticker (Phase 4.1 seam).
+
+    Extracted verbatim from the orchestrator's gathering phase. This is the clean seam a
+    backtest harness can call to obtain the vol snapshot + scorecards + selector output
+    for a symbol without running the downstream scoring/gates/metrics phases.
     """
     from services.market_data_client import MarketDataClient  # late import to avoid circular
 
@@ -2740,6 +2761,58 @@ def analyze_single_ticker(
     )
     structure_scorecards = build_structure_scorecards(vol_snapshot)
     selector_output = select_best_structure(vol_snapshot, structure_scorecards)
+    return AnalysisInputs(
+        clean_symbol=clean_symbol,
+        ticker=ticker,
+        close=close,
+        market_cap=_market_cap,
+        ticker_tier=ticker_tier,
+        ticker_tier_mult=ticker_tier_mult,
+        current_price=current_price,
+        close_for_profile=close_for_profile,
+        chain_df=chain_df,
+        data_source=data_source,
+        dte=dte,
+        earnings_release_time=earnings_release_time,
+        resolved_earnings_event=resolved_earnings_event,
+        earnings_events_for_profile=earnings_events_for_profile,
+        vol_snapshot=vol_snapshot,
+        structure_scorecards=structure_scorecards,
+        selector_output=selector_output,
+    )
+
+
+def analyze_single_ticker(
+    symbol: str,
+    mda_client: Any = None,  # MarketDataClient | None
+    record_to_ledger: bool = True,
+) -> EdgeSnapshot:
+    """
+    Full single-ticker IV crush edge analysis.
+
+    Data strategy:
+      - yfinance  : 6-month OHLCV for RV + 5-year close history for earnings-move anchors
+      - MDApp     : live option chains (IV, Greeks, spread), earnings dates + BMO/AMC timing
+      - Fallback  : if MDApp unavailable or returns empty, yfinance used for options/earnings too
+    """
+    inputs = build_analysis_inputs(symbol, mda_client)
+    clean_symbol = inputs.clean_symbol
+    ticker = inputs.ticker
+    close = inputs.close
+    _market_cap = inputs.market_cap
+    ticker_tier = inputs.ticker_tier
+    ticker_tier_mult = inputs.ticker_tier_mult
+    current_price = inputs.current_price
+    close_for_profile = inputs.close_for_profile
+    chain_df = inputs.chain_df
+    data_source = inputs.data_source
+    dte = inputs.dte
+    earnings_release_time = inputs.earnings_release_time
+    resolved_earnings_event = inputs.resolved_earnings_event
+    earnings_events_for_profile = inputs.earnings_events_for_profile
+    vol_snapshot = inputs.vol_snapshot
+    structure_scorecards = inputs.structure_scorecards
+    selector_output = inputs.selector_output
     lead_scorecard = _selector_lead_scorecard(structure_scorecards, selector_output)
     snapshot_inputs = _snapshot_to_edge_inputs(vol_snapshot)
 
