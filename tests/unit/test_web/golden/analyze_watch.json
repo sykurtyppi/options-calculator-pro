@@ -1,0 +1,1561 @@
+{
+  "confidence_pct": 47.0,
+  "metrics": {
+    "analysis_mode": "selector_first",
+    "atm_delta_call": 0.51671842,
+    "atm_delta_put": -0.48328158,
+    "atm_gamma": 0.09756977,
+    "atm_theta_call": -0.10737424,
+    "atm_theta_put": -0.09618406,
+    "atm_vega": 0.06030842,
+    "base_drawdown_risk_pct": 1.87832231,
+    "calendar_be_vs_implied": 0.36,
+    "calendar_payoff": {
+      "breakeven_moves_pct": [
+        -1.9,
+        2.2
+      ],
+      "calendar_is_theoretical": true,
+      "calendar_note": "Priced from interpolated IV30/IV45; back leg = near + 28d. Not guaranteed to match a live quoted chain.",
+      "calendar_scenario_source": "small_sample_estimate",
+      "entry_back_premium": 3.7959,
+      "entry_debit": 2.6212,
+      "entry_debit_per_contract": 262.12,
+      "entry_near_premium": 1.1747,
+      "iv_back": 0.3,
+      "iv_near": 0.27,
+      "payoff_scenarios": [
+        {
+          "iv_crush_25": -2.616,
+          "iv_crush_45": -2.62,
+          "iv_expand_20": -2.606,
+          "iv_flat": -2.612,
+          "move_pct": -20.0,
+          "price": 81.76
+        },
+        {
+          "iv_crush_25": -2.612,
+          "iv_crush_45": -2.618,
+          "iv_expand_20": -2.598,
+          "iv_flat": -2.606,
+          "move_pct": -19.0,
+          "price": 82.78
+        },
+        {
+          "iv_crush_25": -2.606,
+          "iv_crush_45": -2.616,
+          "iv_expand_20": -2.586,
+          "iv_flat": -2.597,
+          "move_pct": -18.0,
+          "price": 83.8
+        },
+        {
+          "iv_crush_25": -2.597,
+          "iv_crush_45": -2.611,
+          "iv_expand_20": -2.569,
+          "iv_flat": -2.584,
+          "move_pct": -17.0,
+          "price": 84.83
+        },
+        {
+          "iv_crush_25": -2.583,
+          "iv_crush_45": -2.605,
+          "iv_expand_20": -2.545,
+          "iv_flat": -2.565,
+          "move_pct": -16.0,
+          "price": 85.85
+        },
+        {
+          "iv_crush_25": -2.563,
+          "iv_crush_45": -2.594,
+          "iv_expand_20": -2.512,
+          "iv_flat": -2.539,
+          "move_pct": -15.0,
+          "price": 86.87
+        },
+        {
+          "iv_crush_25": -2.534,
+          "iv_crush_45": -2.577,
+          "iv_expand_20": -2.468,
+          "iv_flat": -2.503,
+          "move_pct": -14.0,
+          "price": 87.89
+        },
+        {
+          "iv_crush_25": -2.494,
+          "iv_crush_45": -2.552,
+          "iv_expand_20": -2.41,
+          "iv_flat": -2.454,
+          "move_pct": -13.0,
+          "price": 88.91
+        },
+        {
+          "iv_crush_25": -2.44,
+          "iv_crush_45": -2.516,
+          "iv_expand_20": -2.335,
+          "iv_flat": -2.389,
+          "move_pct": -12.0,
+          "price": 89.94
+        },
+        {
+          "iv_crush_25": -2.368,
+          "iv_crush_45": -2.466,
+          "iv_expand_20": -2.239,
+          "iv_flat": -2.305,
+          "move_pct": -11.0,
+          "price": 90.96
+        },
+        {
+          "iv_crush_25": -2.274,
+          "iv_crush_45": -2.396,
+          "iv_expand_20": -2.12,
+          "iv_flat": -2.198,
+          "move_pct": -10.0,
+          "price": 91.98
+        },
+        {
+          "iv_crush_25": -2.154,
+          "iv_crush_45": -2.303,
+          "iv_expand_20": -1.974,
+          "iv_flat": -2.064,
+          "move_pct": -9.0,
+          "price": 93.0
+        },
+        {
+          "iv_crush_25": -2.004,
+          "iv_crush_45": -2.181,
+          "iv_expand_20": -1.796,
+          "iv_flat": -1.9,
+          "move_pct": -8.0,
+          "price": 94.02
+        },
+        {
+          "iv_crush_25": -1.819,
+          "iv_crush_45": -2.025,
+          "iv_expand_20": -1.584,
+          "iv_flat": -1.7,
+          "move_pct": -7.0,
+          "price": 95.05
+        },
+        {
+          "iv_crush_25": -1.595,
+          "iv_crush_45": -1.829,
+          "iv_expand_20": -1.333,
+          "iv_flat": -1.463,
+          "move_pct": -6.0,
+          "price": 96.07
+        },
+        {
+          "iv_crush_25": -1.328,
+          "iv_crush_45": -1.588,
+          "iv_expand_20": -1.043,
+          "iv_flat": -1.183,
+          "move_pct": -5.0,
+          "price": 97.09
+        },
+        {
+          "iv_crush_25": -1.015,
+          "iv_crush_45": -1.299,
+          "iv_expand_20": -0.709,
+          "iv_flat": -0.859,
+          "move_pct": -4.0,
+          "price": 98.11
+        },
+        {
+          "iv_crush_25": -0.653,
+          "iv_crush_45": -0.956,
+          "iv_expand_20": -0.33,
+          "iv_flat": -0.488,
+          "move_pct": -3.0,
+          "price": 99.13
+        },
+        {
+          "iv_crush_25": -0.24,
+          "iv_crush_45": -0.558,
+          "iv_expand_20": 0.096,
+          "iv_flat": -0.068,
+          "move_pct": -2.0,
+          "price": 100.16
+        },
+        {
+          "iv_crush_25": 0.225,
+          "iv_crush_45": -0.101,
+          "iv_expand_20": 0.568,
+          "iv_flat": 0.401,
+          "move_pct": -1.0,
+          "price": 101.18
+        },
+        {
+          "iv_crush_25": 0.742,
+          "iv_crush_45": 0.413,
+          "iv_expand_20": 1.088,
+          "iv_flat": 0.919,
+          "move_pct": 0.0,
+          "price": 102.2
+        },
+        {
+          "iv_crush_25": 0.288,
+          "iv_crush_45": -0.038,
+          "iv_expand_20": 0.632,
+          "iv_flat": 0.465,
+          "move_pct": 1.0,
+          "price": 103.22
+        },
+        {
+          "iv_crush_25": -0.115,
+          "iv_crush_45": -0.432,
+          "iv_expand_20": 0.222,
+          "iv_flat": 0.057,
+          "move_pct": 2.0,
+          "price": 104.24
+        },
+        {
+          "iv_crush_25": -0.471,
+          "iv_crush_45": -0.774,
+          "iv_expand_20": -0.145,
+          "iv_flat": -0.304,
+          "move_pct": 3.0,
+          "price": 105.27
+        },
+        {
+          "iv_crush_25": -0.781,
+          "iv_crush_45": -1.066,
+          "iv_expand_20": -0.47,
+          "iv_flat": -0.622,
+          "move_pct": 4.0,
+          "price": 106.29
+        },
+        {
+          "iv_crush_25": -1.048,
+          "iv_crush_45": -1.313,
+          "iv_expand_20": -0.756,
+          "iv_flat": -0.9,
+          "move_pct": 5.0,
+          "price": 107.31
+        },
+        {
+          "iv_crush_25": -1.277,
+          "iv_crush_45": -1.519,
+          "iv_expand_20": -1.006,
+          "iv_flat": -1.14,
+          "move_pct": 6.0,
+          "price": 108.33
+        },
+        {
+          "iv_crush_25": -1.472,
+          "iv_crush_45": -1.689,
+          "iv_expand_20": -1.222,
+          "iv_flat": -1.346,
+          "move_pct": 7.0,
+          "price": 109.35
+        },
+        {
+          "iv_crush_25": -1.635,
+          "iv_crush_45": -1.827,
+          "iv_expand_20": -1.408,
+          "iv_flat": -1.521,
+          "move_pct": 8.0,
+          "price": 110.38
+        },
+        {
+          "iv_crush_25": -1.77,
+          "iv_crush_45": -1.938,
+          "iv_expand_20": -1.567,
+          "iv_flat": -1.669,
+          "move_pct": 9.0,
+          "price": 111.4
+        },
+        {
+          "iv_crush_25": -1.882,
+          "iv_crush_45": -2.027,
+          "iv_expand_20": -1.702,
+          "iv_flat": -1.793,
+          "move_pct": 10.0,
+          "price": 112.42
+        },
+        {
+          "iv_crush_25": -1.973,
+          "iv_crush_45": -2.096,
+          "iv_expand_20": -1.815,
+          "iv_flat": -1.895,
+          "move_pct": 11.0,
+          "price": 113.44
+        },
+        {
+          "iv_crush_25": -2.047,
+          "iv_crush_45": -2.15,
+          "iv_expand_20": -1.91,
+          "iv_flat": -1.98,
+          "move_pct": 12.0,
+          "price": 114.46
+        },
+        {
+          "iv_crush_25": -2.106,
+          "iv_crush_45": -2.191,
+          "iv_expand_20": -1.988,
+          "iv_flat": -2.049,
+          "move_pct": 13.0,
+          "price": 115.49
+        },
+        {
+          "iv_crush_25": -2.153,
+          "iv_crush_45": -2.223,
+          "iv_expand_20": -2.052,
+          "iv_flat": -2.105,
+          "move_pct": 14.0,
+          "price": 116.51
+        },
+        {
+          "iv_crush_25": -2.19,
+          "iv_crush_45": -2.246,
+          "iv_expand_20": -2.105,
+          "iv_flat": -2.149,
+          "move_pct": 15.0,
+          "price": 117.53
+        },
+        {
+          "iv_crush_25": -2.218,
+          "iv_crush_45": -2.264,
+          "iv_expand_20": -2.148,
+          "iv_flat": -2.185,
+          "move_pct": 16.0,
+          "price": 118.55
+        },
+        {
+          "iv_crush_25": -2.241,
+          "iv_crush_45": -2.277,
+          "iv_expand_20": -2.182,
+          "iv_flat": -2.214,
+          "move_pct": 17.0,
+          "price": 119.57
+        },
+        {
+          "iv_crush_25": -2.258,
+          "iv_crush_45": -2.286,
+          "iv_expand_20": -2.21,
+          "iv_flat": -2.236,
+          "move_pct": 18.0,
+          "price": 120.6
+        },
+        {
+          "iv_crush_25": -2.271,
+          "iv_crush_45": -2.293,
+          "iv_expand_20": -2.232,
+          "iv_flat": -2.253,
+          "move_pct": 19.0,
+          "price": 121.62
+        },
+        {
+          "iv_crush_25": -2.281,
+          "iv_crush_45": -2.297,
+          "iv_expand_20": -2.249,
+          "iv_flat": -2.267,
+          "move_pct": 20.0,
+          "price": 122.64
+        }
+      ],
+      "payoff_scenarios_per_contract": [
+        {
+          "iv_crush_25": -261.6,
+          "iv_crush_45": -262.0,
+          "iv_expand_20": -260.6,
+          "iv_flat": -261.2,
+          "move_pct": -20.0,
+          "price": 81.76
+        },
+        {
+          "iv_crush_25": -261.2,
+          "iv_crush_45": -261.8,
+          "iv_expand_20": -259.8,
+          "iv_flat": -260.6,
+          "move_pct": -19.0,
+          "price": 82.78
+        },
+        {
+          "iv_crush_25": -260.6,
+          "iv_crush_45": -261.6,
+          "iv_expand_20": -258.6,
+          "iv_flat": -259.7,
+          "move_pct": -18.0,
+          "price": 83.8
+        },
+        {
+          "iv_crush_25": -259.7,
+          "iv_crush_45": -261.1,
+          "iv_expand_20": -256.9,
+          "iv_flat": -258.4,
+          "move_pct": -17.0,
+          "price": 84.83
+        },
+        {
+          "iv_crush_25": -258.3,
+          "iv_crush_45": -260.5,
+          "iv_expand_20": -254.5,
+          "iv_flat": -256.5,
+          "move_pct": -16.0,
+          "price": 85.85
+        },
+        {
+          "iv_crush_25": -256.3,
+          "iv_crush_45": -259.4,
+          "iv_expand_20": -251.2,
+          "iv_flat": -253.9,
+          "move_pct": -15.0,
+          "price": 86.87
+        },
+        {
+          "iv_crush_25": -253.4,
+          "iv_crush_45": -257.7,
+          "iv_expand_20": -246.8,
+          "iv_flat": -250.3,
+          "move_pct": -14.0,
+          "price": 87.89
+        },
+        {
+          "iv_crush_25": -249.4,
+          "iv_crush_45": -255.2,
+          "iv_expand_20": -241.0,
+          "iv_flat": -245.4,
+          "move_pct": -13.0,
+          "price": 88.91
+        },
+        {
+          "iv_crush_25": -244.0,
+          "iv_crush_45": -251.6,
+          "iv_expand_20": -233.5,
+          "iv_flat": -238.9,
+          "move_pct": -12.0,
+          "price": 89.94
+        },
+        {
+          "iv_crush_25": -236.8,
+          "iv_crush_45": -246.6,
+          "iv_expand_20": -223.9,
+          "iv_flat": -230.5,
+          "move_pct": -11.0,
+          "price": 90.96
+        },
+        {
+          "iv_crush_25": -227.4,
+          "iv_crush_45": -239.6,
+          "iv_expand_20": -212.0,
+          "iv_flat": -219.8,
+          "move_pct": -10.0,
+          "price": 91.98
+        },
+        {
+          "iv_crush_25": -215.4,
+          "iv_crush_45": -230.3,
+          "iv_expand_20": -197.4,
+          "iv_flat": -206.4,
+          "move_pct": -9.0,
+          "price": 93.0
+        },
+        {
+          "iv_crush_25": -200.4,
+          "iv_crush_45": -218.1,
+          "iv_expand_20": -179.6,
+          "iv_flat": -190.0,
+          "move_pct": -8.0,
+          "price": 94.02
+        },
+        {
+          "iv_crush_25": -181.9,
+          "iv_crush_45": -202.5,
+          "iv_expand_20": -158.4,
+          "iv_flat": -170.0,
+          "move_pct": -7.0,
+          "price": 95.05
+        },
+        {
+          "iv_crush_25": -159.5,
+          "iv_crush_45": -182.9,
+          "iv_expand_20": -133.3,
+          "iv_flat": -146.3,
+          "move_pct": -6.0,
+          "price": 96.07
+        },
+        {
+          "iv_crush_25": -132.8,
+          "iv_crush_45": -158.8,
+          "iv_expand_20": -104.3,
+          "iv_flat": -118.3,
+          "move_pct": -5.0,
+          "price": 97.09
+        },
+        {
+          "iv_crush_25": -101.5,
+          "iv_crush_45": -129.9,
+          "iv_expand_20": -70.9,
+          "iv_flat": -85.9,
+          "move_pct": -4.0,
+          "price": 98.11
+        },
+        {
+          "iv_crush_25": -65.3,
+          "iv_crush_45": -95.6,
+          "iv_expand_20": -33.0,
+          "iv_flat": -48.8,
+          "move_pct": -3.0,
+          "price": 99.13
+        },
+        {
+          "iv_crush_25": -24.0,
+          "iv_crush_45": -55.8,
+          "iv_expand_20": 9.6,
+          "iv_flat": -6.8,
+          "move_pct": -2.0,
+          "price": 100.16
+        },
+        {
+          "iv_crush_25": 22.5,
+          "iv_crush_45": -10.1,
+          "iv_expand_20": 56.8,
+          "iv_flat": 40.1,
+          "move_pct": -1.0,
+          "price": 101.18
+        },
+        {
+          "iv_crush_25": 74.2,
+          "iv_crush_45": 41.3,
+          "iv_expand_20": 108.8,
+          "iv_flat": 91.9,
+          "move_pct": 0.0,
+          "price": 102.2
+        },
+        {
+          "iv_crush_25": 28.8,
+          "iv_crush_45": -3.8,
+          "iv_expand_20": 63.2,
+          "iv_flat": 46.5,
+          "move_pct": 1.0,
+          "price": 103.22
+        },
+        {
+          "iv_crush_25": -11.5,
+          "iv_crush_45": -43.2,
+          "iv_expand_20": 22.2,
+          "iv_flat": 5.7,
+          "move_pct": 2.0,
+          "price": 104.24
+        },
+        {
+          "iv_crush_25": -47.1,
+          "iv_crush_45": -77.4,
+          "iv_expand_20": -14.5,
+          "iv_flat": -30.4,
+          "move_pct": 3.0,
+          "price": 105.27
+        },
+        {
+          "iv_crush_25": -78.1,
+          "iv_crush_45": -106.6,
+          "iv_expand_20": -47.0,
+          "iv_flat": -62.2,
+          "move_pct": 4.0,
+          "price": 106.29
+        },
+        {
+          "iv_crush_25": -104.8,
+          "iv_crush_45": -131.3,
+          "iv_expand_20": -75.6,
+          "iv_flat": -90.0,
+          "move_pct": 5.0,
+          "price": 107.31
+        },
+        {
+          "iv_crush_25": -127.7,
+          "iv_crush_45": -151.9,
+          "iv_expand_20": -100.6,
+          "iv_flat": -114.0,
+          "move_pct": 6.0,
+          "price": 108.33
+        },
+        {
+          "iv_crush_25": -147.2,
+          "iv_crush_45": -168.9,
+          "iv_expand_20": -122.2,
+          "iv_flat": -134.6,
+          "move_pct": 7.0,
+          "price": 109.35
+        },
+        {
+          "iv_crush_25": -163.5,
+          "iv_crush_45": -182.7,
+          "iv_expand_20": -140.8,
+          "iv_flat": -152.1,
+          "move_pct": 8.0,
+          "price": 110.38
+        },
+        {
+          "iv_crush_25": -177.0,
+          "iv_crush_45": -193.8,
+          "iv_expand_20": -156.7,
+          "iv_flat": -166.9,
+          "move_pct": 9.0,
+          "price": 111.4
+        },
+        {
+          "iv_crush_25": -188.2,
+          "iv_crush_45": -202.7,
+          "iv_expand_20": -170.2,
+          "iv_flat": -179.3,
+          "move_pct": 10.0,
+          "price": 112.42
+        },
+        {
+          "iv_crush_25": -197.3,
+          "iv_crush_45": -209.6,
+          "iv_expand_20": -181.5,
+          "iv_flat": -189.5,
+          "move_pct": 11.0,
+          "price": 113.44
+        },
+        {
+          "iv_crush_25": -204.7,
+          "iv_crush_45": -215.0,
+          "iv_expand_20": -191.0,
+          "iv_flat": -198.0,
+          "move_pct": 12.0,
+          "price": 114.46
+        },
+        {
+          "iv_crush_25": -210.6,
+          "iv_crush_45": -219.1,
+          "iv_expand_20": -198.8,
+          "iv_flat": -204.9,
+          "move_pct": 13.0,
+          "price": 115.49
+        },
+        {
+          "iv_crush_25": -215.3,
+          "iv_crush_45": -222.3,
+          "iv_expand_20": -205.2,
+          "iv_flat": -210.5,
+          "move_pct": 14.0,
+          "price": 116.51
+        },
+        {
+          "iv_crush_25": -219.0,
+          "iv_crush_45": -224.6,
+          "iv_expand_20": -210.5,
+          "iv_flat": -214.9,
+          "move_pct": 15.0,
+          "price": 117.53
+        },
+        {
+          "iv_crush_25": -221.8,
+          "iv_crush_45": -226.4,
+          "iv_expand_20": -214.8,
+          "iv_flat": -218.5,
+          "move_pct": 16.0,
+          "price": 118.55
+        },
+        {
+          "iv_crush_25": -224.1,
+          "iv_crush_45": -227.7,
+          "iv_expand_20": -218.2,
+          "iv_flat": -221.4,
+          "move_pct": 17.0,
+          "price": 119.57
+        },
+        {
+          "iv_crush_25": -225.8,
+          "iv_crush_45": -228.6,
+          "iv_expand_20": -221.0,
+          "iv_flat": -223.6,
+          "move_pct": 18.0,
+          "price": 120.6
+        },
+        {
+          "iv_crush_25": -227.1,
+          "iv_crush_45": -229.3,
+          "iv_expand_20": -223.2,
+          "iv_flat": -225.3,
+          "move_pct": 19.0,
+          "price": 121.62
+        },
+        {
+          "iv_crush_25": -228.1,
+          "iv_crush_45": -229.7,
+          "iv_expand_20": -224.9,
+          "iv_flat": -226.7,
+          "move_pct": 20.0,
+          "price": 122.64
+        }
+      ],
+      "structure": "call_calendar",
+      "t_back_days": 32.0,
+      "t_near_days": 4.0,
+      "t_remaining_days": 28.0
+    },
+    "calendar_spread_quality": "Poor",
+    "calibration_min_for_fit": 120,
+    "calibration_min_for_observational": 40,
+    "calibration_n_observations": 58,
+    "calibration_phase": "observational",
+    "calibration_phase_note": "Calibration phase=observational (N=58): raw bucket observations only; fitted calibration held back until N=120.",
+    "chain_staleness_minutes": 0,
+    "cheapness_score": 0.41,
+    "composite_score": 0.58,
+    "concavity_component": 0.048,
+    "concavity_risk_surcharge_pct": 0.0264,
+    "confidence_adjusted_gross_edge_pct": 0.1353,
+    "confidence_calibration_mult": 0.88,
+    "confidence_cap_pct": 55.0,
+    "confidence_cap_reason": null,
+    "confidence_capped": false,
+    "confidence_pct_raw": 47.0,
+    "confidence_score_source": "shared_selector_confidence_pct",
+    "crush_calibration_mult": 1.0,
+    "crush_hard_gate_reasons": [
+      "Earnings event is not before the short-leg expiry.",
+      "Near/back IV premium too weak (0.87x < 1.02x)."
+    ],
+    "crush_hard_no_trade": true,
+    "current_price": 102.2,
+    "data_quality": "high",
+    "data_quality_score": 0.91,
+    "data_source": "yfinance_fallback",
+    "data_sources": {
+      "earnings_source_confirmed": "sec_submissions",
+      "earnings_source_primary": "fmp_calendar",
+      "earnings_source_stale": false,
+      "options_source": "yfinance",
+      "price_rv_source": "yfinance",
+      "release_timing_source": "sec_submissions"
+    },
+    "days_to_earnings": 8,
+    "decomp_regime_warning": false,
+    "drawdown_risk_pct": 3.85472231,
+    "earnings_move_anchor_pct": 4.995,
+    "earnings_move_avg_last4_pct": 5.1,
+    "earnings_move_median_pct": 4.8,
+    "earnings_move_p90_pct": 6.9,
+    "earnings_move_sample_size": 5,
+    "earnings_move_source": "earnings_history",
+    "earnings_move_std_pct": 1.4,
+    "earnings_release_time": "after market close",
+    "earnings_source_confidence": 0.9,
+    "earnings_source_notes": [],
+    "edge_quality": "Positive",
+    "event_implied_move_pct": 5.61,
+    "event_risk_score": 0.67,
+    "execution_score": 0.72,
+    "expansion_candidate": false,
+    "expansion_excluded_negative_debit": null,
+    "expansion_excluded_structural_invalid": null,
+    "expansion_exit_offset_days": null,
+    "expansion_expected_iv_change": null,
+    "expansion_expected_pnl_adjusted": null,
+    "expansion_expected_pnl_mid": null,
+    "expansion_expected_return_adjusted_pct": null,
+    "expansion_expected_return_mid_pct": null,
+    "expansion_gate_reasons": [
+      "Volatility regime percentile too low (48.0).",
+      "Historical pre-earnings simulation unavailable (no_simulations)."
+    ],
+    "expansion_historical_sample_size": null,
+    "expansion_history_status": "no_simulations",
+    "expansion_live_score": 0.23616971,
+    "expansion_missing_exit_quotes": null,
+    "expansion_priceable_trades": 0,
+    "expansion_ranking_score": 0.12989334,
+    "expansion_selected_entry_offset_days": null,
+    "expansion_structure": null,
+    "expectancy_ratio": -0.30679831,
+    "expectancy_score": 0.42,
+    "expected_gross_edge_pct": -0.5943,
+    "expected_net_edge_pct": -1.18262231,
+    "experimental_contract_selection": null,
+    "fallback_model_confidence_cap_pct": null,
+    "fallback_move_model_flag": false,
+    "hard_gate_reasons": [
+      "Earnings event is not before the short-leg expiry.",
+      "Near/back IV premium too weak (0.87x < 1.02x)."
+    ],
+    "hard_no_trade": true,
+    "hist_crush_rate": null,
+    "implied_move_pct": 5.7,
+    "implied_vs_anchor_ratio": 1.12312312,
+    "iv30": 0.27,
+    "iv45": 0.3,
+    "iv_rv30": 1.28571429,
+    "iv_rv_crowding_warning_threshold": 1.6,
+    "iv_rv_har": 1.421,
+    "kurtosis_conf_mult": 1.0,
+    "legacy_orchestration_mode": "shared_snapshot_selector_adapter",
+    "liquidity_proxy": 2600.0,
+    "low_event_count_confidence_cap_pct": 60.0,
+    "low_event_count_flag": true,
+    "market_cap_usd": null,
+    "max_near_term_spread_pct_for_expansion": 12.0,
+    "max_near_term_spread_pct_for_trade": 12.0,
+    "min_near_back_iv_ratio_for_event": 1.02,
+    "min_near_term_liquidity_proxy_for_expansion": 600.0,
+    "min_near_term_liquidity_proxy_for_trade": 400.0,
+    "min_required_earnings_events": 8,
+    "min_rv_percentile_for_expansion": 60.0,
+    "min_short_leg_dte": 2,
+    "min_term_structure_slope_for_expansion": 0.0005,
+    "ml_crush_prob": null,
+    "model_output_note": "note",
+    "move_kurtosis": null,
+    "move_risk_level": "elevated",
+    "move_risk_ratio": 1.23,
+    "move_risk_sample_size": 5,
+    "move_uncertainty_pct": 0.8,
+    "near_back_iv_ratio": 0.8667,
+    "near_term_dte": 4,
+    "near_term_liquidity_proxy": 2600.0,
+    "near_term_spread_pct": 3.2,
+    "non_event_move_pct": 1.0,
+    "position_sizing_note": "Position sizing guidance not available yet \u2014 requires calibrated win rate and empirical edge estimate.",
+    "price_data_age_days": 0,
+    "price_data_stale": false,
+    "price_staleness_minutes": 0,
+    "pricing_dividend_yield": 0.0,
+    "pricing_risk_free_rate": 0.04,
+    "pricing_risk_free_rate_source": "test",
+    "raw_gross_edge_pct": 0.615,
+    "rv30": 0.21,
+    "rv30_har_forecast": 0.19,
+    "rv_estimator": "yang_zhang",
+    "rv_har_is_fallback": false,
+    "rv_percentile_rank": 48.0,
+    "sample_confidence": 0.22,
+    "selector_expected_edge_tier": "Positive",
+    "selector_expected_return_signal": "Supportive",
+    "setup_base_score": 0.54284523,
+    "setup_score_source": "shared_screener_ranking_score",
+    "smile_concave": true,
+    "smile_curvature": -0.62,
+    "smile_points": 7,
+    "stale_data_confidence_cap_pct": null,
+    "structure_payoff": {
+      "T_near_days": 4.0,
+      "T_remain_days": 1,
+      "breakeven_moves_pct": [
+        -2.2,
+        2.2
+      ],
+      "entry_call": 1.1747,
+      "entry_debit": 2.3045,
+      "entry_debit_per_contract": 230.45,
+      "entry_put": 1.1299,
+      "is_theoretical": true,
+      "iv_entry": 0.27,
+      "note": "Long ATM straddle (K=102.20). P&L shown 1-day post-event with IV scenarios. BSM entry at market IV; breakevens on IV-flat scenario.",
+      "payoff_scenarios": [
+        {
+          "iv_crush_25": 18.124,
+          "iv_crush_45": 18.124,
+          "iv_expand_20": 18.124,
+          "iv_flat": 18.124,
+          "move_pct": -20.0,
+          "price": 81.76
+        },
+        {
+          "iv_crush_25": 17.102,
+          "iv_crush_45": 17.102,
+          "iv_expand_20": 17.102,
+          "iv_flat": 17.102,
+          "move_pct": -19.0,
+          "price": 82.78
+        },
+        {
+          "iv_crush_25": 16.08,
+          "iv_crush_45": 16.08,
+          "iv_expand_20": 16.08,
+          "iv_flat": 16.08,
+          "move_pct": -18.0,
+          "price": 83.8
+        },
+        {
+          "iv_crush_25": 15.058,
+          "iv_crush_45": 15.058,
+          "iv_expand_20": 15.058,
+          "iv_flat": 15.058,
+          "move_pct": -17.0,
+          "price": 84.83
+        },
+        {
+          "iv_crush_25": 14.036,
+          "iv_crush_45": 14.036,
+          "iv_expand_20": 14.036,
+          "iv_flat": 14.036,
+          "move_pct": -16.0,
+          "price": 85.85
+        },
+        {
+          "iv_crush_25": 13.014,
+          "iv_crush_45": 13.014,
+          "iv_expand_20": 13.014,
+          "iv_flat": 13.014,
+          "move_pct": -15.0,
+          "price": 86.87
+        },
+        {
+          "iv_crush_25": 11.992,
+          "iv_crush_45": 11.992,
+          "iv_expand_20": 11.992,
+          "iv_flat": 11.992,
+          "move_pct": -14.0,
+          "price": 87.89
+        },
+        {
+          "iv_crush_25": 10.97,
+          "iv_crush_45": 10.97,
+          "iv_expand_20": 10.97,
+          "iv_flat": 10.97,
+          "move_pct": -13.0,
+          "price": 88.91
+        },
+        {
+          "iv_crush_25": 9.948,
+          "iv_crush_45": 9.948,
+          "iv_expand_20": 9.948,
+          "iv_flat": 9.948,
+          "move_pct": -12.0,
+          "price": 89.94
+        },
+        {
+          "iv_crush_25": 8.926,
+          "iv_crush_45": 8.926,
+          "iv_expand_20": 8.926,
+          "iv_flat": 8.926,
+          "move_pct": -11.0,
+          "price": 90.96
+        },
+        {
+          "iv_crush_25": 7.904,
+          "iv_crush_45": 7.904,
+          "iv_expand_20": 7.904,
+          "iv_flat": 7.904,
+          "move_pct": -10.0,
+          "price": 91.98
+        },
+        {
+          "iv_crush_25": 6.882,
+          "iv_crush_45": 6.882,
+          "iv_expand_20": 6.882,
+          "iv_flat": 6.882,
+          "move_pct": -9.0,
+          "price": 93.0
+        },
+        {
+          "iv_crush_25": 5.86,
+          "iv_crush_45": 5.86,
+          "iv_expand_20": 5.86,
+          "iv_flat": 5.86,
+          "move_pct": -8.0,
+          "price": 94.02
+        },
+        {
+          "iv_crush_25": 4.838,
+          "iv_crush_45": 4.838,
+          "iv_expand_20": 4.838,
+          "iv_flat": 4.838,
+          "move_pct": -7.0,
+          "price": 95.05
+        },
+        {
+          "iv_crush_25": 3.816,
+          "iv_crush_45": 3.816,
+          "iv_expand_20": 3.816,
+          "iv_flat": 3.816,
+          "move_pct": -6.0,
+          "price": 96.07
+        },
+        {
+          "iv_crush_25": 2.794,
+          "iv_crush_45": 2.794,
+          "iv_expand_20": 2.794,
+          "iv_flat": 2.794,
+          "move_pct": -5.0,
+          "price": 97.09
+        },
+        {
+          "iv_crush_25": 1.773,
+          "iv_crush_45": 1.772,
+          "iv_expand_20": 1.775,
+          "iv_flat": 1.774,
+          "move_pct": -4.0,
+          "price": 98.11
+        },
+        {
+          "iv_crush_25": 0.761,
+          "iv_crush_45": 0.755,
+          "iv_expand_20": 0.773,
+          "iv_flat": 0.766,
+          "move_pct": -3.0,
+          "price": 99.13
+        },
+        {
+          "iv_crush_25": -0.192,
+          "iv_crush_45": -0.224,
+          "iv_expand_20": -0.15,
+          "iv_flat": -0.172,
+          "move_pct": -2.0,
+          "price": 100.16
+        },
+        {
+          "iv_crush_25": -0.932,
+          "iv_crush_45": -1.014,
+          "iv_expand_20": -0.84,
+          "iv_flat": -0.885,
+          "move_pct": -1.0,
+          "price": 101.18
+        },
+        {
+          "iv_crush_25": -1.213,
+          "iv_crush_45": -1.325,
+          "iv_expand_20": -1.095,
+          "iv_flat": -1.152,
+          "move_pct": 0.0,
+          "price": 102.2
+        },
+        {
+          "iv_crush_25": -0.911,
+          "iv_crush_45": -0.994,
+          "iv_expand_20": -0.819,
+          "iv_flat": -0.865,
+          "move_pct": 1.0,
+          "price": 103.22
+        },
+        {
+          "iv_crush_25": -0.166,
+          "iv_crush_45": -0.199,
+          "iv_expand_20": -0.122,
+          "iv_flat": -0.144,
+          "move_pct": 2.0,
+          "price": 104.24
+        },
+        {
+          "iv_crush_25": 0.786,
+          "iv_crush_45": 0.778,
+          "iv_expand_20": 0.799,
+          "iv_flat": 0.792,
+          "move_pct": 3.0,
+          "price": 105.27
+        },
+        {
+          "iv_crush_25": 1.796,
+          "iv_crush_45": 1.795,
+          "iv_expand_20": 1.799,
+          "iv_flat": 1.797,
+          "move_pct": 4.0,
+          "price": 106.29
+        },
+        {
+          "iv_crush_25": 2.817,
+          "iv_crush_45": 2.817,
+          "iv_expand_20": 2.817,
+          "iv_flat": 2.817,
+          "move_pct": 5.0,
+          "price": 107.31
+        },
+        {
+          "iv_crush_25": 3.839,
+          "iv_crush_45": 3.839,
+          "iv_expand_20": 3.839,
+          "iv_flat": 3.839,
+          "move_pct": 6.0,
+          "price": 108.33
+        },
+        {
+          "iv_crush_25": 4.861,
+          "iv_crush_45": 4.861,
+          "iv_expand_20": 4.861,
+          "iv_flat": 4.861,
+          "move_pct": 7.0,
+          "price": 109.35
+        },
+        {
+          "iv_crush_25": 5.883,
+          "iv_crush_45": 5.883,
+          "iv_expand_20": 5.883,
+          "iv_flat": 5.883,
+          "move_pct": 8.0,
+          "price": 110.38
+        },
+        {
+          "iv_crush_25": 6.905,
+          "iv_crush_45": 6.905,
+          "iv_expand_20": 6.905,
+          "iv_flat": 6.905,
+          "move_pct": 9.0,
+          "price": 111.4
+        },
+        {
+          "iv_crush_25": 7.927,
+          "iv_crush_45": 7.927,
+          "iv_expand_20": 7.927,
+          "iv_flat": 7.927,
+          "move_pct": 10.0,
+          "price": 112.42
+        },
+        {
+          "iv_crush_25": 8.949,
+          "iv_crush_45": 8.949,
+          "iv_expand_20": 8.949,
+          "iv_flat": 8.949,
+          "move_pct": 11.0,
+          "price": 113.44
+        },
+        {
+          "iv_crush_25": 9.971,
+          "iv_crush_45": 9.971,
+          "iv_expand_20": 9.971,
+          "iv_flat": 9.971,
+          "move_pct": 12.0,
+          "price": 114.46
+        },
+        {
+          "iv_crush_25": 10.993,
+          "iv_crush_45": 10.993,
+          "iv_expand_20": 10.993,
+          "iv_flat": 10.993,
+          "move_pct": 13.0,
+          "price": 115.49
+        },
+        {
+          "iv_crush_25": 12.015,
+          "iv_crush_45": 12.015,
+          "iv_expand_20": 12.015,
+          "iv_flat": 12.015,
+          "move_pct": 14.0,
+          "price": 116.51
+        },
+        {
+          "iv_crush_25": 13.037,
+          "iv_crush_45": 13.037,
+          "iv_expand_20": 13.037,
+          "iv_flat": 13.037,
+          "move_pct": 15.0,
+          "price": 117.53
+        },
+        {
+          "iv_crush_25": 14.059,
+          "iv_crush_45": 14.059,
+          "iv_expand_20": 14.059,
+          "iv_flat": 14.059,
+          "move_pct": 16.0,
+          "price": 118.55
+        },
+        {
+          "iv_crush_25": 15.081,
+          "iv_crush_45": 15.081,
+          "iv_expand_20": 15.081,
+          "iv_flat": 15.081,
+          "move_pct": 17.0,
+          "price": 119.57
+        },
+        {
+          "iv_crush_25": 16.103,
+          "iv_crush_45": 16.103,
+          "iv_expand_20": 16.103,
+          "iv_flat": 16.103,
+          "move_pct": 18.0,
+          "price": 120.6
+        },
+        {
+          "iv_crush_25": 17.125,
+          "iv_crush_45": 17.125,
+          "iv_expand_20": 17.125,
+          "iv_flat": 17.125,
+          "move_pct": 19.0,
+          "price": 121.62
+        },
+        {
+          "iv_crush_25": 18.147,
+          "iv_crush_45": 18.147,
+          "iv_expand_20": 18.147,
+          "iv_flat": 18.147,
+          "move_pct": 20.0,
+          "price": 122.64
+        }
+      ],
+      "payoff_scenarios_per_contract": [
+        {
+          "iv_crush_25": 1812.4,
+          "iv_crush_45": 1812.4,
+          "iv_expand_20": 1812.4,
+          "iv_flat": 1812.4,
+          "move_pct": -20.0,
+          "price": 81.76
+        },
+        {
+          "iv_crush_25": 1710.2,
+          "iv_crush_45": 1710.2,
+          "iv_expand_20": 1710.2,
+          "iv_flat": 1710.2,
+          "move_pct": -19.0,
+          "price": 82.78
+        },
+        {
+          "iv_crush_25": 1608.0,
+          "iv_crush_45": 1608.0,
+          "iv_expand_20": 1608.0,
+          "iv_flat": 1608.0,
+          "move_pct": -18.0,
+          "price": 83.8
+        },
+        {
+          "iv_crush_25": 1505.8,
+          "iv_crush_45": 1505.8,
+          "iv_expand_20": 1505.8,
+          "iv_flat": 1505.8,
+          "move_pct": -17.0,
+          "price": 84.83
+        },
+        {
+          "iv_crush_25": 1403.6,
+          "iv_crush_45": 1403.6,
+          "iv_expand_20": 1403.6,
+          "iv_flat": 1403.6,
+          "move_pct": -16.0,
+          "price": 85.85
+        },
+        {
+          "iv_crush_25": 1301.4,
+          "iv_crush_45": 1301.4,
+          "iv_expand_20": 1301.4,
+          "iv_flat": 1301.4,
+          "move_pct": -15.0,
+          "price": 86.87
+        },
+        {
+          "iv_crush_25": 1199.2,
+          "iv_crush_45": 1199.2,
+          "iv_expand_20": 1199.2,
+          "iv_flat": 1199.2,
+          "move_pct": -14.0,
+          "price": 87.89
+        },
+        {
+          "iv_crush_25": 1097.0,
+          "iv_crush_45": 1097.0,
+          "iv_expand_20": 1097.0,
+          "iv_flat": 1097.0,
+          "move_pct": -13.0,
+          "price": 88.91
+        },
+        {
+          "iv_crush_25": 994.8,
+          "iv_crush_45": 994.8,
+          "iv_expand_20": 994.8,
+          "iv_flat": 994.8,
+          "move_pct": -12.0,
+          "price": 89.94
+        },
+        {
+          "iv_crush_25": 892.6,
+          "iv_crush_45": 892.6,
+          "iv_expand_20": 892.6,
+          "iv_flat": 892.6,
+          "move_pct": -11.0,
+          "price": 90.96
+        },
+        {
+          "iv_crush_25": 790.4,
+          "iv_crush_45": 790.4,
+          "iv_expand_20": 790.4,
+          "iv_flat": 790.4,
+          "move_pct": -10.0,
+          "price": 91.98
+        },
+        {
+          "iv_crush_25": 688.2,
+          "iv_crush_45": 688.2,
+          "iv_expand_20": 688.2,
+          "iv_flat": 688.2,
+          "move_pct": -9.0,
+          "price": 93.0
+        },
+        {
+          "iv_crush_25": 586.0,
+          "iv_crush_45": 586.0,
+          "iv_expand_20": 586.0,
+          "iv_flat": 586.0,
+          "move_pct": -8.0,
+          "price": 94.02
+        },
+        {
+          "iv_crush_25": 483.8,
+          "iv_crush_45": 483.8,
+          "iv_expand_20": 483.8,
+          "iv_flat": 483.8,
+          "move_pct": -7.0,
+          "price": 95.05
+        },
+        {
+          "iv_crush_25": 381.6,
+          "iv_crush_45": 381.6,
+          "iv_expand_20": 381.6,
+          "iv_flat": 381.6,
+          "move_pct": -6.0,
+          "price": 96.07
+        },
+        {
+          "iv_crush_25": 279.4,
+          "iv_crush_45": 279.4,
+          "iv_expand_20": 279.4,
+          "iv_flat": 279.4,
+          "move_pct": -5.0,
+          "price": 97.09
+        },
+        {
+          "iv_crush_25": 177.3,
+          "iv_crush_45": 177.2,
+          "iv_expand_20": 177.5,
+          "iv_flat": 177.4,
+          "move_pct": -4.0,
+          "price": 98.11
+        },
+        {
+          "iv_crush_25": 76.1,
+          "iv_crush_45": 75.5,
+          "iv_expand_20": 77.3,
+          "iv_flat": 76.6,
+          "move_pct": -3.0,
+          "price": 99.13
+        },
+        {
+          "iv_crush_25": -19.2,
+          "iv_crush_45": -22.4,
+          "iv_expand_20": -15.0,
+          "iv_flat": -17.2,
+          "move_pct": -2.0,
+          "price": 100.16
+        },
+        {
+          "iv_crush_25": -93.2,
+          "iv_crush_45": -101.4,
+          "iv_expand_20": -84.0,
+          "iv_flat": -88.5,
+          "move_pct": -1.0,
+          "price": 101.18
+        },
+        {
+          "iv_crush_25": -121.3,
+          "iv_crush_45": -132.5,
+          "iv_expand_20": -109.5,
+          "iv_flat": -115.2,
+          "move_pct": 0.0,
+          "price": 102.2
+        },
+        {
+          "iv_crush_25": -91.1,
+          "iv_crush_45": -99.4,
+          "iv_expand_20": -81.9,
+          "iv_flat": -86.5,
+          "move_pct": 1.0,
+          "price": 103.22
+        },
+        {
+          "iv_crush_25": -16.6,
+          "iv_crush_45": -19.9,
+          "iv_expand_20": -12.2,
+          "iv_flat": -14.4,
+          "move_pct": 2.0,
+          "price": 104.24
+        },
+        {
+          "iv_crush_25": 78.6,
+          "iv_crush_45": 77.8,
+          "iv_expand_20": 79.9,
+          "iv_flat": 79.2,
+          "move_pct": 3.0,
+          "price": 105.27
+        },
+        {
+          "iv_crush_25": 179.6,
+          "iv_crush_45": 179.5,
+          "iv_expand_20": 179.9,
+          "iv_flat": 179.7,
+          "move_pct": 4.0,
+          "price": 106.29
+        },
+        {
+          "iv_crush_25": 281.7,
+          "iv_crush_45": 281.7,
+          "iv_expand_20": 281.7,
+          "iv_flat": 281.7,
+          "move_pct": 5.0,
+          "price": 107.31
+        },
+        {
+          "iv_crush_25": 383.9,
+          "iv_crush_45": 383.9,
+          "iv_expand_20": 383.9,
+          "iv_flat": 383.9,
+          "move_pct": 6.0,
+          "price": 108.33
+        },
+        {
+          "iv_crush_25": 486.1,
+          "iv_crush_45": 486.1,
+          "iv_expand_20": 486.1,
+          "iv_flat": 486.1,
+          "move_pct": 7.0,
+          "price": 109.35
+        },
+        {
+          "iv_crush_25": 588.3,
+          "iv_crush_45": 588.3,
+          "iv_expand_20": 588.3,
+          "iv_flat": 588.3,
+          "move_pct": 8.0,
+          "price": 110.38
+        },
+        {
+          "iv_crush_25": 690.5,
+          "iv_crush_45": 690.5,
+          "iv_expand_20": 690.5,
+          "iv_flat": 690.5,
+          "move_pct": 9.0,
+          "price": 111.4
+        },
+        {
+          "iv_crush_25": 792.7,
+          "iv_crush_45": 792.7,
+          "iv_expand_20": 792.7,
+          "iv_flat": 792.7,
+          "move_pct": 10.0,
+          "price": 112.42
+        },
+        {
+          "iv_crush_25": 894.9,
+          "iv_crush_45": 894.9,
+          "iv_expand_20": 894.9,
+          "iv_flat": 894.9,
+          "move_pct": 11.0,
+          "price": 113.44
+        },
+        {
+          "iv_crush_25": 997.1,
+          "iv_crush_45": 997.1,
+          "iv_expand_20": 997.1,
+          "iv_flat": 997.1,
+          "move_pct": 12.0,
+          "price": 114.46
+        },
+        {
+          "iv_crush_25": 1099.3,
+          "iv_crush_45": 1099.3,
+          "iv_expand_20": 1099.3,
+          "iv_flat": 1099.3,
+          "move_pct": 13.0,
+          "price": 115.49
+        },
+        {
+          "iv_crush_25": 1201.5,
+          "iv_crush_45": 1201.5,
+          "iv_expand_20": 1201.5,
+          "iv_flat": 1201.5,
+          "move_pct": 14.0,
+          "price": 116.51
+        },
+        {
+          "iv_crush_25": 1303.7,
+          "iv_crush_45": 1303.7,
+          "iv_expand_20": 1303.7,
+          "iv_flat": 1303.7,
+          "move_pct": 15.0,
+          "price": 117.53
+        },
+        {
+          "iv_crush_25": 1405.9,
+          "iv_crush_45": 1405.9,
+          "iv_expand_20": 1405.9,
+          "iv_flat": 1405.9,
+          "move_pct": 16.0,
+          "price": 118.55
+        },
+        {
+          "iv_crush_25": 1508.1,
+          "iv_crush_45": 1508.1,
+          "iv_expand_20": 1508.1,
+          "iv_flat": 1508.1,
+          "move_pct": 17.0,
+          "price": 119.57
+        },
+        {
+          "iv_crush_25": 1610.3,
+          "iv_crush_45": 1610.3,
+          "iv_expand_20": 1610.3,
+          "iv_flat": 1610.3,
+          "move_pct": 18.0,
+          "price": 120.6
+        },
+        {
+          "iv_crush_25": 1712.5,
+          "iv_crush_45": 1712.5,
+          "iv_expand_20": 1712.5,
+          "iv_flat": 1712.5,
+          "move_pct": 19.0,
+          "price": 121.62
+        },
+        {
+          "iv_crush_25": 1814.7,
+          "iv_crush_45": 1814.7,
+          "iv_expand_20": 1814.7,
+          "iv_flat": 1814.7,
+          "move_pct": 20.0,
+          "price": 122.64
+        }
+      ],
+      "scenario_source": "small_sample_estimate",
+      "strike": 102.2,
+      "structure": "atm_straddle"
+    },
+    "term_structure_days": [
+      4.0,
+      25.0
+    ],
+    "term_structure_ivs": [
+      0.26,
+      0.3
+    ],
+    "term_structure_slope": 0.0015,
+    "term_structure_slope_0_45": 0.0015,
+    "ticker_tier": "unknown",
+    "ticker_tier_mult": 0.88,
+    "timing_score": 0.73,
+    "ts_slope_far_dte": 25.0,
+    "ts_slope_near_dte": 4.0,
+    "tx_cost_estimate_pct": 0.58832231,
+    "uncertainty_penalty_pct": 0.7296,
+    "vol_regime": "Normal"
+  },
+  "rationale": [
+    "Selector-backed recommendation=Watch; best structure=atm_straddle.",
+    "Selector thesis: Shared thesis.",
+    "Selector evidence: Shared lead.",
+    "IV/RV30=1.29 [YZ] / IV/RV(HAR fwd)=1.42",
+    "Term slope(0-45)=0.0015",
+    "Days to earnings=8 (AMC)",
+    "Shared timing score=0.73 (snapshot-derived pre-earnings entry quality).",
+    "Near-term option DTE=4",
+    "Near-term smile curvature=-0.620 (concave).",
+    "Near-term spread=3.20% (gate <= 12.0%).",
+    "Near/back IV premium=0.87x (gate >= 1.02x).",
+    "Near-term liquidity proxy=2600 (gate >= 400).",
+    "Active mode=selector_first; gate status=FAIL (Earnings event is not before the short-leg expiry.; Near/back IV premium too weak (0.87x < 1.02x).)",
+    "Pre-earnings expansion unavailable.",
+    "Expected net edge=-1.18% (gross -0.59% after sample/uncertainty adjustment - cost 0.59%; event-implied=5.61% from total-implied=5.70% minus non-event=1.00%; implied/anchor=1.12x).",
+    "Anchor uncertainty penalty=0.73% (move std=1.40%, source=earnings_history).",
+    "Drawdown risk estimate=3.85% (expectancy ratio=-0.31; concavity surcharge=0.03%).",
+    "Evidence confidence=0.22 (5 moves, source=earnings_history). [SOFT GATE: thin earnings history (5/8 events) \u2014 confidence capped at 60%]",
+    "Edge quality: Positive.",
+    "note",
+    "Liquidity proxy=2600 (ATM OI/vol aggregate).",
+    "Data source: yfinance_fallback.",
+    "Calibration phase=observational (N=58): raw bucket observations only; fitted calibration held back until N=120.",
+    "RV model: yang_zhang rv30=0.2100; HAR fwd=0.1900 (Corsi 2009 on Rogers-Satchell daily series)."
+  ],
+  "recommendation": "Watch",
+  "sample_provenance": "forward_post_freeze",
+  "setup_score": 0.54284523
+}
