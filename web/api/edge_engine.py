@@ -3212,7 +3212,7 @@ def analyze_single_ticker(
         recommendation = "No Trade"
         analysis_mode = "post_earnings_crush"
 
-    confidence_pct = float(getattr(selector_output, "confidence_pct", confidence_pct_uncapped))
+    # confidence_pct already equals selector_output.confidence_pct (set above). No reassignment needed.
     _confidence_cap_reason: Optional[str] = None
     # Entries collected here are spliced into rationale[] once it is built below.
     _deferred_rationale: List[str] = []
