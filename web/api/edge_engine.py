@@ -3410,12 +3410,17 @@ def analyze_single_ticker(
             if np.isfinite(expectancy_ratio)
             else f"Drawdown risk estimate={drawdown_risk_pct:.2f}%."
         ),
+        # These soft-gate notes are ADVISORY evidence flags. The confidence cap they
+        # historically referenced was never wired (confidence_pct = selector confidence,
+        # never reduced here), so the prior "confidence capped at N%" wording was false.
+        # Language corrected to reflect reality; activating the caps would be a separate,
+        # test-covered product change.
         f"Evidence confidence={sample_confidence:.2f} ({move_sample_size} moves, source={move_source})."
-        + (" [SOFT GATE: fallback move model — confidence capped at "
-           f"{FALLBACK_MODEL_CONFIDENCE_CAP_PCT:.0f}%]" if fallback_move_model_flag else "")
+        + (" [SOFT GATE: fallback move model — earnings-move source is not historical "
+           "(advisory evidence flag; confidence not reduced)]" if fallback_move_model_flag else "")
         + (" [SOFT GATE: thin earnings history "
-           f"({move_sample_size}/{MIN_EARNINGS_EVENTS_FOR_FULL_SIGNAL} events) — "
-           f"confidence capped at {LOW_EVENT_COUNT_CONFIDENCE_CAP_PCT:.0f}%]"
+           f"({move_sample_size}/{MIN_EARNINGS_EVENTS_FOR_FULL_SIGNAL} events) — limited sample "
+           "(advisory evidence flag; confidence not reduced)]"
            if low_event_count_flag and not fallback_move_model_flag else ""),
         f"Edge quality: {edge_quality}.",
         getattr(selector_output, "model_output_note", "Model-output note unavailable."),

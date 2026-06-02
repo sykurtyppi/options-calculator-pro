@@ -1547,7 +1547,7 @@
     "Expected net edge=-1.18% (gross -0.59% after sample/uncertainty adjustment - cost 0.59%; event-implied=5.61% from total-implied=5.70% minus non-event=1.00%; implied/anchor=1.12x).",
     "Anchor uncertainty penalty=0.73% (move std=1.40%, source=earnings_history).",
     "Drawdown risk estimate=3.85% (expectancy ratio=-0.31; concavity surcharge=0.03%).",
-    "Evidence confidence=0.22 (5 moves, source=earnings_history). [SOFT GATE: thin earnings history (5/8 events) \u2014 confidence capped at 60%]",
+    "Evidence confidence=0.22 (5 moves, source=earnings_history). [SOFT GATE: thin earnings history (5/8 events) \u2014 limited sample (advisory evidence flag; confidence not reduced)]",
     "Edge quality: Positive.",
     "note",
     "Liquidity proxy=2600 (ATM OI/vol aggregate).",
