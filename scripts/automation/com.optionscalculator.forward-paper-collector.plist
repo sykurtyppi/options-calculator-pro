@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optionscalculator.forward-paper-collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/scripts/automation/run_forward_paper_collector.sh</string>
+  </array>
+  <!--
+    Daily at 19:30 LOCAL TIME.
+
+    System is Atlantic/Reykjavik (GMT year-round, no DST), so this is 19:30 GMT,
+    which maps to:
+      - 15:30 ET in EDT (summer) — 30 min before market close; ideal for EOD-style
+        exit repricing of the AMC T-3/T-0 OTM-strangle pocket.
+      - 14:30 ET in EST (winter) — 90 min before close; market still open, quotes
+        are live and well before any AMC earnings print (after 16:00 ET).
+
+    Operators in other timezones: change Hour/Minute to your local-time equivalent
+    of "US market open, well before 16:00 ET", then reinstall via install_launchd_jobs.sh.
+  -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>19</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/forward_paper_collector_launchd_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/forward_paper_collector_launchd_stderr.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
