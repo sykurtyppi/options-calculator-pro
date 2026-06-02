@@ -42,12 +42,15 @@ launchctl list | grep optionscalculator
 | `com.optionscalculator.evidence-watchdog` | Daily at 22:15 |
 | `com.optionscalculator.weekly-evidence-report` | Mondays at 22:45 |
 | `com.optionscalculator.log-rotation` | Daily at 03:00 |
+| `com.optionscalculator.forward-paper-collector` | Daily at 19:30 |
 
 All jobs use `RunAtLoad=false`; they fire only on the calendar schedule, never on `launchctl load`.
 
 The log-rotation job runs at 03:00 local — chosen to be safely away from every other launchd job so no other job has an active handle on the `.log` files we rotate. Rotation is size-based (default 5 MB threshold) with gzip + 7-archive retention per file; see `scripts/rotate_launchd_logs.py --help` for the exact contract and tunables. Only `*_launchd*.log` shapes are touched — the Python-logger files (`__main__.log`, `services.*.log`) manage their own rotation via `RotatingFileHandler`.
 
 The candidate exit resolver is scheduled at 12:30 local time so prior-day post-event chains have time to settle before the resolver scans pending forward observations. It is operational infrastructure only: it records whether candidate shadow outcomes could be resolved, and it never alerts on positive/negative PnL or candidate-vs-legacy performance.
+
+The forward paper collector runs at 19:30 local — on an Atlantic/Reykjavik (GMT) machine this maps to **15:30 ET in EDT / 14:30 ET in EST**, i.e. comfortably inside the US options session and well before any AMC earnings print (after 16:00 ET). The job is the daily entry/exit pass for the AMC T-3/T-0 OTM-strangle paper-trade pocket; it appends to `exports/reports/forward_paper_trades.csv` and is idempotent. It is research infrastructure only — it accrues forward samples on the validated config so the edge can be confirmed or refuted over time. Tunables: `FORWARD_PAPER_COLLECTOR_TIMEOUT_SECONDS` (default 1800), `FORWARD_PAPER_COLLECTOR_LOCK_MAX_AGE_SECONDS` (default 7200). Operators in other timezones: change `Hour=19 Minute=30` in `com.optionscalculator.forward-paper-collector.plist` to your local-time equivalent of "US market open, well before 16:00 ET", then reinstall.
 
 ### Resolver due-window check — timezone mapping
 
