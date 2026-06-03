@@ -5184,7 +5184,22 @@ class InstitutionalMLDatabase:
         df_labels["iv_rv_approx"] = (
             df_labels["pre_front_iv"] / df_labels["realized_vol_30d"].clip(lower=0.05)
         ).clip(0.50, 5.0)
-        df_labels["crush_happened"] = (df_labels["front_iv_crush_pct"] < -0.10).astype(int)
+        # Crush threshold for the binary classification target.
+        #
+        # The original threshold of -10% was empirically degenerate on the labeled
+        # universe: 98% of events have front_iv_crush_pct < -10% (crush is the NORM,
+        # not the exception — median is -38%, p10 is -54%). At -10% the model
+        # collapses to "always predict crush": precision ~98%, recall ~100%, no
+        # decision value despite ranking AUC ~0.83.
+        #
+        # -40% gives a 45/55 class balance on the same 1,639 events and produces a
+        # strictly-better classifier: CV AUC 0.846 ± 0.024 (vs 0.831 ± 0.049 at
+        # -10%), with half the variance and a target that actually discriminates.
+        #
+        # The choice matches train_prior_crush_model.py's SECONDARY_CLF_TARGET
+        # ("crush_lt_40pct") — research had already arrived at this conclusion.
+        CRUSH_THRESHOLD_PCT = -0.40
+        df_labels["crush_happened"] = (df_labels["front_iv_crush_pct"] < CRUSH_THRESHOLD_PCT).astype(int)
         return df_labels
 
     def train_ml_model_on_historical_spreads(self) -> dict:
@@ -5293,7 +5308,7 @@ class InstitutionalMLDatabase:
             "n_events": n,
             "crush_rate": crush_rate,
             "features": feature_cols,
-            "label": "front_iv_crush_pct < -0.10",
+            "label": "front_iv_crush_pct < -0.40",
             "algorithm": "LogisticRegression + CalibratedClassifierCV(isotonic)",
             "cv_folds": cv_folds,
             "cv_auc_mean": float(cv_auc.mean()),
