@@ -34,6 +34,10 @@ import yfinance as yf
 DEFAULT_UNIVERSE = [
     # Core — confirmed in backtest (spread ≤3%, AMC, profitable)
     "AMZN", "AAPL", "GOOGL", "MSFT", "ADBE", "PANW", "NFLX", "FTNT", "NKE",
+    # Remaining Fingerprint-C symbols that produced trades in the backtest but
+    # were missing from the forward universe (added 2026-06-04 for complete
+    # coverage of the validated AMC pocket — GILD was the one mild positive).
+    "GILD", "MNST", "OKE", "C", "PRU", "F",
     # High-priority additions — deep option markets
     "META", "NVDA", "TSLA", "AVGO", "AMD", "ORCL", "CRM", "INTU", "NOW",
     "QCOM", "INTC", "LRCX", "KLAC", "CDNS", "SNPS", "AMAT",
@@ -53,6 +57,19 @@ NY_TZ = pytz.timezone("America/New_York")
 # as its dominant feature, so high NBR ≈ "classifier predicts deep crush" ≈
 # "term structure steep enough to support the pre-earnings IV expansion trade."
 NBR_GATE_THRESHOLD = 1.40
+
+# ── ATM-IV selection guards ──────────────────────────────────────────────────
+# yfinance populates impliedVolatility on only some strikes, especially for
+# back-month / illiquid expiries and outside market hours. Without guards, the
+# nearest-to-spot survivor can be a deep ITM/OTM junk strike whose IV is 0 or
+# absurd (observed: strike 45 / IV 0.0 and a 240%-IV put on a $310 underlying).
+# That produces a garbage NBR and a misleading crush gate. We therefore (1) only
+# consider strikes within ATM_MONEYNESS_BAND of spot and (2) require the selected
+# IV to fall in [MIN_SANE_IV, MAX_SANE_IV]; otherwise we return None so the gate
+# reports NO_DATA (honest) instead of a fabricated reading.
+ATM_MONEYNESS_BAND = 0.15   # consider only strikes within ±15% of spot
+MIN_SANE_IV = 0.05          # 5% — below this is almost certainly a data artifact
+MAX_SANE_IV = 2.00          # 200% — above this is almost certainly a junk strike
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -125,18 +142,43 @@ def implied_move_pct(ticker_obj, spot: float, exp_str: str) -> Optional[float]:
         return None
 
 
+def _nearest_atm_iv(df, spot: float) -> Optional[float]:
+    """IV of the strike nearest spot WITHIN the ATM band, with a sane-IV guard.
+
+    Returns None when no strike inside ±ATM_MONEYNESS_BAND of spot has a usable
+    bid and an IV in [MIN_SANE_IV, MAX_SANE_IV]. Restricting to the band BEFORE
+    picking the nearest strike is what prevents a deep ITM/OTM junk strike from
+    being mistaken for the ATM contract.
+    """
+    if df is None or df.empty:
+        return None
+    lo, hi = spot * (1.0 - ATM_MONEYNESS_BAND), spot * (1.0 + ATM_MONEYNESS_BAND)
+    band = df[
+        (df["strike"] >= lo) & (df["strike"] <= hi)
+        & (df["bid"] > 0)
+        & (df["impliedVolatility"] >= MIN_SANE_IV)
+        & (df["impliedVolatility"] <= MAX_SANE_IV)
+    ]
+    if band.empty:
+        return None
+    # Nearest strike to spot among the sane survivors.
+    nearest = band.loc[(band["strike"] - spot).abs().idxmin()]
+    iv = float(nearest["impliedVolatility"])
+    return iv if MIN_SANE_IV <= iv <= MAX_SANE_IV else None
+
+
 def _atm_iv_for_expiry(ticker_obj, spot: float, exp_str: str) -> Optional[float]:
-    """ATM implied vol for a given expiry — average of nearest call+put ATM IVs."""
+    """ATM implied vol for a given expiry — average of nearest call+put ATM IVs.
+
+    Both legs must yield a sane ATM IV (see _nearest_atm_iv); if either is
+    missing we return None rather than averaging against a junk reading.
+    """
     try:
         ch = ticker_obj.option_chain(exp_str)
-        calls = ch.calls[(ch.calls["bid"] > 0) & (ch.calls["impliedVolatility"] > 0)]
-        puts = ch.puts[(ch.puts["bid"] > 0) & (ch.puts["impliedVolatility"] > 0)]
-        if calls.empty or puts.empty:
+        c_iv = _nearest_atm_iv(ch.calls, spot)
+        p_iv = _nearest_atm_iv(ch.puts, spot)
+        if c_iv is None or p_iv is None:
             return None
-        atm_c = calls.iloc[(calls["strike"] - spot).abs().argsort()[:1]]
-        atm_p = puts.iloc[(puts["strike"] - spot).abs().argsort()[:1]]
-        c_iv = float(atm_c.iloc[0]["impliedVolatility"])
-        p_iv = float(atm_p.iloc[0]["impliedVolatility"])
         return (c_iv + p_iv) / 2.0
     except Exception:
         return None
@@ -157,7 +199,12 @@ def _compute_crush_gate_signals(
     trades — high NBR means steep term structure means more vol to accumulate.
     """
     result: dict = {"nbr": None, "crush_prob": None, "crush_gate": "NO_DATA"}
-    if front_iv is None or back_iv is None or back_iv < 0.01:
+    # Both legs must be present and within the sane-IV band, else NBR is garbage.
+    if front_iv is None or back_iv is None:
+        return result
+    if not (MIN_SANE_IV <= front_iv <= MAX_SANE_IV):
+        return result
+    if not (MIN_SANE_IV <= back_iv <= MAX_SANE_IV):
         return result
 
     nbr = front_iv / back_iv
@@ -195,7 +242,7 @@ def screen_one(sym: str, event_date: date, today: date) -> dict:
         "call_sp_pct": None, "put_sp_pct": None, "avg_sp_pct": None,
         "call_OI": None, "put_OI": None,
         "call_IV": None, "put_IV": None,
-        "back_atm_iv": None,
+        "front_atm_iv": None, "back_atm_iv": None,
         "nbr": None, "crush_prob": None, "crush_gate": "NO_DATA",
         "impl_move_pct": None,
         "entry_debit_mid": None,
@@ -256,12 +303,13 @@ def screen_one(sym: str, event_date: date, today: date) -> dict:
 
         result["impl_move_pct"] = round(implied_move_pct(t, spot, exp_str) or 0, 1) or None
 
-        # ── Back-month IV + NBR + crush gate ───────────────────────────────
-        # Front ATM IV: average the call/put IV from the OTM legs (proxy for
-        # ATM since 3% OTM is close). Back ATM IV: look up the monthly expiry.
-        front_atm_iv = None
-        if result["call_IV"] is not None and result["put_IV"] is not None:
-            front_atm_iv = (result["call_IV"] + result["put_IV"]) / 2.0
+        # ── Term-structure NBR + crush gate ────────────────────────────────
+        # NBR = front-ATM-IV / back-ATM-IV, matching the training labels which
+        # used ATM front vs ATM back. Both legs are taken ATM (NOT the 3% OTM
+        # strangle legs) so the ratio is a true term-structure slope rather than
+        # an OTM-skewed proxy. Each leg is guarded for liquidity + sane IV.
+        front_atm_iv = _atm_iv_for_expiry(t, spot, exp_str)
+        result["front_atm_iv"] = round(front_atm_iv, 4) if front_atm_iv else None
 
         back_atm_iv = None
         monthly = result.get("monthly_expiry")
