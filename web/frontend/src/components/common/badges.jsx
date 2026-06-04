@@ -45,7 +45,12 @@ export function dataSourceBadge(ds, dataSources) {
  * Market-cap tier badge with optional multiplier suffix. Returns null on
  * unknown/missing tier so the caller can omit cleanly.
  */
-export function TickerTierBadge({ tier, mult }) {
+export function TickerTierBadge({ tier }) {
+  // NOTE: the tier "multiplier" is intentionally NOT shown. It is an advisory
+  // audit component that the engine never applies to the confidence/setup score
+  // (confidence_pct = selector confidence; the calibration multiplier is
+  // computed for inspection only). Showing it here implied a score adjustment
+  // that does not happen — see the frontend honesty fix.
   if (!tier || tier === 'unknown') return null
   const map = {
     mega_cap: { label: 'Mega-Cap', variant: 'tier-mega' },
@@ -55,8 +60,7 @@ export function TickerTierBadge({ tier, mult }) {
     micro_cap: { label: 'Micro-Cap', variant: 'tier-micro' },
   }
   const { label, variant } = map[tier] || { label: tier, variant: 'default' }
-  const multLabel = mult != null ? ` · ${Math.round(mult * 100)}%` : ''
-  return <Badge variant={variant}>{label}{multLabel}</Badge>
+  return <Badge variant={variant}>{label}</Badge>
 }
 
 /**

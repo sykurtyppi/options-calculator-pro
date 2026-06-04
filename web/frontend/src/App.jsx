@@ -198,7 +198,7 @@ export default function App() {
     ? (noTradeBlocked ? 'No Trade' : result?.recommendation || '--')
     : '--'
   const confidenceValue = result
-    ? `${Number(result.confidence_pct).toFixed(1)}%${result?.metrics?.confidence_capped ? ' (cap)' : ''}`
+    ? `${Number(result.confidence_pct).toFixed(1)}%`
     : '--'
 
   function updateOosParam(key, value) { setOosParams(p => ({ ...p, [key]: value })) }
@@ -493,7 +493,7 @@ export default function App() {
                 <div className="selector-topbar-left">
                   {m.earnings_release_time && releaseTimeBadge(m.earnings_release_time)}
                   <VolRegimeBadge regime={m.vol_regime} pct={m.rv_percentile_rank} />
-                  <TickerTierBadge tier={m.ticker_tier} mult={m.ticker_tier_mult} />
+                  <TickerTierBadge tier={m.ticker_tier} />
                   <MoveRiskBadge level={m.move_risk_level} ratio={m.move_risk_ratio} sampleSize={m.move_risk_sample_size} />
                 </div>
                 <div className="selector-topbar-right">
@@ -755,80 +755,20 @@ export default function App() {
                 </div>
               )}
 
-              {/* Score breakdown */}
-              {m.confidence_pct_raw != null && (
-                <div className="metrics-group">
-                  <div className="metrics-group-label">
-                    Score Breakdown
-                    <span style={{ marginLeft: 10, fontWeight: 400, color: '#8b949e', fontSize: 11 }}>
-                      raw → adjusted via tier × kurtosis × inside-IV rate · not a win rate
-                    </span>
-                  </div>
-                  <div className="metrics-grid">
-                    <Metric
-                      label="Raw Score"
-                      value={`${Number(m.confidence_pct_raw).toFixed(1)}`}
-                      sub="before calibration multipliers"
-                    />
-                    <Metric
-                      label="Ticker Tier"
-                      value={m.ticker_tier ? m.ticker_tier.replace('_', '-') : 'n/a'}
-                      sub={m.market_cap_usd != null
-                        ? `$${(m.market_cap_usd / 1e9).toFixed(1)}B mkt cap`
-                        : 'market cap unavailable'}
-                      tone={
-                        !m.ticker_tier ? 'default'
-                        : ['mega_cap','large_cap'].includes(m.ticker_tier) ? 'good'
-                        : m.ticker_tier === 'mid_cap' ? 'warn'
-                        : 'bad'
-                      }
-                    />
-                    <Metric
-                      label="Tier Multiplier"
-                      value={m.ticker_tier_mult != null ? `${Math.round(m.ticker_tier_mult * 100)}%` : 'n/a'}
-                      tone={tonePos(m.ticker_tier_mult, 0.90, 0.75)}
-                    />
-                    <Metric
-                      label="Move Kurtosis"
-                      value={m.move_kurtosis != null ? fmtNum(m.move_kurtosis, 2) : 'n/a'}
-                      sub="excess kurtosis (normal=0)"
-                      tone={
-                        m.move_kurtosis == null ? 'default'
-                        : m.move_kurtosis < 1.0 ? 'good'
-                        : m.move_kurtosis < 3.0 ? 'warn'
-                        : 'bad'
-                      }
-                    />
-                    <Metric
-                      label="Kurtosis Haircut"
-                      value={m.kurtosis_conf_mult != null ? `${Math.round(m.kurtosis_conf_mult * 100)}%` : 'n/a'}
-                      tone={tonePos(m.kurtosis_conf_mult, 0.90, 0.78)}
-                    />
-                    <Metric
-                      label="Hist. Inside-IV Rate"
-                      value={m.hist_crush_rate != null ? `${Math.round(m.hist_crush_rate * 100)}%` : 'n/a'}
-                      sub="% past moves < implied"
-                      tone={
-                        m.hist_crush_rate == null ? 'default'
-                        : m.hist_crush_rate >= 0.70 ? 'good'
-                        : m.hist_crush_rate >= 0.50 ? 'warn'
-                        : 'bad'
-                      }
-                    />
-                    <Metric
-                      label="Vol Calibration"
-                      value={m.crush_calibration_mult != null ? `${Math.round(m.crush_calibration_mult * 100)}%` : 'n/a'}
-                      tone={tonePos(m.crush_calibration_mult, 0.95, 0.83)}
-                    />
-                    <Metric
-                      label="Combined Multiplier"
-                      value={m.confidence_calibration_mult != null ? `${Math.round(m.confidence_calibration_mult * 100)}%` : 'n/a'}
-                      accent
-                      tone={tonePos(m.confidence_calibration_mult, 0.90, 0.75)}
-                    />
-                  </div>
-                </div>
-              )}
+              {/*
+                The legacy "Score Breakdown" panel was removed in the frontend
+                honesty pass. It presented `confidence_pct_raw` → "adjusted via
+                tier × kurtosis × inside-IV rate" with a "Combined Multiplier",
+                implying the displayed confidence was the raw score times those
+                multipliers. The engine never does this: confidence_pct ==
+                confidence_pct_raw (both = selector confidence) and the
+                calibration multiplier is computed for audit/inspection only,
+                never applied (see web/api/edge_engine.py — _calibration_mult is
+                exposed in metrics but confidence_pct is set to the selector
+                value). The multiplier components remain in the API JSON for
+                anyone auditing; they are no longer presented as an applied
+                score adjustment.
+              */}
 
               <div className="metrics-group">
                 <div className="metrics-group-label">Volatility Surface</div>
@@ -911,10 +851,10 @@ export default function App() {
                   }}>
                     <strong>Reduced-Evidence Signal</strong>
                     {m.fallback_move_model_flag && (
-                      <span>· Move anchor uses a <strong>fallback model</strong> (no earnings history found). Score capped at {m.fallback_model_confidence_cap_pct ?? 55}.</span>
+                      <span>· Move anchor uses a <strong>fallback model</strong> (no earnings history found). Advisory evidence flag — treat the move estimate as lower-confidence; the setup score is not reduced.</span>
                     )}
                     {m.low_event_count_flag && !m.fallback_move_model_flag && (
-                      <span>· Fewer than 8 historical earnings events. Move estimates less reliable. Score capped at {m.low_event_count_confidence_cap_pct ?? 60}.</span>
+                      <span>· Fewer than 8 historical earnings events. Move estimates less reliable. Advisory evidence flag — the setup score is not reduced.</span>
                     )}
                   </div>
                 )}
@@ -1108,21 +1048,20 @@ export default function App() {
                     : m.data_source === 'marketdata_app' ? 'MarketData.app' : 'yfinance'
                 }</span>
                 <span><strong>Updated:</strong> {formatTimestamp(result.generated_at || m.generated_at)}</span>
-                {/* Stale data: IV/RV non-contemporaneous — score is capped */}
+                {/* Stale data: IV/RV non-contemporaneous — advisory flag only */}
                 {(m.price_data_stale || (m.price_data_age_days != null && m.price_data_age_days > 1)) && (
-                  <span style={{ color: '#f0a020', fontWeight: 600 }} title="IV/RV contemporaneity broken — price bars are older than 2 trading days. Setup score is capped to prevent overstatement.">
-                    ⚠ Stale data ({m.price_data_age_days}d old){m.stale_data_confidence_cap_pct != null ? ` · score capped at ${m.stale_data_confidence_cap_pct}` : ''}
+                  <span style={{ color: '#f0a020', fontWeight: 600 }} title="IV/RV contemporaneity broken — price bars are older than 2 trading days. Treat the snapshot as lower-confidence; the setup score is not reduced.">
+                    ⚠ Stale data ({m.price_data_age_days}d old) · advisory flag (score not reduced)
                   </span>
                 )}
-                {/* Score cap reason — shown when a cap is active and stale-data warning is not already covering it */}
-                {m.confidence_capped && m.confidence_cap_reason && !(m.price_data_stale || (m.price_data_age_days != null && m.price_data_age_days > 1)) && (
-                  <span
-                    style={{ color: '#f0a020', fontWeight: 600 }}
-                    title={`Setup score was capped: ${m.confidence_cap_reason}`}
-                  >
-                    ⚠ Score capped · {m.confidence_cap_reason}
-                  </span>
-                )}
+                {/*
+                  Removed: a "Score capped · {reason}" badge gated on
+                  m.confidence_capped. That flag is always False — the engine's
+                  cap system is informational-only and never reduces the score
+                  (confidence_pct = selector confidence). The badge could never
+                  truthfully render, so it was dead code asserting a mechanism
+                  that does not exist.
+                */}
               </div>
 
               {/* Rationale */}
