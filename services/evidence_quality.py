@@ -131,12 +131,33 @@ def evaluate_evidence_quality(
         reasons.append("historical_move_daily_fallback")
         degraded = True
 
+    # Surface-quality gating (M5). A degraded/missing option chain must never
+    # pass as valid just because surface fields are absent. The producer
+    # (diagnose_option_surface_quality) ALWAYS returns a recognized `status`
+    # plus zeroed counts — even a missing chain yields status="record_only".
+    # So an empty/absent surface dict, or one missing its `status`, means the
+    # surface was never diagnosed (lost in a null DB column, an un-enriched
+    # quote, or a degraded pipeline) — "unknown", not "clean". We therefore do
+    # NOT read missing surface fields as zero; absence is treated conservatively
+    # as degraded evidence.
+    surface_provided = bool(surface)
     surface_status = str(surface.get("status") or "")
-    if surface_status == "record_only":
+    if not surface_provided:
+        reasons.append("surface_quality_unavailable")
+        degraded = True
+    elif surface_status == "record_only":
         reasons.append("surface_quality_record_only")
         blocking = True
-    elif surface_status and surface_status != "clean_surface":
+    elif surface_status == "clean_surface":
+        pass  # explicitly diagnosed clean
+    elif surface_status:
+        # Any other recognized-but-not-clean status (e.g. degraded_surface).
         reasons.append(f"surface_quality_{surface_status}")
+        degraded = True
+    else:
+        # Surface dict present but no usable status — incomplete diagnosis.
+        # Treat as unknown rather than silently clean.
+        reasons.append("surface_quality_status_unknown")
         degraded = True
     for flag in surface.get("warning_flags") or []:
         reasons.append(f"surface_{flag}")

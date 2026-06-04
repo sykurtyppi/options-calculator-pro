@@ -16,12 +16,63 @@ def _quote(*, source: str = "broker", quality: str = "execution_grade", legs: di
     }
 
 
-def test_execution_grade_quote_can_support_claims() -> None:
-    result = evaluate_evidence_quality(quote_payload=_quote()).to_dict()
+def _clean_surface() -> dict:
+    # Mirrors diagnose_option_surface_quality's clean output: a recognized
+    # status plus zeroed counts. The live snapshot pipeline always attaches one.
+    return {
+        "status": "clean_surface",
+        "warning_flags": [],
+        "crossed_quote_count": 0,
+        "extreme_spread_count": 0,
+        "missing_iv_count": 0,
+        "iv_outlier_count": 0,
+        "sparse_atm_expiration_count": 0,
+    }
+
+
+def test_execution_grade_quote_with_clean_surface_can_support_claims() -> None:
+    result = evaluate_evidence_quality(
+        quote_payload=_quote(),
+        surface_quality=_clean_surface(),
+    ).to_dict()
 
     assert result["evidence_quality_status"] == VALID_EVIDENCE
     assert result["execution_grade"] is True
     assert result["claim_allowed"] is True
+
+
+def test_absent_surface_is_degraded_not_valid() -> None:
+    # M5: a missing surface dict must NOT pass as valid evidence. Missing
+    # surface fields were previously read as zero ("no problems"), so a
+    # degraded/missing chain could look clean. Absence is now degraded.
+    result = evaluate_evidence_quality(quote_payload=_quote()).to_dict()
+
+    assert result["evidence_quality_status"] == DEGRADED_EVIDENCE
+    assert result["claim_allowed"] is False
+    assert "surface_quality_unavailable" in result["evidence_quality_reasons"]
+
+
+def test_surface_present_without_status_is_degraded() -> None:
+    # An incomplete surface dict (counts present, status missing) is "unknown",
+    # not clean — the missing status must not be treated as clean_surface.
+    result = evaluate_evidence_quality(
+        quote_payload=_quote(),
+        surface_quality={"crossed_quote_count": 0, "extreme_spread_count": 0},
+    ).to_dict()
+
+    assert result["evidence_quality_status"] == DEGRADED_EVIDENCE
+    assert result["claim_allowed"] is False
+    assert "surface_quality_status_unknown" in result["evidence_quality_reasons"]
+
+
+def test_degraded_surface_status_is_degraded() -> None:
+    result = evaluate_evidence_quality(
+        quote_payload=_quote(),
+        surface_quality={**_clean_surface(), "status": "degraded_surface"},
+    ).to_dict()
+
+    assert result["evidence_quality_status"] == DEGRADED_EVIDENCE
+    assert "surface_quality_degraded_surface" in result["evidence_quality_reasons"]
 
 
 def test_research_grade_provider_is_degraded_not_claimable() -> None:
