@@ -96,7 +96,7 @@ jobs:
         run: pytest tests/unit -q
 
   frontend-tests:
-    name: Frontend (node --test)
+    name: Frontend (node --test + vitest)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -138,6 +138,16 @@ jobs:
         # package.json script. Failures from any .test.js file fail
         # the job.
         run: npm test
+
+      - name: Run rendered-component tests (Vitest + jsdom)
+        # `npm run test:dom` runs `vitest run`, scoped (vite.config.js
+        # test.include) to *.dom.test.{js,jsx} ONLY — the rendered-
+        # component suites. Disjoint from the node --test glob above, so
+        # every test file is owned by exactly one runner. These assert the
+        # actual rendered DOM (e.g. the decision card shows confidence as
+        # "not probability" and never a false score-cap), which is stronger
+        # than the source-level honesty guards.
+        run: npm run test:dom
 
       - name: Vite production build smoke
         # The runbook's first-run verification step requires `npm run
