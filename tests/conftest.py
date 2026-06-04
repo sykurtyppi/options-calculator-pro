@@ -66,6 +66,60 @@ def _clear_dotenv_leaked_vars():
             os.environ.pop(k, None)
 
 
+# ── Default singleton-store isolation ─────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
+    """Redirect the default-path singleton stores to a per-test temp dir.
+
+    BaselineEvidenceStore and RecommendationLedger expose module-global
+    singletons (``_store`` / ``_ledger``) that lazily initialize to
+    ``Path.home()/.options_calculator_pro/...`` via their getters. Production
+    code (``run_daily_cycle``, ``evidence_report``, ...) reaches for those
+    singletons whenever a store is not threaded through explicitly.
+
+    conftest.py redirects HOME to the repo-local ``.pytest_home``, so those
+    fall-through reaches wrote WAL SQLite files into
+    ``.pytest_home/.options_calculator_pro/{evidence,recommendations}``. On any
+    host where that directory is read-only (stale WAL/SHM perms from a prior
+    run, a read-only checkout, a sandbox) the writes fail with
+    ``sqlite3.OperationalError: attempt to write a readonly database`` — three
+    such full-suite failures, even though the targeted tests pass.
+
+    Pointing the defaults at a fresh per-test temp dir (and resetting the
+    singletons before and after each test) keeps every test off the repo-local
+    path and isolated from one another. Tests that already inject their own
+    temp store are unaffected; this only governs the default fall-through.
+    """
+    import services.baseline_evidence_store as bes
+    import services.recommendation_ledger as rl
+
+    root = tmp_path_factory.mktemp("default_stores")
+    bes_path = root / "evidence" / "baseline_evidence.sqlite"
+    rl_path = root / "recommendations" / "recommendation_ledger.sqlite"
+    bes_path.parent.mkdir(parents=True, exist_ok=True)
+    rl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Getters read these module globals at call time, so monkeypatch reaches the
+    # fall-through path. monkeypatch auto-restores them after the test.
+    monkeypatch.setattr(bes, "_DEFAULT_STORE", bes_path)
+    monkeypatch.setattr(rl, "_DEFAULT_LEDGER", rl_path)
+
+    def _reset_singletons():
+        for module, attr in ((bes, "_store"), (rl, "_ledger")):
+            existing = getattr(module, attr, None)
+            if existing is not None:
+                try:
+                    existing.close()
+                except Exception:
+                    pass
+            setattr(module, attr, None)
+
+    _reset_singletons()
+    yield
+    _reset_singletons()
+
+
 # ── Sample DataFrames ──────────────────────────────────────────────────────────
 
 @pytest.fixture
