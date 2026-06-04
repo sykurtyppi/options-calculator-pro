@@ -42,8 +42,9 @@ export function dataSourceBadge(ds, dataSources) {
 }
 
 /**
- * Market-cap tier badge with optional multiplier suffix. Returns null on
- * unknown/missing tier so the caller can omit cleanly.
+ * Market-cap tier badge. Returns null on unknown/missing tier so the caller can
+ * omit cleanly. The tier "multiplier" is deliberately NOT rendered (see note
+ * below) — it is an audit-only field the engine never applies to the score.
  */
 export function TickerTierBadge({ tier }) {
   // NOTE: the tier "multiplier" is intentionally NOT shown. It is an advisory
