@@ -42,11 +42,15 @@ DEFAULT_LOG = _ROOT / "exports" / "reports" / "forward_paper_trades.csv"
 
 # Persisted columns. trade_date/debit_per_contract/net_return_pct are the
 # tracker-consumed fields; the rest are identity + diagnostics.
+# nbr/crush_prob/crush_gate were added 2026-06-04 to test the NBR >= 1.40 gate
+# hypothesis from the walk-forward expansion analysis. Both gated and ungated
+# trades are recorded — the gate is ADVISORY so forward data can prove/disprove it.
 FIELDNAMES = [
     "trade_id", "symbol", "trade_date", "event_date", "t3_entry_date",
     "front_expiry", "call_strike", "put_strike",
     "entry_debit_mid", "debit_per_contract", "contracts",
     "avg_sp_pct", "call_OI", "put_OI",
+    "nbr", "crush_prob", "crush_gate",
     "exit_date", "exit_debit_mid", "pnl_per_contract", "net_return_pct",
     "status",  # OPEN | CLOSED | EXIT_MISSING
 ]
@@ -120,6 +124,8 @@ def run_collection(
             "entry_debit_mid": entry_debit, "debit_per_contract": round(entry_debit * 100.0, 2),
             "contracts": 1, "avg_sp_pct": r.get("avg_sp_pct", ""),
             "call_OI": r.get("call_OI", ""), "put_OI": r.get("put_OI", ""),
+            "nbr": r.get("nbr", ""), "crush_prob": r.get("crush_prob", ""),
+            "crush_gate": r.get("crush_gate", "NO_DATA"),
             "exit_date": "", "exit_debit_mid": "", "pnl_per_contract": "",
             "net_return_pct": "", "status": "OPEN",
         }
@@ -224,11 +230,13 @@ def _selftest() -> None:
                 {"symbol": "AAPL", "earnings_date": event_day, "t3_entry_date": today,
                  "status": "QUALIFY", "entry_debit_mid": 2.00, "front_expiry": "2026-01-30",
                  "call_strike": 105.0, "put_strike": 95.0, "avg_sp_pct": 2.1,
-                 "call_OI": 500, "put_OI": 400},
+                 "call_OI": 500, "put_OI": 400,
+                 "nbr": 1.52, "crush_prob": 0.73, "crush_gate": "PASS"},
                 {"symbol": "MSFT", "earnings_date": date(2026, 2, 10), "t3_entry_date": date(2026, 2, 5),
                  "status": "QUALIFY", "entry_debit_mid": 3.0, "front_expiry": "2026-02-13",
                  "call_strike": 410.0, "put_strike": 390.0, "avg_sp_pct": 1.5,
-                 "call_OI": 900, "put_OI": 800},
+                 "call_OI": 900, "put_OI": 800,
+                 "nbr": 1.31, "crush_prob": 0.38, "crush_gate": "FAIL"},
             ]
 
         # Day 1: entry day — opens AAPL only (MSFT's T-3 != today)
@@ -248,6 +256,7 @@ def _selftest() -> None:
         log = load_log(log_path)
         aapl = log[_trade_id("AAPL", event_day)]
         assert aapl["status"] == "CLOSED" and float(aapl["net_return_pct"]) == 30.0, aapl
+        assert aapl["crush_gate"] == "PASS" and float(aapl["nbr"]) == 1.52, f"crush gate: {aapl}"
 
         # Re-run after close — idempotent (no re-exit)
         s2b = run_collection(universe=["AAPL"], weeks=6, today=event_day, log_path=log_path,

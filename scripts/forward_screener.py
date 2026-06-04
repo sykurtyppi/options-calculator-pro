@@ -47,6 +47,13 @@ OI_MIN = 100
 TARGET_OTM_PCT = 0.03             # 3% OTM strangle
 NY_TZ = pytz.timezone("America/New_York")
 
+# ── NBR crush-gate threshold ────────────────────────────────────────────────
+# Walk-forward analysis (2026-06-04) showed NBR >= 1.40 filters to 85% win rate
+# on backtested Fingerprint C trades. The crush classifier (AUC=0.820) uses NBR
+# as its dominant feature, so high NBR ≈ "classifier predicts deep crush" ≈
+# "term structure steep enough to support the pre-earnings IV expansion trade."
+NBR_GATE_THRESHOLD = 1.40
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def t3_entry_date(event_date: date) -> date:
@@ -118,6 +125,61 @@ def implied_move_pct(ticker_obj, spot: float, exp_str: str) -> Optional[float]:
         return None
 
 
+def _atm_iv_for_expiry(ticker_obj, spot: float, exp_str: str) -> Optional[float]:
+    """ATM implied vol for a given expiry — average of nearest call+put ATM IVs."""
+    try:
+        ch = ticker_obj.option_chain(exp_str)
+        calls = ch.calls[(ch.calls["bid"] > 0) & (ch.calls["impliedVolatility"] > 0)]
+        puts = ch.puts[(ch.puts["bid"] > 0) & (ch.puts["impliedVolatility"] > 0)]
+        if calls.empty or puts.empty:
+            return None
+        atm_c = calls.iloc[(calls["strike"] - spot).abs().argsort()[:1]]
+        atm_p = puts.iloc[(puts["strike"] - spot).abs().argsort()[:1]]
+        c_iv = float(atm_c.iloc[0]["impliedVolatility"])
+        p_iv = float(atm_p.iloc[0]["impliedVolatility"])
+        return (c_iv + p_iv) / 2.0
+    except Exception:
+        return None
+
+
+def _compute_crush_gate_signals(
+    front_iv: Optional[float],
+    back_iv: Optional[float],
+) -> dict:
+    """Compute NBR and crush classifier probability from front/back ATM IVs.
+
+    Returns a dict with keys: nbr, crush_prob, crush_gate.
+    crush_gate is 'PASS' if NBR >= NBR_GATE_THRESHOLD, else 'FAIL'.
+
+    The crush classifier (walk-forward AUC=0.820 on 1,143 OOS events) predicts
+    which events will see deep IV crush (>40%). The same NBR feature that drives
+    this prediction also separates winning from losing pre-earnings expansion
+    trades — high NBR means steep term structure means more vol to accumulate.
+    """
+    result: dict = {"nbr": None, "crush_prob": None, "crush_gate": "NO_DATA"}
+    if front_iv is None or back_iv is None or back_iv < 0.01:
+        return result
+
+    nbr = front_iv / back_iv
+    result["nbr"] = round(nbr, 4)
+    result["crush_gate"] = "PASS" if nbr >= NBR_GATE_THRESHOLD else "FAIL"
+
+    # Run the trained crush classifier if available
+    try:
+        from web.api.edge_engine import _ml_crush_probability
+        prob, _mult = _ml_crush_probability(
+            near_iv=front_iv,
+            near_back_ratio=nbr,
+            iv_rv=front_iv * 0.75,  # fallback iv_rv (same as training — RV data empty)
+        )
+        if prob is not None:
+            result["crush_prob"] = round(prob, 4)
+    except Exception:
+        pass  # model unavailable — NBR gate still works standalone
+
+    return result
+
+
 def screen_one(sym: str, event_date: date, today: date) -> dict:
     """Return a screening result dict for one symbol / event date."""
     result = {
@@ -133,6 +195,8 @@ def screen_one(sym: str, event_date: date, today: date) -> dict:
         "call_sp_pct": None, "put_sp_pct": None, "avg_sp_pct": None,
         "call_OI": None, "put_OI": None,
         "call_IV": None, "put_IV": None,
+        "back_atm_iv": None,
+        "nbr": None, "crush_prob": None, "crush_gate": "NO_DATA",
         "impl_move_pct": None,
         "entry_debit_mid": None,
         "status": "ERROR",
@@ -191,6 +255,22 @@ def screen_one(sym: str, event_date: date, today: date) -> dict:
         })
 
         result["impl_move_pct"] = round(implied_move_pct(t, spot, exp_str) or 0, 1) or None
+
+        # ── Back-month IV + NBR + crush gate ───────────────────────────────
+        # Front ATM IV: average the call/put IV from the OTM legs (proxy for
+        # ATM since 3% OTM is close). Back ATM IV: look up the monthly expiry.
+        front_atm_iv = None
+        if result["call_IV"] is not None and result["put_IV"] is not None:
+            front_atm_iv = (result["call_IV"] + result["put_IV"]) / 2.0
+
+        back_atm_iv = None
+        monthly = result.get("monthly_expiry")
+        if monthly and monthly != exp_str:
+            back_atm_iv = _atm_iv_for_expiry(t, spot, monthly)
+            result["back_atm_iv"] = round(back_atm_iv, 4) if back_atm_iv else None
+
+        gate_signals = _compute_crush_gate_signals(front_atm_iv, back_atm_iv)
+        result.update(gate_signals)
 
         # Filter logic
         oi_ok = (
@@ -262,9 +342,14 @@ def print_report(df: pd.DataFrame, today: date) -> None:
         oi = f"c={r['call_OI']}/p={r['put_OI']}" if r["call_OI"] else "OI=N/A"
         iv = f"c={r['call_IV']:.3f}/p={r['put_IV']:.3f}" if r["call_IV"] else ""
         im = f"impl={r['impl_move_pct']:.1f}%" if r["impl_move_pct"] else ""
+        nbr_s = f"NBR={r['nbr']:.3f}" if r.get("nbr") else "NBR=N/A"
+        gate = r.get("crush_gate", "NO_DATA")
+        cp = f"P={r['crush_prob']:.2f}" if r.get("crush_prob") else ""
+        gate_s = f"[{gate}]" if gate != "NO_DATA" else ""
         return (f"  {r['symbol']:6s}  {str(r['earnings_date']):<12}  "
                 f"T-3={str(r['t3_entry_date']):<12}  days={r['days_to_entry']:>3}  "
-                f"spot=${r['spot']:>8.2f}  avg_sp={sp}  {oi:<22}  {iv:<22}  {im}")
+                f"spot=${r['spot']:>8.2f}  avg_sp={sp}  {oi:<22}  "
+                f"{nbr_s:11s} {cp:8s} {gate_s:6s}  {im}")
 
     if not qualify.empty:
         print(f"\n{'─'*width}")
