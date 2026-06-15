@@ -251,11 +251,21 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
       }
       const payload = await response.json()
       setRankedData(payload)
-      // Auto-select top ranked row that has a ranking_score
-      const firstRanked = payload.rows?.find((r) => r.status === 'ranked')
-      if (firstRanked) {
-        setSelectedRankedSymbol((c) => c || firstRanked.symbol)
-      }
+      // Keep the current selection only if it still exists in this result set;
+      // otherwise prefer the top scored setup, then the first upcoming row. This
+      // prevents the detail panel from showing a stale symbol from a prior run
+      // (e.g. after changing filters so the previously-selected row is gone).
+      const newRows = payload.rows || []
+      setSelectedRankedSymbol((current) => {
+        const stillPresent = current && newRows.some(
+          (r) => r.symbol === current && (r.status === 'ranked' || r.status === 'upcoming'),
+        )
+        if (stillPresent) return current
+        const firstRanked = newRows.find((r) => r.status === 'ranked')
+        if (firstRanked) return firstRanked.symbol
+        const firstUpcoming = newRows.find((r) => r.status === 'upcoming')
+        return firstUpcoming ? firstUpcoming.symbol : ''
+      })
     } catch (err) {
       setRankedError(String(err.message || err))
     } finally {
@@ -445,8 +455,8 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
                       return (
                         <p>
                           No setups in the entry window right now — {upcomingCount} earnings
-                          {upcomingCount === 1 ? '' : ''} coming up in the look-ahead window (shown below,
-                          soonest first). They enter the window as their date approaches.
+                          event{upcomingCount === 1 ? '' : 's'} coming up in the look-ahead window (shown
+                          below, soonest first). They enter the window as their date approaches.
                         </p>
                       )
                     }
@@ -477,28 +487,51 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
                   )}
                 </div>
 
-                {/* Score components */}
-                {selectedRankedRow.score_components && Object.keys(selectedRankedRow.score_components).length > 0 && (
-                  <div style={{ marginTop: 10 }}>
-                    <div style={{ fontSize: '0.72rem', fontWeight: 600, color: '#8b949e', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-                      Score components
-                    </div>
-                    {Object.entries(selectedRankedRow.score_components).map(([k, v]) => (
-                      <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', padding: '2px 0', borderBottom: '1px solid #21262d' }}>
-                        <span style={{ color: '#8b949e' }}>{k.replace(/_/g, ' ')}</span>
-                        <span style={{ color: '#c9d1d9', fontVariantNumeric: 'tabular-nums' }}>
-                          {typeof v === 'number' ? v.toFixed(3) : String(v)}
-                        </span>
-                      </div>
-                    ))}
+                {selectedRankedRow.status === 'upcoming' ? (
+                  /* Upcoming rows aren't scored yet — show why, not an empty chart */
+                  <div
+                    style={{
+                      marginTop: 12,
+                      padding: '10px 12px',
+                      background: '#0d1117',
+                      border: '1px solid #21262d',
+                      borderRadius: 6,
+                      fontSize: '0.8rem',
+                      color: '#8b949e',
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    Not yet in the entry window — no setup score until it&apos;s within{' '}
+                    {rankedFilters.dteMax} DTE
+                    {selectedRankedRow.dte != null ? ` (currently ${selectedRankedRow.dte}d out)` : ''}.
+                    Run the analysis below for a full single-ticker view now.
                   </div>
-                )}
+                ) : (
+                  <>
+                    {/* Score components */}
+                    {selectedRankedRow.score_components && Object.keys(selectedRankedRow.score_components).length > 0 && (
+                      <div style={{ marginTop: 10 }}>
+                        <div style={{ fontSize: '0.72rem', fontWeight: 600, color: '#8b949e', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+                          Score components
+                        </div>
+                        {Object.entries(selectedRankedRow.score_components).map(([k, v]) => (
+                          <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', padding: '2px 0', borderBottom: '1px solid #21262d' }}>
+                            <span style={{ color: '#8b949e' }}>{k.replace(/_/g, ' ')}</span>
+                            <span style={{ color: '#c9d1d9', fontVariantNumeric: 'tabular-nums' }}>
+                              {typeof v === 'number' ? v.toFixed(3) : String(v)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
 
-                {/* Calibration insight */}
-                <CalibrationInsight
-                  apiBase={apiBase}
-                  score={selectedRankedRow.ranking_score}
-                />
+                    {/* Calibration insight */}
+                    <CalibrationInsight
+                      apiBase={apiBase}
+                      score={selectedRankedRow.ranking_score}
+                    />
+                  </>
+                )}
 
                 {/* Deep-dive link */}
                 {onAnalyzeSymbol && (

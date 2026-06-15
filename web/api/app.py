@@ -1790,7 +1790,7 @@ def ranked_screener(
     dte_min: int = Query(3, ge=0, le=60),
     dte_max: int = Query(10, ge=1, le=120),
     min_sample_size: int = Query(4, ge=0, le=40),
-    release_filter: str = Query("all", pattern="^(all|bmo|amc|dmh|unknown)$"),
+    release_filter: str = Query("all", pattern="^(all|bmo|amc|unknown)$"),
     weeks: int = Query(4, ge=1, le=26),
     symbols: Optional[str] = Query(None, max_length=2000),
     http_request: Request = None,

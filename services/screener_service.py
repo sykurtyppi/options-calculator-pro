@@ -449,6 +449,7 @@ def _screen_one_symbol_ranked(
     today: date,
     cutoff: date,
     dte_max: int = DTE_MAX_DEFAULT,
+    dte_min: int = DTE_MIN_DEFAULT,
 ) -> Optional[Dict[str, Any]]:
     """Fetch data and compute ranking signal for a single symbol.
 
@@ -485,7 +486,9 @@ def _screen_one_symbol_ranked(
         if snapshot_error:
             return {
                 "symbol": symbol,
-                "earnings_date": str(earnings_date),
+                # Never emit the literal string "None" — the API maps this onto a
+                # date field and Pydantic would 500 on "None".
+                "earnings_date": str(earnings_date) if earnings_date is not None else None,
                 "days_to_earnings": (earnings_date - today).days if earnings_date is not None else None,
                 "release_timing": release_timing or "UNKNOWN",
                 "ranking_score": 0.0,
@@ -539,7 +542,7 @@ def _screen_one_symbol_ranked(
             "sample_size": sample_size,
             "avg_spread_pct": spread_pct,
             "ranking_score": round(ranking_score, 4),
-            "in_entry_window": (DTE_MIN_DEFAULT <= dte <= DTE_MAX_DEFAULT),
+            "in_entry_window": (dte_min <= dte <= dte_max),
             "earnings_source_primary": snapshot.earnings_source_primary,
             "earnings_source_confirmed": snapshot.earnings_source_confirmed,
             "earnings_source_confidence": snapshot.earnings_source_confidence,
@@ -590,7 +593,7 @@ def build_ranked_screener(
 
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         futures = {
-            pool.submit(_screen_one_symbol_ranked, sym, as_of, cutoff, dte_max): sym
+            pool.submit(_screen_one_symbol_ranked, sym, as_of, cutoff, dte_max, dte_min): sym
             for sym in universe
         }
         for future in as_completed(futures, timeout=_SYMBOL_TIMEOUT_S * len(universe)):

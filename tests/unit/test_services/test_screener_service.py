@@ -415,7 +415,7 @@ class TestScreenerSortDeterminism:
             s: self._make_row(s, tied_score, tied_dte) for s in symbols
         }
 
-        def fake_screen(sym, today, cutoff, dte_max=14):
+        def fake_screen(sym, today, cutoff, dte_max=14, dte_min=3):
             return rows_by_symbol[sym]
 
         with patch("services.screener_service._screen_one_symbol_ranked", side_effect=fake_screen):
@@ -439,7 +439,7 @@ class TestScreenerSortDeterminism:
 
         symbols = ["AAAA", "ZZZY"]
 
-        def fake_screen(sym, today, cutoff, dte_max=14):
+        def fake_screen(sym, today, cutoff, dte_max=14, dte_min=3):
             return rows_by_symbol[sym]
 
         with patch("services.screener_service._screen_one_symbol_ranked", side_effect=fake_screen):
@@ -496,7 +496,7 @@ class TestScreenerDeterminismM3:
     def _run_order(self, symbols):
         rows_by_symbol = {s: self._row_for(s) for s in symbols}
 
-        def fake_screen(sym, today, cutoff, dte_max=14):
+        def fake_screen(sym, today, cutoff, dte_max=14, dte_min=3):
             return rows_by_symbol[sym]
 
         with patch(
@@ -539,7 +539,7 @@ class TestScreenerDeterminismM3:
                      "days_to_earnings": 9, "error": None},   # earlier alpha, later dte
         }
 
-        def fake_screen(sym, today, cutoff, dte_max=14):
+        def fake_screen(sym, today, cutoff, dte_max=14, dte_min=3):
             return rows[sym]
 
         with patch(
@@ -632,7 +632,7 @@ class TestUpcomingPipeline:
                      "sample_size": None, "upcoming": True, "error": None},
         }
 
-        def fake_screen(sym, today, cutoff, dte_max=14):
+        def fake_screen(sym, today, cutoff, dte_max=14, dte_min=3):
             return rows[sym]
 
         with patch("services.screener_service._screen_one_symbol_ranked", side_effect=fake_screen):
@@ -648,3 +648,62 @@ class TestUpcomingPipeline:
         )
         assert result["upcoming_count"] == 2
         assert result["in_entry_window"] == 1
+
+    def test_dte_equal_dte_max_is_scored_not_upcoming(self):
+        """Boundary: dte == dte_max must take the SCORED path (call the heavy
+        snapshot), not the upcoming early-return. Guards an off-by-one (> vs >=)."""
+        ticker = MagicMock()
+        with patch("services.screener_service.yf.Ticker", return_value=ticker):
+            with patch(
+                "services.screener_service.resolve_upcoming_earnings_event",
+                return_value=self._resolved(date(2026, 5, 4)),  # dte == 14
+            ):
+                with patch(
+                    "services.screener_service._build_ranked_snapshot",
+                    return_value=(_stub_snapshot(), "AMC", date(2026, 5, 4), None),
+                ) as mock_snap:
+                    row = _screen_one_symbol_ranked(
+                        "AAPL", date(2026, 4, 20), date(2026, 7, 18), dte_max=14
+                    )
+
+        mock_snap.assert_called_once()  # boundary symbol is scored, not upcoming
+        assert row is not None
+        assert not row.get("upcoming")
+        assert row["ranking_score"] is not None
+
+    def test_upcoming_unexpected_timing_normalizes_to_unknown(self):
+        """A resolved event whose timing is neither AMC nor BMO (e.g. DMH) must
+        be reported as UNKNOWN on the upcoming row, never a raw/odd label."""
+        ticker = MagicMock()
+        with patch("services.screener_service.yf.Ticker", return_value=ticker):
+            with patch(
+                "services.screener_service.resolve_upcoming_earnings_event",
+                return_value=self._resolved(date(2026, 6, 1), timing="DMH"),  # dte=42
+            ):
+                row = _screen_one_symbol_ranked(
+                    "AAPL", date(2026, 4, 20), date(2026, 7, 18), dte_max=14
+                )
+        assert row["upcoming"] is True
+        assert row["release_timing"] == "UNKNOWN"
+
+    def test_in_entry_window_uses_caller_bounds_not_module_defaults(self):
+        """The per-symbol in_entry_window flag must honor the caller's
+        dte_min/dte_max, not the module defaults. A scored row at dte=7 is
+        OUTSIDE a narrowed [9, 12] window and must be flagged False."""
+        ticker = MagicMock()
+        with patch("services.screener_service.yf.Ticker", return_value=ticker):
+            with patch(
+                "services.screener_service.resolve_upcoming_earnings_event",
+                return_value=self._resolved(date(2026, 4, 27)),  # dte == 7
+            ):
+                with patch(
+                    "services.screener_service._build_ranked_snapshot",
+                    return_value=(_stub_snapshot(), "AMC", date(2026, 4, 27), None),
+                ):
+                    row = _screen_one_symbol_ranked(
+                        "AAPL", date(2026, 4, 20), date(2026, 7, 18),
+                        dte_max=12, dte_min=9,
+                    )
+        assert row is not None
+        assert row["ranking_score"] is not None
+        assert row["in_entry_window"] is False  # dte=7 is below dte_min=9

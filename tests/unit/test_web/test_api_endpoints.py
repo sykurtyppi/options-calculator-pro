@@ -1131,6 +1131,36 @@ class TestApiEndpoints(unittest.TestCase):
             self.client.get("/api/screener/ranked?release_filter=amc")
             self.assertEqual(build_mock.call_args.kwargs["release_filter"], "AMC")
 
+    def test_ranked_screener_maps_errored_row(self):
+        """An errored service row (minimal key set, no rank/status) must map to
+        status='error' with error_note populated — the one branch of
+        _to_ranked_setup_row not covered by the main shape test."""
+        payload = {
+            "generated_at": "2026-06-15T10:00:00Z",
+            "as_of_date": "2026-06-15",
+            "universe_size": 1, "rows_returned": 1, "in_entry_window": 0,
+            "upcoming_count": 0, "ranking_weights": {}, "strategy_note": "",
+            "rows": [
+                {
+                    "symbol": "XYZ",
+                    "earnings_date": "2026-06-25",
+                    "days_to_earnings": 10,
+                    "release_timing": "UNKNOWN",
+                    "ranking_score": 0.0,
+                    "error": "insufficient price history",
+                },
+            ],
+        }
+        with patch("services.screener_service.build_ranked_screener", return_value=payload):
+            response = self.client.get("/api/screener/ranked")
+
+        self.assertEqual(response.status_code, 200)
+        row = response.json()["rows"][0]
+        self.assertEqual(row["symbol"], "XYZ")
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["error_note"], "insufficient price history")
+        self.assertEqual(row["dte"], 10)
+
     # ── F2: screener rate-limit (web-hardening audit) ─────────────────────
 
     def test_edge_screener_rate_limited_returns_429(self):
