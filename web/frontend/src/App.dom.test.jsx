@@ -65,6 +65,18 @@ describe('App — decision-first result tabs', () => {
     expect(screen.getByRole('tab', { name: /Full metrics/i })).toBeInTheDocument()
     // The dense legacy block (e.g. "Edge & Expectancy") is NOT in the default view.
     expect(document.body.textContent).not.toMatch(/Edge & Expectancy/i)
+    // The live forward-evidence strip is surfaced in the Decision view.
+    await waitFor(() => expect(document.body.textContent).toMatch(/Live forward evidence/i))
+  })
+
+  test('the operational tail (warehouse / OOS / diagnostics) is collapsed by default', async () => {
+    await _runAnalysis()
+    // The disclosure exists but its contents are not mounted yet.
+    expect(screen.getByRole('button', { name: /Tools & diagnostics/i })).toBeInTheDocument()
+    expect(document.body.textContent).not.toMatch(/Walk-Forward OOS Report Card/i)
+    // Expanding it reveals the tail.
+    fireEvent.click(screen.getByRole('button', { name: /Tools & diagnostics/i }))
+    await waitFor(() => expect(document.body.textContent).toMatch(/Walk-Forward OOS Report Card/i))
   })
 
   test('the Full metrics tab reveals the legacy block, with honest advisory wording and no false cap', async () => {

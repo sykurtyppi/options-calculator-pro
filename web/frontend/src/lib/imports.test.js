@@ -50,7 +50,9 @@ test('every file referencing apiFetch also imports it', () => {
     // exempt for obvious reasons.
     const basename = path.split('/').pop()
     if (basename === 'api.js') continue
-    if (basename.endsWith('.test.js')) continue
+    // All test files are exempt (they reference symbols to test invariants,
+    // not because they're subject to them) — .test.js AND .test.jsx / .dom.test.jsx.
+    if (basename.includes('.test.')) continue
     const text = readFileSync(path, 'utf8')
     const references = /\bapiFetch\s*\(/.test(text)
     if (!references) continue
