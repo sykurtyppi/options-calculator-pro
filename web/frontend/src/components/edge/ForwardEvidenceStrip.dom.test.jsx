@@ -36,6 +36,16 @@ describe('ForwardEvidenceStrip', () => {
     expect(body).toMatch(/paper · not execution-grade/i)  // honest label kept
   })
 
+  test('treats resolved-without-summary-stats as accruing, not n/a-filled stats', async () => {
+    // counts and stats come from different backend paths; guard against showing
+    // "12 resolved · n/a win · realized n/a".
+    apiFetch.mockResolvedValue(_resp({ resolved_outcome_count: 12, open_outcome_count: 0 }))
+    render(<ForwardEvidenceStrip apiBase="" />)
+    await waitFor(() => expect(screen.getByText(/Live forward evidence/i)).toBeInTheDocument())
+    expect(document.body.textContent).toMatch(/no resolved paper trades yet/i)
+    expect(document.body.textContent).not.toMatch(/n\/a win/i)
+  })
+
   test('fails quiet (renders nothing) when the endpoint errors', async () => {
     apiFetch.mockResolvedValue({ ok: false, status: 500, json: async () => ({}) })
     const { container } = render(<ForwardEvidenceStrip apiBase="" />)
