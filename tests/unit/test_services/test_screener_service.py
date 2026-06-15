@@ -351,10 +351,22 @@ class TestSnapshotBackedRankedScreener:
 
         with patch("services.screener_service.yf.Ticker", return_value=ticker):
             with patch(
-                "services.screener_service._build_ranked_snapshot",
-                return_value=(_stub_snapshot(), "AMC", date(2026, 4, 28), None),
-            ) as mock_snapshot:
-                row = _screen_one_symbol_ranked("AAPL", date(2026, 4, 20), date(2026, 5, 18))
+                "services.screener_service.resolve_upcoming_earnings_event",
+                return_value=ResolvedEarningsEvent(
+                    symbol="AAPL",
+                    earnings_date=date(2026, 4, 28),  # dte=8, inside dte_max
+                    release_timing="AMC",
+                    primary_source="alpha_vantage_calendar",
+                    confirmed_source=None,
+                    source_confidence=0.72,
+                    source_notes=["cached alpha vantage"],
+                ),
+            ):
+                with patch(
+                    "services.screener_service._build_ranked_snapshot",
+                    return_value=(_stub_snapshot(), "AMC", date(2026, 4, 28), None),
+                ) as mock_snapshot:
+                    row = _screen_one_symbol_ranked("AAPL", date(2026, 4, 20), date(2026, 5, 18))
 
         assert row is not None
         mock_snapshot.assert_called_once()
@@ -403,7 +415,7 @@ class TestScreenerSortDeterminism:
             s: self._make_row(s, tied_score, tied_dte) for s in symbols
         }
 
-        def fake_screen(sym, today, cutoff):
+        def fake_screen(sym, today, cutoff, dte_max=14):
             return rows_by_symbol[sym]
 
         with patch("services.screener_service._screen_one_symbol_ranked", side_effect=fake_screen):
@@ -427,7 +439,7 @@ class TestScreenerSortDeterminism:
 
         symbols = ["AAAA", "ZZZY"]
 
-        def fake_screen(sym, today, cutoff):
+        def fake_screen(sym, today, cutoff, dte_max=14):
             return rows_by_symbol[sym]
 
         with patch("services.screener_service._screen_one_symbol_ranked", side_effect=fake_screen):
@@ -484,7 +496,7 @@ class TestScreenerDeterminismM3:
     def _run_order(self, symbols):
         rows_by_symbol = {s: self._row_for(s) for s in symbols}
 
-        def fake_screen(sym, today, cutoff):
+        def fake_screen(sym, today, cutoff, dte_max=14):
             return rows_by_symbol[sym]
 
         with patch(
@@ -527,7 +539,7 @@ class TestScreenerDeterminismM3:
                      "days_to_earnings": 9, "error": None},   # earlier alpha, later dte
         }
 
-        def fake_screen(sym, today, cutoff):
+        def fake_screen(sym, today, cutoff, dte_max=14):
             return rows[sym]
 
         with patch(
@@ -551,3 +563,88 @@ class TestScreenerDeterminismM3:
             assert round(base, 4) == round(jittered, 4), (
                 f"jitter {delta:.0e} on an input must not change round(4) score"
             )
+
+
+# ── Upcoming pipeline (fix/screener-upcoming-pipeline) ────────────────────────
+
+
+class TestUpcomingPipeline:
+    """The screener must never return a blank '0 setups' between earnings
+    seasons. Symbols whose earnings are beyond the entry window (dte > dte_max)
+    are returned as lightweight 'upcoming' pipeline rows — no score, no IV, no
+    expensive snapshot fetch — so the user always sees what's coming and when."""
+
+    def _resolved(self, earnings_date, timing="AMC"):
+        return ResolvedEarningsEvent(
+            symbol="AAPL",
+            earnings_date=earnings_date,
+            release_timing=timing,
+            primary_source="alpha_vantage_calendar",
+            confirmed_source=None,
+            source_confidence=0.5,
+            source_notes=[],
+        )
+
+    def test_far_earnings_returns_upcoming_row_without_snapshot(self):
+        """A symbol with earnings beyond dte_max yields an upcoming row and
+        does NOT pay for the heavy _build_ranked_snapshot fetch."""
+        ticker = MagicMock()
+        with patch("services.screener_service.yf.Ticker", return_value=ticker):
+            with patch(
+                "services.screener_service.resolve_upcoming_earnings_event",
+                return_value=self._resolved(date(2026, 6, 1)),  # dte=42
+            ):
+                with patch("services.screener_service._build_ranked_snapshot") as mock_snap:
+                    row = _screen_one_symbol_ranked(
+                        "AAPL", date(2026, 4, 20), date(2026, 7, 18), dte_max=14
+                    )
+
+        mock_snap.assert_not_called()  # the whole point: no expensive fetch
+        assert row is not None
+        assert row["upcoming"] is True
+        assert row["ranking_score"] is None
+        assert row["sample_size"] is None
+        assert row["days_to_earnings"] == 42
+        assert row["release_timing"] == "AMC"
+        assert row["error"] is None
+
+    def test_no_earnings_returns_none(self):
+        ticker = MagicMock()
+        with patch("services.screener_service.yf.Ticker", return_value=ticker):
+            with patch(
+                "services.screener_service.resolve_upcoming_earnings_event",
+                return_value=self._resolved(None),
+            ):
+                row = _screen_one_symbol_ranked(
+                    "AAPL", date(2026, 4, 20), date(2026, 7, 18), dte_max=14
+                )
+        assert row is None
+
+    def test_scored_rows_sort_above_upcoming_and_count_is_reported(self):
+        """Scored rows (in-window) sort above upcoming rows; upcoming rows sort
+        by DTE ascending; upcoming_count is reported separately."""
+        rows = {
+            "SCOR": {"symbol": "SCOR", "ranking_score": 0.50, "days_to_earnings": 7,
+                     "sample_size": 8, "error": None},
+            "FARB": {"symbol": "FARB", "ranking_score": None, "days_to_earnings": 40,
+                     "sample_size": None, "upcoming": True, "error": None},
+            "NEAR": {"symbol": "NEAR", "ranking_score": None, "days_to_earnings": 20,
+                     "sample_size": None, "upcoming": True, "error": None},
+        }
+
+        def fake_screen(sym, today, cutoff, dte_max=14):
+            return rows[sym]
+
+        with patch("services.screener_service._screen_one_symbol_ranked", side_effect=fake_screen):
+            result = build_ranked_screener(
+                symbols=["FARB", "SCOR", "NEAR"],
+                min_sample_size=4,  # must NOT drop upcoming rows (sample_size None)
+                today=date(2026, 5, 28),
+            )
+
+        order = [r["symbol"] for r in result["rows"]]
+        assert order == ["SCOR", "NEAR", "FARB"], (
+            f"scored first, then upcoming by DTE asc; got {order}"
+        )
+        assert result["upcoming_count"] == 2
+        assert result["in_entry_window"] == 1

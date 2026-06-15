@@ -1752,6 +1752,39 @@ def get_ml_train_status(job_id: str) -> Dict[str, Any]:
 
 # ── Ranked screener endpoint ─────────────────────────────────────────────────
 
+def _to_ranked_setup_row(rank: int, r: Dict[str, Any]) -> RankedSetupRow:
+    """Map a screener-service row dict to the API's RankedSetupRow shape.
+
+    The service emits internal field names (days_to_earnings, iv30,
+    term_structure_ratio, avg_spread_pct) and three row kinds: scored, upcoming
+    (pipeline, no score), and errored. This is the single translation point —
+    keeping the wire schema decoupled from the service's internal dict.
+    """
+    if r.get("error"):
+        status = "error"
+    elif r.get("upcoming"):
+        status = "upcoming"
+    else:
+        status = "ranked"
+    return RankedSetupRow(
+        rank=rank,
+        symbol=r["symbol"],
+        earnings_date=r.get("earnings_date"),
+        dte=r.get("days_to_earnings"),
+        release_timing=r.get("release_timing") or "UNKNOWN",
+        iv_rv_ratio=r.get("iv_rv_ratio"),
+        atm_iv=r.get("iv30"),
+        rv30=r.get("rv30"),
+        ts_ratio=r.get("term_structure_ratio"),
+        median_earnings_move_pct=r.get("median_earnings_move_pct"),
+        sample_size=r.get("sample_size"),
+        spread_pct=r.get("avg_spread_pct"),
+        ranking_score=r.get("ranking_score"),
+        status=status,
+        error_note=r.get("error"),
+    )
+
+
 @app.get("/api/screener/ranked", response_model=RankedScreenerResponse)
 def ranked_screener(
     dte_min: int = Query(3, ge=0, le=60),
@@ -1789,26 +1822,33 @@ def ranked_screener(
         raise HTTPException(status_code=400, detail="dte_min must be less than or equal to dte_max.")
     universe = _parse_symbol_universe(symbols, DEFAULT_UNIVERSE)
 
+    # The query param is lowercase ("all"|"amc"|"bmo"|...); the service expects
+    # None (= no filter) or an uppercase timing label matching the row data
+    # ("AMC"/"BMO"). Without this normalization "all" was treated as a literal
+    # timing and silently dropped every AMC/BMO row.
+    service_release_filter = None if release_filter == "all" else release_filter.upper()
+
     try:
         payload = build_ranked_screener(
             symbols=universe,
             dte_min=dte_min,
             dte_max=dte_max,
             min_sample_size=min_sample_size,
-            release_filter=release_filter,
+            release_filter=service_release_filter,
             weeks=weeks,
             today=today,
         )
     except Exception as exc:
         _raise_public_error(400, "Ranked screener failed. Check data availability and request parameters.", exc)
 
-    rows = [RankedSetupRow(**r) for r in payload["rows"]]
+    rows = [_to_ranked_setup_row(i, r) for i, r in enumerate(payload["rows"], start=1)]
     return RankedScreenerResponse(
         generated_at=datetime.now(timezone.utc),
         as_of_date=payload["as_of_date"],
         universe_size=payload["universe_size"],
         rows_returned=payload["rows_returned"],
         in_entry_window=payload["in_entry_window"],
+        upcoming_count=payload.get("upcoming_count", 0),
         ranking_weights=payload["ranking_weights"],
         strategy_note=payload["strategy_note"],
         rows=rows,

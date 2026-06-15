@@ -1007,12 +1007,19 @@ class TestApiEndpoints(unittest.TestCase):
         """GET /api/screener/ranked should return RankedScreenerResponse shape."""
         from datetime import date as _date
 
+        # Rows are stubbed in the screener SERVICE's internal dict shape
+        # (days_to_earnings, iv30, term_structure_ratio, avg_spread_pct, no
+        # rank/status) — NOT the wire shape — so this exercises the real
+        # _to_ranked_setup_row mapping. A prior version of this test stubbed the
+        # already-mapped shape, which masked a mapping bug that crashed on any
+        # non-empty result. Includes one upcoming-pipeline row (null score).
         stub_payload = {
             "generated_at": "2026-04-20T10:00:00Z",
             "as_of_date": str(_date.today()),
             "universe_size": 40,
             "rows_returned": 2,
-            "in_entry_window": 2,
+            "in_entry_window": 1,
+            "upcoming_count": 1,
             "ranking_weights": {
                 "iv_entry_score": 0.32,
                 "move_history_score": 0.25,
@@ -1024,40 +1031,39 @@ class TestApiEndpoints(unittest.TestCase):
             "strategy_note": "Pre-earnings long-vega: enter 3-10 DTE, exit T-1 before event.",
             "rows": [
                 {
-                    "rank": 1,
                     "symbol": "NVDA",
                     "earnings_date": str(_date.today()),
-                    "dte": 5,
+                    "days_to_earnings": 5,
                     "release_timing": "AMC",
                     "iv_rv_ratio": 0.92,
-                    "atm_iv": 55.2,
+                    "iv30": 55.2,
                     "rv30": 60.0,
-                    "ts_ratio": 0.88,
+                    "term_structure_ratio": 0.88,
                     "median_earnings_move_pct": 9.5,
+                    "p90_earnings_move_pct": 14.0,
                     "sample_size": 10,
-                    "spread_pct": 1.8,
+                    "avg_spread_pct": 1.8,
                     "ranking_score": 0.74,
-                    "score_components": {"iv_entry_score": 0.8, "dte_score": 0.9},
-                    "status": "ranked",
-                    "error_note": None,
+                    "in_entry_window": True,
+                    "error": None,
                 },
                 {
-                    "rank": 2,
-                    "symbol": "META",
+                    "symbol": "AAPL",
                     "earnings_date": str(_date.today()),
-                    "dte": 7,
+                    "days_to_earnings": 40,
                     "release_timing": "AMC",
-                    "iv_rv_ratio": 1.10,
-                    "atm_iv": 42.0,
-                    "rv30": 38.0,
-                    "ts_ratio": 0.95,
-                    "median_earnings_move_pct": 6.2,
-                    "sample_size": 8,
-                    "spread_pct": 2.1,
-                    "ranking_score": 0.55,
-                    "score_components": {},
-                    "status": "ranked",
-                    "error_note": None,
+                    "iv30": None,
+                    "rv30": None,
+                    "iv_rv_ratio": None,
+                    "term_structure_ratio": None,
+                    "median_earnings_move_pct": None,
+                    "p90_earnings_move_pct": None,
+                    "sample_size": None,
+                    "avg_spread_pct": None,
+                    "ranking_score": None,
+                    "in_entry_window": False,
+                    "upcoming": True,
+                    "error": None,
                 },
             ],
         }
@@ -1069,9 +1075,25 @@ class TestApiEndpoints(unittest.TestCase):
         payload = response.json()
         self.assertIn("rows", payload)
         self.assertEqual(payload["universe_size"], 40)
-        self.assertEqual(payload["in_entry_window"], 2)
+        self.assertEqual(payload["in_entry_window"], 1)
+        self.assertEqual(payload["upcoming_count"], 1)
         self.assertIn("ranking_weights", payload)
         self.assertAlmostEqual(payload["ranking_weights"]["iv_entry_score"], 0.32)
+
+        # Mapping: service internal keys → wire fields.
+        scored, upcoming = payload["rows"][0], payload["rows"][1]
+        self.assertEqual(scored["symbol"], "NVDA")
+        self.assertEqual(scored["rank"], 1)
+        self.assertEqual(scored["status"], "ranked")
+        self.assertEqual(scored["dte"], 5)              # from days_to_earnings
+        self.assertAlmostEqual(scored["atm_iv"], 55.2)  # from iv30
+        self.assertAlmostEqual(scored["ts_ratio"], 0.88)  # from term_structure_ratio
+        self.assertAlmostEqual(scored["spread_pct"], 1.8)  # from avg_spread_pct
+        self.assertEqual(upcoming["symbol"], "AAPL")
+        self.assertEqual(upcoming["status"], "upcoming")
+        self.assertIsNone(upcoming["ranking_score"])
+        self.assertIsNone(upcoming["sample_size"])
+        self.assertEqual(upcoming["dte"], 40)
 
     def test_ranked_screener_rejects_invalid_or_excessive_symbol_universe(self):
         with patch("services.screener_service.build_ranked_screener") as build_mock:
@@ -1089,6 +1111,25 @@ class TestApiEndpoints(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         build_mock.assert_not_called()
+
+    def test_ranked_screener_normalizes_release_filter(self):
+        """The lowercase query param must be normalized for the service:
+        'all' -> None (no filter), 'amc' -> 'AMC'. A prior bug passed 'all'
+        through literally, and the service's `release_timing != 'all'` check
+        then silently dropped every AMC/BMO row."""
+        empty = {
+            "generated_at": "2026-06-15T10:00:00Z",
+            "as_of_date": "2026-06-15",
+            "universe_size": 0, "rows_returned": 0, "in_entry_window": 0,
+            "upcoming_count": 0, "ranking_weights": {}, "strategy_note": "", "rows": [],
+        }
+        with patch("services.screener_service.build_ranked_screener", return_value=empty) as build_mock:
+            self.client.get("/api/screener/ranked?release_filter=all")
+            self.assertIsNone(build_mock.call_args.kwargs["release_filter"])
+
+            build_mock.reset_mock()
+            self.client.get("/api/screener/ranked?release_filter=amc")
+            self.assertEqual(build_mock.call_args.kwargs["release_filter"], "AMC")
 
     # ── F2: screener rate-limit (web-hardening audit) ─────────────────────
 

@@ -58,11 +58,33 @@ const COLS = [
   { key: 'ranking_score', label: 'Setup Score', width: 130 },
 ]
 
+function upcomingPill() {
+  return (
+    <span
+      style={{
+        fontSize: '0.72rem',
+        color: '#8b949e',
+        fontStyle: 'italic',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 5,
+      }}
+    >
+      <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#58a6ff', display: 'inline-block' }} />
+      upcoming
+    </span>
+  )
+}
+
 export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
   if (!rows || rows.length === 0) {
     return (
-      <div style={{ padding: '16px 0', color: '#8b949e', fontSize: '0.85rem', textAlign: 'center' }}>
-        No setups in entry window
+      <div style={{ padding: '20px 0', color: '#8b949e', fontSize: '0.85rem', textAlign: 'center', lineHeight: 1.5 }}>
+        No upcoming earnings found in the look-ahead window.
+        <br />
+        <span style={{ fontSize: '0.78rem', color: '#6e7681' }}>
+          Try increasing <strong>Weeks</strong> or widening the <strong>DTE</strong> range.
+        </span>
       </div>
     )
   }
@@ -95,14 +117,16 @@ export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
             const isSelected = row.symbol === selectedSymbol
             const isError = row.status === 'error'
             const isNoEvent = row.status === 'no_earnings'
+            const isUpcoming = row.status === 'upcoming'
+            const isInert = isError || isNoEvent
             return (
               <tr
                 key={`${row.symbol}-${row.earnings_date}`}
-                onClick={() => !isError && !isNoEvent && onSelect && onSelect(row)}
+                onClick={() => !isInert && onSelect && onSelect(row)}
                 style={{
-                  cursor: isError || isNoEvent ? 'default' : 'pointer',
+                  cursor: isInert ? 'default' : 'pointer',
                   background: isSelected ? '#1c3a5e22' : 'transparent',
-                  opacity: isError || isNoEvent ? 0.45 : 1,
+                  opacity: isInert ? 0.45 : isUpcoming ? 0.72 : 1,
                 }}
               >
                 <td style={{ padding: '5px 8px', textAlign: 'right', color: '#8b949e' }}>{row.rank}</td>
@@ -138,6 +162,8 @@ export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
                     ? <span style={{ color: '#da3633', fontSize: '0.75rem' }}>{row.error_note || 'error'}</span>
                     : isNoEvent
                     ? <span style={{ color: '#8b949e', fontSize: '0.75rem' }}>no event in window</span>
+                    : isUpcoming
+                    ? upcomingPill()
                     : scoreBar(row.ranking_score)}
                 </td>
               </tr>

@@ -359,8 +359,14 @@ def _build_ranked_snapshot(
     ticker: yf.Ticker,
     today: date,
     cutoff: date,
+    resolved_event: Optional[Any] = None,
 ) -> Tuple[Optional[VolSnapshot], Optional[str], Optional[date], Optional[str]]:
-    resolved_event = resolve_upcoming_earnings_event(symbol, today, cutoff, ticker=ticker)
+    # resolved_event may be supplied by the caller to avoid resolving earnings
+    # twice (the caller resolves cheaply first to decide whether the expensive
+    # snapshot below is even needed). Falls back to resolving here for callers
+    # that don't pass it (and the existing unit test).
+    if resolved_event is None:
+        resolved_event = resolve_upcoming_earnings_event(symbol, today, cutoff, ticker=ticker)
     earnings_date = resolved_event.earnings_date
     release_timing = resolved_event.release_timing
     if earnings_date is None:
@@ -401,23 +407,78 @@ def _build_ranked_snapshot(
     return snapshot, release_timing, earnings_date, None
 
 
+def _upcoming_pipeline_row(
+    symbol: str, earnings_date: date, dte: int, release_timing: str
+) -> Dict[str, Any]:
+    """A lightweight row for an upcoming-but-not-yet-enterable earnings event.
+
+    Carries only the cheap-to-resolve fields (symbol, earnings date, DTE,
+    timing); scored/IV fields are null. These are the screener's forward
+    pipeline — what's coming and when it enters the window — so the table is
+    never just a blank '0 setups' between earnings seasons.
+    """
+    return {
+        "symbol": symbol,
+        "earnings_date": str(earnings_date),
+        "days_to_earnings": dte,
+        "release_timing": release_timing,
+        "iv30": None,
+        "rv30": None,
+        "iv_rv_ratio": None,
+        "term_structure_ratio": None,
+        "median_earnings_move_pct": None,
+        "p90_earnings_move_pct": None,
+        "sample_size": None,
+        "avg_spread_pct": None,
+        "ranking_score": None,
+        "in_entry_window": False,
+        "upcoming": True,
+        "earnings_source_primary": None,
+        "earnings_source_confirmed": None,
+        "earnings_source_confidence": None,
+        "earnings_source_stale": None,
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "error": None,
+    }
+
+
 # ── Per-symbol orchestration ──────────────────────────────────────────────────
 
 def _screen_one_symbol_ranked(
     symbol: str,
     today: date,
     cutoff: date,
+    dte_max: int = DTE_MAX_DEFAULT,
 ) -> Optional[Dict[str, Any]]:
     """Fetch data and compute ranking signal for a single symbol.
 
     Returns None if no upcoming earnings found within the cutoff window.
-    Returns a dict with an 'error' key if data is partial.
+    Returns a lightweight 'upcoming' row (no score, no IV) for symbols whose
+    earnings are beyond dte_max — the pipeline of what's coming — WITHOUT paying
+    for the expensive 5y-history + option-chain snapshot. Returns a dict with an
+    'error' key if data is partial.
     """
     try:
         ticker = yf.Ticker(symbol)
 
+        # Resolve earnings cheaply first; only entry-window symbols (dte <=
+        # dte_max) get the heavy snapshot. Scanning the full universe with the
+        # heavy per-symbol fetch was getting yfinance-rate-limited to ~0 results.
+        resolved_event = resolve_upcoming_earnings_event(symbol, today, cutoff, ticker=ticker)
+        earnings_date = resolved_event.earnings_date
+        if earnings_date is None:
+            return None
+        dte = (earnings_date - today).days
+        if dte > dte_max:
+            # resolved_event.release_timing is already a short label (AMC/BMO/UNKNOWN),
+            # so normalize directly rather than via the full-form converter.
+            timing = (resolved_event.release_timing or "UNKNOWN").upper()
+            if timing not in ("AMC", "BMO"):
+                timing = "UNKNOWN"
+            return _upcoming_pipeline_row(symbol, earnings_date, dte, timing)
+
         snapshot, release_timing, earnings_date, snapshot_error = _build_ranked_snapshot(
-            symbol, ticker, today, cutoff
+            symbol, ticker, today, cutoff, resolved_event=resolved_event
         )
         if snapshot is None and earnings_date is None:
             return None
@@ -529,7 +590,7 @@ def build_ranked_screener(
 
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         futures = {
-            pool.submit(_screen_one_symbol_ranked, sym, as_of, cutoff): sym
+            pool.submit(_screen_one_symbol_ranked, sym, as_of, cutoff, dte_max): sym
             for sym in universe
         }
         for future in as_completed(futures, timeout=_SYMBOL_TIMEOUT_S * len(universe)):
@@ -550,31 +611,41 @@ def build_ranked_screener(
         dte_val = row.get("days_to_earnings")
         if dte_val is None:
             continue
-        # DTE window filter (informational only — rows outside window still shown)
-        if min_sample_size > 0 and row.get("sample_size", 0) < min_sample_size:
+        # min-sample filter applies only to SCORED rows; upcoming-pipeline rows
+        # carry no sample (sample_size is None) and must not be dropped by it.
+        if (
+            not row.get("upcoming")
+            and min_sample_size > 0
+            and (row.get("sample_size") or 0) < min_sample_size
+        ):
             continue
         if release_filter and row.get("release_timing") not in (release_filter, "UNKNOWN"):
             continue
         filtered.append(row)
 
-    # Sort: valid rows by ranking_score desc, then DTE asc, then symbol asc
-    # as a deterministic tie-breaker. Without symbol, two rows with identical
-    # ranking_score and DTE sort by thread-completion order, which varies
-    # across runs and makes screener output non-reproducible.
-    valid = [r for r in filtered if not r.get("error")]
+    # Sort order, top to bottom:
+    #   1. Scored rows (in/near the entry window) by ranking_score desc
+    #   2. Upcoming-pipeline rows (no score yet) by DTE asc — "what's coming, soonest first"
+    #   3. Errored rows last, so the user still sees data-coverage gaps
+    # Symbol is the deterministic final tie-breaker; without it, rows with equal
+    # keys sort by thread-completion order and screener output is non-reproducible.
+    scored = [r for r in filtered if not r.get("error") and r.get("ranking_score") is not None]
+    upcoming = [r for r in filtered if not r.get("error") and r.get("ranking_score") is None]
     errored = [r for r in filtered if r.get("error")]
 
-    valid.sort(key=lambda r: (-r.get("ranking_score", 0.0), r.get("days_to_earnings", 9999), r.get("symbol", "")))
+    scored.sort(key=lambda r: (-r["ranking_score"], r.get("days_to_earnings", 9999), r.get("symbol", "")))
+    upcoming.sort(key=lambda r: (r.get("days_to_earnings", 9999), r.get("symbol", "")))
     errored.sort(key=lambda r: str(r.get("symbol", "")))
 
-    rows = valid + errored
+    rows = scored + upcoming + errored
 
-    # Label entry window
+    # Label entry window (scored rows only — upcoming rows are by definition beyond it)
     in_window = sum(
-        1 for r in valid
+        1 for r in scored
         if r.get("days_to_earnings") is not None
         and dte_min <= r["days_to_earnings"] <= dte_max
     )
+    upcoming_count = len(upcoming)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -582,6 +653,7 @@ def build_ranked_screener(
         "universe_size": len(universe),
         "rows_returned": len(rows),
         "in_entry_window": in_window,
+        "upcoming_count": upcoming_count,
         "ranking_weights": {
             "iv_entry": _W_IV_ENTRY,
             "move_history": _W_MOVE_HISTORY,
