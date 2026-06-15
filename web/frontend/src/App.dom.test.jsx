@@ -48,26 +48,37 @@ vi.mock('./lib/api', () => ({
 
 import App from './App'
 
-describe('App — legacy block honesty (rendered)', () => {
-  test('a reduced-evidence flag renders advisory wording, never a false score cap', async () => {
-    render(<App />)
+async function _runAnalysis() {
+  render(<App />)
+  fireEvent.change(screen.getByLabelText('Ticker'), { target: { value: 'AAPL' } })
+  fireEvent.click(screen.getByRole('button', { name: /Run Edge Analysis/i }))
+  // Wait for the result block (and its tab bar) to render.
+  await screen.findByRole('tab', { name: /^Decision$/i }, { timeout: 5000 })
+}
 
-    fireEvent.change(screen.getByLabelText('Ticker'), { target: { value: 'AAPL' } })
-    fireEvent.click(screen.getByRole('button', { name: /Run Edge Analysis/i }))
+describe('App — decision-first result tabs', () => {
+  test('lands on the Decision tab; the legacy metrics block is not shown by default', async () => {
+    await _runAnalysis()
+    // Three result views are offered.
+    expect(screen.getByRole('tab', { name: /^Decision$/i })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tab', { name: /Evidence & regime/i })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /Full metrics/i })).toBeInTheDocument()
+    // The dense legacy block (e.g. "Edge & Expectancy") is NOT in the default view.
+    expect(document.body.textContent).not.toMatch(/Edge & Expectancy/i)
+  })
 
-    // The advisory block sits inside the lazy LegacyAnalysisPanel Suspense, so
-    // wait for the chunk to resolve and the text to appear. Assert on
-    // body.textContent because the sentence is split by a <strong> node.
+  test('the Full metrics tab reveals the legacy block, with honest advisory wording and no false cap', async () => {
+    await _runAnalysis()
+    fireEvent.click(screen.getByRole('tab', { name: /Full metrics/i }))
+
+    // The reduced-evidence advisory block lives in the lazy LegacyAnalysisPanel.
     await waitFor(
       () => expect(document.body.textContent).toMatch(/advisory evidence flag/i),
       { timeout: 5000 },
     )
-
     const body = document.body.textContent
-    // Honest: the flag explicitly states the score is not reduced.
-    expect(body).toMatch(/not reduced/i)
-    // Never the false claim the honesty fix removed.
-    expect(body).not.toMatch(/capped at/i)
+    expect(body).toMatch(/not reduced/i)          // honest: score not reduced
+    expect(body).not.toMatch(/capped at/i)        // never the false claim
     expect(body).not.toMatch(/score capped/i)
   })
 })
