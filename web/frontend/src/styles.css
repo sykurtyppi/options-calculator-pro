@@ -2300,22 +2300,17 @@ button:disabled {
   background: rgba(7, 20, 29, 0.36);
 }
 
-.legacy-analysis-panel summary {
-  list-style: none;
-  cursor: pointer;
+.legacy-analysis-head {
   padding: 14px 16px;
+  border-bottom: 1px solid rgba(90, 114, 131, 0.18);
 }
 
-.legacy-analysis-panel summary::-webkit-details-marker {
-  display: none;
-}
-
-.legacy-analysis-panel summary strong {
+.legacy-analysis-head strong {
   display: block;
   font-size: 0.94rem;
 }
 
-.legacy-analysis-panel summary span {
+.legacy-analysis-head span {
   display: block;
   margin-top: 4px;
   color: var(--muted);
@@ -2323,8 +2318,20 @@ button:disabled {
 }
 
 .legacy-analysis-body {
-  padding: 0 16px 16px;
+  padding: 16px;
 }
+
+.decision-empty {
+  padding: 16px;
+  margin: 12px 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+.decision-empty strong { color: var(--text); font-weight: 500; }
 
 /* ── Recommendation ledger diagnostics ──────────────────────────────────── */
 

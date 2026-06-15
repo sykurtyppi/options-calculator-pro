@@ -67,6 +67,18 @@ describe('App — decision-first result tabs', () => {
     expect(document.body.textContent).not.toMatch(/Edge & Expectancy/i)
     // The live forward-evidence strip is surfaced in the Decision view.
     await waitFor(() => expect(document.body.textContent).toMatch(/Live forward evidence/i))
+    // With selector_output null (this mock), the Decision tab is not silently
+    // empty — it shows a fallback that points at the other tabs.
+    expect(document.body.textContent).toMatch(/No structured decision is available/i)
+  })
+
+  test('the Full metrics tab shows its content directly (not behind a second collapse)', async () => {
+    await _runAnalysis()
+    fireEvent.click(screen.getByRole('tab', { name: /Full metrics/i }))
+    // The legacy panel must render OPEN (no nested <details> to click again).
+    await waitFor(() => expect(document.body.textContent).toMatch(/Edge & Expectancy/i))
+    expect(document.querySelector('.legacy-analysis-panel')).not.toBeNull()
+    expect(document.querySelector('.legacy-analysis-panel details')).toBeNull()
   })
 
   test('the operational tail (warehouse / OOS / diagnostics) is collapsed by default', async () => {

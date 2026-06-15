@@ -548,6 +548,12 @@ export default function App() {
               </div>
 
               {resultView === 'decision' && (<>
+              {!selectorOutput && (
+                <div className="decision-empty">
+                  No structured decision is available for this symbol. See <strong>Evidence &amp; regime</strong> for
+                  the volatility snapshot, or <strong>Full metrics</strong> for the raw numbers.
+                </div>
+              )}
               <SelectorDecisionCard
                 selectorOutput={selectorOutput}
                 scorecards={structureScorecards}
@@ -853,11 +859,6 @@ export default function App() {
                   <Metric label="Liquidity Proxy" value={m.liquidity_proxy != null ? Number(m.liquidity_proxy).toFixed(0) : 'n/a'}
                     tone={tonePos(m.liquidity_proxy, 2000, 400)} />
                 </div>
-                <TermStructureChart
-                  days={m.term_structure_days}
-                  ivs={m.term_structure_ivs}
-                  earningsDte={m.days_to_earnings}
-                />
               </div>
 
               <div className="metrics-group">
