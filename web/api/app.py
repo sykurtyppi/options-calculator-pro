@@ -476,6 +476,7 @@ class _AuthMiddleware(BaseHTTPMiddleware):
 from scripts.institutional_backfill import InstitutionalDataCollector
 from services import external_io_gate
 from services.market_data_client import MarketDataClient
+from services.market_data_provider import build_market_data_client, get_options_provider_name
 from services.options_feature_store import OptionsFeatureStore, OptionsFeatureStoreError
 from web.api.edge_engine import analyze_single_ticker
 from web.api.screener_engine import build_edge_screener
@@ -500,11 +501,24 @@ _mda_client: Optional[MarketDataClient] = None
 _feature_store: Optional[OptionsFeatureStore] = None
 
 
-def _get_mda_client() -> MarketDataClient:
+def _get_mda_client():
+    """Return the active options/earnings client (provider-selected).
+
+    Governed by OPTIONS_CALCULATOR_OPTIONS_PROVIDER (default: yfinance). The
+    returned object is duck-typed to the MarketDataClient interface, so callers
+    are provider-agnostic. The gate category asserted matches the active
+    provider so the IO guard stays accurate.
+    """
     global _mda_client
     if _mda_client is None:
-        external_io_gate.assert_allowed(external_io_gate.Category.MARKETDATA)
-        _mda_client = MarketDataClient()
+        provider = get_options_provider_name()
+        category = (
+            external_io_gate.Category.YFINANCE
+            if provider in {"yfinance", "yahoo", "yf"}
+            else external_io_gate.Category.MARKETDATA
+        )
+        external_io_gate.assert_allowed(category)
+        _mda_client = build_market_data_client(provider=provider)
     return _mda_client
 
 
