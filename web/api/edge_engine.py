@@ -2536,10 +2536,19 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     if not clean_symbol:
         raise ValueError("Symbol is required")
 
-    # Determine data source availability
-    client: Optional[MarketDataClient] = mda_client
-    use_mda = isinstance(client, MarketDataClient) and client.is_available()
-    data_source = "marketdata_app" if use_mda else "yfinance_fallback"
+    # Determine data source availability. Duck-typed: any injected client that
+    # implements the provider interface (MarketDataClient OR the yfinance
+    # adapter) is honored — an isinstance() check here previously made the
+    # yfinance provider dead code on this path, silently falling back to the
+    # cruder raw-yfinance term structure. data_source reflects the ACTUAL
+    # provider (via provider_name), not a hardcoded label.
+    client = mda_client
+    use_provider = (
+        client is not None
+        and hasattr(client, "get_option_chain")
+        and client.is_available()
+    )
+    data_source = getattr(client, "provider_name", "marketdata_app") if use_provider else "yfinance_fallback"
 
     # ── 1. Price history via yfinance (free, reliable for OHLCV) ─────────────
     ticker = yf.Ticker(clean_symbol)
@@ -2622,7 +2631,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     # Yang-Zhang 30-day RV (primary — ~5x more efficient than close-to-close)
     # ── 2. Option chain: MDApp (one call, reused for term structure + curvature) ──
     chain_df: Optional[pd.DataFrame] = None
-    if use_mda:
+    if use_provider:
         try:
             chain_df = client.get_option_chain(
                 clean_symbol,
@@ -2630,11 +2639,11 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
                 strike_limit=10,
             )
             if chain_df is None or chain_df.empty:
-                logger.info("MDApp chain empty for %s, falling back to yfinance", clean_symbol)
+                logger.info("Provider chain empty for %s, falling back to yfinance", clean_symbol)
                 chain_df = None
                 data_source = "yfinance_fallback"
         except Exception as exc:
-            logger.warning("MDApp chain fetch failed for %s: %s", clean_symbol, exc)
+            logger.warning("Provider chain fetch failed for %s: %s", clean_symbol, exc)
             chain_df = None
             data_source = "yfinance_fallback"
 
@@ -2645,14 +2654,14 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     earnings_metadata_for_snapshot: Optional[Any] = None
     resolved_earnings_event = None
 
-    if use_mda:
+    if use_provider:
         try:
             earnings_df = client.get_earnings(clean_symbol, countback=24)
             if earnings_df is not None and not earnings_df.empty:
                 dte, earnings_release_time = _next_earnings_from_mda(earnings_df)
                 earnings_events_for_profile = _earnings_dates_from_mda(earnings_df)
         except Exception as exc:
-            logger.warning("MDApp earnings fetch failed for %s: %s", clean_symbol, exc)
+            logger.warning("Provider earnings fetch failed for %s: %s", clean_symbol, exc)
 
     try:
         resolved_earnings_event = resolve_upcoming_earnings_event(
@@ -2660,7 +2669,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
             _utc_today_date(),
             _utc_today_date() + timedelta(days=120),
             ticker=ticker,
-            mda_client=client if use_mda else None,
+            mda_client=client if use_provider else None,
         )
     except Exception as exc:
         logger.debug("Shared earnings event resolution failed for %s: %s", clean_symbol, exc)
@@ -2832,7 +2841,10 @@ def analyze_single_ticker(
             _, _,
             ts_slope_near_dte, ts_slope_far_dte,
         ) = _term_structure_points_yf(ticker, current_price)
-    options_source = "marketdata_app" if chain_df is not None else "yfinance"
+    # Honest provenance: when the provider supplied the chain, report the actual
+    # provider (data_source carries provider_name); otherwise the raw-yfinance
+    # term-structure fallback was used.
+    options_source = data_source if chain_df is not None else "yfinance"
 
     rv30_yz = _safe_float(snapshot_inputs["rv30_yz"], np.nan)
     rv30_cc = float(close.pct_change().dropna().tail(30).std(ddof=1) * np.sqrt(252))

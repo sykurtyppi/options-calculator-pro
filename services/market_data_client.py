@@ -81,6 +81,10 @@ class MarketDataClient:
       - Quotes: 30 s
     """
 
+    # Stable provider label (parity with YFinanceMarketDataClient.provider_name)
+    # so consumers can report the active provider without an isinstance check.
+    provider_name = "marketdata_app"
+
     def __init__(self, token: Optional[str] = None):
         # Explicit token argument takes precedence.
         # Passing token="" should intentionally disable API usage (useful for tests/fallback paths).

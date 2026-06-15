@@ -35,6 +35,11 @@ def _reset_web_app_mda_singleton():
 
 _ENV_VARS_LEAKED_BY_DOTENV = [
     "WATCHDOG_IMESSAGE_TO",
+    # The options-provider flag is set in .env (=yfinance). Clear it per test so
+    # a leaked value can't bleed across tests and — combined with the
+    # _mda_client singleton reset below — rebuild the client under the wrong
+    # provider. Tests that need a specific provider set it via monkeypatch.
+    "OPTIONS_CALCULATOR_OPTIONS_PROVIDER",
 ]
 
 
