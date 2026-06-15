@@ -559,6 +559,10 @@ export default function App() {
                 scorecards={structureScorecards}
                 volSnapshot={volSnapshot}
               />
+              <ForwardEvidenceStrip apiBase={API_BASE} />
+              </>)}
+
+              {resultView === 'evidence' && (<>
               <RegimeNarrativePanel
                 selectorOutput={selectorOutput}
                 scorecards={structureScorecards}
@@ -569,10 +573,6 @@ export default function App() {
                 scorecards={structureScorecards}
                 volSnapshot={volSnapshot}
               />
-              <ForwardEvidenceStrip apiBase={API_BASE} />
-              </>)}
-
-              {resultView === 'evidence' && (<>
               <div className="selector-secondary-grid selector-secondary-grid-trust">
                 <CalibrationInsightPanel
                   apiBase={API_BASE}

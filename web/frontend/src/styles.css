@@ -20,6 +20,14 @@ body {
   padding: 24px;
 }
 
+/* Centered, readability-capped content. Per dashboard UX guidance, text+data
+   hybrids read best ~1200-1280px; full-width sprawl hurts scannability on wide
+   and ultrawide monitors. Side margins auto-stretch to keep content centered. */
+.page-shell > main {
+  max-width: 1280px;
+  margin-inline: auto;
+}
+
 .bg-orb {
   position: fixed;
   width: 380px;
