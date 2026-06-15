@@ -127,6 +127,7 @@ import.
 | `OPTIONS_CALCULATOR_HOSTED_MODE=true` | Implies `OPTIONS_CALCULATOR_SECURE_COOKIES=true`, `OPTIONS_CALCULATOR_PROTECT_API_DOCS=true`, and `OPTIONS_CALCULATOR_TRUST_PROXY_HEADERS=true`. |
 | `OPTIONS_CALCULATOR_TRUST_PROXY_HEADERS=true` | Honour leftmost `X-Forwarded-For` for per-IP rate-limiting on `/login`, `/api/ml/train`, `/api/oos/submit`. Without this, behind a tunnel ALL login attempts share one global bucket. Spoof-safe only when a real proxy is enforced in front. |
 | `WATCHDOG_IMESSAGE_TO` | Address (phone or email) that receives daily watchdog iMessage alerts. If unset, the watchdog logs but does not page. |
+| `OPTIONS_CALCULATOR_OPTIONS_PROVIDER` | Options/earnings data provider for the live web API + evidence cycle: `yfinance` (default, free) or `marketdata_app` (paid, requires `MARKETDATA_TOKEN`). Default is `yfinance` so the system runs on free data; switch to `marketdata_app` once a paid plan is in place — no code change. Caveat: yfinance has no greeks and flakier IV (degrades honestly via the evidence-quality gate). The forward paper collector always uses yfinance regardless of this flag. |
 
 ### C. Optional tuning
 

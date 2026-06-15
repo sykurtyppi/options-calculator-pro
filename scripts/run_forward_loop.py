@@ -40,6 +40,7 @@ from services.execution_scenarios import (
 )
 from services import external_io_gate
 from services.market_data_client import MarketDataClient
+from services.market_data_provider import build_market_data_client, get_options_provider_name
 from services.option_surface_quality import diagnose_option_surface_quality
 from services.outcome_recorder import (
     OutcomeStore,
@@ -164,15 +165,23 @@ def _fetch_quote_for_forward_loop(
     return price_fetcher(**kwargs)
 
 
-def _get_marketdata_client(candidate: Any = None) -> Optional[MarketDataClient]:
+def _get_marketdata_client(candidate: Any = None) -> Optional[Any]:
     if candidate is not None and hasattr(candidate, "is_available"):
         return candidate if bool(candidate.is_available()) else None
-    if not external_io_gate.is_allowed(external_io_gate.Category.MARKETDATA):
+    # Provider-selected (default: yfinance). Gate on the active provider's
+    # category so the IO guard stays accurate for whichever feed is live.
+    provider = get_options_provider_name()
+    category = (
+        external_io_gate.Category.YFINANCE
+        if provider in {"yfinance", "yahoo", "yf"}
+        else external_io_gate.Category.MARKETDATA
+    )
+    if not external_io_gate.is_allowed(category):
         return None
     try:
-        resolved = MarketDataClient()
+        resolved = build_market_data_client(provider=provider)
     except Exception:
-        logger.debug("forward_loop: failed to construct MarketDataClient", exc_info=True)
+        logger.debug("forward_loop: failed to construct market-data client", exc_info=True)
         return None
     return resolved if resolved.is_available() else None
 
