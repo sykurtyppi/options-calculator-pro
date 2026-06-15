@@ -127,7 +127,12 @@ class YFinanceMarketDataClient:
             frames: List[pd.DataFrame] = []
             for exp in target_exps:
                 frames.append(self._one_expiry_frame(t, symbol, exp, spot, side, strike_limit, range_filter))
-            frame = pd.concat([f for f in frames if not f.empty], ignore_index=True) if frames else pd.DataFrame()
+            # Guard on the FILTERED list, not `frames` — when every per-expiry
+            # frame is empty, `frames` is truthy but the comprehension yields []
+            # and pd.concat([]) raises (mis-recording a legitimately-empty chain
+            # as a fetch error).
+            nonempty = [f for f in frames if not f.empty]
+            frame = pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
         except Exception as exc:
             logger.warning("yfinance get_option_chain(%s) failed: %s", symbol, exc)
             return self._empty_chain_telemetry(symbol, start, "fetch_error")
@@ -164,14 +169,25 @@ class YFinanceMarketDataClient:
             parts.append(self._normalize_legs(legs, leg_side, symbol, exp, spot))
         if not parts:
             return pd.DataFrame()
-        df = pd.concat([p for p in parts if not p.empty], ignore_index=True) if parts else pd.DataFrame()
+        nonempty = [p for p in parts if not p.empty]
+        df = pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
         if df.empty:
             return df
         if range_filter and spot:
             df = self._apply_range_filter(df, range_filter, float(spot))
-        # Cap strikes nearest to spot per expiry to mirror MDApp's strikeLimit.
-        if strike_limit and spot and len(df) > strike_limit * 2:
-            df = df.assign(_dist=(df["strike"] - float(spot)).abs()).nsmallest(strike_limit * 2, "_dist").drop(columns="_dist")
+        # Cap to the N STRIKES nearest spot (MDApp's strikeLimit is per-strike,
+        # not per-row), keeping both legs of each kept strike. This avoids
+        # doubling the strike count when a single side is requested and never
+        # splits a call/put pair at the cutoff.
+        if strike_limit and spot and not df.empty:
+            strikes = df["strike"].dropna().drop_duplicates()
+            if len(strikes) > strike_limit:
+                keep = set(
+                    strikes.to_frame()
+                    .assign(_d=(strikes - float(spot)).abs().values)
+                    .nsmallest(strike_limit, "_d")["strike"]
+                )
+                df = df[df["strike"].isin(keep)]
         return df
 
     def _normalize_legs(self, legs: pd.DataFrame, side: str, symbol: str, exp: str, spot) -> pd.DataFrame:
