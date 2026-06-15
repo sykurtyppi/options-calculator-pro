@@ -68,4 +68,16 @@ describe('RankedSetupTable', () => {
     fireEvent.click(screen.getByText('AAPL'))
     expect(onSelect).toHaveBeenCalledWith(upcomingRow)
   })
+
+  test('upcoming row never paints a null metric green (null < 1.0 coercion guard)', () => {
+    // Regression: `null < 1.0` is true in JS, which used to color the "—"
+    // em-dash cells green (signaling a favorable IV/RV or TS the row doesn't have).
+    const { container } = render(
+      <RankedSetupTable rows={[upcomingRow]} selectedSymbol={null} onSelect={() => {}} />,
+    )
+    const cells = [...container.querySelectorAll('tbody td')]
+    const green = 'rgb(46, 160, 67)' // #2ea043
+    const greenCells = cells.filter((td) => td.style.color === green)
+    expect(greenCells).toHaveLength(0)
+  })
 })

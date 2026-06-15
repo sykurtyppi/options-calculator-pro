@@ -142,13 +142,13 @@ export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
                 <td style={{ padding: '5px 8px', textAlign: 'center' }}>
                   {releaseBadge(row.release_timing)}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.iv_rv_ratio < 1.0 ? '#2ea043' : '#c9d1d9' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.iv_rv_ratio != null && row.iv_rv_ratio < 1.0 ? '#2ea043' : '#c9d1d9' }}>
                   {fmt(row.iv_rv_ratio)}
                 </td>
                 <td style={{ padding: '5px 8px', textAlign: 'right', color: '#c9d1d9' }}>
                   {fmt(row.atm_iv, 1, '%')}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.ts_ratio < 1.0 ? '#2ea043' : '#c9d1d9' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.ts_ratio != null && row.ts_ratio < 1.0 ? '#2ea043' : '#c9d1d9' }}>
                   {fmt(row.ts_ratio)}
                 </td>
                 <td style={{ padding: '5px 8px', textAlign: 'right', color: '#c9d1d9' }}>
