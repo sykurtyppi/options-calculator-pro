@@ -2722,3 +2722,34 @@ button:disabled {
   letter-spacing: 0.02em;
   border-top: 1px solid rgba(80, 120, 145, 0.12);
 }
+
+/* ── Result view tabs (decision-first IA) ─────────────────────────────────── */
+.result-tabs {
+  display: flex;
+  gap: 2px;
+  margin: 4px 0 18px;
+  border-bottom: 1px solid var(--line);
+}
+.result-tab {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  padding: 9px 16px;
+  cursor: pointer;
+  margin-bottom: -1px;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.result-tab:hover { color: var(--text); }
+.result-tab-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.result-tab:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--ring);
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+}

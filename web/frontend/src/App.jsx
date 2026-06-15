@@ -117,6 +117,9 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState(null)
+  // Which view of the result is shown. Decision-first IA: land on the call,
+  // drill into evidence/metrics only on demand. Reset to 'decision' per run.
+  const [resultView, setResultView] = useState('decision')
 
   const [oosLoading, setOosLoading] = useState(false)
   const [oosError, setOosError] = useState('')
@@ -254,7 +257,7 @@ export default function App() {
     const controller = new AbortController()
     analyzeAbortRef.current = controller
 
-    setError(''); setLoading(true); setResult(null)
+    setError(''); setLoading(true); setResult(null); setResultView('decision')
     try {
       const res = await apiFetch(`${API_BASE}/api/edge/analyze`, {
         method: 'POST',
@@ -523,6 +526,24 @@ export default function App() {
                 </div>
               </div>
 
+              <div className="result-tabs" role="tablist" aria-label="Result views">
+                {[
+                  ['decision', 'Decision'],
+                  ['evidence', 'Evidence & regime'],
+                  ['metrics', 'Full metrics'],
+                ].map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={resultView === id}
+                    className={`result-tab${resultView === id ? ' result-tab-active' : ''}`}
+                    onClick={() => setResultView(id)}
+                  >{label}</button>
+                ))}
+              </div>
+
+              {resultView === 'decision' && (<>
               <SelectorDecisionCard
                 selectorOutput={selectorOutput}
                 scorecards={structureScorecards}
@@ -538,6 +559,9 @@ export default function App() {
                 scorecards={structureScorecards}
                 volSnapshot={volSnapshot}
               />
+              </>)}
+
+              {resultView === 'evidence' && (<>
               <div className="selector-secondary-grid selector-secondary-grid-trust">
                 <CalibrationInsightPanel
                   apiBase={API_BASE}
@@ -648,7 +672,9 @@ export default function App() {
                   </div>
                 )
               })()}
+              </>)}
 
+              {resultView === 'metrics' && (
               <Suspense fallback={<div className="oos-message">Loading legacy analysis…</div>}>
               <LegacyAnalysisPanel>
               {/* Recommendation strip */}
@@ -1073,6 +1099,7 @@ export default function App() {
               </div>
               </LegacyAnalysisPanel>
               </Suspense>
+              )}
             </>
           )}
         </section>
