@@ -148,11 +148,11 @@ class RankedSetupRow(BaseModel):
     rv30: Optional[float]
     ts_ratio: Optional[float]
     median_earnings_move_pct: Optional[float]
-    sample_size: int
+    sample_size: Optional[int] = None
     spread_pct: Optional[float]
     ranking_score: Optional[float]
     score_components: Dict[str, Any] = Field(default_factory=dict)
-    status: Literal["ranked", "no_earnings", "error"]
+    status: Literal["ranked", "upcoming", "no_earnings", "error"]
     error_note: Optional[str] = None
 
 
@@ -162,6 +162,7 @@ class RankedScreenerResponse(BaseModel):
     universe_size: int
     rows_returned: int
     in_entry_window: int
+    upcoming_count: int = 0
     ranking_weights: Dict[str, float]
     strategy_note: str
     rows: list[RankedSetupRow]

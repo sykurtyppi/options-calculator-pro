@@ -402,6 +402,10 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
                 <span>In window</span>
                 <strong>{rankedData.in_entry_window}</strong>
               </div>
+              <div className="summary-pill" title="Earnings beyond the entry window, in the look-ahead pipeline">
+                <span>Upcoming</span>
+                <strong>{rankedData.upcoming_count ?? 0}</strong>
+              </div>
               <div className="summary-pill">
                 <span>Universe</span>
                 <strong>{rankedData.universe_size}</strong>
@@ -426,10 +430,28 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
               <div className="screener-board-head">
                 <div>
                   <h3>Ranked Setups</h3>
-                  <p>
-                    {visibleRankedRows.filter((r) => r.status === 'ranked').length} setups in entry window,
-                    sorted by setup quality. Click a row to see details.
-                  </p>
+                  {(() => {
+                    const rankedCount = visibleRankedRows.filter((r) => r.status === 'ranked').length
+                    const upcomingCount = visibleRankedRows.filter((r) => r.status === 'upcoming').length
+                    if (rankedCount > 0) {
+                      return (
+                        <p>
+                          {rankedCount} setup{rankedCount === 1 ? '' : 's'} in entry window,
+                          sorted by setup quality. Click a row to see details.
+                        </p>
+                      )
+                    }
+                    if (upcomingCount > 0) {
+                      return (
+                        <p>
+                          No setups in the entry window right now — {upcomingCount} earnings
+                          {upcomingCount === 1 ? '' : ''} coming up in the look-ahead window (shown below,
+                          soonest first). They enter the window as their date approaches.
+                        </p>
+                      )
+                    }
+                    return <p>No upcoming earnings in the look-ahead window.</p>
+                  })()}
                 </div>
               </div>
               <RankedSetupTable
