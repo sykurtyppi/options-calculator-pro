@@ -1,6 +1,7 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import ScreenerConsole from './components/screener/ScreenerConsole'
 import SelectorDecisionCard from './components/edge/SelectorDecisionCard'
+import ForwardEvidenceStrip from './components/edge/ForwardEvidenceStrip'
 import DecisionEvidenceStrip from './components/edge/DecisionEvidenceStrip'
 import CalibrationInsightPanel from './components/edge/CalibrationInsightPanel'
 import RegimeNarrativePanel from './components/edge/RegimeNarrativePanel'
@@ -120,6 +121,9 @@ export default function App() {
   // Which view of the result is shown. Decision-first IA: land on the call,
   // drill into evidence/metrics only on demand. Reset to 'decision' per run.
   const [resultView, setResultView] = useState('decision')
+  // The operational tail (warehouse, diagnostics, OOS) is collapsed by default
+  // so the page ends at the result. Heavy lazy panels only mount when opened.
+  const [toolsOpen, setToolsOpen] = useState(false)
 
   const [oosLoading, setOosLoading] = useState(false)
   const [oosError, setOosError] = useState('')
@@ -559,6 +563,7 @@ export default function App() {
                 scorecards={structureScorecards}
                 volSnapshot={volSnapshot}
               />
+              <ForwardEvidenceStrip apiBase={API_BASE} />
               </>)}
 
               {resultView === 'evidence' && (<>
@@ -1104,6 +1109,19 @@ export default function App() {
           )}
         </section>
 
+        <section className="tools-section">
+          <button
+            type="button"
+            className="tools-toggle"
+            aria-expanded={toolsOpen}
+            onClick={() => setToolsOpen((o) => !o)}
+          >
+            <span className="tools-toggle-caret" aria-hidden="true">{toolsOpen ? '▾' : '▸'}</span>
+            Tools &amp; diagnostics
+            <span className="tools-toggle-hint">warehouse · ledger · data quality · provider telemetry · forward performance · OOS</span>
+          </button>
+          {toolsOpen && (<>
+
         <Suspense fallback={<div className="oos-message">Loading historical warehouse…</div>}>
           <HistoricalWarehousePanel
             warehouse={warehouse}
@@ -1285,6 +1303,8 @@ export default function App() {
               </>
             )
           })()}
+        </section>
+          </>)}
         </section>
 
         <footer className="app-footer">
