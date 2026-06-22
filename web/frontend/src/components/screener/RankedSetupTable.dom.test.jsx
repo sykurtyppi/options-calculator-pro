@@ -48,6 +48,14 @@ describe('RankedSetupTable', () => {
     expect(container.textContent).toMatch(/DTE/)
   })
 
+  test('column headers carry plain-language tooltips (newcomer comprehension)', () => {
+    render(<RankedSetupTable rows={[scoredRow]} selectedSymbol={null} onSelect={() => {}} />)
+    // The opaque acronyms must be explained on hover, not left bare.
+    expect(screen.getByText('DTE').closest('th')).toHaveAttribute('title', expect.stringMatching(/days to earnings/i))
+    expect(screen.getByText('TS').closest('th')).toHaveAttribute('title', expect.stringMatching(/term-structure/i))
+    expect(screen.getByText('Setup Score').closest('th')).toHaveAttribute('title', expect.stringMatching(/not a calibrated win rate/i))
+  })
+
   test('renders a scored row with its setup score', () => {
     render(<RankedSetupTable rows={[scoredRow]} selectedSymbol={null} onSelect={() => {}} />)
     expect(screen.getByText('NVDA')).toBeInTheDocument()

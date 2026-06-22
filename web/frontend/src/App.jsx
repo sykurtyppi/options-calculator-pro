@@ -22,6 +22,7 @@ import TermStructureChart from './components/charts/TermStructureChart'
 import OosSplitChart from './components/charts/OosSplitChart'
 import StructurePayoffChart from './components/charts/StructurePayoffChart'
 import CalendarSpreadChart from './components/charts/CalendarSpreadChart'
+import HowItWorksPanel from './components/common/HowItWorksPanel'
 import WatchlistChips from './components/alerts/WatchlistChips'
 import AlertBanner from './components/alerts/AlertBanner'
 import AlertConfigPanel from './components/alerts/AlertConfigPanel'
@@ -438,16 +439,18 @@ export default function App() {
         <header className="panel-header">
           <div>
             <h1>Earnings Volatility Research</h1>
-            <p>Pre-earnings volatility setup quality analysis · Forward screener plus single-ticker drill-down</p>
+            <p>
+              Find stocks where options look mispriced ahead of earnings — and see whether that
+              edge has actually held up out-of-sample before you trust it.
+            </p>
           </div>
           <div className="header-badges">
-            <a className="docs-link" href={`${API_BASE}/product-docs/architecture.md`} target="_blank" rel="noreferrer">
-              Learn how this works
-            </a>
             <div className="status-chip">Research Tool · Not Financial Advice</div>
             <LogoutButton />
           </div>
         </header>
+
+        <HowItWorksPanel apiBase={API_BASE} />
 
         <ScreenerConsole apiBase={API_BASE} onAnalyzeSymbol={runForSymbol} />
 
