@@ -18,8 +18,10 @@ describe('ForwardEvidenceStrip', () => {
     apiFetch.mockResolvedValue(_resp({ open_outcome_count: 2, resolved_outcome_count: 0 }))
     render(<ForwardEvidenceStrip apiBase="" />)
     await waitFor(() => expect(screen.getByText(/Live forward evidence/i)).toBeInTheDocument())
-    expect(document.body.textContent).toMatch(/no resolved paper trades yet/i)
+    expect(document.body.textContent).toMatch(/nothing has resolved yet/i)
     expect(document.body.textContent).toMatch(/2 open/)
+    // Reframed to sell the honesty (the marquee differentiator), not read as "no results".
+    expect(document.body.textContent).toMatch(/wins and losses/i)
   })
 
   test('shows resolved stats once paper outcomes exist', async () => {
@@ -42,7 +44,7 @@ describe('ForwardEvidenceStrip', () => {
     apiFetch.mockResolvedValue(_resp({ resolved_outcome_count: 12, open_outcome_count: 0 }))
     render(<ForwardEvidenceStrip apiBase="" />)
     await waitFor(() => expect(screen.getByText(/Live forward evidence/i)).toBeInTheDocument())
-    expect(document.body.textContent).toMatch(/no resolved paper trades yet/i)
+    expect(document.body.textContent).toMatch(/nothing has resolved yet/i)
     expect(document.body.textContent).not.toMatch(/n\/a win/i)
   })
 

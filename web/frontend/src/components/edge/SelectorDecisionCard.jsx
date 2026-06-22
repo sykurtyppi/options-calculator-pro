@@ -45,7 +45,10 @@ export default function SelectorDecisionCard({ selectorOutput, scorecards = [], 
             ))}
           </div>
         </div>
-        <div className="selector-score-pill">
+        <div
+          className="selector-score-pill"
+          title="How strongly the available evidence backs this call, 0–100. It is NOT the probability the trade wins."
+        >
           <span>Decision Quality</span>
           <strong>{Math.round(Number(selectorOutput.confidence_pct || 0))}%</strong>
           <em>evidence-backed, not probability</em>
@@ -53,12 +56,18 @@ export default function SelectorDecisionCard({ selectorOutput, scorecards = [], 
       </div>
 
       <div className="selector-metrics-grid">
-        <div className="selector-metric">
+        <div
+          className="selector-metric"
+          title="The model’s rating of how favorable this setup’s structure is. Derived from the volatility model, not from realized trade outcomes."
+        >
           <span>Edge Quality</span>
           <strong>{edgeTier.label}</strong>
           <em>modeled, not empirical</em>
         </div>
-        <div className="selector-metric">
+        <div
+          className="selector-metric"
+          title="Direction/size the score implies for this setup. Derived from the setup score only — not a forecast of actual return."
+        >
           <span>Return Signal</span>
           <strong>{getReturnSignalLabel(selectorOutput.expected_return_pct)}</strong>
           <em>score-derived only</em>

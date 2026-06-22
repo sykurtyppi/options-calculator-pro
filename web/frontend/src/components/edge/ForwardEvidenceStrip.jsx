@@ -32,16 +32,20 @@ export default function ForwardEvidenceStrip({ apiBase }) {
   const accruing = summary.resolvedCount === 0 || summary.winRateLabel === 'n/a'
 
   return (
-    <div className="forward-evidence-strip" data-accruing={accruing ? 'true' : 'false'}>
+    <div
+      className="forward-evidence-strip"
+      data-accruing={accruing ? 'true' : 'false'}
+      title="A paper trade is a simulated position we track but never actually place — it measures the signal’s real out-of-sample performance without risking money."
+    >
       <div className="fe-label">
         <span className="fe-dot" aria-hidden="true" />
         Live forward evidence
       </div>
       {accruing ? (
         <div className="fe-body fe-accruing">
-          Collecting — no resolved paper trades yet
-          {summary.openCount > 0 ? ` · ${summary.openCount} open` : ''}. The validated pocket
-          qualifies only ~10–40×/yr; this is the out-of-sample proof as it lands.
+          We paper-trade every qualifying signal forward and publish the real out-of-sample
+          results here — wins and losses alike. Nothing has resolved yet: qualifying setups are
+          rare (~10–40/year){summary.openCount > 0 ? ` · ${summary.openCount} open now` : ''}.
         </div>
       ) : (
         <div className="fe-body">
