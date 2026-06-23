@@ -653,7 +653,7 @@ export default function App() {
                     {/* Calendar-specific: breakeven coverage warning */}
                     {isCalendar && m.calendar_be_vs_implied != null && m.calendar_be_vs_implied < 0.70 && (
                       <div style={{
-                        background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.35)',
+                        background: 'color-mix(in srgb, var(--neg) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--neg) 35%, transparent)',
                         borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: 'var(--neg-bright)',
                       }}>
                         ⚠ Breakevens cover only {Math.round(m.calendar_be_vs_implied * 100)}% of the implied move.
@@ -869,7 +869,7 @@ export default function App() {
                 {/* Fix 8: decomposition warning in High vol regime */}
                 {m.decomp_regime_warning && (
                   <div style={{
-                    background: 'rgba(240,160,32,0.09)', border: '1px solid rgba(240,160,32,0.30)',
+                    background: 'color-mix(in srgb, var(--warn) 9%, transparent)', border: '1px solid color-mix(in srgb, var(--warn) 30%, transparent)',
                     borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: 'var(--warn)',
                   }}>
                     ⚠ <strong>Vol Regime Warning:</strong> High realized-vol environment detected. Event-move and non-event-move
@@ -880,7 +880,7 @@ export default function App() {
                 {/* Fix 3: disclosure when move model uses fallback or thin sample */}
                 {(m.fallback_move_model_flag || m.low_event_count_flag) && (
                   <div style={{
-                    background: 'rgba(88,166,255,0.07)', border: '1px solid rgba(88,166,255,0.25)',
+                    background: 'color-mix(in srgb, var(--accent-2) 7%, transparent)', border: '1px solid color-mix(in srgb, var(--accent-2) 25%, transparent)',
                     borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: 'var(--accent-2-bright)',
                     display: 'flex', flexDirection: 'column', gap: 3,
                   }}>
@@ -993,7 +993,7 @@ export default function App() {
                   {/* FIX 2: always show theoretical disclaimer — pricing uses interpolated IV, not live chain */}
                   {m.calendar_payoff.calendar_is_theoretical && (
                     <div style={{
-                      background: 'rgba(240,160,32,0.08)', border: '1px solid rgba(240,160,32,0.30)',
+                      background: 'color-mix(in srgb, var(--warn) 8%, transparent)', border: '1px solid color-mix(in srgb, var(--warn) 30%, transparent)',
                       borderRadius: 6, padding: '6px 12px', marginBottom: 8, fontSize: 11,
                       color: 'var(--warn)',
                     }}>
@@ -1004,7 +1004,7 @@ export default function App() {
                   {/* Fix 4: warn if breakevens are tighter than implied move */}
                   {m.calendar_be_vs_implied != null && m.calendar_be_vs_implied < 0.70 && (
                     <div style={{
-                      background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.35)',
+                      background: 'color-mix(in srgb, var(--neg) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--neg) 35%, transparent)',
                       borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12,
                       color: 'var(--neg-bright)',
                     }}>
@@ -1032,26 +1032,26 @@ export default function App() {
                       historical_symbol_calibrated: {
                         label: 'Calibrated (symbol history)',
                         color: 'var(--pos-bright)',
-                        bg: 'rgba(34,197,94,0.10)',
-                        border: 'rgba(34,197,94,0.28)',
+                        bg: 'color-mix(in srgb, var(--pos) 10%, transparent)',
+                        border: 'color-mix(in srgb, var(--pos) 28%, transparent)',
                         tip: 'Scenarios derived from ≥8 earnings events for this ticker — full statistical power.',
                       },
                       small_sample_estimate: {
                         label: 'Small-sample estimate',
                         color: 'var(--warn-bright)',
-                        bg: 'rgba(240,160,32,0.10)',
-                        border: 'rgba(240,160,32,0.28)',
+                        bg: 'color-mix(in srgb, var(--warn) 10%, transparent)',
+                        border: 'color-mix(in srgb, var(--warn) 28%, transparent)',
                         tip: 'Fewer than 8 earnings events available. Scenarios are estimates with elevated uncertainty.',
                       },
                       heuristic_fallback: {
                         label: 'Heuristic fallback',
                         color: 'var(--neg-bright)',
-                        bg: 'rgba(239,68,68,0.10)',
-                        border: 'rgba(239,68,68,0.28)',
+                        bg: 'color-mix(in srgb, var(--neg) 10%, transparent)',
+                        border: 'color-mix(in srgb, var(--neg) 28%, transparent)',
                         tip: 'No usable earnings history. Scenarios built from sector/macro heuristics — treat as illustrative only.',
                       },
                     }
-                    const m2 = srcMeta[src] || { label: src, color: 'var(--muted)', bg: 'rgba(139,148,158,0.08)', border: 'rgba(139,148,158,0.22)', tip: '' }
+                    const m2 = srcMeta[src] || { label: src, color: 'var(--muted)', bg: 'color-mix(in srgb, var(--muted) 8%, transparent)', border: 'color-mix(in srgb, var(--muted) 22%, transparent)', tip: '' }
                     return (
                       <div style={{ marginTop: 7, display: 'flex', alignItems: 'center', gap: 8 }}>
                         <span style={{ fontSize: 10, color: 'var(--muted)' }}>Scenario source:</span>
