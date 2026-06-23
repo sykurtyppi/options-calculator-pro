@@ -28,7 +28,7 @@ export function dataSourceBadge(ds, dataSources) {
     const rvSrc = dataSources.price_rv_source === 'marketdata_app' ? 'MDApp' : 'yfinance'
     if (optSrc !== rvSrc) {
       return (
-        <span style={{ fontSize: 11, color: '#8b949e' }}>
+        <span style={{ fontSize: 11, color: 'var(--muted)' }}>
           <Badge variant={dataSources.options_source === 'marketdata_app' ? 'mda' : 'yf'}>{optSrc}</Badge>
           <span style={{ margin: '0 4px', opacity: 0.6 }}>·</span>
           <span style={{ opacity: 0.8 }}>Prices/RV: {rvSrc}</span>
