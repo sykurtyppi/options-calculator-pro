@@ -10,6 +10,7 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 import { CHART, axisTick, tooltipContentStyle } from './chartTheme'
+import { termStructureYDomain } from './termStructureDomain'
 
 /**
  * Volatility term-structure chart: DTE on x-axis vs IV % on y-axis,
@@ -31,15 +32,13 @@ export default function TermStructureChart({ days, ivs, earningsDte }) {
 
   const ivMin = Math.min(...data.map((d) => d.iv))
   const ivMax = Math.max(...data.map((d) => d.iv))
-  const pad = Math.max((ivMax - ivMin) * 0.25, 0.5)
-  const yMin = Math.max(0, (ivMin - pad).toFixed(1))
-  const yMax = (ivMax + pad).toFixed(1)
+  const [yMin, yMax] = termStructureYDomain(ivMin, ivMax)
 
   return (
     <div className="vol-chart-wrapper">
       <div className="vol-chart-label">Vol Term Structure (DTE vs IV%)</div>
-      <ResponsiveContainer width="100%" height={190}>
-        <LineChart data={data} margin={{ top: 6, right: 18, bottom: 4, left: 0 }}>
+      <ResponsiveContainer width="100%" height={210}>
+        <LineChart data={data} margin={{ top: 24, right: 18, bottom: 4, left: 4 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
           <XAxis
             dataKey="dte"
@@ -51,9 +50,10 @@ export default function TermStructureChart({ days, ivs, earningsDte }) {
           />
           <YAxis
             domain={[yMin, yMax]}
-            tickFormatter={(v) => `${v}%`}
+            allowDecimals={false}
+            tickFormatter={(v) => `${Math.round(v)}%`}
             tick={axisTick}
-            width={42}
+            width={48}
           />
           <Tooltip
             formatter={(v) => [`${v}%`, 'IV']}
@@ -78,6 +78,7 @@ export default function TermStructureChart({ days, ivs, earningsDte }) {
             strokeWidth={2}
             dot={{ fill: CHART.series.accent, r: 3 }}
             activeDot={{ r: 5 }}
+            isAnimationActive={false}
           />
         </LineChart>
       </ResponsiveContainer>
