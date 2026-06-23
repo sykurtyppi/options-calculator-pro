@@ -31,5 +31,3 @@ export const tooltipContentStyle = {
   color: CHART.text,
   fontSize: '0.8rem',
 }
-
-export const tooltipLabelStyle = { color: CHART.text }

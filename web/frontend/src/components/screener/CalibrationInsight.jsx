@@ -159,7 +159,7 @@ export default function CalibrationInsight({ apiBase, score }) {
                   padding: '4px 8px',
                   borderRadius: 6,
                   border: isActive ? '1px solid var(--accent-2)' : '1px solid var(--line)',
-                  background: isActive ? 'var(--surface-sunken)' : 'var(--surface-sunken)',
+                  background: isActive ? 'var(--row-selected-bg)' : 'var(--surface-sunken)',
                 }}
               >
                 <strong>{b.score_lo.toFixed(1)}–{b.score_hi.toFixed(1)}</strong>
