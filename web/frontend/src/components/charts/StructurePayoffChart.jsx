@@ -7,9 +7,14 @@ import {
   CartesianGrid,
   Tooltip,
   ReferenceLine,
+  ReferenceArea,
   ResponsiveContainer,
 } from 'recharts'
 import { CHART, axisTick, tooltipContentStyle } from './chartTheme'
+import { usePayoffZoom } from './usePayoffZoom'
+import ChartZoomHint from './ChartZoomHint'
+
+const SERIES_KEYS = ['expand', 'flat', 'crush25', 'crush45']
 
 /**
  * Unified payoff diagram for the four supported structures
@@ -37,12 +42,8 @@ export default function StructurePayoffChart({ payoff }) {
     crush45: Number((s.iv_crush_45 ?? 0).toFixed(2)),
   }))
 
-  const allVals = data.flatMap((d) => [d.expand, d.flat, d.crush25, d.crush45]).filter((v) => isFinite(v))
-  const minV = Math.min(...allVals)
-  const maxV = Math.max(...allVals)
-  const pad = Math.max((maxV - minV) * 0.14, 0.01)
-
   const breakevens = payoff.breakeven_moves_pct || []
+  const zoom = usePayoffZoom(data, SERIES_KEYS)
 
   const titleMap = {
     atm_straddle: 'Long ATM Straddle · P&L at 1-Day Post-Event',
@@ -83,19 +84,26 @@ export default function StructurePayoffChart({ payoff }) {
           ))}
         </div>
       )}
-      <ResponsiveContainer width="100%" height={220}>
-        <LineChart data={data} margin={{ top: 8, right: 24, bottom: 20, left: 8 }}>
+      <ResponsiveContainer width="100%" height={240}>
+        <LineChart
+          data={data}
+          margin={{ top: 24, right: 24, bottom: 20, left: 8 }}
+          style={{ cursor: 'crosshair', userSelect: 'none' }}
+          {...zoom.handlers}
+        >
           <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
           <XAxis
             dataKey="move"
             type="number"
-            domain={['dataMin', 'dataMax']}
+            domain={zoom.xDomain}
+            allowDataOverflow
             tickFormatter={(v) => `${v > 0 ? '+' : ''}${v}%`}
             tick={{ ...axisTick, fontSize: 10 }}
             label={{ value: xAxisLabel, position: 'insideBottom', offset: -8, fill: CHART.axis, fontSize: 10 }}
           />
           <YAxis
-            domain={[minV - pad, maxV + pad]}
+            domain={zoom.yDomain}
+            allowDataOverflow
             tickFormatter={(v) => `$${v.toFixed(2)}`}
             tick={{ ...axisTick, fontSize: 10 }}
             width={58}
@@ -120,10 +128,13 @@ export default function StructurePayoffChart({ payoff }) {
               label={{ value: 'BE', position: 'top', fill: CHART.series.warn, fontSize: 9 }}
             />
           ))}
-          <Line type="monotone" dataKey="expand" stroke={CHART.series.pos} strokeWidth={1.5} dot={false} />
-          <Line type="monotone" dataKey="flat" stroke={CHART.series.accent} strokeWidth={2} dot={false} />
-          <Line type="monotone" dataKey="crush25" stroke={CHART.series.warn} strokeWidth={1.5} dot={false} />
-          <Line type="monotone" dataKey="crush45" stroke={CHART.series.neg} strokeWidth={1.5} dot={false} />
+          <Line type="monotone" dataKey="expand" stroke={CHART.series.pos} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          <Line type="monotone" dataKey="flat" stroke={CHART.series.accent} strokeWidth={2} dot={false} isAnimationActive={false} />
+          <Line type="monotone" dataKey="crush25" stroke={CHART.series.warn} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          <Line type="monotone" dataKey="crush45" stroke={CHART.series.neg} strokeWidth={1.5} dot={false} isAnimationActive={false} />
+          {zoom.sel && zoom.sel.x1 !== zoom.sel.x2 && (
+            <ReferenceArea x1={zoom.sel.x1} x2={zoom.sel.x2} strokeOpacity={0.3} fill={CHART.series.accent} fillOpacity={0.12} />
+          )}
         </LineChart>
       </ResponsiveContainer>
       <div style={{ display: 'flex', gap: 14, marginTop: 4, fontSize: 11, color: CHART.axis, flexWrap: 'wrap' }}>
@@ -136,6 +147,7 @@ export default function StructurePayoffChart({ payoff }) {
           <span style={{ color: CHART.axis, marginLeft: 4 }}>· MTM 1-day post-event</span>
         )}
       </div>
+      <ChartZoomHint zoomed={zoom.zoomed} onReset={zoom.reset} />
       {(payoff.is_theoretical || payoff.calendar_is_theoretical) && (
         <div style={{ marginTop: 6, fontSize: 10, color: CHART.axisDim }}>
           {isCalendar
