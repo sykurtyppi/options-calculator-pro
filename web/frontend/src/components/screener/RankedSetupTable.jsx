@@ -12,14 +12,14 @@ function fmt(value, digits = 2, suffix = '') {
 function scoreBar(score) {
   if (score == null) return null
   const pct = Math.round(Math.min(Math.max(Number(score), 0), 1) * 100)
-  const color = pct >= 60 ? '#2ea043' : pct >= 35 ? '#d29922' : '#da3633'
+  const color = pct >= 60 ? 'var(--pos)' : pct >= 35 ? 'var(--warn)' : 'var(--neg)'
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
       <div
         style={{
           width: 48,
           height: 6,
-          background: '#21262d',
+          background: 'var(--line-subtle)',
           borderRadius: 3,
           overflow: 'hidden',
         }}
@@ -38,8 +38,8 @@ function releaseBadge(timing) {
     borderRadius: 3,
     fontWeight: 600,
     letterSpacing: '0.03em',
-    background: timing === 'BMO' ? '#1c3a5e' : timing === 'AMC' ? '#2d2a1e' : '#21262d',
-    color: timing === 'BMO' ? '#79c0ff' : timing === 'AMC' ? '#e3b341' : '#8b949e',
+    background: timing === 'BMO' ? 'var(--accent-2-surface)' : timing === 'AMC' ? 'var(--warn-surface)' : 'var(--line-subtle)',
+    color: timing === 'BMO' ? 'var(--accent-2-bright)' : timing === 'AMC' ? 'var(--warn-bright)' : 'var(--muted)',
   }
   return <span style={style}>{timing || '?'}</span>
 }
@@ -63,14 +63,14 @@ function upcomingPill() {
     <span
       style={{
         fontSize: '0.72rem',
-        color: '#8b949e',
+        color: 'var(--muted)',
         fontStyle: 'italic',
         display: 'inline-flex',
         alignItems: 'center',
         gap: 5,
       }}
     >
-      <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#58a6ff', display: 'inline-block' }} />
+      <span style={{ width: 5, height: 5, borderRadius: '50%', background: 'var(--accent-2)', display: 'inline-block' }} />
       upcoming
     </span>
   )
@@ -79,10 +79,10 @@ function upcomingPill() {
 export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
   if (!rows || rows.length === 0) {
     return (
-      <div style={{ padding: '20px 0', color: '#8b949e', fontSize: '0.85rem', textAlign: 'center', lineHeight: 1.5 }}>
+      <div style={{ padding: '20px 0', color: 'var(--muted)', fontSize: '0.85rem', textAlign: 'center', lineHeight: 1.5 }}>
         No upcoming earnings found in the look-ahead window.
         <br />
-        <span style={{ fontSize: '0.78rem', color: '#6e7681' }}>
+        <span style={{ fontSize: '0.78rem', color: 'var(--muted-dim)' }}>
           Try increasing <strong>Weeks</strong> or widening the <strong>DTE</strong> range.
         </span>
       </div>
@@ -101,9 +101,9 @@ export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
                 style={{
                   padding: '5px 8px',
                   textAlign: col.align || 'left',
-                  color: '#8b949e',
+                  color: 'var(--muted)',
                   fontWeight: 500,
-                  borderBottom: '1px solid #21262d',
+                  borderBottom: '1px solid var(--line-subtle)',
                   whiteSpace: 'nowrap',
                   minWidth: col.width,
                   cursor: col.tip ? 'help' : 'default',
@@ -127,43 +127,43 @@ export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
                 onClick={() => !isInert && onSelect && onSelect(row)}
                 style={{
                   cursor: isInert ? 'default' : 'pointer',
-                  background: isSelected ? '#1c3a5e22' : 'transparent',
+                  background: isSelected ? 'var(--row-selected-bg)' : 'transparent',
                   opacity: isInert ? 0.45 : isUpcoming ? 0.72 : 1,
                 }}
               >
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#8b949e' }}>{row.rank}</td>
-                <td style={{ padding: '5px 8px', fontWeight: isSelected ? 600 : 400, color: '#e6edf3' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: 'var(--muted)' }}>{row.rank}</td>
+                <td style={{ padding: '5px 8px', fontWeight: isSelected ? 600 : 400, color: 'var(--text)' }}>
                   {row.symbol}
                 </td>
-                <td style={{ padding: '5px 8px', color: '#c9d1d9', whiteSpace: 'nowrap' }}>
+                <td style={{ padding: '5px 8px', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
                   {row.earnings_date || NA}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#c9d1d9' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: 'var(--text-secondary)' }}>
                   {row.dte != null ? row.dte : NA}
                 </td>
                 <td style={{ padding: '5px 8px', textAlign: 'center' }}>
                   {releaseBadge(row.release_timing)}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.iv_rv_ratio != null && row.iv_rv_ratio < 1.0 ? '#2ea043' : '#c9d1d9' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.iv_rv_ratio != null && row.iv_rv_ratio < 1.0 ? 'var(--pos)' : 'var(--text-secondary)' }}>
                   {fmt(row.iv_rv_ratio)}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#c9d1d9' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: 'var(--text-secondary)' }}>
                   {fmt(row.atm_iv, 1, '%')}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.ts_ratio != null && row.ts_ratio < 1.0 ? '#2ea043' : '#c9d1d9' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.ts_ratio != null && row.ts_ratio < 1.0 ? 'var(--pos)' : 'var(--text-secondary)' }}>
                   {fmt(row.ts_ratio)}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#c9d1d9' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: 'var(--text-secondary)' }}>
                   {fmt(row.median_earnings_move_pct, 1, '%')}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: '#8b949e' }}>
+                <td style={{ padding: '5px 8px', textAlign: 'right', color: 'var(--muted)' }}>
                   {row.sample_size ?? NA}
                 </td>
                 <td style={{ padding: '5px 8px' }}>
                   {isError
-                    ? <span style={{ color: '#da3633', fontSize: '0.75rem' }}>{row.error_note || 'error'}</span>
+                    ? <span style={{ color: 'var(--neg)', fontSize: '0.75rem' }}>{row.error_note || 'error'}</span>
                     : isNoEvent
-                    ? <span style={{ color: '#8b949e', fontSize: '0.75rem' }}>no event in window</span>
+                    ? <span style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>no event in window</span>
                     : isUpcoming
                     ? upcomingPill()
                     : scoreBar(row.ranking_score)}

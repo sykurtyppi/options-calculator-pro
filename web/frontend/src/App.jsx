@@ -636,9 +636,9 @@ export default function App() {
                       <h3>{panelTitle}</h3>
                       <span>
                         {isCalendar && m.calendar_spread_quality && (() => {
-                          const qColors = { Strong: '#22c55e', Moderate: '#58a6ff', Weak: '#f0a020', Poor: '#ef4444', unknown: '#8b949e' }
+                          const qColors = { Strong: 'var(--pos)', Moderate: 'var(--accent-2)', Weak: 'var(--warn)', Poor: 'var(--neg)', unknown: 'var(--muted)' }
                           return (
-                            <span style={{ fontWeight: 600, color: qColors[m.calendar_spread_quality] || '#8b949e', marginRight: 10 }}>
+                            <span style={{ fontWeight: 600, color: qColors[m.calendar_spread_quality] || 'var(--muted)', marginRight: 10 }}>
                               {m.calendar_spread_quality} term structure ·&nbsp;
                             </span>
                           )
@@ -646,7 +646,7 @@ export default function App() {
                         {isStrangle && sp.wing_pct != null && (
                           <span style={{ marginRight: 10 }}>Wings ±{Number(sp.wing_pct).toFixed(1)}% (at implied move) ·&nbsp;</span>
                         )}
-                        <span style={{ color: '#6e7681' }}>IV scenarios: symbol-calibrated where available</span>
+                        <span style={{ color: 'var(--muted-dim)' }}>IV scenarios: symbol-calibrated where available</span>
                       </span>
                     </div>
 
@@ -654,7 +654,7 @@ export default function App() {
                     {isCalendar && m.calendar_be_vs_implied != null && m.calendar_be_vs_implied < 0.70 && (
                       <div style={{
                         background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.35)',
-                        borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: '#fca5a5',
+                        borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: 'var(--neg-bright)',
                       }}>
                         ⚠ Breakevens cover only {Math.round(m.calendar_be_vs_implied * 100)}% of the implied move.
                         The market is pricing a larger move than this structure profits from.
@@ -665,19 +665,19 @@ export default function App() {
 
                     {/* Metadata footer */}
                     {isCalendar && sp.iv_near != null && (
-                      <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: '#8b949e', flexWrap: 'wrap' }}>
+                      <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: 'var(--muted)', flexWrap: 'wrap' }}>
                         <span>Near IV: {(sp.iv_near * 100).toFixed(1)}%</span>
                         <span>Back IV: {(sp.iv_back * 100).toFixed(1)}%</span>
                         <span>Remaining: {sp.t_remaining_days}d</span>
                         {m.calendar_be_vs_implied != null && (
-                          <span style={{ color: m.calendar_be_vs_implied < 0.70 ? '#f0a020' : '#8b949e' }}>
+                          <span style={{ color: m.calendar_be_vs_implied < 0.70 ? 'var(--warn)' : 'var(--muted)' }}>
                             BE covers {Math.round(m.calendar_be_vs_implied * 100)}% of implied move
                           </span>
                         )}
                       </div>
                     )}
                     {(sp.structure === 'atm_straddle' || isStrangle) && sp.iv_entry != null && (
-                      <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: '#8b949e', flexWrap: 'wrap' }}>
+                      <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: 'var(--muted)', flexWrap: 'wrap' }}>
                         <span>Entry IV: {(sp.iv_entry * 100).toFixed(1)}%</span>
                         <span>DTE: {sp.T_near_days}d</span>
                         <span>P&L eval: 1-day post-event</span>
@@ -870,7 +870,7 @@ export default function App() {
                 {m.decomp_regime_warning && (
                   <div style={{
                     background: 'rgba(240,160,32,0.09)', border: '1px solid rgba(240,160,32,0.30)',
-                    borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: '#f0a020',
+                    borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: 'var(--warn)',
                   }}>
                     ⚠ <strong>Vol Regime Warning:</strong> High realized-vol environment detected. Event-move and non-event-move
                     decomposition may be unreliable — baseline volatility is elevated enough to corrupt
@@ -881,7 +881,7 @@ export default function App() {
                 {(m.fallback_move_model_flag || m.low_event_count_flag) && (
                   <div style={{
                     background: 'rgba(88,166,255,0.07)', border: '1px solid rgba(88,166,255,0.25)',
-                    borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: '#79b8ff',
+                    borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12, color: 'var(--accent-2-bright)',
                     display: 'flex', flexDirection: 'column', gap: 3,
                   }}>
                     <strong>Reduced-Evidence Signal</strong>
@@ -977,14 +977,14 @@ export default function App() {
                     Calendar Spread · ATM · Short Near / Long Back+28d
                     {/* FIX 8: show per-contract value prominently */}
                     {m.calendar_payoff.entry_debit_per_contract != null && (
-                      <span style={{ marginLeft: 10, fontWeight: 400, color: '#8b949e', fontSize: 11 }}>
+                      <span style={{ marginLeft: 10, fontWeight: 400, color: 'var(--muted)', fontSize: 11 }}>
                         Entry debit ${Number(m.calendar_payoff.entry_debit_per_contract).toFixed(2)}/contract
                       </span>
                     )}
                     {m.calendar_spread_quality && (() => {
-                      const qColors = { Strong: '#22c55e', Moderate: '#58a6ff', Weak: '#f0a020', Poor: '#ef4444', unknown: '#8b949e' }
+                      const qColors = { Strong: 'var(--pos)', Moderate: 'var(--accent-2)', Weak: 'var(--warn)', Poor: 'var(--neg)', unknown: 'var(--muted)' }
                       return (
-                        <span style={{ marginLeft: 12, fontWeight: 600, fontSize: 11, color: qColors[m.calendar_spread_quality] || '#8b949e' }}>
+                        <span style={{ marginLeft: 12, fontWeight: 600, fontSize: 11, color: qColors[m.calendar_spread_quality] || 'var(--muted)' }}>
                           {m.calendar_spread_quality} term structure
                         </span>
                       )
@@ -995,7 +995,7 @@ export default function App() {
                     <div style={{
                       background: 'rgba(240,160,32,0.08)', border: '1px solid rgba(240,160,32,0.30)',
                       borderRadius: 6, padding: '6px 12px', marginBottom: 8, fontSize: 11,
-                      color: '#f0a020',
+                      color: 'var(--warn)',
                     }}>
                       ⚠ Theoretical illustration — priced from interpolated IV30/IV45, back leg = near+28d.
                       Not guaranteed to match a live quoted chain. Verify debit with your broker before trading.
@@ -1006,7 +1006,7 @@ export default function App() {
                     <div style={{
                       background: 'rgba(239,68,68,0.10)', border: '1px solid rgba(239,68,68,0.35)',
                       borderRadius: 6, padding: '7px 12px', marginBottom: 8, fontSize: 12,
-                      color: '#fca5a5',
+                      color: 'var(--neg-bright)',
                     }}>
                       ⚠ Breakevens cover only {Math.round(m.calendar_be_vs_implied * 100)}% of the implied move.
                       The market is pricing a larger move than this structure profits from.
@@ -1014,12 +1014,12 @@ export default function App() {
                   )}
                   <CalendarSpreadChart calPayoff={m.calendar_payoff} />
                   {m.calendar_payoff.iv_near != null && (
-                    <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: '#8b949e', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: 'var(--muted)', flexWrap: 'wrap' }}>
                       <span>Near IV: {(m.calendar_payoff.iv_near * 100).toFixed(1)}%</span>
                       <span>Back IV: {(m.calendar_payoff.iv_back * 100).toFixed(1)}%</span>
                       <span>Remaining: {m.calendar_payoff.t_remaining_days}d</span>
                       {m.calendar_be_vs_implied != null && (
-                        <span style={{ color: m.calendar_be_vs_implied < 0.70 ? '#f0a020' : '#8b949e' }}>
+                        <span style={{ color: m.calendar_be_vs_implied < 0.70 ? 'var(--warn)' : 'var(--muted)' }}>
                           BE covers {Math.round(m.calendar_be_vs_implied * 100)}% of implied move
                         </span>
                       )}
@@ -1031,30 +1031,30 @@ export default function App() {
                     const srcMeta = {
                       historical_symbol_calibrated: {
                         label: 'Calibrated (symbol history)',
-                        color: '#4ade80',
+                        color: 'var(--pos-bright)',
                         bg: 'rgba(34,197,94,0.10)',
                         border: 'rgba(34,197,94,0.28)',
                         tip: 'Scenarios derived from ≥8 earnings events for this ticker — full statistical power.',
                       },
                       small_sample_estimate: {
                         label: 'Small-sample estimate',
-                        color: '#fbbf24',
+                        color: 'var(--warn-bright)',
                         bg: 'rgba(240,160,32,0.10)',
                         border: 'rgba(240,160,32,0.28)',
                         tip: 'Fewer than 8 earnings events available. Scenarios are estimates with elevated uncertainty.',
                       },
                       heuristic_fallback: {
                         label: 'Heuristic fallback',
-                        color: '#f87171',
+                        color: 'var(--neg-bright)',
                         bg: 'rgba(239,68,68,0.10)',
                         border: 'rgba(239,68,68,0.28)',
                         tip: 'No usable earnings history. Scenarios built from sector/macro heuristics — treat as illustrative only.',
                       },
                     }
-                    const m2 = srcMeta[src] || { label: src, color: '#8b949e', bg: 'rgba(139,148,158,0.08)', border: 'rgba(139,148,158,0.22)', tip: '' }
+                    const m2 = srcMeta[src] || { label: src, color: 'var(--muted)', bg: 'rgba(139,148,158,0.08)', border: 'rgba(139,148,158,0.22)', tip: '' }
                     return (
                       <div style={{ marginTop: 7, display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <span style={{ fontSize: 10, color: '#8b949e' }}>Scenario source:</span>
+                        <span style={{ fontSize: 10, color: 'var(--muted)' }}>Scenario source:</span>
                         <span
                           title={m2.tip}
                           style={{
@@ -1085,7 +1085,7 @@ export default function App() {
                 <span><strong>Updated:</strong> {formatTimestamp(result.generated_at || m.generated_at)}</span>
                 {/* Stale data: IV/RV non-contemporaneous — advisory flag only */}
                 {(m.price_data_stale || (m.price_data_age_days != null && m.price_data_age_days > 1)) && (
-                  <span style={{ color: '#f0a020', fontWeight: 600 }} title="IV/RV contemporaneity broken — price bars are older than 2 trading days. Treat the snapshot as lower-confidence; the setup score is not reduced.">
+                  <span style={{ color: 'var(--warn)', fontWeight: 600 }} title="IV/RV contemporaneity broken — price bars are older than 2 trading days. Treat the snapshot as lower-confidence; the setup score is not reduced.">
                     ⚠ Stale data ({m.price_data_age_days}d old) · advisory flag (score not reduced)
                   </span>
                 )}

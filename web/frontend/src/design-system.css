@@ -23,6 +23,30 @@
   --accent: #3dd2a2;
   --accent-2: #39a0ff;
   --danger: #f05d5e;
+
+  /* ── Semantic layer (palette unification) ──
+     One source of truth for the colors components were hardcoding inline. The
+     structural roles (text/surface/border/accent) are unified into the teal-navy
+     family that the page chrome already uses; the signal roles (pos/warn/neg)
+     keep conventional green/amber/red so up/down stays legible. "-bright" and
+     "-surface" variants exist for light-text-on-dark-badge contrast. */
+  --text-secondary: #c4d3e0;     /* mid-emphasis text (was #c9d1d9) */
+  --muted-dim: #6b7f93;          /* faintest text (was #6e7681 / #484f58) */
+
+  --surface-sunken: #0a1826;     /* inset panels/tooltips (was #161b22 / #0d1117) */
+  --line-subtle: #1c3447;        /* faint divider (was #21262d) */
+
+  --pos: #2ea043;                /* positive / cheap-IV / win */
+  --pos-bright: #4ade80;
+  --warn: #f0a020;               /* caution / mid-quality */
+  --warn-bright: #e3b341;        /* AMC badge text */
+  --warn-surface: #2d2a1e;       /* AMC badge background */
+  --neg: #da3633;                /* negative / loss */
+  --neg-bright: #fca5a5;
+
+  --accent-2-bright: #79c0ff;    /* BMO badge text, link hover */
+  --accent-2-surface: #1c3a5e;   /* BMO badge background */
+  --row-selected-bg: rgba(57, 160, 255, 0.12); /* translucent selected-row tint */
 }
 
 button {

@@ -53,11 +53,11 @@ export default function CalibrationInsight({ apiBase, score }) {
   }, [apiBase])
 
   if (loading) {
-    return <div style={{ color: '#8b949e', fontSize: '0.8rem', padding: '8px 0' }}>Loading calibration…</div>
+    return <div style={{ color: 'var(--muted)', fontSize: '0.8rem', padding: '8px 0' }}>Loading calibration…</div>
   }
 
   if (error) {
-    return <div style={{ color: '#da3633', fontSize: '0.8rem', padding: '8px 0' }}>Calibration unavailable: {error}</div>
+    return <div style={{ color: 'var(--neg)', fontSize: '0.8rem', padding: '8px 0' }}>Calibration unavailable: {error}</div>
   }
 
   if (!data) return null
@@ -84,7 +84,7 @@ export default function CalibrationInsight({ apiBase, score }) {
   return (
     <div style={{ marginTop: 12 }}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
-        <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#8b949e', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+        <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
           IV Expansion Calibration
         </span>
         <span
@@ -92,8 +92,8 @@ export default function CalibrationInsight({ apiBase, score }) {
             fontSize: '0.68rem',
             padding: '1px 5px',
             borderRadius: 3,
-            background: isPrior ? '#2d2a1e' : '#1c3a5e',
-            color: isPrior ? '#e3b341' : '#79c0ff',
+            background: isPrior ? 'var(--warn-surface)' : 'var(--accent-2-surface)',
+            color: isPrior ? 'var(--warn-bright)' : 'var(--accent-2-bright)',
             fontWeight: 600,
           }}
         >
@@ -106,13 +106,13 @@ export default function CalibrationInsight({ apiBase, score }) {
       </div>
 
       {isPrior && (
-        <p style={{ fontSize: '0.72rem', color: '#8b949e', marginBottom: 8, lineHeight: 1.4 }}>
+        <p style={{ fontSize: '0.72rem', color: 'var(--muted)', marginBottom: 8, lineHeight: 1.4 }}>
           Research prior only. This is ordering context, not an empirical estimate.
         </p>
       )}
 
       {isObservational && (
-        <p style={{ fontSize: '0.72rem', color: '#8b949e', marginBottom: 8, lineHeight: 1.4 }}>
+        <p style={{ fontSize: '0.72rem', color: 'var(--muted)', marginBottom: 8, lineHeight: 1.4 }}>
           Raw bucket observations are being accumulated, but the fitted curve is held back until {min_for_fit} observations.
         </p>
       )}
@@ -130,16 +130,16 @@ export default function CalibrationInsight({ apiBase, score }) {
                   style={{
                     flex: 1,
                     height: `${Math.max(height, 2)}px`,
-                    background: isActive ? '#388bfd' : '#30363d',
+                    background: isActive ? 'var(--accent-2)' : 'var(--line)',
                     borderRadius: '2px 2px 0 0',
                     transition: 'height 0.2s',
-                    outline: isActive ? '1px solid #58a6ff' : 'none',
+                    outline: isActive ? '1px solid var(--accent-2)' : 'none',
                   }}
                 />
               )
             })}
           </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: '#484f58', marginBottom: 6 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: 'var(--muted-dim)', marginBottom: 6 }}>
             <span>0.0</span>
             <span>Score →</span>
             <span>1.0</span>
@@ -158,13 +158,13 @@ export default function CalibrationInsight({ apiBase, score }) {
                   gap: 8,
                   padding: '4px 8px',
                   borderRadius: 6,
-                  border: isActive ? '1px solid #58a6ff' : '1px solid #30363d',
-                  background: isActive ? '#111d2f' : '#161b22',
+                  border: isActive ? '1px solid var(--accent-2)' : '1px solid var(--line)',
+                  background: isActive ? 'var(--surface-sunken)' : 'var(--surface-sunken)',
                 }}
               >
                 <strong>{b.score_lo.toFixed(1)}–{b.score_hi.toFixed(1)}</strong>
                 <span>{fmt(b.expected_expansion_pct)}</span>
-                <span style={{ color: '#8b949e' }}>{b.n > 0 ? `N=${b.n}` : 'Prior'}</span>
+                <span style={{ color: 'var(--muted)' }}>{b.n > 0 ? `N=${b.n}` : 'Prior'}</span>
               </div>
             )
           })}
@@ -176,18 +176,18 @@ export default function CalibrationInsight({ apiBase, score }) {
         <div
           style={{
             padding: '6px 10px',
-            background: '#161b22',
-            border: '1px solid #30363d',
+            background: 'var(--surface-sunken)',
+            border: '1px solid var(--line)',
             borderRadius: 6,
             fontSize: '0.78rem',
-            color: '#c9d1d9',
+            color: 'var(--text-secondary)',
           }}
         >
-          <span style={{ color: '#8b949e' }}>Score {activeBucket.score_lo.toFixed(1)}–{activeBucket.score_hi.toFixed(1)}: </span>
-          <strong style={{ color: '#58a6ff' }}>
+          <span style={{ color: 'var(--muted)' }}>Score {activeBucket.score_lo.toFixed(1)}–{activeBucket.score_hi.toFixed(1)}: </span>
+          <strong style={{ color: 'var(--accent-2)' }}>
             ~{fmt(activeBucket.expected_expansion_pct)} {isFitted ? 'empirical IV expansion' : 'context estimate'}
           </strong>
-          <span style={{ color: '#8b949e' }}>
+          <span style={{ color: 'var(--muted)' }}>
             {' '}(±{fmt(activeBucket.std_pct)}{activeBucket.n > 0 ? `, N=${activeBucket.n}` : ', prior'})
           </span>
         </div>

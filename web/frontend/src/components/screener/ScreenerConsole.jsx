@@ -480,7 +480,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
                 <div className="detail-panel-header">
                   <span className="detail-symbol">{selectedRankedRow.symbol}</span>
                   {selectedRankedRow.earnings_date && (
-                    <span style={{ color: '#8b949e', fontSize: '0.8rem' }}>
+                    <span style={{ color: 'var(--muted)', fontSize: '0.8rem' }}>
                       {' · '}Earns {selectedRankedRow.earnings_date}
                       {selectedRankedRow.dte != null ? ` (${selectedRankedRow.dte}d)` : ''}
                     </span>
@@ -493,11 +493,11 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
                     style={{
                       marginTop: 12,
                       padding: '10px 12px',
-                      background: '#0d1117',
-                      border: '1px solid #21262d',
+                      background: 'var(--surface-sunken)',
+                      border: '1px solid var(--line-subtle)',
                       borderRadius: 6,
                       fontSize: '0.8rem',
-                      color: '#8b949e',
+                      color: 'var(--muted)',
                       lineHeight: 1.5,
                     }}
                   >
@@ -511,13 +511,13 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
                     {/* Score components */}
                     {selectedRankedRow.score_components && Object.keys(selectedRankedRow.score_components).length > 0 && (
                       <div style={{ marginTop: 10 }}>
-                        <div style={{ fontSize: '0.72rem', fontWeight: 600, color: '#8b949e', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+                        <div style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
                           Score components
                         </div>
                         {Object.entries(selectedRankedRow.score_components).map(([k, v]) => (
-                          <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', padding: '2px 0', borderBottom: '1px solid #21262d' }}>
-                            <span style={{ color: '#8b949e' }}>{k.replace(/_/g, ' ')}</span>
-                            <span style={{ color: '#c9d1d9', fontVariantNumeric: 'tabular-nums' }}>
+                          <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', padding: '2px 0', borderBottom: '1px solid var(--line-subtle)' }}>
+                            <span style={{ color: 'var(--muted)' }}>{k.replace(/_/g, ' ')}</span>
+                            <span style={{ color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums' }}>
                               {typeof v === 'number' ? v.toFixed(3) : String(v)}
                             </span>
                           </div>
