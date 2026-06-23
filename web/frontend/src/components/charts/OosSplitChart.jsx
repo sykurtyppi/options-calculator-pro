@@ -11,6 +11,7 @@ import {
   ReferenceLine,
   ResponsiveContainer,
 } from 'recharts'
+import { CHART, axisTick, tooltipContentStyle } from './chartTheme'
 
 // Coerce any value to a finite number, falling back to 0 for null, undefined,
 // NaN, Infinity, and non-numeric strings like "n/a".
@@ -53,12 +54,12 @@ export default function OosSplitChart({ splitsDetail }) {
           <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
           <XAxis
             dataKey="label"
-            tick={{ fill: '#8b949e', fontSize: 10 }}
+            tick={{ ...axisTick, fontSize: 10 }}
             interval="preserveStartEnd"
           />
           <YAxis
             tickFormatter={(v) => `$${v}`}
-            tick={{ fill: '#8b949e', fontSize: 10 }}
+            tick={{ ...axisTick, fontSize: 10 }}
             domain={[-maxAbs - padY, maxAbs + padY]}
             width={52}
           />
@@ -71,20 +72,20 @@ export default function OosSplitChart({ splitsDetail }) {
               const d = payload?.[0]?.payload
               return d ? `Split ${d.split} · ${d.label} · ${d.winRate} WR · ${d.trades} trades · Sharpe ${d.sharpe}` : l
             }}
-            contentStyle={{ background: '#161b22', border: '1px solid #30363d', borderRadius: 6, fontSize: 11 }}
-            itemStyle={{ color: '#e6edf3' }}
-            labelStyle={{ color: '#8b949e' }}
+            contentStyle={tooltipContentStyle}
+            itemStyle={{ color: CHART.text }}
+            labelStyle={{ color: CHART.axis }}
           />
           <ReferenceLine y={0} stroke="rgba(139,148,158,0.4)" strokeWidth={1} />
           <Bar dataKey="pnl" radius={[3, 3, 0, 0]} maxBarSize={32}>
             {data.map((d, i) => (
-              <Cell key={i} fill={d.pnl >= 0 ? 'rgba(34,197,94,0.65)' : 'rgba(239,68,68,0.65)'} />
+              <Cell key={i} fill={d.pnl >= 0 ? CHART.series.posFill : CHART.series.negFill} />
             ))}
           </Bar>
           <Line
             type="monotone"
             dataKey="cumPnl"
-            stroke="#58a6ff"
+            stroke={CHART.series.accent}
             strokeWidth={2}
             dot={false}
             strokeDasharray="4 2"
