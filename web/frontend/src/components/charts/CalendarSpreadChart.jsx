@@ -9,6 +9,7 @@ import {
   ReferenceLine,
   ResponsiveContainer,
 } from 'recharts'
+import { CHART, axisTick, tooltipContentStyle } from './chartTheme'
 
 /**
  * Calendar-spread payoff diagram, kept for the legacy analysis panel.
@@ -67,13 +68,13 @@ export default function CalendarSpreadChart({ calPayoff }) {
             type="number"
             domain={['dataMin', 'dataMax']}
             tickFormatter={(v) => `${v > 0 ? '+' : ''}${v}%`}
-            tick={{ fill: '#8b949e', fontSize: 10 }}
-            label={{ value: 'Underlying Move at Expiry', position: 'insideBottom', offset: -8, fill: '#8b949e', fontSize: 10 }}
+            tick={{ ...axisTick, fontSize: 10 }}
+            label={{ value: 'Underlying Move at Expiry', position: 'insideBottom', offset: -8, fill: CHART.axis, fontSize: 10 }}
           />
           <YAxis
             domain={[minV - pad, maxV + pad]}
             tickFormatter={(v) => `$${v.toFixed(2)}`}
-            tick={{ fill: '#8b949e', fontSize: 10 }}
+            tick={{ ...axisTick, fontSize: 10 }}
             width={58}
           />
           <Tooltip
@@ -82,9 +83,9 @@ export default function CalendarSpreadChart({ calPayoff }) {
               return [`$${Number(v).toFixed(3)}`, labels[name] || name]
             }}
             labelFormatter={(l) => `Move: ${Number(l) > 0 ? '+' : ''}${Number(l)}%`}
-            contentStyle={{ background: '#161b22', border: '1px solid #30363d', borderRadius: 6, fontSize: 11 }}
-            itemStyle={{ color: '#e6edf3' }}
-            labelStyle={{ color: '#8b949e' }}
+            contentStyle={tooltipContentStyle}
+            itemStyle={{ color: CHART.text }}
+            labelStyle={{ color: CHART.axis }}
           />
           <ReferenceLine y={0} stroke="rgba(139,148,158,0.4)" strokeWidth={1} />
           {breakevens.map((b, i) => (
@@ -93,20 +94,20 @@ export default function CalendarSpreadChart({ calPayoff }) {
               x={Number(b)}
               stroke="rgba(240,160,32,0.55)"
               strokeDasharray="4 3"
-              label={{ value: 'BE', position: 'top', fill: '#f0a020', fontSize: 9 }}
+              label={{ value: 'BE', position: 'top', fill: CHART.series.warn, fontSize: 9 }}
             />
           ))}
-          <Line type="monotone" dataKey="expand" stroke="#22c55e" strokeWidth={1.5} dot={false} />
-          <Line type="monotone" dataKey="flat" stroke="#58a6ff" strokeWidth={2} dot={false} />
-          <Line type="monotone" dataKey="crush25" stroke="#f0a020" strokeWidth={1.5} dot={false} />
-          <Line type="monotone" dataKey="crush45" stroke="#ef4444" strokeWidth={1.5} dot={false} />
+          <Line type="monotone" dataKey="expand" stroke={CHART.series.pos} strokeWidth={1.5} dot={false} />
+          <Line type="monotone" dataKey="flat" stroke={CHART.series.accent} strokeWidth={2} dot={false} />
+          <Line type="monotone" dataKey="crush25" stroke={CHART.series.warn} strokeWidth={1.5} dot={false} />
+          <Line type="monotone" dataKey="crush45" stroke={CHART.series.neg} strokeWidth={1.5} dot={false} />
         </LineChart>
       </ResponsiveContainer>
-      <div style={{ display: 'flex', gap: 14, marginTop: 4, fontSize: 11, color: '#8b949e', flexWrap: 'wrap' }}>
-        <span style={{ color: '#22c55e' }}>━ IV +20%</span>
-        <span style={{ color: '#58a6ff' }}>━ IV Flat</span>
-        <span style={{ color: '#f0a020' }}>━ IV −25%</span>
-        <span style={{ color: '#ef4444' }}>━ IV −45%</span>
+      <div style={{ display: 'flex', gap: 14, marginTop: 4, fontSize: 11, color: CHART.axis, flexWrap: 'wrap' }}>
+        <span style={{ color: CHART.series.pos }}>━ IV +20%</span>
+        <span style={{ color: CHART.series.accent }}>━ IV Flat</span>
+        <span style={{ color: CHART.series.warn }}>━ IV −25%</span>
+        <span style={{ color: CHART.series.neg }}>━ IV −45%</span>
         <span style={{ color: 'rgba(240,160,32,0.6)' }}>╌ BE</span>
       </div>
     </div>

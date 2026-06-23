@@ -9,6 +9,7 @@ import {
   ReferenceLine,
   ResponsiveContainer,
 } from 'recharts'
+import { CHART, axisTick, tooltipContentStyle } from './chartTheme'
 
 /**
  * Volatility term-structure chart: DTE on x-axis vs IV % on y-axis,
@@ -45,37 +46,37 @@ export default function TermStructureChart({ days, ivs, earningsDte }) {
             type="number"
             domain={['dataMin', 'dataMax']}
             tickCount={6}
-            tick={{ fill: '#8b949e', fontSize: 11 }}
-            label={{ value: 'DTE', position: 'insideBottomRight', offset: -4, fill: '#8b949e', fontSize: 11 }}
+            tick={axisTick}
+            label={{ value: 'DTE', position: 'insideBottomRight', offset: -4, fill: CHART.axis, fontSize: 11 }}
           />
           <YAxis
             domain={[yMin, yMax]}
             tickFormatter={(v) => `${v}%`}
-            tick={{ fill: '#8b949e', fontSize: 11 }}
+            tick={axisTick}
             width={42}
           />
           <Tooltip
             formatter={(v) => [`${v}%`, 'IV']}
             labelFormatter={(l) => `DTE ${l}`}
-            contentStyle={{ background: '#161b22', border: '1px solid #30363d', borderRadius: 6, fontSize: 12 }}
-            itemStyle={{ color: '#e6edf3' }}
-            labelStyle={{ color: '#8b949e' }}
+            contentStyle={tooltipContentStyle}
+            itemStyle={{ color: CHART.text }}
+            labelStyle={{ color: CHART.axis }}
           />
           {earningsDte != null && (
             <ReferenceLine
               x={earningsDte}
-              stroke="#f0a020"
+              stroke={CHART.series.warn}
               strokeDasharray="4 3"
-              label={{ value: 'Earnings', position: 'top', fill: '#f0a020', fontSize: 10 }}
+              label={{ value: 'Earnings', position: 'top', fill: CHART.series.warn, fontSize: 10 }}
             />
           )}
           <ReferenceLine x={30} stroke="rgba(139,148,158,0.35)" strokeDasharray="2 4" />
           <Line
             type="monotone"
             dataKey="iv"
-            stroke="#58a6ff"
+            stroke={CHART.series.accent}
             strokeWidth={2}
-            dot={{ fill: '#58a6ff', r: 3 }}
+            dot={{ fill: CHART.series.accent, r: 3 }}
             activeDot={{ r: 5 }}
           />
         </LineChart>
