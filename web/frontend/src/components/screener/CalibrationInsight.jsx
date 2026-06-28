@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 
 import { apiFetch } from '../../lib/api'
+import { httpErrorMessage, fetchErrorMessage } from '../../lib/errors'
 const NA = '—'
 
 function fmt(v, digits = 1) {
@@ -35,7 +36,7 @@ export default function CalibrationInsight({ apiBase, score }) {
       .then(async (r) => {
         if (!r.ok) {
           const body = await r.json().catch(() => ({}))
-          throw new Error(body.detail || `HTTP ${r.status}`)
+          throw new Error(httpErrorMessage(r.status, body.detail))
         }
         return r.json()
       })
@@ -43,7 +44,7 @@ export default function CalibrationInsight({ apiBase, score }) {
         if (!cancelled) setData(payload)
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err.message || err))
+        if (!cancelled) setError(fetchErrorMessage(err))
       })
       .finally(() => {
         if (!cancelled) setLoading(false)

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { apiFetch } from '../../lib/api'
+import { httpErrorMessage, fetchErrorMessage } from '../../lib/errors'
 import { buildCalibrationModel } from './selectorViewModel'
 
 export default function CalibrationInsightPanel({ apiBase, score, curveData = null }) {
@@ -21,7 +22,7 @@ export default function CalibrationInsightPanel({ apiBase, score, curveData = nu
       .then(async (response) => {
         if (!response.ok) {
           const body = await response.json().catch(() => ({}))
-          throw new Error(body.detail || `HTTP ${response.status}`)
+          throw new Error(httpErrorMessage(response.status, body.detail))
         }
         return response.json()
       })
@@ -29,7 +30,7 @@ export default function CalibrationInsightPanel({ apiBase, score, curveData = nu
         if (!cancelled) setData(payload)
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err.message || err))
+        if (!cancelled) setError(fetchErrorMessage(err))
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
