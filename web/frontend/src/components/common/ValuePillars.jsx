@@ -25,7 +25,10 @@ export default function ValuePillars() {
     <ul className="value-pillars" aria-label="What this tool does">
       {PILLARS.map(([title, body]) => (
         <li className="value-pillar" key={title}>
-          <h2 className="value-pillar-title">{title}</h2>
+          {/* Not a heading element: these are value-prop blurbs, and making them
+              <h2> would imply the real <h3> sections below are nested under the
+              last pillar — a false outline for screen-reader heading nav. */}
+          <div className="value-pillar-title">{title}</div>
           <p className="value-pillar-body">{body}</p>
         </li>
       ))}
