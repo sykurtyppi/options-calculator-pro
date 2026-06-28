@@ -103,6 +103,18 @@ describe('App — decision-first result tabs', () => {
     expect(screen.queryByText(/See a live example in one click/i)).toBeNull()
   })
 
+  test('the value-pillars strip is always visible on load', async () => {
+    await act(async () => { render(<App />) })
+    expect(screen.getByText(/Spot mispriced earnings options/i)).toBeInTheDocument()
+    expect(screen.getByText(/losers included/i)).toBeInTheDocument()
+  })
+
+  test('the in-flight skeleton does not linger once the result has rendered', async () => {
+    await _runAnalysis()
+    // After the analysis resolves, the loading skeleton must be gone.
+    expect(document.querySelector('.analysis-skeleton')).toBeNull()
+  })
+
   test('the ticker input has a describedby helper hint', async () => {
     // Async-wrap so the mount-time effects (watchlist / screener fetches) settle
     // inside act() — otherwise their late setState logs an act() warning.

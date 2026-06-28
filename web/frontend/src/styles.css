@@ -316,6 +316,111 @@ button:disabled {
   color: var(--muted-dim);
 }
 
+/* Visually-hidden but screen-reader-available text. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── Value pillars (always-visible "what this does" strip) ── */
+.value-pillars {
+  list-style: none;
+  margin: 0 0 var(--space-4);
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-3);
+}
+
+.value-pillar {
+  padding: var(--space-4);
+  background: var(--surface-sunken);
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--radius-md);
+}
+
+.value-pillar-title {
+  margin: 0 0 6px;
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.value-pillar-body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+/* ── Analysis skeleton (in-flight placeholder) ── */
+@keyframes skeleton-shimmer {
+  0% { background-position: -180% 0; }
+  100% { background-position: 180% 0; }
+}
+
+.analysis-skeleton {
+  margin-top: 16px;
+}
+
+.skel {
+  border-radius: var(--radius-sm);
+  background: linear-gradient(
+    90deg,
+    var(--surface-sunken) 25%,
+    var(--line-subtle) 50%,
+    var(--surface-sunken) 75%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+.skel-tabs {
+  height: 34px;
+  width: 320px;
+  max-width: 100%;
+  margin-bottom: 14px;
+}
+
+.skel-card {
+  padding: var(--space-5);
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--radius-md);
+  background: var(--panel-2);
+}
+
+.skel-line { height: 16px; margin-bottom: 12px; }
+.skel-line-lg { width: 55%; height: 22px; }
+.skel-line-md { width: 80%; }
+
+.skel-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-3);
+  margin: 18px 0;
+}
+
+.skel-stat { height: 64px; }
+
+.skel-block { height: 120px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .skel { animation: none; }
+}
+
+@media (max-width: 720px) {
+  .value-pillars { grid-template-columns: 1fr; }
+}
+
 .no-trade-banner {
   margin-top: 12px;
   border: 1px solid rgba(255, 88, 88, 0.7);
