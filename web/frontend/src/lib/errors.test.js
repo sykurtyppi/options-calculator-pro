@@ -26,6 +26,18 @@ test('httpErrorMessage ignores whitespace-only detail', () => {
   assert.match(httpErrorMessage(500, '   '), /transient/i)
 })
 
+// FastAPI 422 validation errors return `detail` as an ARRAY of objects (and
+// some paths an object). The old `body.detail || ...` would stringify that to
+// "[object Object]"; the typeof-string guard must prevent that. Lock it.
+test('httpErrorMessage never stringifies a non-string detail (422 array / object)', () => {
+  const arrayDetail = [{ loc: ['body', 'symbol'], msg: 'field required' }]
+  const m = httpErrorMessage(422, arrayDetail)
+  assert.match(m, /HTTP 422/)
+  assert.doesNotMatch(m, /object Object/)
+  // An object detail on a mapped status falls back to the mapped message.
+  assert.match(httpErrorMessage(500, { msg: 'boom' }), /transient/i)
+})
+
 test('fetchErrorMessage gives a connectivity hint for network TypeErrors', () => {
   const err = new TypeError('Failed to fetch')
   assert.match(fetchErrorMessage(err), /reach the server/i)
