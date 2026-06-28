@@ -500,6 +500,39 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         self.assertGreater(profile["p90_move_pct"], profile["median_move_pct"])
         self.assertGreater(profile["std_move_pct"], 0.0)
 
+    def test_historical_profile_emits_dated_raw_events(self):
+        """raw_events pairs each past earnings date with its actual move (for the UI panel)."""
+        dates = pd.bdate_range("2024-01-02", periods=140)
+        prices = pd.Series(100.0 + np.linspace(0, 1.0, len(dates)), index=dates)
+
+        earnings_positions = [20, 40, 60, 80, 100]
+        target_moves = [4.0, 5.0, 6.0, 7.0, 8.0]
+        earnings_events = [
+            {"event_date": pd.Timestamp(dates[i]), "release_timing": "after market close"}
+            for i in earnings_positions
+        ]
+        for pos, move in zip(earnings_positions, target_moves):
+            prices.iloc[pos + 1] = float(prices.iloc[pos]) * (1.0 + move / 100.0)
+
+        profile = _historical_earnings_move_profile(close=prices, earnings_events=earnings_events)
+
+        events = profile["raw_events"]
+        self.assertEqual(len(events), 5)
+        # Chronological, dated, and each move matches the injected target (unclipped).
+        self.assertEqual([e["date"] for e in events], sorted(e["date"] for e in events))
+        for e, expected in zip(events, target_moves):
+            self.assertRegex(e["date"], r"^\d{4}-\d{2}-\d{2}$")
+            self.assertAlmostEqual(e["move_pct"], expected, places=1)
+            self.assertEqual(e["release_timing"], "after market close")
+
+    def test_historical_profile_daily_fallback_has_no_raw_events(self):
+        """Daily-fallback path has no per-event dates, so the panel must not render bars."""
+        dates = pd.bdate_range("2024-01-02", periods=80)
+        prices = pd.Series(np.linspace(100.0, 110.0, len(dates)), index=dates)
+        profile = _historical_earnings_move_profile(close=prices, earnings_events=[])
+        self.assertEqual(profile["source"], "daily_fallback")
+        self.assertNotIn("raw_events", profile)
+
     def test_historical_profile_bmo_alignment_uses_prev_to_event_close(self):
         dates = pd.bdate_range("2024-01-02", periods=80)
         prices = pd.Series(np.linspace(100.0, 104.0, len(dates)), index=dates)

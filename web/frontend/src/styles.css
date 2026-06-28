@@ -1038,6 +1038,18 @@ button:disabled {
   padding-left: 6px;
 }
 
+.earnings-history-caption {
+  margin: 10px 6px 2px;
+  font-family: var(--font-sans);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.earnings-history-takeaway {
+  color: var(--accent-2-bright);
+}
+
 /* ── Zoomable payoff charts ── */
 .chart-zoom-hint {
   margin-top: 6px;
