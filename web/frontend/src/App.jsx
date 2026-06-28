@@ -23,6 +23,8 @@ import OosSplitChart from './components/charts/OosSplitChart'
 import StructurePayoffChart from './components/charts/StructurePayoffChart'
 import CalendarSpreadChart from './components/charts/CalendarSpreadChart'
 import HowItWorksPanel from './components/common/HowItWorksPanel'
+import ValuePillars from './components/common/ValuePillars'
+import AnalysisSkeleton from './components/edge/AnalysisSkeleton'
 import WatchlistChips from './components/alerts/WatchlistChips'
 import AlertBanner from './components/alerts/AlertBanner'
 import AlertConfigPanel from './components/alerts/AlertConfigPanel'
@@ -456,6 +458,8 @@ export default function App() {
           </div>
         </header>
 
+        <ValuePillars />
+
         <HowItWorksPanel apiBase={API_BASE} />
 
         <ScreenerConsole apiBase={API_BASE} onAnalyzeSymbol={runForSymbol} />
@@ -506,6 +510,8 @@ export default function App() {
 
           {error && <div className="error-banner">{error}</div>}
           <AlertBanner config={alertConfig} result={result} />
+
+          {loading && <AnalysisSkeleton />}
 
           {!result && !loading && !error && (
             <div className="analysis-empty">
