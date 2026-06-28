@@ -53,3 +53,13 @@ test('null implied move yields null reference and null exceedRate', () => {
 test('non-array history is safe', () => {
   assert.deepEqual(buildEarningsMoveHistory(undefined, 5).data, [])
 })
+
+test('median is computed over the displayed bars (even count averages the middle two)', () => {
+  const hist = [4, 11, 7, 9].map((m, i) => ({ date: `2024-0${i + 1}-01`, move_pct: m }))
+  // Sorted [4,7,9,11] → median (7+9)/2 = 8.
+  assert.equal(buildEarningsMoveHistory(hist, 6).median, 8)
+  // Odd count → middle element.
+  const odd = [4, 9, 7].map((m, i) => ({ date: `2024-0${i + 1}-01`, move_pct: m }))
+  assert.equal(buildEarningsMoveHistory(odd, 6).median, 7)
+  assert.equal(buildEarningsMoveHistory([], 6).median, null)
+})

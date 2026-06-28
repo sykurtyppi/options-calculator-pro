@@ -12,6 +12,13 @@ export function shortDateLabel(iso) {
   return `${MONTHS[Number(m[2]) - 1] || m[2]} '${m[1].slice(2)}`
 }
 
+function medianOf(nums) {
+  if (!nums.length) return null
+  const s = [...nums].sort((a, b) => a - b)
+  const mid = Math.floor(s.length / 2)
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2
+}
+
 export function buildEarningsMoveHistory(history, impliedMovePct, limit = 12) {
   const rows = Array.isArray(history) ? history : []
   const data = rows
@@ -44,5 +51,11 @@ export function buildEarningsMoveHistory(history, impliedMovePct, limit = 12) {
     exceedRate = exceed / data.length
   }
 
-  return { data, impliedMove, exceedRate }
+  // Median over the SAME bars we display (unclipped) — so the caption's median,
+  // exceed-count, and "last N" all describe one coherent set. (Deliberately not
+  // the backend's earnings_move_median_pct, which is winsorized over a wider
+  // window and would misattribute a different-set stat to the N shown bars.)
+  const median = data.length ? Number(medianOf(data.map((d) => d.move)).toFixed(2)) : null
+
+  return { data, impliedMove, exceedRate, median }
 }

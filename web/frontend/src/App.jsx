@@ -652,8 +652,6 @@ export default function App() {
               <EarningsMoveHistoryPanel
                 history={m.earnings_move_history}
                 impliedMove={m.event_implied_move_pct}
-                medianPct={m.earnings_move_median_pct}
-                sampleSize={m.earnings_move_sample_size}
               />
 
               {m.structure_payoff && (() => {

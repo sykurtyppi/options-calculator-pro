@@ -10,11 +10,10 @@ import { buildEarningsMoveHistory } from './earningsMoveHistory'
  * additive evidence panel, not a guaranteed one, so it stays quiet rather than
  * showing an empty frame.
  */
-export default function EarningsMoveHistoryPanel({ history, impliedMove, medianPct, sampleSize }) {
-  const { data, impliedMove: implied, exceedRate } = buildEarningsMoveHistory(history, impliedMove)
+export default function EarningsMoveHistoryPanel({ history, impliedMove }) {
+  const { data, impliedMove: implied, exceedRate, median } = buildEarningsMoveHistory(history, impliedMove)
   if (data.length < 1) return null
 
-  const median = Number(medianPct)
   const n = data.length
 
   return (
