@@ -19,6 +19,7 @@ import {
   MoveRiskBadge,
 } from './components/common/badges'
 import VolTermPanel from './components/charts/VolTermPanel'
+import EarningsMoveHistoryPanel from './components/charts/EarningsMoveHistoryPanel'
 import OosSplitChart from './components/charts/OosSplitChart'
 import StructurePayoffChart from './components/charts/StructurePayoffChart'
 import CalendarSpreadChart from './components/charts/CalendarSpreadChart'
@@ -646,6 +647,13 @@ export default function App() {
                 days={m.term_structure_days}
                 ivs={m.term_structure_ivs}
                 earningsDte={m.days_to_earnings}
+              />
+
+              <EarningsMoveHistoryPanel
+                history={m.earnings_move_history}
+                impliedMove={m.event_implied_move_pct}
+                medianPct={m.earnings_move_median_pct}
+                sampleSize={m.earnings_move_sample_size}
               />
 
               {m.structure_payoff && (() => {

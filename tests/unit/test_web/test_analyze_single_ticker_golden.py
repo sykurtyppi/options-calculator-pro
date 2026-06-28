@@ -140,7 +140,7 @@ def _run_watch_scenario():
          patch.object(edge_engine, "build_structure_scorecards", return_value=scorecards), \
          patch.object(edge_engine, "select_best_structure", return_value=selector), \
          patch.object(edge_engine, "_term_structure_points_yf", return_value=([4.0, 25.0], [0.26, 0.30], np.nan, np.nan, 0.0, 0.0, None, None, None, None, None, 4.0, 25.0)), \
-         patch.object(edge_engine, "_historical_earnings_move_profile", return_value={"event_count": 5, "median_move_pct": 4.8, "p90_move_pct": 6.9, "avg_last4_move_pct": 5.1, "std_move_pct": 1.4, "raw_moves_pct": [4.2, 4.9, 5.1, 5.4, 6.9], "source": "earnings_history"}), \
+         patch.object(edge_engine, "_historical_earnings_move_profile", return_value={"event_count": 5, "median_move_pct": 4.8, "p90_move_pct": 6.9, "avg_last4_move_pct": 5.1, "std_move_pct": 1.4, "raw_moves_pct": [4.2, 4.9, 5.1, 5.4, 6.9], "raw_events": [{"date": "2023-05-04", "move_pct": 4.2, "release_timing": "after market close"}, {"date": "2023-08-03", "move_pct": 4.9, "release_timing": "after market close"}, {"date": "2023-11-02", "move_pct": 5.1, "release_timing": "after market close"}, {"date": "2024-02-01", "move_pct": 5.4, "release_timing": "after market close"}, {"date": "2024-05-02", "move_pct": 6.9, "release_timing": "after market close"}], "source": "earnings_history"}), \
          patch.object(edge_engine, "_summarize_pre_earnings_expansion", return_value={"available": False, "status": "no_simulations", "priceable_trades": 0, "ranking_score": None}), \
          patch.object(edge_engine, "_get_feature_store", return_value=None), \
          patch.object(edge_engine, "_get_pricing_risk_free_rate", return_value=(0.04, "test")), \
@@ -166,7 +166,7 @@ class TestAnalyzeSingleTickerGolden(unittest.TestCase):
     def test_golden_pins_full_metrics_surface(self):
         """Guard against the golden silently shrinking — pins the key count."""
         golden = json.loads(_FIXTURE.read_text())
-        self.assertEqual(len(golden["metrics"]), 150,
+        self.assertEqual(len(golden["metrics"]), 151,
                          "golden metrics key count changed; confirm intentional")
 
 

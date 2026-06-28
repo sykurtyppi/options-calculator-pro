@@ -1,0 +1,55 @@
+// Pure-function tests for the earnings-move-history transform (node --test).
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { buildEarningsMoveHistory, shortDateLabel } from './earningsMoveHistory.js'
+
+test('shortDateLabel formats ISO dates without TZ drift', () => {
+  assert.equal(shortDateLabel('2024-05-02'), "May '24")
+  assert.equal(shortDateLabel('2023-11-30'), "Nov '23")
+  assert.equal(shortDateLabel('garbage'), 'garbage')
+})
+
+test('builds chronological rows and caps to the limit (keeping most recent)', () => {
+  const history = Array.from({ length: 15 }, (_, i) => ({
+    date: `2020-01-${String((i % 28) + 1).padStart(2, '0')}`,
+    move_pct: i,
+    release_timing: 'after market close',
+  }))
+  const { data } = buildEarningsMoveHistory(history, 5, 12)
+  assert.equal(data.length, 12)
+  // Most-recent kept: first retained move is the 4th element (index 3) of input.
+  assert.equal(data[0].move, 3)
+  assert.equal(data[data.length - 1].move, 14)
+})
+
+test('drops non-finite moves', () => {
+  const { data } = buildEarningsMoveHistory(
+    [
+      { date: '2024-01-01', move_pct: 4 },
+      { date: '2024-04-01', move_pct: null },
+      { date: '2024-07-01', move_pct: 'x' },
+      { date: '2024-10-01', move_pct: 6 },
+    ],
+    5,
+  )
+  assert.deepEqual(data.map((d) => d.move), [4, 6])
+})
+
+test('exceedRate = fraction of moves >= implied', () => {
+  const hist = [2, 4, 6, 8].map((m, i) => ({ date: `2024-0${i + 1}-01`, move_pct: m }))
+  const { exceedRate } = buildEarningsMoveHistory(hist, 5) // >=5 → {6,8} => 2/4
+  assert.equal(exceedRate, 0.5)
+})
+
+test('null implied move yields null reference and null exceedRate', () => {
+  const { impliedMove, exceedRate } = buildEarningsMoveHistory(
+    [{ date: '2024-01-01', move_pct: 4 }],
+    null,
+  )
+  assert.equal(impliedMove, null)
+  assert.equal(exceedRate, null)
+})
+
+test('non-array history is safe', () => {
+  assert.deepEqual(buildEarningsMoveHistory(undefined, 5).data, [])
+})

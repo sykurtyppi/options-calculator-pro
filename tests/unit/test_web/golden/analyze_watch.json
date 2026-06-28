@@ -730,6 +730,33 @@
     "drawdown_risk_pct": 3.85472231,
     "earnings_move_anchor_pct": 4.995,
     "earnings_move_avg_last4_pct": 5.1,
+    "earnings_move_history": [
+      {
+        "date": "2023-05-04",
+        "move_pct": 4.2,
+        "release_timing": "after market close"
+      },
+      {
+        "date": "2023-08-03",
+        "move_pct": 4.9,
+        "release_timing": "after market close"
+      },
+      {
+        "date": "2023-11-02",
+        "move_pct": 5.1,
+        "release_timing": "after market close"
+      },
+      {
+        "date": "2024-02-01",
+        "move_pct": 5.4,
+        "release_timing": "after market close"
+      },
+      {
+        "date": "2024-05-02",
+        "move_pct": 6.9,
+        "release_timing": "after market close"
+      }
+    ],
     "earnings_move_median_pct": 4.8,
     "earnings_move_p90_pct": 6.9,
     "earnings_move_sample_size": 5,

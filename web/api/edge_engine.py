@@ -2243,6 +2243,9 @@ def _historical_earnings_move_profile(
 
     past_events = [parsed_events[key] for key in sorted(parsed_events.keys())]
     event_moves: List[float] = []
+    # Per-event records (date + actual move) for the "last N earnings" UI panel.
+    # Kept UNCLIPPED — this is what the stock actually did, not a stat input.
+    event_records: List[Dict[str, Any]] = []
 
     for event in past_events[-24:]:
         event_ts = pd.Timestamp(event["event_date"]).normalize()
@@ -2273,6 +2276,11 @@ def _historical_earnings_move_profile(
         move_pct = abs((post_px - pre_px) / pre_px) * 100.0
         if np.isfinite(move_pct):
             event_moves.append(float(move_pct))
+            event_records.append({
+                "date": event_ts.strftime("%Y-%m-%d"),
+                "move_pct": float(move_pct),
+                "release_timing": release_timing,
+            })
 
     if not event_moves:
         # Fallback to recent daily absolute moves
@@ -2308,6 +2316,7 @@ def _historical_earnings_move_profile(
         "avg_last4_move_pct": avg_last4,
         "std_move_pct": std_move,
         "raw_moves_pct": [float(x) for x in moves.tolist()],  # for kurtosis + crush-rate
+        "raw_events": event_records,  # dated per-event moves for the history panel
         "source": "earnings_history",
     }
 
@@ -3035,6 +3044,9 @@ def analyze_single_ticker(
     _raw_moves: List[float] = move_profile.get("raw_moves_pct") or []
     kurtosis_conf_mult, move_kurtosis = _kurtosis_confidence_mult(_raw_moves)
 
+    # Dated per-event move history for the "last N earnings" UI panel (display only).
+    _earnings_move_history: List[Dict[str, Any]] = move_profile.get("raw_events") or []
+
     # Fix 5: historical crush calibration — did the stock historically stay inside IV?
     _implied_for_crush = (
         float(implied_move_total_pct)
@@ -3536,6 +3548,7 @@ def analyze_single_ticker(
         "implied_vs_anchor_ratio": float(implied_vs_anchor_ratio) if np.isfinite(implied_vs_anchor_ratio) else None,
         "earnings_move_sample_size": move_sample_size,
         "earnings_move_source": move_source,
+        "earnings_move_history": _earnings_move_history if _earnings_move_history else None,
         "sample_confidence": sample_confidence,
         "min_required_earnings_events": MIN_EARNINGS_EVENTS_FOR_FULL_SIGNAL,
         "min_short_leg_dte": MIN_SHORT_LEG_DTE,
