@@ -55,6 +55,11 @@ const ProviderTelemetryPanel = lazy(() => import('./components/diagnostics/Provi
 const ForwardPerformancePanel = lazy(() => import('./components/diagnostics/ForwardPerformancePanel'))
 const EvidenceReportPanel = lazy(() => import('./components/diagnostics/EvidenceReportPanel'))
 
+// Default ticker for the first-load "see an example" demo. A liquid, famously
+// vol-sensitive earnings name so the example analysis is always meaningful.
+// The demo runs a REAL, live analysis — same data every visitor sees.
+const DEMO_SYMBOL = 'NVDA'
+
 // Inline chart / badge / hook / alert definitions were moved to dedicated
 // modules in PR-S so the main App component stays readable:
 //   - charts/{TermStructureChart, OosSplitChart, StructurePayoffChart,
@@ -489,14 +494,39 @@ export default function App() {
               onChange={(e) => setSymbol(e.target.value.toUpperCase())}
               placeholder="AAPL"
               autoComplete="off"
+              aria-describedby="symbol-hint"
             />
             <button type="submit" disabled={loading || !normalizedSymbol}>
               {loading ? 'Analyzing…' : 'Run Edge Analysis'}
             </button>
+            <span id="symbol-hint" className="symbol-hint">
+              Any optionable US stock with upcoming earnings (e.g. NVDA, AAPL, NFLX).
+            </span>
           </form>
 
           {error && <div className="error-banner">{error}</div>}
           <AlertBanner config={alertConfig} result={result} />
+
+          {!result && !loading && !error && (
+            <div className="analysis-empty">
+              <p className="analysis-empty-lead">New here? See a live example in one click.</p>
+              <p className="analysis-empty-body">
+                We analyze whether a stock's options look mispriced ahead of earnings —
+                then show you whether that edge has actually held up out-of-sample. Run a
+                real analysis on {DEMO_SYMBOL} to see the full picture.
+              </p>
+              <button
+                type="button"
+                className="demo-cta"
+                onClick={() => runForSymbol(DEMO_SYMBOL)}
+              >
+                See an example: analyze {DEMO_SYMBOL} →
+              </button>
+              <p className="analysis-empty-note">
+                Live data — the same signals every visitor sees. No sign-up, nothing simulated.
+              </p>
+            </div>
+          )}
 
           {result && (
             <>

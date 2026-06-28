@@ -91,6 +91,25 @@ describe('App — decision-first result tabs', () => {
     await waitFor(() => expect(document.body.textContent).toMatch(/Walk-Forward OOS Report Card/i))
   })
 
+  test('first load shows the example-analysis empty state; the demo CTA runs an analysis', async () => {
+    render(<App />)
+    // Before any analysis, the first-load empty state and the live-demo CTA show.
+    expect(screen.getByText(/See a live example in one click/i)).toBeInTheDocument()
+    expect(screen.getByText(/the same signals every visitor sees/i)).toBeInTheDocument()
+    const cta = screen.getByRole('button', { name: /See an example: analyze NVDA/i })
+    fireEvent.click(cta)
+    // The analysis renders and the empty state is replaced by the result tabs.
+    await screen.findByRole('tab', { name: /^Decision$/i }, { timeout: 5000 })
+    expect(screen.queryByText(/See a live example in one click/i)).toBeNull()
+  })
+
+  test('the ticker input has a describedby helper hint', () => {
+    render(<App />)
+    const input = screen.getByLabelText('Ticker')
+    expect(input).toHaveAttribute('aria-describedby', 'symbol-hint')
+    expect(screen.getByText(/optionable US stock with upcoming earnings/i)).toBeInTheDocument()
+  })
+
   test('the Full metrics tab reveals the legacy block, with honest advisory wording and no false cap', async () => {
     await _runAnalysis()
     fireEvent.click(screen.getByRole('tab', { name: /Full metrics/i }))

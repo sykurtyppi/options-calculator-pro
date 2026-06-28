@@ -258,6 +258,14 @@ button:disabled {
   cursor: default;
 }
 
+.symbol-hint {
+  grid-column: 1 / -1;
+  margin-top: -2px;
+  font-family: var(--font-sans);
+  font-size: 0.82rem;
+  color: var(--muted-dim);
+}
+
 .error-banner {
   margin-top: 12px;
   border: 1px solid rgba(240, 93, 94, 0.55);
@@ -265,6 +273,47 @@ button:disabled {
   background: rgba(117, 30, 35, 0.45);
   border-radius: var(--radius-sm);
   padding: 10px 12px;
+}
+
+/* First-load empty state for the Edge Analysis section — a one-click live demo
+   so a new visitor sees the product's value without knowing what to type. */
+.analysis-empty {
+  margin-top: 16px;
+  padding: 28px 24px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  text-align: center;
+}
+
+.analysis-empty-lead {
+  margin: 0 0 8px;
+  font-family: var(--font-sans);
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.analysis-empty-body {
+  margin: 0 auto 18px;
+  max-width: 56ch;
+  font-family: var(--font-sans);
+  font-size: 0.92rem;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.demo-cta {
+  width: auto;
+  padding: 0 22px;
+  font-size: 0.95rem;
+}
+
+.analysis-empty-note {
+  margin: 14px 0 0;
+  font-family: var(--font-sans);
+  font-size: 0.8rem;
+  color: var(--muted-dim);
 }
 
 .no-trade-banner {
