@@ -18,7 +18,7 @@ import {
   VolRegimeBadge,
   MoveRiskBadge,
 } from './components/common/badges'
-import TermStructureChart from './components/charts/TermStructureChart'
+import VolTermPanel from './components/charts/VolTermPanel'
 import OosSplitChart from './components/charts/OosSplitChart'
 import StructurePayoffChart from './components/charts/StructurePayoffChart'
 import CalendarSpreadChart from './components/charts/CalendarSpreadChart'
@@ -46,6 +46,7 @@ import {
 } from './lib/formatters'
 
 import { API_BASE, apiFetch } from './lib/api'
+import { httpErrorMessage, fetchErrorMessage } from './lib/errors'
 const LegacyAnalysisPanel = lazy(() => import('./components/edge/LegacyAnalysisPanel'))
 const HistoricalWarehousePanel = lazy(() => import('./components/historical/HistoricalWarehousePanel'))
 const LedgerDiagnosticsPanel = lazy(() => import('./components/diagnostics/LedgerDiagnosticsPanel'))
@@ -273,14 +274,14 @@ export default function App() {
       if (controller.signal.aborted) return
       if (!res.ok) {
         const b = await res.json().catch(() => ({}))
-        throw new Error(b.detail || `HTTP ${res.status}`)
+        throw new Error(httpErrorMessage(res.status, b.detail))
       }
       setResult(await res.json())
     } catch (err) {
       // AbortError is expected when a newer request superseded this one —
       // silently drop it; the newer call owns the UI state now.
       if (err && err.name === 'AbortError') return
-      setError(String(err.message || err))
+      setError(fetchErrorMessage(err))
     } finally {
       // Only release loading/ref state if we're still the current
       // in-flight call. If a newer call took over, leave its state alone.
@@ -302,7 +303,7 @@ export default function App() {
       const res = await apiFetch(`${API_BASE}/api/historical/options/symbols`)
       if (!res.ok) {
         const b = await res.json().catch(() => ({}))
-        throw new Error(b.detail || `HTTP ${res.status}`)
+        throw new Error(httpErrorMessage(res.status, b.detail))
       }
       const data = await res.json()
       setWarehouse(p => ({
@@ -313,7 +314,7 @@ export default function App() {
         error: '',
       }))
     } catch (err) {
-      setWarehouse(p => ({ ...p, loadingSymbols: false, error: String(err.message || err) }))
+      setWarehouse(p => ({ ...p, loadingSymbols: false, error: fetchErrorMessage(err) }))
     }
   }
 
@@ -325,7 +326,7 @@ export default function App() {
       const coverageRes = await apiFetch(`${API_BASE}/api/historical/options/${encodeURIComponent(sym)}/coverage`)
       if (!coverageRes.ok) {
         const b = await coverageRes.json().catch(() => ({}))
-        throw new Error(b.detail || `Coverage HTTP ${coverageRes.status}`)
+        throw new Error(httpErrorMessage(coverageRes.status, b.detail))
       }
       const coverageData = await coverageRes.json()
 
@@ -339,7 +340,7 @@ export default function App() {
       const chainRes = await apiFetch(`${API_BASE}/api/historical/options/${encodeURIComponent(sym)}/chain?${params.toString()}`)
       if (!chainRes.ok) {
         const b = await chainRes.json().catch(() => ({}))
-        throw new Error(b.detail || `Chain HTTP ${chainRes.status}`)
+        throw new Error(httpErrorMessage(chainRes.status, b.detail))
       }
       const chainData = await chainRes.json()
       setWarehouse(p => ({
@@ -351,7 +352,7 @@ export default function App() {
         error: '',
       }))
     } catch (err) {
-      setWarehouse(p => ({ ...p, loadingRows: false, error: String(err.message || err) }))
+      setWarehouse(p => ({ ...p, loadingRows: false, error: fetchErrorMessage(err) }))
     }
   }
 
@@ -373,7 +374,7 @@ export default function App() {
       })
       if (!submitRes.ok) {
         const b = await submitRes.json().catch(() => ({}))
-        throw new Error(b.detail || `HTTP ${submitRes.status}`)
+        throw new Error(httpErrorMessage(submitRes.status, b.detail))
       }
       const { job_id } = await submitRes.json()
       jobId = job_id
@@ -419,7 +420,7 @@ export default function App() {
       }
       if (mountedRef.current) {
         setOosLoading(false)
-        setOosError(String(err.message || err))
+        setOosError(fetchErrorMessage(err))
       }
     }
   }
@@ -605,19 +606,11 @@ export default function App() {
                 <VolSnapshotPanel volSnapshot={volSnapshot} />
               </div>
 
-              {m.term_structure_days?.length >= 2 && (
-                <div className="selector-panel selector-panel-vol-term">
-                  <div className="selector-panel-header">
-                    <h3>Vol Term Structure</h3>
-                    <span>Implied vol across expirations — steepness drives calendar carry; event premium shows near-term elevation.</span>
-                  </div>
-                  <TermStructureChart
-                    days={m.term_structure_days}
-                    ivs={m.term_structure_ivs}
-                    earningsDte={m.days_to_earnings}
-                  />
-                </div>
-              )}
+              <VolTermPanel
+                days={m.term_structure_days}
+                ivs={m.term_structure_ivs}
+                earningsDte={m.days_to_earnings}
+              />
 
               {m.structure_payoff && (() => {
                 const sp = m.structure_payoff

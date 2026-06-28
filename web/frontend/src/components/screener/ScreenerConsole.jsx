@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 import { apiFetch } from '../../lib/api'
+import { httpErrorMessage, fetchErrorMessage } from '../../lib/errors'
 import CalibrationInsight from './CalibrationInsight'
 import ExpiryModeToggle from './ExpiryModeToggle'
 import QualificationBadge from './QualificationBadge'
@@ -92,7 +93,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
       const response = await apiFetch(`${apiBase}/api/edge/screener?expiry_mode=${mode}`)
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
-        throw new Error(body.detail || `HTTP ${response.status}`)
+        throw new Error(httpErrorMessage(response.status, body.detail))
       }
       const payload = await response.json()
       setData(payload)
@@ -101,7 +102,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
         setSelectedKey((current) => current || `${firstRow.symbol}-${firstRow.earnings_date}-${firstRow.expiry_mode}`)
       }
     } catch (loadError) {
-      setError(String(loadError.message || loadError))
+      setError(fetchErrorMessage(loadError))
     } finally {
       setLoading(false)
     }
@@ -194,7 +195,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
       .then(async (response) => {
         if (!response.ok) {
           const body = await response.json().catch(() => ({}))
-          throw new Error(body.detail || `HTTP ${response.status}`)
+          throw new Error(httpErrorMessage(response.status, body.detail))
         }
         return response.json()
       })
@@ -211,7 +212,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
         if (controller.signal.aborted || (detailError && detailError.name === 'AbortError')) return
         setDetailCache((current) => ({
           ...current,
-          [cacheKey]: { loading: false, error: String(detailError.message || detailError), result: null },
+          [cacheKey]: { loading: false, error: fetchErrorMessage(detailError), result: null },
         }))
       })
       .finally(() => {
@@ -247,7 +248,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
       const response = await apiFetch(`${apiBase}/api/screener/ranked?${params}`)
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
-        throw new Error(body.detail || `HTTP ${response.status}`)
+        throw new Error(httpErrorMessage(response.status, body.detail))
       }
       const payload = await response.json()
       setRankedData(payload)
@@ -267,7 +268,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
         return firstUpcoming ? firstUpcoming.symbol : ''
       })
     } catch (err) {
-      setRankedError(String(err.message || err))
+      setRankedError(fetchErrorMessage(err))
     } finally {
       setRankedLoading(false)
     }
