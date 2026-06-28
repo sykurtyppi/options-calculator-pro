@@ -512,7 +512,7 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
                     {/* Score components */}
                     {selectedRankedRow.score_components && Object.keys(selectedRankedRow.score_components).length > 0 && (
                       <div style={{ marginTop: 10 }}>
-                        <div style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+                        <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--muted)', marginBottom: 6 }}>
                           Score components
                         </div>
                         {Object.entries(selectedRankedRow.score_components).map(([k, v]) => (
