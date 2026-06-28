@@ -8,7 +8,7 @@
 // advisory wording and never a false "score capped" claim.
 import React from 'react'
 import { describe, test, expect, vi } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 
 // vi.mock is hoisted; keep the payload INSIDE the factory to avoid a TDZ on a
 // module-scope const. The analyze endpoint returns a result whose metrics carry
@@ -103,8 +103,10 @@ describe('App — decision-first result tabs', () => {
     expect(screen.queryByText(/See a live example in one click/i)).toBeNull()
   })
 
-  test('the ticker input has a describedby helper hint', () => {
-    render(<App />)
+  test('the ticker input has a describedby helper hint', async () => {
+    // Async-wrap so the mount-time effects (watchlist / screener fetches) settle
+    // inside act() — otherwise their late setState logs an act() warning.
+    await act(async () => { render(<App />) })
     const input = screen.getByLabelText('Ticker')
     expect(input).toHaveAttribute('aria-describedby', 'symbol-hint')
     expect(screen.getByText(/optionable US stock with upcoming earnings/i)).toBeInTheDocument()
