@@ -76,6 +76,10 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
   // bug fixed in PR-U).
   const [detailLoadingKey, setDetailLoadingKey] = useState('')
   const detailLoadingKeyRef = useRef('')
+  // Abort guards so a slow earlier board/ranked fetch can't land after a newer
+  // one (rapid tab/filter switching) and overwrite state — mirrors App.runForSymbol.
+  const screenerAbortRef = useRef(null)
+  const rankedAbortRef = useRef(null)
 
   // ── Ranked setups state ───────────────────────────────────────────────────
   const [rankedFilters, setRankedFilters] = useState(DEFAULT_RANKED_FILTERS)
@@ -87,24 +91,33 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
   // ── Liquidity board functions ─────────────────────────────────────────────
 
   async function loadScreener(mode = expiryMode) {
+    if (screenerAbortRef.current) screenerAbortRef.current.abort()
+    const controller = new AbortController()
+    screenerAbortRef.current = controller
     setLoading(true)
     setError('')
     try {
-      const response = await apiFetch(`${apiBase}/api/edge/screener?expiry_mode=${mode}`)
+      const response = await apiFetch(`${apiBase}/api/edge/screener?expiry_mode=${mode}`, { signal: controller.signal })
+      if (controller.signal.aborted) return
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
         throw new Error(httpErrorMessage(response.status, body.detail))
       }
       const payload = await response.json()
+      if (controller.signal.aborted) return
       setData(payload)
       const firstRow = payload.rows?.[0]
       if (firstRow) {
         setSelectedKey((current) => current || `${firstRow.symbol}-${firstRow.earnings_date}-${firstRow.expiry_mode}`)
       }
     } catch (loadError) {
+      if (loadError && loadError.name === 'AbortError') return
       setError(fetchErrorMessage(loadError))
     } finally {
-      setLoading(false)
+      if (screenerAbortRef.current === controller) {
+        screenerAbortRef.current = null
+        setLoading(false)
+      }
     }
   }
 
@@ -235,6 +248,9 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
 
   async function loadRanked(overrides = {}) {
     const f = { ...rankedFilters, ...overrides }
+    if (rankedAbortRef.current) rankedAbortRef.current.abort()
+    const controller = new AbortController()
+    rankedAbortRef.current = controller
     setRankedLoading(true)
     setRankedError('')
     try {
@@ -245,12 +261,14 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
         release_filter: f.releaseFilter,
         weeks: f.weeks,
       })
-      const response = await apiFetch(`${apiBase}/api/screener/ranked?${params}`)
+      const response = await apiFetch(`${apiBase}/api/screener/ranked?${params}`, { signal: controller.signal })
+      if (controller.signal.aborted) return
       if (!response.ok) {
         const body = await response.json().catch(() => ({}))
         throw new Error(httpErrorMessage(response.status, body.detail))
       }
       const payload = await response.json()
+      if (controller.signal.aborted) return
       setRankedData(payload)
       // Keep the current selection only if it still exists in this result set;
       // otherwise prefer the top scored setup, then the first upcoming row. This
@@ -268,9 +286,13 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
         return firstUpcoming ? firstUpcoming.symbol : ''
       })
     } catch (err) {
+      if (err && err.name === 'AbortError') return
       setRankedError(fetchErrorMessage(err))
     } finally {
-      setRankedLoading(false)
+      if (rankedAbortRef.current === controller) {
+        rankedAbortRef.current = null
+        setRankedLoading(false)
+      }
     }
   }
 
@@ -279,6 +301,12 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
       loadRanked()
     }
   }, [activeTab])
+
+  // Abort any in-flight board/ranked fetch on unmount.
+  useEffect(() => () => {
+    if (screenerAbortRef.current) screenerAbortRef.current.abort()
+    if (rankedAbortRef.current) rankedAbortRef.current.abort()
+  }, [])
 
   const visibleRankedRows = useMemo(() => {
     const rows = rankedData?.rows || []
