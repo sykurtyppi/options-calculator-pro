@@ -1,6 +1,6 @@
 :root {
-  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  --font-sans: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
 
   --space-1: 4px;
   --space-2: 8px;
@@ -12,41 +12,42 @@
   --radius-sm: 10px;
   --radius-md: 12px;
   --radius-lg: 14px;
-  --ring: 0 0 0 2px rgba(61, 210, 162, 0.3);
+  --ring: 0 0 0 2px rgba(79, 134, 232, 0.35);
 
-  --bg: #07131d;
-  --panel: #0c1e2d;
-  --panel-2: #10293b;
-  --text: #e6f0f8;
-  --muted: #8ea4b7;
-  --line: #27445c;
-  --accent: #3dd2a2;
-  --accent-2: #39a0ff;
-  --danger: #f05d5e;
+  /* ── "Finance blue + amber" identity (Direction A) ──
+     Near-neutral graphite base (not saturated navy) with a real elevation
+     ladder; ONE blue accent for interactive/primary (replaces the old teal +
+     blue pair); desaturated signal colors so nothing "glows" on dark. */
+  --bg: #101214;                 /* near-neutral graphite base */
+  --panel: #181b1f;              /* elevated card */
+  --panel-2: #212529;            /* raised / nested-up surface */
+  --text: #eaecee;
+  --muted: #959ba2;
+  --line: #2d3238;               /* quiet hairline — separation comes from elevation */
+  --accent: #4f86e8;             /* single institutional-blue accent */
+  --accent-2: #4f86e8;
+  --danger: #d36450;
 
-  /* ── Semantic layer (palette unification) ──
-     One source of truth for the colors components were hardcoding inline. The
-     structural roles (text/surface/border/accent) are unified into the teal-navy
-     family that the page chrome already uses; the signal roles (pos/warn/neg)
-     keep conventional green/amber/red so up/down stays legible. "-bright" and
-     "-surface" variants exist for light-text-on-dark-badge contrast. */
-  --text-secondary: #c4d3e0;     /* mid-emphasis text (was #c9d1d9) */
-  --muted-dim: #6b7f93;          /* faintest text (was #6e7681 / #484f58) */
+  --text-secondary: #c3cad1;     /* mid-emphasis text */
+  --muted-dim: #6c747c;          /* faintest text */
 
-  --surface-sunken: #0a1826;     /* inset panels/tooltips (was #161b22 / #0d1117) */
-  --line-subtle: #1c3447;        /* faint divider (was #21262d) */
+  --surface-sunken: #14181c;     /* inset surface — recedes below panel */
+  --line-subtle: #23272c;        /* very faint divider */
 
-  --pos: #2ea043;                /* positive / cheap-IV / win */
-  --pos-bright: #4ade80;
-  --warn: #f0a020;               /* caution / mid-quality */
-  --warn-bright: #e3b341;        /* AMC badge text */
-  --warn-surface: #2d2a1e;       /* AMC badge background */
-  --neg: #da3633;                /* negative / loss */
-  --neg-bright: #fca5a5;
+  /* Signal roles — desaturated so they sit on the surface, not vibrate off it.
+     Conventional green-up / red-down kept for instant legibility; amber is the
+     caution tier (and the implied-move reference cue). */
+  --pos: #46a07a;                /* positive / cheap-IV / win */
+  --pos-bright: #6cc79e;
+  --warn: #e8943a;               /* caution / mid-quality / implied-move cue */
+  --warn-bright: #f0b35f;        /* AMC badge text */
+  --warn-surface: #2a2114;       /* AMC badge background */
+  --neg: #d36450;                /* negative / loss */
+  --neg-bright: #e89a8e;
 
-  --accent-2-bright: #79c0ff;    /* BMO badge text, link hover */
-  --accent-2-surface: #1c3a5e;   /* BMO badge background */
-  --row-selected-bg: rgba(57, 160, 255, 0.12); /* translucent selected-row tint */
+  --accent-2-bright: #8fb6f2;    /* BMO badge text, link hover */
+  --accent-2-surface: #1b2c44;   /* BMO badge background */
+  --row-selected-bg: rgba(79, 134, 232, 0.12); /* translucent selected-row tint */
 }
 
 button {

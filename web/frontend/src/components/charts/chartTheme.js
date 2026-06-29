@@ -5,18 +5,18 @@
 // MIRROR the design tokens in src/design-system.css. Keep them in sync with that
 // file (axis = --muted, grid/border = --line, series = --pos/--neg/--accent-2/--warn).
 export const CHART = {
-  axis: '#8ea4b7', // --muted (axis ticks + labels)
-  axisDim: '#6b7f93', // --muted-dim
-  grid: '#27445c', // --line (gridlines + tooltip border)
-  text: '#e6f0f8', // --text (tooltip label, emphasis)
-  tooltipBg: '#0a1826', // --surface-sunken
+  axis: '#959ba2', // --muted (axis ticks + labels)
+  axisDim: '#6c747c', // --muted-dim
+  grid: '#2d3238', // --line (gridlines + tooltip border)
+  text: '#eaecee', // --text (tooltip label, emphasis)
+  tooltipBg: '#181b1f', // --panel (raised tooltip)
   series: {
-    pos: '#2ea043', // --pos
-    neg: '#da3633', // --neg
-    accent: '#39a0ff', // --accent-2
-    warn: '#f0a020', // --warn
-    posFill: 'rgba(46, 160, 67, 0.65)', // translucent --pos for bars
-    negFill: 'rgba(218, 54, 51, 0.65)', // translucent --neg for bars
+    pos: '#46a07a', // --pos
+    neg: '#d36450', // --neg
+    accent: '#4f86e8', // --accent
+    warn: '#e8943a', // --warn
+    posFill: 'rgba(70, 160, 122, 0.55)', // translucent --pos for bars
+    negFill: 'rgba(211, 100, 80, 0.55)', // translucent --neg for bars
   },
 }
 

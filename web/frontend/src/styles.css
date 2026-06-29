@@ -7,10 +7,14 @@
 body {
   margin: 0;
   font-family: var(--font-sans);
-  background: radial-gradient(circle at 8% 10%, #12344d 0%, transparent 35%),
-              radial-gradient(circle at 82% 82%, #17304a 0%, transparent 38%),
-              var(--bg);
+  background: var(--bg);
   color: var(--text);
+  /* Tabular, lining figures everywhere — digits share one width so numbers and
+     table columns line up instead of subtly wobbling (a key credibility cue for
+     a finance tool). */
+  font-variant-numeric: tabular-nums lining-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 .page-shell {
@@ -28,37 +32,21 @@ body {
   margin-inline: auto;
 }
 
+/* Background orbs removed for a flat, clean base — they muddied the surface.
+   Kept as no-ops so the JSX nodes render harmlessly. */
 .bg-orb {
-  position: fixed;
-  width: 380px;
-  height: 380px;
-  border-radius: 50%;
-  filter: blur(100px);
-  pointer-events: none;
-  opacity: 0.2;
+  display: none;
 }
 
-.bg-orb-a {
-  top: -120px;
-  left: -80px;
-  background: #2ad9a3;
-}
-
-.bg-orb-b {
-  bottom: -180px;
-  right: -120px;
-  background: #4aa8ff;
-}
-
+/* The outer wrapper is now a transparent centering container, not a giant card.
+   Hierarchy comes from the inner panels reading as elevated surfaces on the flat
+   page — not from one big bordered box holding everything. */
 .terminal-panel {
   max-width: 1120px;
   margin: 0 auto;
-  background: linear-gradient(165deg, rgba(16, 41, 59, 0.94), rgba(9, 24, 35, 0.96));
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  backdrop-filter: blur(10px);
-  padding: 22px;
-  box-shadow: 0 22px 50px rgba(0, 0, 0, 0.35);
+  background: transparent;
+  border: none;
+  padding: 0;
 }
 
 .panel-header {
@@ -81,7 +69,7 @@ body {
 
 .status-chip {
   border: 1px solid var(--line);
-  background: rgba(18, 53, 78, 0.55);
+  background: var(--surface-sunken);
   border-radius: 999px;
   padding: 8px 12px;
   font-size: 0.8rem;
@@ -89,9 +77,28 @@ body {
   white-space: nowrap;
 }
 
+/* Secondary action — quiet ghost, not the teal primary gradient. The accent is
+   reserved for the one primary action on screen (Run / Analyze). */
+.logout-button {
+  height: auto;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.logout-button:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--muted-dim);
+}
+
 .docs-link {
-  border: 1px solid rgba(88, 166, 255, 0.26);
-  background: rgba(88, 166, 255, 0.08);
+  border: 1px solid rgba(79, 134, 232, 0.26);
+  background: rgba(79, 134, 232, 0.08);
   border-radius: 999px;
   padding: 8px 12px;
   color: #9dd0ff;
@@ -101,7 +108,7 @@ body {
 }
 
 .docs-link:hover {
-  border-color: rgba(88, 166, 255, 0.42);
+  border-color: rgba(79, 134, 232, 0.42);
   color: #c7e4ff;
 }
 
@@ -152,8 +159,6 @@ button.docs-link {
 .hiw-glossary-title {
   font-size: 0.72rem;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
   color: var(--muted);
   margin-bottom: var(--space-2);
 }
@@ -186,7 +191,7 @@ button.docs-link {
   margin: 0 0 var(--space-3);
   padding: var(--space-3);
   border-left: 2px solid var(--accent);
-  background: rgba(61, 210, 162, 0.06);
+  background: rgba(79, 134, 232, 0.06);
   color: var(--text);
   font-size: 0.82rem;
   line-height: 1.5;
@@ -246,10 +251,10 @@ button.docs-link {
 button {
   height: 42px;
   border-radius: var(--radius-sm);
-  border: 1px solid #2d7f88;
-  background: linear-gradient(135deg, #168cb6, #24b285);
-  color: #f5fcff;
-  font-weight: 700;
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -460,8 +465,6 @@ button:disabled {
 .metric-label {
   color: var(--muted);
   font-size: 0.76rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
 }
 
 .metric-value {
@@ -621,8 +624,6 @@ button:disabled {
 .quality-legend-label {
   color: var(--muted);
   font-size: 0.70rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
   margin-right: 4px;
 }
 
@@ -670,8 +671,6 @@ button:disabled {
 .oos-field span {
   color: var(--muted);
   font-size: 0.74rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
 }
 
 .oos-field input,
@@ -712,8 +711,6 @@ button:disabled {
   margin: 0;
   font-size: 0.95rem;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
   color: var(--text);
 }
 
@@ -810,8 +807,6 @@ button:disabled {
 .watchlist-label {
   font-size: 0.70rem;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
   color: var(--muted);
   margin-right: 4px;
   flex-shrink: 0;
@@ -825,7 +820,7 @@ button:disabled {
   overflow: hidden;
   transition: border-color 0.12s;
 }
-.watchlist-chip:hover { border-color: rgba(88, 166, 255, 0.45); }
+.watchlist-chip:hover { border-color: rgba(79, 134, 232, 0.45); }
 .watchlist-chip-label {
   display: flex;
   align-items: center;
@@ -866,8 +861,8 @@ button:disabled {
   padding: 3px 9px;
   font-size: 14px;
   line-height: 1;
-  background: rgba(88,166,255,0.07);
-  border: 1px solid rgba(88,166,255,0.22);
+  background: rgba(79,134,232,0.07);
+  border: 1px solid rgba(79,134,232,0.22);
   border-radius: 5px;
   color: #8b949e;
   cursor: pointer;
@@ -925,8 +920,8 @@ button:disabled {
 .position-sizing-note {
   margin-top: 10px;
   padding: 8px 12px;
-  border-left: 2px solid rgba(88, 166, 255, 0.3);
-  background: rgba(88, 166, 255, 0.04);
+  border-left: 2px solid rgba(79, 134, 232, 0.3);
+  background: rgba(79, 134, 232, 0.04);
   border-radius: 0 4px 4px 0;
   font-size: 11px;
   color: #8b949e;
@@ -958,8 +953,8 @@ button:disabled {
 
 /* ── Ticker tier badges (Fix 1) ──────────────────────────────────────────── */
 .badge-tier-mega {
-  background: rgba(88, 166, 255, 0.13);
-  border-color: rgba(88, 166, 255, 0.35);
+  background: rgba(79, 134, 232, 0.13);
+  border-color: rgba(79, 134, 232, 0.35);
   color: #58a6ff;
 }
 .badge-tier-large {
@@ -1009,16 +1004,16 @@ button:disabled {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.04em;
-  background: rgba(88, 166, 255, 0.10);
-  border: 1px solid rgba(88, 166, 255, 0.28);
+  background: rgba(79, 134, 232, 0.10);
+  border: 1px solid rgba(79, 134, 232, 0.28);
   border-radius: 5px;
   color: #58a6ff;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
 }
 .export-btn:hover {
-  background: rgba(88, 166, 255, 0.20);
-  border-color: rgba(88, 166, 255, 0.50);
+  background: rgba(79, 134, 232, 0.20);
+  border-color: rgba(79, 134, 232, 0.50);
 }
 
 /* ── Vol term structure chart ────────────────────────────────────────────── */
@@ -1031,8 +1026,6 @@ button:disabled {
 .vol-chart-label {
   font-size: 11px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
   color: #8b949e;
   margin-bottom: 10px;
   padding-left: 6px;
@@ -1172,8 +1165,6 @@ button:disabled {
 .metrics-group-label {
   font-size: 0.73rem;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
   color: var(--muted);
   padding-bottom: 6px;
   border-bottom: 1px solid var(--line);
@@ -1264,8 +1255,9 @@ button:disabled {
 }
 
 .expiry-mode-pill.active {
-  border-color: rgba(61, 210, 162, 0.55);
-  background: linear-gradient(135deg, rgba(39, 123, 167, 0.92), rgba(39, 166, 116, 0.92));
+  border-color: transparent;
+  background: var(--accent);
+  color: #ffffff;
 }
 
 .screener-summary-strip {
@@ -1285,8 +1277,6 @@ button:disabled {
 .summary-pill span {
   display: block;
   font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
   color: var(--muted);
 }
 
@@ -1319,8 +1309,6 @@ button:disabled {
 
 .filter-grid span {
   font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
   color: var(--muted);
 }
 
@@ -1516,8 +1504,6 @@ button:disabled {
 
 .detail-metric-label {
   font-size: 0.68rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
   color: var(--muted);
 }
 
@@ -1541,8 +1527,6 @@ button:disabled {
 
 .detail-section-title {
   font-size: 0.78rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
   color: var(--muted);
   margin-bottom: 10px;
 }
@@ -1560,7 +1544,7 @@ button:disabled {
 }
 
 .check-card.passed {
-  border-color: rgba(61, 210, 162, 0.26);
+  border-color: rgba(79, 134, 232, 0.26);
 }
 
 .check-card.failed {
@@ -1626,17 +1610,17 @@ button:disabled {
   border-radius: var(--radius-md);
   border: 1px solid var(--line);
   padding: 18px;
-  background: linear-gradient(160deg, rgba(10, 29, 42, 0.92), rgba(8, 22, 32, 0.96));
+  background: var(--panel);
 }
 
 .selector-card-best {
-  border-color: rgba(61, 210, 162, 0.36);
-  box-shadow: inset 0 0 0 1px rgba(61, 210, 162, 0.08);
+  border-color: rgba(79, 134, 232, 0.36);
+  box-shadow: inset 0 0 0 1px rgba(79, 134, 232, 0.08);
 }
 
 .selector-card-candidate {
-  border-color: rgba(88, 166, 255, 0.32);
-  box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.07);
+  border-color: rgba(79, 134, 232, 0.32);
+  box-shadow: inset 0 0 0 1px rgba(79, 134, 232, 0.07);
 }
 
 .selector-card-watch {
@@ -1659,8 +1643,6 @@ button:disabled {
 .selector-eyebrow {
   color: var(--muted);
   font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
 }
 
 .selector-title-row {
@@ -1703,9 +1685,9 @@ button:disabled {
 }
 
 .selector-recommendation-candidate {
-  background: rgba(88, 166, 255, 0.12);
+  background: rgba(79, 134, 232, 0.12);
   color: #8fc8ff;
-  border-color: rgba(88, 166, 255, 0.24);
+  border-color: rgba(79, 134, 232, 0.24);
 }
 
 .selector-recommendation-watch {
@@ -1782,7 +1764,7 @@ button:disabled {
   border: 1px solid rgba(69, 101, 128, 0.46);
   border-radius: var(--radius-md);
   padding: 14px 16px;
-  background: linear-gradient(180deg, rgba(11, 31, 44, 0.92), rgba(8, 24, 35, 0.86));
+  background: var(--panel);
 }
 
 .selector-inline-evidence-strong {
@@ -1806,8 +1788,6 @@ button:disabled {
 
 .selector-inline-label {
   font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
   color: #8ea5b4;
 }
 
@@ -1846,8 +1826,6 @@ button:disabled {
   display: block;
   color: #8ea5b4;
   font-size: 0.68rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
 }
 
 .selector-inline-stat strong {
@@ -1894,14 +1872,18 @@ button:disabled {
 .evidence-item span {
   color: var(--muted);
   font-size: 0.74rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 
-.selector-metric strong,
+/* Numeric tiles stay mono for tabular feel; the decision-card values are words
+   (e.g. "Negative / Unclear"), so they read better in the sans. */
 .snapshot-item strong,
 .evidence-item strong {
   font-family: var(--font-mono);
+  font-size: 1.02rem;
+}
+
+.selector-metric strong {
+  font-weight: 700;
   font-size: 1.02rem;
 }
 
@@ -1923,17 +1905,15 @@ button:disabled {
 .selector-thesis-block,
 .selector-risk-block,
 .selector-panel {
-  border: 1px solid rgba(74, 108, 128, 0.26);
-  border-radius: var(--radius-sm);
-  background: rgba(8, 22, 33, 0.5);
-  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--panel);
+  padding: 14px 16px;
 }
 
 .selector-subtitle {
   color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  font-size: 0.72rem;
+  font-size: 0.78rem;
 }
 
 .selector-thesis-block p,
@@ -1976,8 +1956,6 @@ button:disabled {
   align-items: center;
   color: var(--text);
   font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
   font-size: 0.88rem;
 }
 
@@ -1995,7 +1973,7 @@ button:disabled {
 }
 
 .selector-panel-nested {
-  background: rgba(5, 18, 28, 0.34);
+  background: var(--surface-sunken);
 }
 
 .selector-panel-header {
@@ -2008,9 +1986,8 @@ button:disabled {
 
 .selector-panel-header h3 {
   margin: 0;
-  font-size: 0.95rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  font-size: 1rem;
+  font-weight: 700;
 }
 
 .selector-panel-header span {
@@ -2027,10 +2004,10 @@ button:disabled {
   grid-template-columns: minmax(0, 1.5fr) minmax(260px, 0.8fr);
   gap: 14px;
   margin-bottom: 14px;
-  border: 1px solid rgba(72, 103, 123, 0.36);
-  border-radius: var(--radius-sm);
-  padding: 14px;
-  background: linear-gradient(180deg, rgba(10, 29, 42, 0.92), rgba(7, 21, 31, 0.88));
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  background: var(--panel);
 }
 
 .regime-banner-supportive {
@@ -2046,10 +2023,8 @@ button:disabled {
 }
 
 .regime-banner-label {
-  color: #8ea5b4;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  color: var(--muted);
+  font-size: 0.78rem;
 }
 
 .regime-banner strong,
@@ -2076,9 +2051,8 @@ button:disabled {
 }
 
 .regime-confidence-chip {
-  border: 1px solid rgba(72, 103, 123, 0.36);
   border-radius: var(--radius-sm);
-  background: rgba(10, 27, 39, 0.72);
+  background: var(--surface-sunken);
   padding: 12px;
 }
 
@@ -2106,18 +2080,15 @@ button:disabled {
 }
 
 .regime-stat {
-  border: 1px solid rgba(74, 108, 128, 0.26);
   border-radius: var(--radius-sm);
-  background: rgba(8, 22, 33, 0.5);
+  background: var(--surface-sunken);
   padding: 12px;
 }
 
 .regime-stat span,
 .durability-card span {
-  color: #8ea5b4;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-size: 0.78rem;
 }
 
 .regime-stat strong {
@@ -2147,18 +2118,15 @@ button:disabled {
 
 .narrative-item,
 .outcome-item {
-  border: 1px solid rgba(74, 108, 128, 0.26);
   border-radius: var(--radius-sm);
-  background: rgba(8, 22, 33, 0.5);
+  background: var(--surface-sunken);
   padding: 12px;
 }
 
 .narrative-item span,
 .outcome-item span {
-  color: #8ea5b4;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-size: 0.78rem;
 }
 
 .narrative-note {
@@ -2172,9 +2140,8 @@ button:disabled {
 .durability-card,
 .advantage-card,
 .sensitivity-warning-box {
-  border: 1px solid rgba(74, 108, 128, 0.26);
   border-radius: var(--radius-sm);
-  background: rgba(8, 22, 33, 0.5);
+  background: var(--surface-sunken);
   padding: 12px;
 }
 
@@ -2297,8 +2264,8 @@ button:disabled {
   align-items: center;
   padding: 2px 6px;
   border-radius: 999px;
-  background: rgba(88, 166, 255, 0.1);
-  border: 1px solid rgba(88, 166, 255, 0.22);
+  background: rgba(79, 134, 232, 0.1);
+  border: 1px solid rgba(79, 134, 232, 0.22);
   color: #8fc8ff;
   font-size: 0.68rem;
   text-transform: uppercase;
@@ -2316,7 +2283,7 @@ button:disabled {
 }
 
 .structure-row-runner-up {
-  background: rgba(88, 166, 255, 0.04);
+  background: rgba(79, 134, 232, 0.04);
 }
 
 .structure-row-ineligible {
@@ -2342,15 +2309,13 @@ button:disabled {
 .calibration-callout {
   border: 1px solid rgba(61, 125, 183, 0.42);
   border-radius: var(--radius-sm);
-  background: linear-gradient(180deg, rgba(13, 35, 52, 0.92), rgba(10, 28, 40, 0.86));
+  background: var(--surface-sunken);
   padding: 12px 13px;
 }
 
 .calibration-callout-label {
   color: #8ea5b4;
   font-size: 0.68rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 
 .calibration-callout strong,
@@ -2423,12 +2388,12 @@ button:disabled {
   width: 100%;
   min-height: 10px;
   border-radius: 8px 8px 2px 2px;
-  background: linear-gradient(180deg, rgba(64, 127, 180, 0.95), rgba(44, 90, 128, 0.75));
+  background: var(--accent);
   border: 1px solid rgba(78, 133, 176, 0.45);
 }
 
 .calibration-bar-item.active .calibration-bar-fill {
-  background: linear-gradient(180deg, rgba(88, 182, 255, 0.98), rgba(52, 129, 196, 0.82));
+  background: var(--accent-2-bright);
   border-color: rgba(116, 193, 255, 0.72);
   box-shadow: 0 0 0 1px rgba(98, 180, 255, 0.22);
 }
@@ -2464,8 +2429,8 @@ button:disabled {
 }
 
 .calibration-observational-row.active {
-  border-color: rgba(88, 166, 255, 0.55);
-  box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.16);
+  border-color: rgba(79, 134, 232, 0.55);
+  box-shadow: inset 0 0 0 1px rgba(79, 134, 232, 0.16);
 }
 
 .calibration-observational-row strong {
@@ -2513,8 +2478,6 @@ button:disabled {
 .decision-breakdown-head span {
   color: #8ea5b4;
   font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 
 .decision-stability-card-stable {
@@ -2668,8 +2631,6 @@ button:disabled {
   display: block;
   color: var(--muted);
   font-size: 0.72rem;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
 }
 
 .ledger-summary-pill strong,
@@ -2765,7 +2726,7 @@ button:disabled {
 .data-quality-block {
   border-color: rgba(109, 139, 169, 0.24);
   background:
-    radial-gradient(circle at top right, rgba(88, 166, 255, 0.06), transparent 34%),
+    radial-gradient(circle at top right, rgba(79, 134, 232, 0.06), transparent 34%),
     rgba(4, 16, 24, 0.46);
 }
 
@@ -2793,8 +2754,6 @@ button:disabled {
   display: block;
   color: var(--muted);
   font-size: 0.72rem;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
 }
 
 .data-quality-card strong,

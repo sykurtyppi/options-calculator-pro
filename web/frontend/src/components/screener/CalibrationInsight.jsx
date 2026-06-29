@@ -85,7 +85,7 @@ export default function CalibrationInsight({ apiBase, score }) {
   return (
     <div style={{ marginTop: 12 }}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
-        <span style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+        <span style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--muted)' }}>
           IV Expansion Calibration
         </span>
         <span
