@@ -19,7 +19,24 @@ from web.api.edge_engine import (
     _normalize_release_timing,
     _simulate_pre_earnings_calendar_trade,
     _summarize_pre_earnings_expansion,
+    _term_structure_from_mda_chain,
 )
+
+_TERM_STRUCTURE_TUPLE_LEN = 13
+
+
+def _one_expiry_chain(exp="2026-07-18"):
+    """A single-expiry call+put chain (yields <2 term-structure points)."""
+    return pd.DataFrame([
+        {"expiration_date": exp, "strike": 100, "option_type": "call",
+         "implied_volatility": 0.30, "bid": 1.0, "ask": 1.1, "open_interest": 10,
+         "volume": 5, "last_price": 1.05},
+        {"expiration_date": exp, "strike": 100, "option_type": "put",
+         "implied_volatility": 0.31, "bid": 1.0, "ask": 1.1, "open_interest": 10,
+         "volume": 5, "last_price": 1.05},
+    ])
+
+
 
 
 class _StubExpansionFeatureStore:
@@ -532,6 +549,20 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         profile = _historical_earnings_move_profile(close=prices, earnings_events=[])
         self.assertEqual(profile["source"], "daily_fallback")
         self.assertNotIn("raw_events", profile)
+
+    def test_term_structure_mda_returns_13_tuple_on_thin_and_empty_paths(self):
+        """Regression (audit HIGH): analyze_single_ticker unpacks 13 values from
+        the term-structure tuple, but the empty and thin (<2 expiries) early
+        returns used to be 11-wide — so a thin/illiquid chain crashed the whole
+        analyze request with a ValueError → HTTP 400. Every path must be 13-wide.
+        """
+        # Empty chain → empty_return (was 11).
+        self.assertEqual(len(_term_structure_from_mda_chain(pd.DataFrame(), 100.0)),
+                         _TERM_STRUCTURE_TUPLE_LEN)
+        # Single expiry → the `len(days) < 2` early return (was 11 — the bug).
+        thin = _term_structure_from_mda_chain(_one_expiry_chain(), 100.0)
+        self.assertEqual(len(thin), _TERM_STRUCTURE_TUPLE_LEN)
+        self.assertLess(len(thin[0]), 2)  # days has <2 points → thin branch taken
 
     def test_historical_profile_bmo_alignment_uses_prev_to_event_close(self):
         dates = pd.bdate_range("2024-01-02", periods=80)

@@ -107,6 +107,13 @@ _OOS_SUBMIT_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_OOS_SUBMIT_RATE_
 _SCREENER_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_SCREENER_RATE_LIMIT_PER_MIN", "6")))
 _SCREENER_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_SCREENER_RATE_LIMIT_PER_HOUR", "40")))
 
+# /api/edge/analyze also fans out to the external provider (one symbol per call).
+# Lighter than the screener (single symbol, not a universe sweep) so the limit is
+# more permissive, but it still must be bounded — an auth'd loop here burns
+# provider quota + CPU just like the screener path.
+_ANALYZE_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("OPTIONS_ANALYZE_RATE_LIMIT_PER_MIN", "20")))
+_ANALYZE_RATE_LIMIT_PER_HOUR = max(1, int(os.getenv("OPTIONS_ANALYZE_RATE_LIMIT_PER_HOUR", "200")))
+
 # (bucket_name, ip) -> list of recent attempt timestamps. Same shape used for
 # all rate-limited endpoints; keyed by bucket so /login attempts can't be
 # counted against /api/ml/train, etc.
@@ -1090,7 +1097,15 @@ def health() -> Dict[str, Any]:
 
 
 @app.post("/api/edge/analyze", response_model=EdgeAnalyzeResponse)
-def analyze_edge(request: EdgeAnalyzeRequest) -> EdgeAnalyzeResponse:
+def analyze_edge(request: EdgeAnalyzeRequest, http_request: Request = None) -> EdgeAnalyzeResponse:
+    if not _check_rate_limit(
+        "analyze", _client_ip(http_request),
+        _ANALYZE_RATE_LIMIT_PER_MIN, _ANALYZE_RATE_LIMIT_PER_HOUR,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Analyze rate limit exceeded. Wait a moment and try again.",
+        )
     try:
         snapshot = analyze_single_ticker(request.symbol, mda_client=_get_mda_client())
         return EdgeAnalyzeResponse(

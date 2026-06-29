@@ -10,7 +10,7 @@ import WhyStructurePanel from './components/edge/WhyStructurePanel'
 import StructureComparisonTable from './components/edge/StructureComparisonTable'
 import VolSnapshotPanel from './components/edge/VolSnapshotPanel'
 import EvidenceQualityPanel from './components/edge/EvidenceQualityPanel'
-import { Badge, Metric, SectionTitle } from './components/common/DisplayAtoms'
+import { Metric, SectionTitle } from './components/common/DisplayAtoms'
 import {
   releaseTimeBadge,
   dataSourceBadge,
@@ -214,7 +214,7 @@ export default function App() {
   const recommendationValue = result
     ? (noTradeBlocked ? 'No Trade' : result?.recommendation || '--')
     : '--'
-  const confidenceValue = result
+  const confidenceValue = result && Number.isFinite(Number(result.confidence_pct))
     ? `${Number(result.confidence_pct).toFixed(1)}%`
     : '--'
 
@@ -440,8 +440,6 @@ export default function App() {
 
   return (
     <div className="page-shell">
-      <div className="bg-orb bg-orb-a" />
-      <div className="bg-orb bg-orb-b" />
       <main className="terminal-panel">
 
         {/* ── Header ── */}

@@ -32,12 +32,6 @@ body {
   margin-inline: auto;
 }
 
-/* Background orbs removed for a flat, clean base — they muddied the surface.
-   Kept as no-ops so the JSX nodes render harmlessly. */
-.bg-orb {
-  display: none;
-}
-
 /* The outer wrapper is now a transparent centering container, not a giant card.
    Hierarchy comes from the inner panels reading as elevated surfaces on the flat
    page — not from one big bordered box holding everything. */

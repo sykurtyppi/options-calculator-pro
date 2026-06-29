@@ -501,6 +501,23 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(statuses[:3], [401, 401, 401])
         self.assertEqual(statuses[3], 429)
 
+    def test_analyze_rate_limit_blocks_provider_fanout_loop(self):
+        """Regression (audit): /api/edge/analyze fans out to the external provider
+        on every call (like the screener), so it must be rate-limited. With the
+        per-minute limit patched to 2, the 3rd call returns 429 — before reaching
+        the (here mocked-failing) handler."""
+        app_module._reset_rate_limits()
+        with patch.object(app_module, "analyze_single_ticker", side_effect=ValueError("boom")), \
+             patch.object(app_module, "_ANALYZE_RATE_LIMIT_PER_MIN", 2), \
+             patch.object(app_module, "_ANALYZE_RATE_LIMIT_PER_HOUR", 100):
+            statuses = [
+                self.client.post("/api/edge/analyze", json={"symbol": "AAPL"}).status_code
+                for _ in range(3)
+            ]
+        # First two reach the handler (400 — mocked failure), third is rate-limited.
+        self.assertEqual(statuses[:2], [400, 400])
+        self.assertEqual(statuses[2], 429)
+
     def test_login_rate_limit_blocks_even_successful_attempts(self):
         """Brute force can't hide behind an eventual win — successful logins
         still count toward the limit."""

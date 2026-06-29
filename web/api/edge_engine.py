@@ -1650,9 +1650,13 @@ def _term_structure_from_mda_chain(
     One chain fetch covers all expirations simultaneously, saving API credits
     vs. the yfinance approach (which fetches one expiry at a time).
 
-    Returns the same 11-element tuple as the legacy _term_structure_points().
+    Returns the same 13-element tuple as the legacy _term_structure_points()
+    (the trailing two are the term-structure-slope near/far DTE endpoints; both
+    None on the thin/empty early-return paths). All return paths MUST stay 13
+    wide — the caller unpacks 13 (see analyze_single_ticker), so a short tuple
+    crashes the whole analysis on a thin chain.
     """
-    empty_return = ([], [], np.nan, np.nan, 0.0, 0.0, None, None, None, None, None)
+    empty_return = ([], [], np.nan, np.nan, 0.0, 0.0, None, None, None, None, None, None, None)
 
     if chain_df is None or chain_df.empty or "expiration_date" not in chain_df.columns:
         return empty_return
@@ -1759,6 +1763,7 @@ def _term_structure_from_mda_chain(
             days, ivs, np.nan, np.nan, 0.0, 0.0,
             near_term_implied_move_pct, near_term_spread_pct,
             near_term_dte, None, near_term_liquidity_proxy,
+            None, None,
         )
 
     order = np.argsort(np.array(days, dtype=float))
@@ -2046,7 +2051,8 @@ def _term_structure_points_yf(
 
     if len(days) < 2:
         return (days, ivs, np.nan, np.nan, 0.0, 0.0, near_term_implied_move_pct,
-                near_term_spread_pct, near_term_dte, None, near_term_liquidity_proxy)
+                near_term_spread_pct, near_term_dte, None, near_term_liquidity_proxy,
+                None, None)
 
     order = np.argsort(np.array(days, dtype=float))
     days_arr = np.array(days, dtype=float)[order]
