@@ -68,8 +68,8 @@ export default function CalendarSpreadChart({ calPayoff }) {
           style={{ cursor: 'crosshair', userSelect: 'none' }}
           {...zoom.handlers}
         >
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
-          <XAxis
+          <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
+          <XAxis axisLine={false} tickLine={false}
             dataKey="move"
             type="number"
             domain={zoom.xDomain}
@@ -78,7 +78,7 @@ export default function CalendarSpreadChart({ calPayoff }) {
             tick={{ ...axisTick, fontSize: 10 }}
             label={{ value: 'Underlying Move at Expiry', position: 'insideBottom', offset: -8, fill: CHART.axis, fontSize: 10 }}
           />
-          <YAxis
+          <YAxis axisLine={false} tickLine={false}
             domain={zoom.yDomain}
             allowDataOverflow
             tickFormatter={(v) => `$${v.toFixed(2)}`}

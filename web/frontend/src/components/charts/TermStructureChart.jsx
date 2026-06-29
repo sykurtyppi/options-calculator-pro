@@ -39,8 +39,8 @@ export default function TermStructureChart({ days, ivs, earningsDte }) {
       <div className="vol-chart-label">Vol Term Structure (DTE vs IV%)</div>
       <ResponsiveContainer width="100%" height={210}>
         <LineChart data={data} margin={{ top: 24, right: 18, bottom: 4, left: 4 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
-          <XAxis
+          <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
+          <XAxis axisLine={false} tickLine={false}
             dataKey="dte"
             type="number"
             domain={['dataMin', 'dataMax']}
@@ -48,7 +48,7 @@ export default function TermStructureChart({ days, ivs, earningsDte }) {
             tick={axisTick}
             label={{ value: 'DTE', position: 'insideBottomRight', offset: -4, fill: CHART.axis, fontSize: 11 }}
           />
-          <YAxis
+          <YAxis axisLine={false} tickLine={false}
             domain={[yMin, yMax]}
             allowDecimals={false}
             tickFormatter={(v) => `${Math.round(v)}%`}

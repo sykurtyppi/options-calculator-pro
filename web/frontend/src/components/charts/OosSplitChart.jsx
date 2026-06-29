@@ -51,13 +51,13 @@ export default function OosSplitChart({ splitsDetail }) {
       <div className="vol-chart-label">OOS Per-Split P&amp;L + Cumulative ($)</div>
       <ResponsiveContainer width="100%" height={210}>
         <ComposedChart data={data} margin={{ top: 8, right: 18, bottom: 4, left: 8 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
-          <XAxis
+          <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
+          <XAxis axisLine={false} tickLine={false}
             dataKey="label"
             tick={{ ...axisTick, fontSize: 10 }}
             interval="preserveStartEnd"
           />
-          <YAxis
+          <YAxis axisLine={false} tickLine={false}
             tickFormatter={(v) => `$${v}`}
             tick={{ ...axisTick, fontSize: 10 }}
             domain={[-maxAbs - padY, maxAbs + padY]}
