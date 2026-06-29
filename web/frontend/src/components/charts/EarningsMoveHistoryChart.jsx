@@ -30,9 +30,9 @@ export default function EarningsMoveHistoryChart({ data, impliedMove }) {
       <div className="vol-chart-label">Actual move % by earnings date · dashed = implied now</div>
       <ResponsiveContainer width="100%" height={210}>
         <BarChart data={data} margin={{ top: 24, right: 18, bottom: 4, left: 4 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" vertical={false} />
-          <XAxis dataKey="label" tick={axisTick} interval={0} />
-          <YAxis
+          <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
+          <XAxis axisLine={false} tickLine={false} dataKey="label" tick={axisTick} interval={0} />
+          <YAxis axisLine={false} tickLine={false}
             domain={[0, yMax]}
             allowDecimals={false}
             tickFormatter={(v) => `${Math.round(v)}%`}
