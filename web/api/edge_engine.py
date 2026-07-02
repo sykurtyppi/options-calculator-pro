@@ -3070,7 +3070,8 @@ def analyze_single_ticker(
         iv_rv=_safe_float(iv_rv, 1.10),
     )
     # Combined calibration factor — informational only; selector owns the final confidence value.
-    # Exposed as "confidence_calibration_mult" in metrics so the components can be audited,
+    # Exposed as "confidence_calibration_mult_informational" in metrics (the "_informational"
+    # suffix makes the key itself say it's audit-only) so the components can be inspected,
     # but NOT applied to confidence_pct (selector_output.confidence_pct is the authoritative output).
     _calibration_mult = float(np.clip(
         ticker_tier_mult * kurtosis_conf_mult * crush_calibration_mult * _ml_mult,
@@ -3658,20 +3659,22 @@ def analyze_single_ticker(
         # Fix 4: calendar spread viability
         "calendar_spread_quality": calendar_spread_quality,
         "calendar_be_vs_implied": _cal_be_vs_implied,
-        # Fix 1: ticker tier
+        # Fix 1: ticker tier. NOTE: the *_mult_informational keys are AUDIT-ONLY —
+        # computed for inspection, never applied to confidence_pct (the selector owns
+        # that). The "_informational" suffix makes each key state that outright.
         "ticker_tier": ticker_tier,
-        "ticker_tier_mult": ticker_tier_mult,
+        "ticker_tier_mult_informational": ticker_tier_mult,
         "market_cap_usd": _market_cap,
         # Fix 2: kurtosis penalty
         "move_kurtosis": move_kurtosis if move_kurtosis != 0.0 else None,
-        "kurtosis_conf_mult": kurtosis_conf_mult,
+        "kurtosis_conf_mult_informational": kurtosis_conf_mult,
         # Fix 5: historical crush calibration
         "hist_crush_rate": hist_crush_rate if np.isfinite(hist_crush_rate) else None,
-        "crush_calibration_mult": crush_calibration_mult,
+        "crush_calibration_mult_informational": crush_calibration_mult,
         # ML crush probability (None when model not yet trained)
         "ml_crush_prob": round(_ml_crush_prob, 3) if _ml_crush_prob is not None else None,
-        # Combined confidence calibration
-        "confidence_calibration_mult": round(_calibration_mult, 3),
+        # Combined confidence calibration — informational only, NOT applied.
+        "confidence_calibration_mult_informational": round(_calibration_mult, 3),
         "confidence_pct_raw": round(confidence_pct_raw, 2),
         "confidence_score_source": "shared_selector_confidence_pct",
         "calibration_phase": calibration_diag.get("phase") if calibration_diag else None,
