@@ -214,10 +214,14 @@ def _compute_crush_gate_signals(
     # Run the trained crush classifier if available
     try:
         from web.api.edge_engine import _ml_crush_probability
+        from services.crush_features import NO_RV_IV_RV_RATIO
         prob, _mult = _ml_crush_probability(
             near_iv=front_iv,
             near_back_ratio=nbr,
-            iv_rv=front_iv * 0.75,  # fallback iv_rv (same as training — RV data empty)
+            # No RV series here — use the SAME no-RV ratio the model trained on
+            # (front_iv / (front_iv * 0.75) = 1.333), NOT `front_iv * 0.75`, which
+            # fed the classifier a completely different feature.
+            iv_rv=NO_RV_IV_RV_RATIO,
         )
         if prob is not None:
             result["crush_prob"] = round(prob, 4)

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import asyncio
 
 from utils.logger import setup_logger as get_logger
+from services import crush_features as _CF
 from services.execution_cost_model import ExecutionCostModel
 
 # Optional MarketData.app client — imported lazily so the module loads even
@@ -5165,25 +5166,27 @@ class InstitutionalMLDatabase:
             pre_dt = row["pre_capture_date"]
             sym_p = df_prices[df_prices["symbol"] == sym].copy()
             if sym_p.empty or pd.isnull(pre_dt):
-                rv_rows.append(float(row["pre_front_iv"]) * 0.75)
+                rv_rows.append(float(row["pre_front_iv"]) * _CF.RV_FALLBACK_FACTOR)
                 continue
             sym_p = sym_p.copy()
             sym_p["days_away"] = (sym_p["date"] - pre_dt).abs().dt.days
             close = sym_p[sym_p["days_away"] < 5].nsmallest(1, "days_away")
             if close.empty:
-                rv_rows.append(float(row["pre_front_iv"]) * 0.75)
+                rv_rows.append(float(row["pre_front_iv"]) * _CF.RV_FALLBACK_FACTOR)
             else:
                 rv_rows.append(float(close["realized_vol_30d"].iloc[0]))
 
         df_labels = df_labels.copy()
         df_labels["realized_vol_30d"] = rv_rows
+        # Clip bounds + floors are shared with serving (services.crush_features)
+        # so the train/serve feature transform can't drift.
         df_labels["near_back_ratio"] = (
-            df_labels["pre_front_iv"] / df_labels["pre_back_iv"].clip(lower=0.01)
-        ).clip(0.50, 4.0)
-        df_labels["log_front_iv"] = np.log(df_labels["pre_front_iv"].clip(lower=0.01))
+            df_labels["pre_front_iv"] / df_labels["pre_back_iv"].clip(lower=_CF.IV_FLOOR)
+        ).clip(*_CF.NBR_CLIP)
+        df_labels["log_front_iv"] = np.log(df_labels["pre_front_iv"].clip(lower=_CF.IV_FLOOR))
         df_labels["iv_rv_approx"] = (
-            df_labels["pre_front_iv"] / df_labels["realized_vol_30d"].clip(lower=0.05)
-        ).clip(0.50, 5.0)
+            df_labels["pre_front_iv"] / df_labels["realized_vol_30d"].clip(lower=_CF.RV_FLOOR)
+        ).clip(*_CF.IV_RV_CLIP)
         # Crush threshold for the binary classification target.
         #
         # The original threshold of -10% was empirically degenerate on the labeled
