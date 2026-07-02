@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from services.crush_features import crush_feature_vector
 from services.dividend_yields import get_dividend_yield
 from services.iv_term_structure import bounded_interp
 from services.earnings_event_service import resolve_upcoming_earnings_event
@@ -108,10 +109,9 @@ def _ml_crush_probability(
     if clf is None or scaler is None:
         return None, 1.0
     try:
-        nb = float(near_back_ratio) if np.isfinite(float(near_back_ratio)) else 1.10
-        lniv = float(np.log(max(float(near_iv), 0.01)))
-        ivr = float(iv_rv) if np.isfinite(float(iv_rv)) else 1.10
-        feat = np.array([[nb, lniv, ivr]])
+        # Shared transform applies the SAME clips the model was trained with —
+        # without them, out-of-range NBR/iv_rv saturate predict_proba to 1.0.
+        feat = np.array([crush_feature_vector(near_iv, near_back_ratio, iv_rv)])
         feat_scaled = scaler.transform(feat)
         prob = float(clf.predict_proba(feat_scaled)[0][1])
         mult = float(np.clip(0.85 + 0.30 * prob, 0.85, 1.15))

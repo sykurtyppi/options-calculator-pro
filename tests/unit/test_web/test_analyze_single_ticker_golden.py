@@ -136,6 +136,8 @@ def _run_watch_scenario():
         why_not_others={"otm_strangle": ["Trails winner."]}, runner_up_structures=["otm_strangle"],
         data_quality="high", data_quality_score=0.91)
     with patch.object(edge_engine.yf, "Ticker", return_value=ticker), \
+         patch.object(edge_engine, "_crush_clf", None), \
+         patch.object(edge_engine, "_crush_scaler", None), \
          patch.object(edge_engine, "build_vol_snapshot", return_value=snapshot), \
          patch.object(edge_engine, "build_structure_scorecards", return_value=scorecards), \
          patch.object(edge_engine, "select_best_structure", return_value=selector), \

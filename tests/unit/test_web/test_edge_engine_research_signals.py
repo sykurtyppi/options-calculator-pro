@@ -1113,5 +1113,45 @@ class TestAnalyzeSingleTickerDividendYieldCallChain(unittest.TestCase):
         )
 
 
+class TestMlCrushProbabilityServeClips(unittest.TestCase):
+    """Regression (audit H1): serving must apply the SAME feature clips as
+    training. Pre-fix, _ml_crush_probability fed raw NBR/iv_rv into the scaler,
+    so out-of-range inputs produced z-scores the model never saw and
+    predict_proba saturated. Post-fix, any NBR beyond the train clip bound must
+    yield the SAME probability as the bound itself (identical clipped vector).
+
+    Uses a real (tiny) sklearn model so the whole scaler→clf path is exercised —
+    the golden master only ever covers the model-absent branch.
+    """
+
+    def test_out_of_range_nbr_equals_clip_boundary_probability(self):
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.preprocessing import StandardScaler
+        except ImportError:
+            self.skipTest("scikit-learn not installed")
+        import numpy as np
+        rng = np.random.RandomState(0)
+        X = rng.uniform([0.5, -3.0, 0.5], [4.0, 0.0, 5.0], size=(80, 3))
+        y = (X[:, 0] > 1.5).astype(int)  # crush ~ high NBR, like the real model
+        scaler = StandardScaler().fit(X)
+        clf = LogisticRegression().fit(scaler.transform(X), y)
+
+        with patch.object(edge_engine, "_crush_clf", clf), \
+             patch.object(edge_engine, "_crush_scaler", scaler):
+            p_bound, _ = edge_engine._ml_crush_probability(
+                near_iv=0.30, near_back_ratio=4.0, iv_rv=1.333)
+            p_wild, _ = edge_engine._ml_crush_probability(
+                near_iv=0.30, near_back_ratio=50.0, iv_rv=1.333)
+            p_sane, _ = edge_engine._ml_crush_probability(
+                near_iv=0.30, near_back_ratio=1.10, iv_rv=1.333)
+
+        self.assertIsNotNone(p_bound)
+        # The fix: out-of-range NBR clips to the bound → identical probability.
+        self.assertAlmostEqual(p_wild, p_bound, places=9)
+        # And a sane mid-range NBR still differs (the clip isn't flattening everything).
+        self.assertNotAlmostEqual(p_sane, p_bound, places=3)
+
+
 if __name__ == "__main__":
     unittest.main()
