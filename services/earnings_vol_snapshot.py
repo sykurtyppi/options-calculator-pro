@@ -9,6 +9,10 @@ import math
 import numpy as np
 import pandas as pd
 
+from services.earnings_move_profile import (
+    compute_earnings_move_profile as _compute_earnings_move_profile,
+    normalize_release_timing as _normalize_release_timing,
+)
 from services.event_vol_decomposition import decompose_event_vol
 from services.iv_term_structure import (
     INTERP_INSUFFICIENT_POINTS,
@@ -576,27 +580,8 @@ def _safe_float(value: Any, default: float = np.nan) -> float:
         return float(default)
 
 
-def _normalize_release_timing(value: Any) -> str:
-    if isinstance(value, pd.Timestamp):
-        value = value.to_pydatetime()
-    if isinstance(value, datetime):
-        if any((value.hour, value.minute, value.second, value.microsecond)):
-            total_minutes = (value.hour * 60) + value.minute
-            if total_minutes < (9 * 60 + 30):
-                return "before market open"
-            if total_minutes >= (16 * 60):
-                return "after market close"
-            return "during market hours"
-    text = str(value or "").strip().lower()
-    if not text:
-        return "unknown"
-    if "before" in text or text in {"bmo", "pre", "am"}:
-        return "before market open"
-    if "after" in text or text in {"amc", "post", "pm"}:
-        return "after market close"
-    if "during" in text or "intraday" in text:
-        return "during market hours"
-    return "unknown"
+# _normalize_release_timing is imported from services.earnings_move_profile
+# (canonical single source of truth) at the top of this module.
 
 
 def _normalize_price_frame(price_data: Any) -> Tuple[pd.DataFrame, Optional[str]]:
@@ -1107,109 +1092,23 @@ def _historical_earnings_move_profile(
     earnings_events: List[Any],
     as_of_date: date,
 ) -> _HistoricalMoveProfile:
-    empty = _HistoricalMoveProfile(
-        earnings_event_count=0,
-        sample_size=0,
-        median_move_pct=None,
-        avg_last4_move_pct=None,
-        p90_move_pct=None,
-        std_move_pct=None,
-        source="none",
+    """Thin adapter over the shared ``compute_earnings_move_profile`` (single
+    source of truth, shared with ``web/api/edge_engine.py``). Maps the canonical
+    profile to this module's ``_HistoricalMoveProfile`` shape (the snapshot does
+    not surface the unclipped raw moves / per-event records)."""
+    profile = _compute_earnings_move_profile(
+        close=close,
+        earnings_events=earnings_events,
+        as_of_date=as_of_date,
     )
-    if close is None or close.empty:
-        return empty
-
-    price_series = close.copy()
-    if isinstance(price_series.index, pd.DatetimeIndex):
-        idx = price_series.index.tz_localize(None) if price_series.index.tz is not None else price_series.index
-        price_series.index = idx.normalize()
-    price_series = price_series[~price_series.index.duplicated(keep="last")].sort_index()
-    index_arr = price_series.index.to_numpy()
-    if len(index_arr) < 10:
-        return empty
-
-    parsed_events: Dict[pd.Timestamp, Dict[str, Any]] = {}
-    cutoff = pd.Timestamp(as_of_date)
-    for item in earnings_events or []:
-        try:
-            if isinstance(item, Mapping):
-                event_ts_raw = item.get("event_date")
-                timing = _normalize_release_timing(item.get("release_timing"))
-            else:
-                event_ts_raw = item
-                timing = _normalize_release_timing(item)
-            if event_ts_raw is None:
-                continue
-            event_ts = pd.Timestamp(event_ts_raw).normalize()
-            if event_ts > cutoff:
-                continue
-            existing = parsed_events.get(event_ts)
-            if existing is None or existing.get("release_timing") == "unknown":
-                parsed_events[event_ts] = {"event_date": event_ts, "release_timing": timing}
-        except Exception:
-            continue
-
-    past_events = [parsed_events[key] for key in sorted(parsed_events.keys())]
-    event_moves: List[float] = []
-    for event in past_events[-24:]:
-        event_ts = pd.Timestamp(event["event_date"]).normalize()
-        release_timing = _normalize_release_timing(event.get("release_timing"))
-        event_loc = int(index_arr.searchsorted(event_ts.to_datetime64(), side="left"))
-        if event_loc >= len(index_arr):
-            continue
-        matched_event_session = pd.Timestamp(index_arr[event_loc]).normalize() == event_ts
-
-        if release_timing == "after market close":
-            if matched_event_session:
-                pre_loc = event_loc
-                post_loc = event_loc + 1
-            else:
-                pre_loc = event_loc - 1
-                post_loc = event_loc
-        else:
-            pre_loc = event_loc - 1
-            post_loc = event_loc
-
-        if pre_loc < 0 or post_loc < 0 or pre_loc >= len(index_arr) or post_loc >= len(index_arr):
-            continue
-
-        pre_px = _safe_float(price_series.iloc[pre_loc], np.nan)
-        post_px = _safe_float(price_series.iloc[post_loc], np.nan)
-        if not np.isfinite(pre_px) or not np.isfinite(post_px) or pre_px <= 0:
-            continue
-        move_pct = abs((post_px - pre_px) / pre_px) * 100.0
-        if np.isfinite(move_pct):
-            event_moves.append(float(move_pct))
-
-    if event_moves:
-        moves = np.array(event_moves, dtype=float)
-        if moves.size >= 5:
-            low_clip, high_clip = np.percentile(moves, [1.0, 99.0])
-            moves = np.clip(moves, low_clip, high_clip)
-        return _HistoricalMoveProfile(
-            earnings_event_count=int(len(event_moves)),
-            sample_size=int(moves.size),
-            median_move_pct=float(np.median(moves)),
-            avg_last4_move_pct=float(np.mean(moves[-4:])),
-            p90_move_pct=float(np.percentile(moves, 90)),
-            std_move_pct=float(np.std(moves, ddof=1)) if moves.size > 1 else 0.0,
-            source="earnings_history",
-        )
-
-    daily_moves = price_series.pct_change().abs().dropna().tail(126).to_numpy(dtype=float) * 100.0
-    if daily_moves.size == 0:
-        return empty
-    if daily_moves.size >= 5:
-        low_clip, high_clip = np.percentile(daily_moves, [1.0, 99.0])
-        daily_moves = np.clip(daily_moves, low_clip, high_clip)
     return _HistoricalMoveProfile(
-        earnings_event_count=0,
-        sample_size=int(daily_moves.size),
-        median_move_pct=float(np.median(daily_moves)),
-        avg_last4_move_pct=float(np.mean(daily_moves[-4:])),
-        p90_move_pct=float(np.percentile(daily_moves, 90)),
-        std_move_pct=float(np.std(daily_moves, ddof=1)) if daily_moves.size > 1 else 0.0,
-        source="daily_fallback",
+        earnings_event_count=profile.earnings_event_count,
+        sample_size=profile.sample_size,
+        median_move_pct=profile.median_move_pct,
+        avg_last4_move_pct=profile.avg_last4_move_pct,
+        p90_move_pct=profile.p90_move_pct,
+        std_move_pct=profile.std_move_pct,
+        source=profile.source,
     )
 
 

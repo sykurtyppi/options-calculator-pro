@@ -199,6 +199,12 @@ def _utc_today_date():
 # _safe_float is preserved here as an alias so every existing call
 # site below works unchanged.
 from services.candidate_shadow_outcome import safe_float as _safe_float  # noqa: E402
+# Shared historical earnings-move computation (single source of truth). The
+# private aliases keep every existing call site below working unchanged.
+from services.earnings_move_profile import (  # noqa: E402
+    compute_earnings_move_profile as _compute_earnings_move_profile,
+    normalize_release_timing as _normalize_release_timing,
+)
 
 
 def _get_feature_store() -> Optional[Any]:
@@ -1504,27 +1510,8 @@ def _nearest_atm_option_stats(
     }
 
 
-def _normalize_release_timing(value: Any) -> str:
-    if isinstance(value, pd.Timestamp):
-        value = value.to_pydatetime()
-    if isinstance(value, datetime):
-        if any((value.hour, value.minute, value.second, value.microsecond)):
-            total_minutes = (value.hour * 60) + value.minute
-            if total_minutes < (9 * 60 + 30):
-                return "before market open"
-            if total_minutes >= (16 * 60):
-                return "after market close"
-            return "during market hours"
-    text = str(value or "").strip().lower()
-    if not text:
-        return "unknown"
-    if "before" in text or text in {"bmo", "pre", "am"}:
-        return "before market open"
-    if "after" in text or text in {"amc", "post", "pm"}:
-        return "after market close"
-    if "during" in text or "intraday" in text:
-        return "during market hours"
-    return "unknown"
+# _normalize_release_timing is imported from services.earnings_move_profile
+# (canonical single source of truth) near the top of this module.
 
 
 def _nearest_common_strike_pair_stats(
@@ -2197,133 +2184,36 @@ def _historical_earnings_move_profile(
     earnings_events: list of either:
                      - pandas timestamps (legacy compatibility), or
                      - dicts with {"event_date": Timestamp, "release_timing": str}
+
+    Thin adapter over the shared ``compute_earnings_move_profile`` (single
+    source of truth, shared with the vol snapshot). Maps the canonical profile
+    to this path's dict shape: ``event_count`` is the observation count, and the
+    unclipped ``raw_moves_pct`` / ``raw_events`` are exposed ONLY on the
+    earnings_history path (kurtosis / crush-rate + the "last N earnings" panel).
     """
-    empty = {
-        "event_count": 0,
-        "median_move_pct": None,
-        "p90_move_pct": None,
-        "avg_last4_move_pct": None,
-        "std_move_pct": None,
-        "source": "none",
-    }
-
-    if close.empty:
-        return empty
-
-    price_series = close.copy()
-    if isinstance(price_series.index, pd.DatetimeIndex):
-        idx = price_series.index
-        if idx.tz is not None:
-            idx = idx.tz_localize(None)
-        price_series.index = idx.normalize()
-    price_series = price_series[~price_series.index.duplicated(keep="last")].sort_index()
-    index_arr = price_series.index.to_numpy()
-    if len(index_arr) < 10:
-        return empty
-
-    today = pd.Timestamp(_utc_today_date())
-    parsed_events: Dict[pd.Timestamp, Dict[str, Any]] = {}
-    for item in earnings_events or []:
-        try:
-            if isinstance(item, dict):
-                event_ts_raw = item.get("event_date")
-                timing = _normalize_release_timing(item.get("release_timing"))
-            else:
-                # Raw timestamp (not a dict) — infer BMO/AMC from time-of-day
-                # instead of silently collapsing to "unknown".
-                event_ts_raw = item
-                timing = _normalize_release_timing(item)
-            if event_ts_raw is None:
-                continue
-            event_ts = pd.Timestamp(event_ts_raw).normalize()
-            if event_ts > today:
-                continue
-            existing = parsed_events.get(event_ts)
-            if existing is None or existing.get("release_timing") == "unknown":
-                parsed_events[event_ts] = {
-                    "event_date": event_ts,
-                    "release_timing": timing,
-                }
-        except Exception:
-            continue
-
-    past_events = [parsed_events[key] for key in sorted(parsed_events.keys())]
-    event_moves: List[float] = []
-    # Per-event records (date + actual move) for the "last N earnings" UI panel.
-    # Kept UNCLIPPED — this is what the stock actually did, not a stat input.
-    event_records: List[Dict[str, Any]] = []
-
-    for event in past_events[-24:]:
-        event_ts = pd.Timestamp(event["event_date"]).normalize()
-        release_timing = _normalize_release_timing(event.get("release_timing"))
-        event_loc = int(index_arr.searchsorted(event_ts.to_datetime64(), side="left"))
-        if event_loc >= len(index_arr):
-            continue
-        matched_event_session = pd.Timestamp(index_arr[event_loc]).normalize() == event_ts
-
-        if release_timing == "after market close":
-            if matched_event_session:
-                pre_loc = event_loc
-                post_loc = event_loc + 1
-            else:
-                pre_loc = event_loc - 1
-                post_loc = event_loc
-        else:
-            pre_loc = event_loc - 1
-            post_loc = event_loc
-
-        if pre_loc < 0 or post_loc < 0 or pre_loc >= len(index_arr) or post_loc >= len(index_arr):
-            continue
-
-        pre_px = _safe_float(price_series.iloc[pre_loc], np.nan)
-        post_px = _safe_float(price_series.iloc[post_loc], np.nan)
-        if not np.isfinite(pre_px) or not np.isfinite(post_px) or pre_px <= 0:
-            continue
-        move_pct = abs((post_px - pre_px) / pre_px) * 100.0
-        if np.isfinite(move_pct):
-            event_moves.append(float(move_pct))
-            event_records.append({
-                "date": event_ts.strftime("%Y-%m-%d"),
-                "move_pct": float(move_pct),
-                "release_timing": release_timing,
-            })
-
-    if not event_moves:
-        # Fallback to recent daily absolute moves
-        daily_moves = (
-            price_series.pct_change().abs().dropna().tail(126).to_numpy(dtype=float) * 100.0
-        )
-        if daily_moves.size == 0:
-            return empty
-        if daily_moves.size >= 5:
-            low_clip, high_clip = np.percentile(daily_moves, [1.0, 99.0])
-            daily_moves = np.clip(daily_moves, low_clip, high_clip)
-        avg_last4 = float(np.mean(daily_moves[-4:]))
-        std_move = float(np.std(daily_moves, ddof=1)) if daily_moves.size > 1 else 0.0
+    profile = _compute_earnings_move_profile(
+        close=close,
+        earnings_events=earnings_events,
+        as_of_date=_utc_today_date(),
+    )
+    if profile.source == "earnings_history":
         return {
-            "event_count": int(daily_moves.size),
-            "median_move_pct": float(np.median(daily_moves)),
-            "p90_move_pct": float(np.percentile(daily_moves, 90)),
-            "avg_last4_move_pct": avg_last4,
-            "std_move_pct": std_move,
-            "source": "daily_fallback",
+            "event_count": int(profile.sample_size),
+            "median_move_pct": profile.median_move_pct,
+            "p90_move_pct": profile.p90_move_pct,
+            "avg_last4_move_pct": profile.avg_last4_move_pct,
+            "std_move_pct": profile.std_move_pct,
+            "raw_moves_pct": list(profile.raw_moves_pct),  # for kurtosis + crush-rate
+            "raw_events": profile.raw_events,  # dated per-event moves for the history panel
+            "source": "earnings_history",
         }
-
-    moves = np.array(event_moves, dtype=float)
-    if moves.size >= 5:
-        low_clip, high_clip = np.percentile(moves, [1.0, 99.0])
-        moves = np.clip(moves, low_clip, high_clip)
-    avg_last4 = float(np.mean(moves[-4:]))
-    std_move = float(np.std(moves, ddof=1)) if moves.size > 1 else 0.0
     return {
-        "event_count": int(moves.size),
-        "median_move_pct": float(np.median(moves)),
-        "p90_move_pct": float(np.percentile(moves, 90)),
-        "avg_last4_move_pct": avg_last4,
-        "std_move_pct": std_move,
-        "raw_moves_pct": [float(x) for x in moves.tolist()],  # for kurtosis + crush-rate
-        "raw_events": event_records,  # dated per-event moves for the history panel
-        "source": "earnings_history",
+        "event_count": int(profile.sample_size),
+        "median_move_pct": profile.median_move_pct,
+        "p90_move_pct": profile.p90_move_pct,
+        "avg_last4_move_pct": profile.avg_last4_move_pct,
+        "std_move_pct": profile.std_move_pct,
+        "source": profile.source,
     }
 
 
