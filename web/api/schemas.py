@@ -5,7 +5,13 @@ from pydantic import BaseModel, Field
 
 
 class EdgeAnalyzeRequest(BaseModel):
-    symbol: str = Field(..., min_length=1, max_length=10, description="Ticker symbol")
+    # Charset-validated at the boundary (defense in depth): a ticker starts with a
+    # letter and is letters/digits/./- only — matches the screener's _SYMBOL_RE so
+    # a non-ticker string can't reach the provider lookup. Rejected as a clean 422.
+    symbol: str = Field(
+        ..., min_length=1, max_length=10, description="Ticker symbol",
+        pattern=r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$",
+    )
 
 
 class EdgeAnalyzeResponse(BaseModel):

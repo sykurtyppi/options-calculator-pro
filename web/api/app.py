@@ -606,6 +606,27 @@ def _compute_allowed_origins(share_auth_enabled: bool, origins_env: str) -> List
 origins_env = os.getenv("OPTIONS_CALCULATOR_ALLOWED_ORIGINS", "")
 allowed_origins = _compute_allowed_origins(_SHARE_AUTH_ENABLED, origins_env)
 
+class _SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Baseline security response headers on every response (audit hardening).
+
+    X-Frame-Options: DENY stops clickjacking of the SPA/login page; nosniff and
+    a strict Referrer-Policy are cheap defaults. HSTS only when the session
+    cookie is served secure (i.e. over HTTPS) — never on plain-HTTP local dev.
+    CSP is intentionally NOT set here: a strict policy would need tuning against
+    the inline login HTML + the built SPA and is left for a dedicated pass.
+    """
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        if _SECURE_SESSION_COOKIE:
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+            )
+        return response
+
+
 # Starlette applies middleware in LIFO order: the last add_middleware() call
 # becomes the outermost layer (first to see requests, last to see responses).
 # _AuthMiddleware must be INNER so its 401 responses flow back through
@@ -621,6 +642,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Outermost layer (added last) so the headers land on every response — including
+# CORS preflight and auth 401s.
+app.add_middleware(_SecurityHeadersMiddleware)
 
 
 # ── Login routes ──────────────────────────────────────────────────────────────
