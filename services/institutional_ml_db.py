@@ -5116,7 +5116,8 @@ class InstitutionalMLDatabase:
 
         Label
         -----
-        crush_happened  : 1 if front_iv_crush_pct < -0.10 (≥10% IV crush), else 0
+        crush_happened  : 1 if front_iv_crush_pct < -0.40 (≥40% IV crush), else 0
+                          (-0.10 was degenerate — 98% positive; see CRUSH_THRESHOLD_PCT)
 
         Note: uses two separate queries + pandas merge to avoid SQLite correlated-
         subquery limitations inside COALESCE.
@@ -5213,7 +5214,8 @@ class InstitutionalMLDatabase:
         training labels — NOT synthetic formulas.
 
         Features (3): near_back_ratio, log_front_iv, iv_rv_approx
-        Label       : crush_happened (front_iv_crush_pct < -0.10)
+                      (shared transform: services.crush_features)
+        Label       : crush_happened (front_iv_crush_pct < -0.40)
         Algorithm   : LogisticRegression + CalibratedClassifierCV(isotonic)
                       — appropriate for 100–500 labeled events; does not overfit
                         the way Random Forest does on small samples
@@ -5247,7 +5249,8 @@ class InstitutionalMLDatabase:
             return {"error": "no_training_data", "trained": False, "n_events": 0}
 
         feature_cols = ["near_back_ratio", "log_front_iv", "iv_rv_approx"]
-        df_clean = df[feature_cols + ["crush_happened"]].dropna()
+        # Keep `symbol` so cross-validation can group by ticker (no same-symbol leak).
+        df_clean = df[feature_cols + ["crush_happened", "symbol"]].dropna()
         n = len(df_clean)
 
         if n < 30:
@@ -5258,42 +5261,30 @@ class InstitutionalMLDatabase:
 
         X = df_clean[feature_cols].values
         y = df_clean["crush_happened"].values
+        groups = df_clean["symbol"].astype(str).values
         crush_rate = float(y.mean())
         self.logger.info("Training on %d events — crush rate %.1f%%", n, crush_rate * 100)
 
-        # Scale features
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-
-        # Calibrated logistic regression — correct for small-N classification
-        # cv=3 keeps ~33 samples per fold even at n=100
+        # Final deployed artifacts: scaler fit on all data + calibrated LR fit on
+        # all scaled data (saved separately; serving re-applies the transform).
         cv_folds = min(5, max(3, n // 30))
         base_lr = LogisticRegression(C=0.5, max_iter=1000, random_state=42, class_weight="balanced")
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
         clf = CalibratedClassifierCV(estimator=base_lr, method="isotonic", cv=cv_folds)
         clf.fit(X_scaled, y)
 
-        # Out-of-fold cross-validation metrics
-        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        cv_auc = cross_val_score(base_lr, X_scaled, y, cv=skf, scoring="roc_auc")
-        cv_acc = cross_val_score(base_lr, X_scaled, y, cv=skf, scoring="accuracy")
-
-        # In-sample calibration quality (Brier score — lower is better, 0.25 = random)
-        probs = clf.predict_proba(X_scaled)[:, 1]
-        brier = float(brier_score_loss(y, probs))
-        try:
-            auc = float(roc_auc_score(y, probs))
-        except Exception:
-            auc = float("nan")
-
-        # Precision and recall at the default 0.5 decision threshold
+        # Honest generalization metrics (audit H3/H4): score the SAME architecture
+        # that ships (scaler + calibrated LR) OUT OF FOLD, split by SYMBOL so a
+        # ticker's multiple earnings events can't leak across folds. The old code
+        # scored the bare *uncalibrated* LR and computed AUC/Brier/precision/recall
+        # IN-SAMPLE (predicting on the data it was fit on) — both optimistic.
         _PRED_THRESHOLD = 0.50
-        y_pred_thresh = (probs >= _PRED_THRESHOLD).astype(int)
-        try:
-            precision_at_thresh = float(precision_score(y, y_pred_thresh, zero_division=0))
-            recall_at_thresh = float(recall_score(y, y_pred_thresh, zero_division=0))
-        except Exception:
-            precision_at_thresh = float("nan")
-            recall_at_thresh = float("nan")
+        m = self._crush_oof_metrics(X, y, groups, cv_folds, base_lr, _PRED_THRESHOLD)
+        cv_auc, cv_acc = m["cv_auc"], m["cv_acc"]
+        auc, brier = m["oof_auc"], m["oof_brier"]
+        precision_at_thresh, recall_at_thresh = m["oof_precision"], m["oof_recall"]
+        cv_scheme = m["cv_scheme"]
 
         # Save models and metadata
         model_dir = os.path.expanduser("~/.options_calculator_pro/models")
@@ -5314,14 +5305,15 @@ class InstitutionalMLDatabase:
             "label": "front_iv_crush_pct < -0.40",
             "algorithm": "LogisticRegression + CalibratedClassifierCV(isotonic)",
             "cv_folds": cv_folds,
+            "cv_scheme": cv_scheme,
             "cv_auc_mean": float(cv_auc.mean()),
             "cv_auc_std": float(cv_auc.std()),
             "cv_accuracy_mean": float(cv_acc.mean()),
-            "insample_auc": auc,
-            "insample_brier": brier,
+            "oof_auc": auc,
+            "oof_brier": brier,
             "pred_threshold": _PRED_THRESHOLD,
-            "precision_at_threshold": precision_at_thresh if np.isfinite(precision_at_thresh) else None,
-            "recall_at_threshold": recall_at_thresh if np.isfinite(recall_at_thresh) else None,
+            "oof_precision_at_threshold": precision_at_thresh if np.isfinite(precision_at_thresh) else None,
+            "oof_recall_at_threshold": recall_at_thresh if np.isfinite(recall_at_thresh) else None,
         }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
@@ -5334,19 +5326,79 @@ class InstitutionalMLDatabase:
             "trained": True,
             "n_events": n,
             "crush_rate_pct": round(crush_rate * 100, 1),
+            "cv_scheme": cv_scheme,
             "cv_auc": round(float(cv_auc.mean()), 3),
             "cv_auc_std": round(float(cv_auc.std()), 3),
             "cv_accuracy": round(float(cv_acc.mean()), 3),
-            "insample_auc": round(auc, 3) if np.isfinite(auc) else None,
-            "insample_brier": round(brier, 4),
+            "oof_auc": round(auc, 3) if np.isfinite(auc) else None,
+            "oof_brier": round(brier, 4),
             "pred_threshold": _PRED_THRESHOLD,
-            "precision_at_threshold": round(precision_at_thresh, 3) if np.isfinite(precision_at_thresh) else None,
-            "recall_at_threshold": round(recall_at_thresh, 3) if np.isfinite(recall_at_thresh) else None,
+            "oof_precision_at_threshold": round(precision_at_thresh, 3) if np.isfinite(precision_at_thresh) else None,
+            "oof_recall_at_threshold": round(recall_at_thresh, 3) if np.isfinite(recall_at_thresh) else None,
             "model_paths": {
                 "classifier": clf_path,
                 "scaler": scaler_path,
                 "meta": meta_path,
             },
+        }
+
+    def _crush_oof_metrics(self, X, y, groups, cv_folds, base_lr, pred_threshold):
+        """Honest out-of-fold, symbol-grouped metrics for the DEPLOYED architecture
+        (StandardScaler + CalibratedClassifierCV(isotonic)).
+
+        Fixes audit H3 (metrics were scored on the bare uncalibrated LR and computed
+        in-sample) and H4 (StratifiedKFold with no grouping leaked same-symbol events
+        across folds). Every returned number is measured on held-out folds of the
+        exact pipeline that ships; splitting is by symbol when there are enough
+        distinct tickers, else it falls back to ungrouped stratified CV and says so.
+        """
+        import numpy as np
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.model_selection import (
+            StratifiedGroupKFold, StratifiedKFold, cross_val_score, cross_val_predict,
+        )
+        from sklearn.metrics import (
+            roc_auc_score, brier_score_loss, precision_score, recall_score,
+        )
+
+        n_groups = int(len(np.unique(groups)))
+        if n_groups >= cv_folds:
+            splitter = StratifiedGroupKFold(n_splits=cv_folds)
+            split_kwargs = {"groups": groups}
+            scheme = f"stratified_group_kfold_by_symbol(groups={n_groups})"
+        else:
+            # Too few tickers to group without collapsing folds — be explicit.
+            splitter = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+            split_kwargs = {}
+            scheme = f"stratified_kfold_ungrouped(groups={n_groups}<folds={cv_folds})"
+
+        pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", CalibratedClassifierCV(estimator=base_lr, method="isotonic", cv=cv_folds)),
+        ])
+
+        cv_auc = cross_val_score(pipe, X, y, cv=splitter, scoring="roc_auc", **split_kwargs)
+        cv_acc = cross_val_score(pipe, X, y, cv=splitter, scoring="accuracy", **split_kwargs)
+        oof = cross_val_predict(pipe, X, y, cv=splitter, method="predict_proba", **split_kwargs)[:, 1]
+
+        try:
+            oof_auc = float(roc_auc_score(y, oof))
+        except Exception:
+            oof_auc = float("nan")
+        oof_brier = float(brier_score_loss(y, oof))
+        pred = (oof >= pred_threshold).astype(int)
+        try:
+            oof_precision = float(precision_score(y, pred, zero_division=0))
+            oof_recall = float(recall_score(y, pred, zero_division=0))
+        except Exception:
+            oof_precision = float("nan")
+            oof_recall = float("nan")
+
+        return {
+            "cv_auc": cv_auc, "cv_acc": cv_acc, "oof_auc": oof_auc, "oof_brier": oof_brier,
+            "oof_precision": oof_precision, "oof_recall": oof_recall, "cv_scheme": scheme,
         }
 
     def _simulate_calendar_spread_pnl(self, df) -> pd.Series:

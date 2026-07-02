@@ -495,7 +495,8 @@ class IVExpansionCalibration:
         n_observations : int
             Number of real observations backing the estimate.
         prior_only : bool
-            True when using the bootstrap prior (N < 30).
+            True when using the bootstrap prior (N < _MIN_OBS_FOR_OBSERVATIONAL,
+            currently 40).
         phase : str
             ``"bootstrap_prior"``, ``"observational"``, ``"fitted_moderate"``,
             or ``"fitted_high"``.

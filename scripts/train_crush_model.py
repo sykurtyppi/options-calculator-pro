@@ -9,8 +9,8 @@ The trainer:
   - reads labels from earnings_iv_decay_labels (1,639 events available)
   - features: near_back_ratio, log_front_iv, iv_rv_approx (constant fallback if
     daily_prices is empty — current state)
-  - label: binary crush_happened (front_iv_crush_pct < -0.10) — see methodology
-    note below; this default threshold is severely degenerate on the actual data
+  - label: binary crush_happened (front_iv_crush_pct < -0.40); the earlier -0.10
+    threshold was degenerate (~98% positive) so -0.40 is used — see CRUSH_THRESHOLD_PCT
   - algorithm: CalibratedClassifierCV(LogisticRegression, isotonic, cv=3-5)
   - saves crush_classifier.pkl / crush_scaler.pkl / crush_model_meta.json to
     ~/.options_calculator_pro/models/
@@ -59,16 +59,19 @@ def check_prereqs() -> dict:
         "SELECT COUNT(*) FROM daily_prices "
         "WHERE realized_vol_30d IS NOT NULL AND realized_vol_30d > 0"
     ).fetchone()[0]
+    # Balance at the ACTUAL training threshold (-0.40). Evaluating at the obsolete
+    # -0.10 always looked "degenerate" (~98% positive) even though training is fine.
     crush, no_crush = con.execute("""
         SELECT
-          SUM(CASE WHEN front_iv_crush_pct < -0.10 THEN 1 ELSE 0 END),
-          SUM(CASE WHEN front_iv_crush_pct >= -0.10 THEN 1 ELSE 0 END)
+          SUM(CASE WHEN front_iv_crush_pct < -0.40 THEN 1 ELSE 0 END),
+          SUM(CASE WHEN front_iv_crush_pct >= -0.40 THEN 1 ELSE 0 END)
         FROM earnings_iv_decay_labels
         WHERE quality_score >= 0.40
           AND pre_front_iv > 0.01 AND pre_back_iv > 0.01
           AND front_iv_crush_pct IS NOT NULL
     """).fetchone()
-    info["label_at_minus10"] = {
+    info["label_at_threshold"] = {
+        "threshold": -0.40,
         "positive": int(crush or 0),
         "negative": int(no_crush or 0),
         "positive_rate": (crush / (crush + no_crush)) if (crush or no_crush) else 0.0,
@@ -96,13 +99,12 @@ def main() -> int:
         print(f"\nABORT: {info.get('labels_eligible')} eligible labels < 30 minimum.")
         return 2
 
-    bal = info.get("label_at_minus10", {})
+    bal = info.get("label_at_threshold", {})
     pos_rate = bal.get("positive_rate", 0)
     if pos_rate > 0.95 or pos_rate < 0.05:
-        print(f"\n⚠️  Label balance at -10% threshold is DEGENERATE: "
+        print(f"\n⚠️  Label balance at the -40% threshold is DEGENERATE: "
               f"{pos_rate*100:.1f}% positive. The trained model will likely "
               "collapse to a constant predictor.")
-        print("    (For a meaningfully-balanced target, -40% threshold yields ~45/55.)")
 
     if args.dry_run:
         print("\n--dry-run: not training.")
