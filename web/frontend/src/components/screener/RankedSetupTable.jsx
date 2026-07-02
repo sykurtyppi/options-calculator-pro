@@ -1,4 +1,5 @@
 import React from 'react'
+import { releaseTimeBadge } from '../common/badges'
 
 const NA = '—'
 
@@ -29,19 +30,6 @@ function scoreBar(score) {
       <span style={{ color, fontVariantNumeric: 'tabular-nums' }}>{(Number(score)).toFixed(2)}</span>
     </div>
   )
-}
-
-function releaseBadge(timing) {
-  const style = {
-    fontSize: '0.7rem',
-    padding: '1px 5px',
-    borderRadius: 3,
-    fontWeight: 600,
-    letterSpacing: '0.03em',
-    background: timing === 'BMO' ? 'var(--accent-2-surface)' : timing === 'AMC' ? 'var(--warn-surface)' : 'var(--line-subtle)',
-    color: timing === 'BMO' ? 'var(--accent-2-bright)' : timing === 'AMC' ? 'var(--warn-bright)' : 'var(--muted)',
-  }
-  return <span style={style}>{timing || '?'}</span>
 }
 
 const COLS = [
@@ -142,7 +130,7 @@ export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
                   {row.dte != null ? row.dte : NA}
                 </td>
                 <td style={{ padding: '5px 8px', textAlign: 'center' }}>
-                  {releaseBadge(row.release_timing)}
+                  {releaseTimeBadge(row.release_timing)}
                 </td>
                 <td style={{ padding: '5px 8px', textAlign: 'right', color: row.iv_rv_ratio != null && row.iv_rv_ratio < 1.0 ? 'var(--pos)' : 'var(--text-secondary)' }}>
                   {fmt(row.iv_rv_ratio)}
