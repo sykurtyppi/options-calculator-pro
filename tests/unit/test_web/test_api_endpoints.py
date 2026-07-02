@@ -313,6 +313,34 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertIn("timestamp", payload)
 
+    def test_security_headers_present(self):
+        """Audit hardening: baseline security headers on every response."""
+        r = self.client.get("/api/health")
+        self.assertEqual(r.headers.get("x-frame-options"), "DENY")
+        self.assertEqual(r.headers.get("x-content-type-options"), "nosniff")
+        self.assertEqual(r.headers.get("referrer-policy"), "no-referrer")
+
+    def test_analyze_rejects_non_ticker_symbol(self):
+        """Audit: EdgeAnalyzeRequest.symbol is charset-validated → 422, not passed
+        to the provider lookup."""
+        for bad in ["1AAPL", "A B", "'; DROP", "@@@", "../etc"]:
+            r = self.client.post("/api/edge/analyze", json={"symbol": bad})
+            self.assertEqual(r.status_code, 422, f"expected 422 for {bad!r}, got {r.status_code}")
+
+    def test_oos_status_unknown_job_returns_404(self):
+        r = self.client.get("/api/oos/status/does-not-exist")
+        self.assertEqual(r.status_code, 404)
+
+    def test_ml_train_status_unknown_job_returns_404(self):
+        r = self.client.get("/api/ml/train-status/does-not-exist")
+        self.assertEqual(r.status_code, 404)
+
+    def test_ml_status_responds_without_error(self):
+        """Untrained (or trained) — must return a clean 200/404, never a 500."""
+        r = self.client.get("/api/ml/status")
+        self.assertIn(r.status_code, (200, 404))
+        self.assertIsInstance(r.json(), dict)
+
     def test_health_endpoint_remains_public_when_share_auth_enabled(self):
         with patch.object(app_module, "_SHARE_AUTH_ENABLED", True):
             with patch.object(app_module, "_SHARE_PASSWORD", "secret"):
