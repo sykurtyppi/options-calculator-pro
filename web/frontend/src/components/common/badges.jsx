@@ -2,15 +2,22 @@ import React from 'react'
 import { Badge } from './DisplayAtoms'
 
 /**
- * Earnings release-time badge — BMO / AMC / Intraday based on the raw
- * `release_timing` string from the vol snapshot. Returns null when the
- * string is missing or unrecognised (the caller renders a fallback).
+ * Earnings release-time badge — BMO / AMC / Intraday.
+ *
+ * Accepts BOTH release-timing representations the app produces:
+ *   - the raw analyze-path string from the vol snapshot
+ *     ("before market open" / "after market close" / "during market hours")
+ *   - the normalized screener code ("BMO" / "AMC" / "UNKNOWN")
+ *
+ * Returns null when the value is missing; renders a default badge with the
+ * raw text for anything unrecognised (e.g. "UNKNOWN").
  */
 export function releaseTimeBadge(rt) {
   if (!rt) return null
-  if (rt.includes('before')) return <Badge variant="bmo">BMO</Badge>
-  if (rt.includes('after')) return <Badge variant="amc">AMC</Badge>
-  if (rt.includes('during')) return <Badge variant="intraday">Intraday</Badge>
+  const s = String(rt).toLowerCase()
+  if (s === 'bmo' || s.includes('before')) return <Badge variant="bmo">BMO</Badge>
+  if (s === 'amc' || s.includes('after')) return <Badge variant="amc">AMC</Badge>
+  if (s === 'intraday' || s.includes('during')) return <Badge variant="intraday">Intraday</Badge>
   return <Badge>{rt}</Badge>
 }
 
