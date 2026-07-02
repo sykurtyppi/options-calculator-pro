@@ -51,13 +51,27 @@ FIELDNAMES = [
     "entry_debit_mid", "debit_per_contract", "contracts",
     "avg_sp_pct", "call_OI", "put_OI",
     "nbr", "crush_prob", "crush_gate",
-    "exit_date", "exit_debit_mid", "pnl_per_contract", "net_return_pct",
-    "status",  # OPEN | CLOSED | EXIT_MISSING
+    "exit_date", "exit_debit_mid", "pnl_per_contract", "net_return_pct",  # net_return_pct is a FRACTION
+    "status",  # OPEN | CLOSED | EXIT_MISSING | EXIT_LATE (missed T-0, excluded)
 ]
 
 
 def _trade_id(symbol: str, event_date: Any) -> str:
     return f"{str(symbol).upper()}|{event_date}"
+
+
+def _as_date(value: Any) -> Optional[date]:
+    """Coerce a date / datetime / ISO string to a date (None if not parseable)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except (ValueError, TypeError):
+        return None
 
 
 def load_log(path: Path) -> Dict[str, Dict[str, Any]]:
@@ -82,11 +96,17 @@ def save_log(path: Path, log: Dict[str, Dict[str, Any]]) -> None:
 
 
 def realized(entry_debit: float, exit_debit: float) -> Dict[str, float]:
-    """Long-strangle P&L: buy at entry_debit, sell at exit_debit (per share)."""
+    """Long-strangle P&L: buy at entry_debit, sell at exit_debit (per share).
+
+    net_return_pct is a FRACTION (0.30 = +30%), matching the system-wide
+    convention — the tracker's derived rows (pnl/debit) and every `.2%` report.
+    It was previously written as a percent (30.0), a 100x mismatch against the
+    derived/reported values.
+    """
     pnl_per_contract = (exit_debit - entry_debit) * 100.0
-    net_return_pct = ((exit_debit - entry_debit) / entry_debit * 100.0) if entry_debit else 0.0
+    net_return = ((exit_debit - entry_debit) / entry_debit) if entry_debit else 0.0
     return {"pnl_per_contract": round(pnl_per_contract, 2),
-            "net_return_pct": round(net_return_pct, 4)}
+            "net_return_pct": round(net_return, 6)}
 
 
 def run_collection(
@@ -101,7 +121,7 @@ def run_collection(
 ) -> Dict[str, int]:
     """Run one entry+exit pass. screen_fn/exit_pricer_fn are injected for testability."""
     log = load_log(log_path)
-    stats = {"opened": 0, "closed": 0, "exit_missing": 0, "open_carried": 0}
+    stats = {"opened": 0, "closed": 0, "exit_missing": 0, "exit_late": 0, "open_carried": 0}
 
     # ── ENTRY pass: open positions whose T-3 entry day is today and that QUALIFY ──
     screened = screen_fn(universe, weeks, today)
@@ -109,7 +129,14 @@ def run_collection(
     for r in rows:
         if str(r.get("status")) != "QUALIFY":
             continue
-        if r.get("t3_entry_date") != today:   # only enter on the exact T-3 business day
+        # Enter anywhere in the window [T-3 entry day, event date). The old exact-
+        # T-3-only gate meant a single missed launchd run (Mac asleep/off) silently
+        # DROPPED the trade forever. Idempotency below (`tid in log`) still opens at
+        # most once — on the first qualifying run within the window; trade_date vs
+        # t3_entry_date makes any late entry visible.
+        t3 = _as_date(r.get("t3_entry_date"))
+        ev = _as_date(r.get("earnings_date"))
+        if t3 is None or ev is None or not (t3 <= today < ev):
             continue
         tid = _trade_id(r["symbol"], r["earnings_date"])
         if tid in log:                         # idempotent — already recorded
@@ -142,6 +169,15 @@ def run_collection(
         if today < event_date:                 # not yet at T-0
             stats["open_carried"] += 1
             continue
+        if today > event_date:
+            # Missed the T-0 pre-print exit run — a later run prices POST-earnings,
+            # contaminating the sample with the exact move this strategy exits to
+            # avoid. Exclude from realized P&L (like EXIT_MISSING), don't fabricate.
+            pos["status"] = "EXIT_LATE"
+            pos["exit_date"] = today.isoformat()
+            stats["exit_late"] += 1
+            continue
+        # today == event_date: exit before the AMC print (collector fires pre-close).
         exit_debit = exit_pricer_fn(pos)
         if exit_debit is None:                  # exact contracts not quotable
             pos["status"] = "EXIT_MISSING"
@@ -216,7 +252,7 @@ def main() -> int:
 def _selftest() -> None:
     """Offline logic check (no network): entry idempotency, exit resolution, PnL math."""
     import tempfile
-    assert realized(2.00, 2.60) == {"pnl_per_contract": 60.0, "net_return_pct": 30.0}, "PnL math"
+    assert realized(2.00, 2.60) == {"pnl_per_contract": 60.0, "net_return_pct": 0.3}, "PnL math"
     assert realized(2.00, 1.50)["pnl_per_contract"] == -50.0, "loss math"
 
     with tempfile.TemporaryDirectory() as td:
@@ -255,7 +291,8 @@ def _selftest() -> None:
         assert s2["closed"] == 1, s2
         log = load_log(log_path)
         aapl = log[_trade_id("AAPL", event_day)]
-        assert aapl["status"] == "CLOSED" and float(aapl["net_return_pct"]) == 30.0, aapl
+        # net_return_pct is a FRACTION (0.30 = +30%), matching the system convention.
+        assert aapl["status"] == "CLOSED" and float(aapl["net_return_pct"]) == 0.3, aapl
         assert aapl["crush_gate"] == "PASS" and float(aapl["nbr"]) == 1.52, f"crush gate: {aapl}"
 
         # Re-run after close — idempotent (no re-exit)
