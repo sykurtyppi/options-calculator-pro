@@ -106,7 +106,9 @@ export function MoveRiskBadge({ level, ratio, sampleSize }) {
       variant={variant}
       title="Soft advisory: p90 historical move vs. event-implied move. Not a hard gate."
     >
-      {label}{ratioLabel}{sampleLabel}
+      {/* FE-5: "advisory" is shown, not hover-only, so the soft-gate nature is
+          visible to keyboard/touch/screen-reader users, not just on hover. */}
+      {label}{ratioLabel}{sampleLabel} · advisory
     </Badge>
   )
 }

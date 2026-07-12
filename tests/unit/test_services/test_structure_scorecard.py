@@ -91,6 +91,52 @@ def _neutral_priors() -> dict[str, WalkForwardPrior]:
     }
 
 
+def _simulated_calendar_priors() -> dict[str, WalkForwardPrior]:
+    priors = _neutral_priors()
+    for structure in ("call_calendar", "put_calendar"):
+        priors[structure] = WalkForwardPrior(
+            structure=structure,
+            history_count=40,
+            win_rate=0.58,
+            avg_return_pct=3.0,
+            rank_score=0.60,
+            source="iv_expansion_study_x:baseline",
+            is_simulated=True,
+        )
+    return priors
+
+
+class TestSimulatedPriorFlag(unittest.TestCase):
+    @patch(
+        "services.structure_scorecard._load_walk_forward_priors",
+        side_effect=lambda as_of_date=None: _simulated_calendar_priors(),
+    )
+    def test_simulated_calendar_prior_is_flagged_and_realized_is_not(self, _mock_priors):
+        # V3: calendar priors come from a simulated scoreboard; straddle/strangle
+        # from realized logs. The scorecard must carry that distinction so a
+        # simulated history_count is never read as empirical.
+        snapshot = _base_snapshot(
+            cheapness_score=0.95,
+            term_structure_slope=0.0034,
+            near_back_iv_ratio=0.82,
+            event_move_share_of_total=0.58,
+            historical_move_anchor_pct=5.6,
+            historical_vs_implied_move_ratio=0.96,
+            tail_vs_implied_move_ratio=1.05,
+            event_risk_score=0.48,
+            iv_rv_yz=0.84,
+            iv_rv_har=0.86,
+            atm_call_spread_pct=1.8,
+            atm_put_spread_pct=1.9,
+        )
+        cards = {c.structure: c for c in build_structure_scorecards(snapshot)}
+        assert cards["call_calendar"].walk_forward_is_simulated is True
+        assert cards["put_calendar"].walk_forward_is_simulated is True
+        assert cards["atm_straddle"].walk_forward_is_simulated is False
+        assert any("SIMULATED" in b for b in cards["call_calendar"].rationale_bullets)
+        assert not any("SIMULATED" in b for b in cards["atm_straddle"].rationale_bullets)
+
+
 class TestStructureScorecards(unittest.TestCase):
     @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_structure_differentiation_by_regime(self, _mock_priors):

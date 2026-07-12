@@ -98,6 +98,34 @@ def test_recommendation_records_are_written_with_provenance_and_quotes(tmp_path:
     assert row["structure_scorecards_json"][0]["structure"] == "atm_straddle"
 
 
+def test_provided_sentinel_does_not_mask_honest_option_source(tmp_path: Path) -> None:
+    """V1 regression: in production the VolSnapshot always carries the generic
+    ``option_source="provided"`` sentinel (it is built from an already-fetched
+    chain and cannot see the provider). The honest provider label lives in
+    ``metrics["data_sources"]["options_source"]``. The sentinel must not win, or
+    a silent degrade to delayed yfinance is undetectable in the stored record.
+    """
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    analysis = _analysis()
+    # Reproduce production exactly: snapshot emits the sentinel; metrics carry
+    # the real provider, here a silent fallback to delayed yfinance.
+    analysis.vol_snapshot["option_source"] = "provided"
+    analysis.metrics = {"data_sources": {"options_source": "yfinance", "price_rv_source": "yfinance"}}
+
+    rec_id = record_recommendation(analysis, ledger=ledger, recommendation_id="rec_prov_v1")
+    row = ledger.get(rec_id)
+    assert row is not None
+    assert row["option_source"] == "yfinance", "sentinel masked the honest yfinance downgrade"
+    assert row["provider_names_json"]["option_source"] == "yfinance"
+
+    # And the real provider is preserved when it is MarketData.
+    analysis2 = _analysis()
+    analysis2.vol_snapshot["option_source"] = "provided"
+    analysis2.metrics = {"data_sources": {"options_source": "marketdata_app", "price_rv_source": "yfinance"}}
+    rec_id2 = record_recommendation(analysis2, ledger=ledger, recommendation_id="rec_prov_v1_mda")
+    assert ledger.get(rec_id2)["option_source"] == "marketdata_app"
+
+
 def test_no_trade_recommendations_are_recorded_with_abstain_reason(tmp_path: Path) -> None:
     ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
     recommendation_id = record_recommendation(

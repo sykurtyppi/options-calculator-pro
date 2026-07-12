@@ -11,7 +11,7 @@ import { buildEarningsMoveHistory } from './earningsMoveHistory'
  * showing an empty frame.
  */
 export default function EarningsMoveHistoryPanel({ history, impliedMove }) {
-  const { data, impliedMove: implied, exceedRate, median } = buildEarningsMoveHistory(history, impliedMove)
+  const { data, impliedMove: implied, exceedRate, median, takeawaySufficient } = buildEarningsMoveHistory(history, impliedMove)
   if (data.length < 1) return null
 
   const n = data.length
@@ -37,11 +37,17 @@ export default function EarningsMoveHistoryPanel({ history, impliedMove }) {
         )}
         .{' '}
         {exceedRate != null && (
-          <span className="earnings-history-takeaway">
-            {exceedRate >= 0.5
-              ? 'History suggests the priced move is on the low side.'
-              : 'History suggests the priced move is on the high side.'}
-          </span>
+          takeawaySufficient ? (
+            <span className="earnings-history-takeaway">
+              {exceedRate >= 0.5
+                ? 'History suggests the priced move is on the low side.'
+                : 'History suggests the priced move is on the high side.'}
+            </span>
+          ) : (
+            <span className="earnings-history-takeaway-insufficient">
+              Too few past earnings ({n}) to call the priced move cheap or rich.
+            </span>
+          )
         )}
       </p>
     </div>

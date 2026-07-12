@@ -18,6 +18,7 @@ Qualifying rule (Fingerprint C from structural analysis):
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -27,6 +28,8 @@ import numpy as np
 import pandas as pd
 import pytz
 import yfinance as yf
+
+logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -53,9 +56,11 @@ NY_TZ = pytz.timezone("America/New_York")
 
 # ── NBR crush-gate threshold ────────────────────────────────────────────────
 # Walk-forward analysis (2026-06-04) showed NBR >= 1.40 filters to 85% win rate
-# on backtested Fingerprint C trades. The crush classifier (AUC=0.820) uses NBR
-# as its dominant feature, so high NBR ≈ "classifier predicts deep crush" ≈
-# "term structure steep enough to support the pre-earnings IV expansion trade."
+# on backtested Fingerprint C trades. NBR is the dominant feature of the crush
+# classifier, so high NBR ≈ "classifier predicts deep crush" ≈ "term structure
+# steep enough to support the pre-earnings IV expansion trade." (The "AUC=0.820
+# on 1,143 events" figure belongs to the separate NBR-ONLY prior model in
+# train_prior_crush_model.py, not to the classifier invoked below — see V6.)
 NBR_GATE_THRESHOLD = 1.40
 
 # ── ATM-IV selection guards ──────────────────────────────────────────────────
@@ -193,10 +198,18 @@ def _compute_crush_gate_signals(
     Returns a dict with keys: nbr, crush_prob, crush_gate.
     crush_gate is 'PASS' if NBR >= NBR_GATE_THRESHOLD, else 'FAIL'.
 
-    The crush classifier (walk-forward AUC=0.820 on 1,143 OOS events) predicts
-    which events will see deep IV crush (>40%). The same NBR feature that drives
-    this prediction also separates winning from losing pre-earnings expansion
-    trades — high NBR means steep term structure means more vol to accumulate.
+    The crush classifier invoked here is the institutional_ml_db 3-feature
+    CalibratedClassifierCV (near_iv, near/back ratio, iv_rv), scored with grouped
+    out-of-fold CV at roughly AUC ~0.83 (see
+    InstitutionalMLDatabase._crush_oof_metrics / the model manifest for the
+    current value). It predicts which events will see deep IV crush (>40%). The
+    NBR feature that drives it also separates winning from losing pre-earnings
+    expansion trades — high NBR means steep term structure means more vol to
+    accumulate.
+
+    V6 note: the previously-cited "walk-forward AUC=0.820 on 1,143 OOS events" is
+    the SEPARATE NBR-only prior model (train_prior_crush_model.py), not this
+    classifier; do not re-attach that figure here.
     """
     result: dict = {"nbr": None, "crush_prob": None, "crush_gate": "NO_DATA"}
     # Both legs must be present and within the sane-IV band, else NBR is garbage.
@@ -225,8 +238,10 @@ def _compute_crush_gate_signals(
         )
         if prob is not None:
             result["crush_prob"] = round(prob, 4)
-    except Exception:
-        pass  # model unavailable — NBR gate still works standalone
+    except Exception as exc:
+        # V7: model unavailable — NBR gate still works standalone, but log so a
+        # voided crush prediction is visible rather than silently dropped.
+        logger.debug("crush classifier unavailable, using NBR gate only: %s", exc)
 
     return result
 

@@ -5,6 +5,12 @@
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
+// FE-2: minimum number of past earnings events before the highlighted
+// "cheap/rich" directional takeaway is allowed to fire. Below this the exceed
+// ratio is too noisy to call a direction (an n=1 exceedRate is 0 or 1). This
+// matches the app's n<8 reduced-evidence discipline used elsewhere.
+export const MIN_TAKEAWAY_EVENTS = 6
+
 // "2024-05-02" -> "May '24". Parsed manually (no Date) to avoid TZ/locale drift.
 export function shortDateLabel(iso) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''))
@@ -57,5 +63,8 @@ export function buildEarningsMoveHistory(history, impliedMovePct, limit = 12) {
   // window and would misattribute a different-set stat to the N shown bars.)
   const median = data.length ? Number(medianOf(data.map((d) => d.move)).toFixed(2)) : null
 
-  return { data, impliedMove, exceedRate, median }
+  // Only enough events to make a directional cheap/rich call above the floor.
+  const takeawaySufficient = data.length >= MIN_TAKEAWAY_EVENTS
+
+  return { data, impliedMove, exceedRate, median, takeawaySufficient }
 }

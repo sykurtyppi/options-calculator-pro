@@ -579,36 +579,25 @@ export function buildOutcomeScenarios(selectorOutput = null, scorecards = [], sn
   const best = getBestScorecard(scorecards, selectorOutput)
   if (!best) return []
 
-  const baseEdge = Number(best.expected_edge_pct || 0)
-  const ivContribution = Number(best.expected_iv_contribution_pct || 0)
-  const moveContribution = Number(best.expected_return_pct || 0) - ivContribution
-  const moveDispersion = Math.max(
-    Number(snapshot?.historical_move_std_pct || 0) * 0.35,
-    Number(snapshot?.historical_move_uncertainty_pct || 0) * 0.25,
-    0.5,
-  )
-  const frictionStress = Math.max(Number(best.execution_penalty || 0) * 100, 0.6)
-  const ivShock = Math.max(Math.abs(ivContribution) * 0.35, 0.5)
-  const moveShock = Math.max(Math.abs(moveContribution) * 0.30, moveDispersion)
-
-  const bestCase = baseEdge + ivShock + moveShock - frictionStress * 0.20
-  const baseCase = baseEdge
-  const worstCase = baseEdge - ivShock - moveShock - frictionStress * 0.60
-
+  // FE-1: previously synthesized Best/Base/Worst *percentages* from hard-coded
+  // multipliers (ivShock*0.35, moveShock*0.30, frictionStress*0.20/0.60…). That
+  // manufactured a numeric outcome distribution the engine does not possess.
+  // The three-scenario narrative is legitimate; the cardinal magnitude is not.
+  // Keep the qualitative direction, drop the fabricated number.
   return [
     {
       label: 'Best Case',
-      value: `${formatSignedPercent(bestCase, 1)} signal`,
+      value: 'More favorable',
       detail: 'Score-derived upside case: IV expands cleanly, the realized move lands toward the favorable end of history, and live fills stay efficient.',
     },
     {
       label: 'Base Case',
-      value: `${formatSignedPercent(baseCase, 1)} signal`,
-      detail: 'Matches the current modeled edge after existing penalties and costs. This is not a calibrated return forecast.',
+      value: 'Central',
+      detail: 'The current modeled edge after existing penalties and costs. This is not a calibrated return forecast.',
     },
     {
       label: 'Worst Case',
-      value: `${formatSignedPercent(worstCase, 1)} signal`,
+      value: 'More adverse',
       detail: 'Score-derived downside case: IV expansion underdelivers, the realized move is muted, and execution gets worse than the quoted snapshot.',
     },
   ]
@@ -631,25 +620,32 @@ export function buildEdgeDurability(selectorOutput = null, scorecards = [], snap
   const extraExecution = Math.max(Number(best.execution_penalty || 0) * 100 * 0.75, 0.7)
   const reducedIv = Math.max(Math.abs(ivContribution) * 0.40, 0.5)
   const reducedMove = Math.max(Math.abs(moveContribution) * 0.35, Number(snapshot?.historical_move_uncertainty_pct || 0) * 0.20, 0.5)
+  // FE-1: the stressed-edge number is used only to *bucket* durability, never
+  // surfaced as a cardinal figure — the multipliers below are not calibrated,
+  // so a "-2.3% signal" would over-claim. The Fragile/Moderate/Robust bucket is
+  // an honest qualitative summary of the same monotonic stress; the number is not.
   const stressedEdge = baseEdge - extraExecution - reducedIv - reducedMove
 
   let label = 'Fragile'
   let tone = 'fragile'
   let detail = 'Small adverse changes in IV expansion, realized move, or execution would likely erase the modeled edge.'
+  let stressedEdgeLabel = 'does not survive the haircut'
   if (stressedEdge > 1.0) {
     label = 'Robust'
     tone = 'robust'
     detail = 'The edge still survives a conservative stress on execution, IV expansion, and realized move assumptions.'
+    stressedEdgeLabel = 'survives the haircut'
   } else if (stressedEdge > 0) {
     label = 'Moderate'
     tone = 'moderate'
     detail = 'The edge survives some stress, but not with much cushion.'
+    stressedEdgeLabel = 'barely survives the haircut'
   }
 
   return {
     label,
     tone,
-    stressedEdgeLabel: `${formatSignedPercent(stressedEdge, 1)} signal`,
+    stressedEdgeLabel,
     detail,
   }
 }

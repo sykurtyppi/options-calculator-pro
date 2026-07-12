@@ -49,6 +49,7 @@ class StructureScorecard:
 
     composite_structure_score: float
 
+    walk_forward_is_simulated: bool = False
     rationale_bullets: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -63,6 +64,11 @@ class WalkForwardPrior:
     avg_return_pct: float
     rank_score: float
     source: str
+    # V3: True when history_count comes from a SIMULATED scoreboard (e.g. the
+    # calendar iv-expansion study) rather than realized trade logs / the
+    # persistent observation store. Lets downstream rank/evidence/UI avoid
+    # reading simulated counts as empirical.
+    is_simulated: bool = False
 
 
 @dataclass(frozen=True)
@@ -264,7 +270,7 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
         _ratio_rationale("historical/implied move", snapshot.historical_vs_implied_move_ratio, favorable="above 1 favors long gamma", cautious="below 1 dampens move capture"),
         _ratio_rationale("tail/implied move", snapshot.tail_vs_implied_move_ratio, favorable="fat historical tails support convex payoff", cautious="tails do not clear current implied move"),
         _execution_rationale(snapshot, execution_penalty),
-        f"Walk-forward prior: {prior.history_count} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
+        f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
     if _using_daily_fallback:
         rationale.append(
@@ -365,7 +371,7 @@ def score_otm_strangle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
         _ratio_rationale("tail/implied move", snapshot.tail_vs_implied_move_ratio, favorable="historical tails support wing exposure", cautious="tails do not justify the wider payoff shape"),
         f"Event-risk score {event_risk:.2f} {'supports' if event_risk >= 0.6 else 'does not strongly support'} a convex wings structure.",
         _execution_rationale(snapshot, execution_penalty),
-        f"Walk-forward prior: {prior.history_count} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
+        f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
     if _using_daily_fallback:
         rationale.append(
@@ -478,7 +484,7 @@ def _score_calendar(
             else "Term-structure slope is unavailable; that component stays neutral."
         ),
         _execution_rationale(snapshot, execution_penalty),
-        f"Walk-forward prior: {prior.history_count} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
+        f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
     if _using_daily_fallback:
         rationale.append(
@@ -554,6 +560,7 @@ def _finalize_scorecard(
         walk_forward_avg_return_pct=float(prior.avg_return_pct),
         walk_forward_rank_score=float(prior.rank_score),
         composite_structure_score=float(composite),
+        walk_forward_is_simulated=bool(prior.is_simulated),
         rationale_bullets=rationale,
     )
 
@@ -819,6 +826,7 @@ def _load_calendar_prior_from_reports(structure: str) -> WalkForwardPrior:
         avg_return_pct=float(avg_return),
         rank_score=rank,
         source=f"{path.parent.name}:{PROMOTION_BASELINE_SCENARIO}",
+        is_simulated=True,  # V3: iv_expansion_simulated_scoreboard.csv is simulated, not realized
     )
 
 
