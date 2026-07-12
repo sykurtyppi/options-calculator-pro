@@ -2666,12 +2666,18 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     option_snapshot_frame = chain_df if chain_df is not None else _collect_yf_option_chain_frame(
         ticker, as_of_date=_utc_today_date()
     )
+    # V2: same honest provenance the term-structure path reports (see options_source
+    # below) — when the provider supplied the chain, use its name; otherwise the
+    # raw-yfinance fallback was used. Threaded so data_quality_score can penalize a
+    # delayed/greek-less surface instead of scoring it like real-time MarketData.
+    snapshot_options_provider = data_source if chain_df is not None else "yfinance"
     vol_snapshot = build_vol_snapshot(
         clean_symbol,
         _utc_today_date(),
         option_chain_data=option_snapshot_frame,
         earnings_metadata=earnings_metadata_for_snapshot,
         price_data=price_snapshot_frame,
+        options_provider=snapshot_options_provider,
     )
     structure_scorecards = build_structure_scorecards(vol_snapshot)
     selector_output = select_best_structure(vol_snapshot, structure_scorecards)
