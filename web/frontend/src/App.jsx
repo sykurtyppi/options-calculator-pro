@@ -759,15 +759,15 @@ export default function App() {
                 <div className="metrics-group-label">Edge &amp; Expectancy</div>
                 <div className="metrics-grid">
                   <Metric label="Expected Net Edge" value={fmtSpp(m.expected_net_edge_pct)}
-                    tone={tonePos(m.expected_net_edge_pct, 0.25, 0)} />
+                    tone={tonePos(m.expected_net_edge_pct, 0.25, 0)} provenance="modeled" />
                   <Metric label="Expected Gross Edge" value={fmtSpp(m.expected_gross_edge_pct)}
-                    tone={tonePos(m.expected_gross_edge_pct, 0.5, 0)} />
+                    tone={tonePos(m.expected_gross_edge_pct, 0.5, 0)} provenance="modeled" />
                   <Metric label="Expectancy Ratio" value={fmtSn(m.expectancy_ratio, 2)}
-                    tone={tonePos(m.expectancy_ratio, 0.2, 0)} />
+                    tone={tonePos(m.expectancy_ratio, 0.2, 0)} provenance="modeled" />
                   <Metric label="Implied / Anchor" value={fmtNum(m.implied_vs_anchor_ratio, 2)}
                     tone={tonePos(m.implied_vs_anchor_ratio, 1.05, 1.0)} />
                   <Metric label="Drawdown Risk" value={fmtPp(m.drawdown_risk_pct, 2)}
-                    tone={toneNeg(m.drawdown_risk_pct, 1.25, 2.0)} />
+                    tone={toneNeg(m.drawdown_risk_pct, 1.25, 2.0)} provenance="modeled" />
                   {/* FIX 7: clarify this is a model-derived friction score, not a broker-quoted cost */}
                   <Metric label="Friction Score" value={fmtPp(m.tx_cost_estimate_pct, 2)}
                     tone={toneNeg(m.tx_cost_estimate_pct, 0.5, 1.0)}
