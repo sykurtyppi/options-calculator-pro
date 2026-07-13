@@ -104,3 +104,50 @@ class TestComputeEarningsMoveProfile:
         profile = compute_earnings_move_profile(close=prices, earnings_events=events, as_of_date=cutoff)
         assert profile.source == "daily_fallback"
         assert profile.earnings_event_count == 0
+
+
+class TestAsOfCutoffLeakage:
+    """F1: the as_of cutoff must bound the PRICE series, not just the events."""
+
+    def test_daily_fallback_ignores_post_cutoff_prices(self):
+        # Calm early regime (~0.02%/day), then a volatile post-cutoff regime
+        # (alternating +/-5%/day). The daily-fallback p90 must reflect only the
+        # calm pre-cutoff regime when as_of precedes the volatility.
+        calm = np.full(140, 0.0002)
+        volatile = np.tile([0.05, -0.05], 10)  # 20 sessions of large moves
+        rets = np.concatenate([calm, volatile])
+        idx = pd.bdate_range("2024-01-02", periods=len(rets))
+        prices = pd.Series(100.0 * np.cumprod(1.0 + rets), index=idx)
+
+        cutoff = idx[130].date()  # strictly before the volatile regime
+        # No usable earnings events -> daily fallback path.
+        pre = compute_earnings_move_profile(close=prices, earnings_events=[], as_of_date=cutoff)
+        full = compute_earnings_move_profile(close=prices, earnings_events=[], as_of_date=idx[-1].date())
+
+        assert pre.source == "daily_fallback"
+        # The calm pre-cutoff regime must not reflect the ~5% post-cutoff moves.
+        assert pre.p90_move_pct is not None and pre.p90_move_pct < 1.0
+        # Sanity: including the volatile tail (as_of at series end) is materially
+        # larger, proving the truncation is what suppressed the leak.
+        assert full.p90_move_pct > 2.0
+        assert full.p90_move_pct > pre.p90_move_pct
+
+    def test_amc_event_on_cutoff_does_not_consume_next_session_close(self):
+        dates = pd.bdate_range("2024-01-02", periods=60)
+        prices = pd.Series(np.linspace(100.0, 101.0, len(dates)), index=dates)
+        event_i = 40
+        event_date = dates[event_i].date()
+        # Make the post-event session (D+1) a large, distinctive move.
+        prices.iloc[event_i + 1] = prices.iloc[event_i] * 1.20  # +20% the day AFTER the AMC event
+        events = [{"event_date": pd.Timestamp(event_date), "release_timing": "after market close"}]
+
+        # cutoff == the event date: the AMC post-close is the NEXT session, which is
+        # after the cutoff and must not be read -> the event forms no move.
+        at_event = compute_earnings_move_profile(close=prices, earnings_events=events, as_of_date=event_date)
+        assert at_event.earnings_event_count == 0
+
+        # cutoff == D+1: the post-close is now legitimately available -> the event counts.
+        next_day = dates[event_i + 1].date()
+        at_next = compute_earnings_move_profile(close=prices, earnings_events=events, as_of_date=next_day)
+        assert at_next.earnings_event_count == 1
+        assert at_next.source == "earnings_history"

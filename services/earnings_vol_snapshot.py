@@ -221,6 +221,7 @@ def build_vol_snapshot(
     earnings_metadata: Any = None,
     price_data: Any = None,
     config: Optional[VolSnapshotConfig] = None,
+    options_provider: Optional[str] = None,
 ) -> VolSnapshot:
     cfg = config or VolSnapshotConfig()
     as_of_date = _coerce_date(as_of)
@@ -443,6 +444,7 @@ def build_vol_snapshot(
         rv_har_forecast=rv_har_forecast,
         historical_move_source=move_profile.source,
         historical_event_count=move_profile.earnings_event_count,
+        options_provider=options_provider,
     )
     data_quality = _quality_label(data_quality_score)
 
@@ -1289,6 +1291,7 @@ def _data_quality_score(
     rv_har_forecast: Optional[float],
     historical_move_source: str,
     historical_event_count: int,
+    options_provider: Optional[str] = None,
 ) -> float:
     price_score = _freshness_score(price_staleness_minutes, same_day_cutoff=1_440, warn_cutoff=4_320)
     chain_score = _freshness_score(chain_staleness_minutes, same_day_cutoff=1_440, warn_cutoff=2_880)
@@ -1321,6 +1324,15 @@ def _data_quality_score(
     )
     if earnings_source_stale:
         score = min(score, 0.72)
+    # V2: a delayed / greek-less options provider must not be able to score as a
+    # clean real-time surface. yfinance quotes are ~15-min delayed and carry no
+    # greeks, yet the term-based score above is blind to provider identity — so a
+    # silent fallback to yfinance could reach "high" and clear the abstention
+    # gate (MIN_DATA_QUALITY_FOR_ANY_TRADE) exactly like real-time MarketData.
+    # Penalize + cap so the gate can see the downgrade. (Provider identity is the
+    # faithful proxy for greek availability, which the normalized chain drops.)
+    if options_provider and "yfinance" in str(options_provider).lower():
+        score = min(score * 0.85, 0.80)
     return float(np.clip(score, 0.0, 1.0))
 
 

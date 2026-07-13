@@ -1123,6 +1123,45 @@ def _write_labels(
     return inserted
 
 
+# ─── Leakage-safe event date selection ────────────────────────────────────────
+
+def _select_pre_post_event_dates(
+    trade_dates: Sequence[date],
+    event_date: date,
+    post_max_days_forward: int = POST_MAX_DAYS_FORWARD,
+) -> Tuple[Optional[date], Optional[date], Optional[str]]:
+    """Select the leakage-safe pre/post-event trade dates from available dates.
+
+    LEAKAGE INVARIANT (the guarantee this pipeline's labels depend on):
+      * ``pre_date`` is the LATEST trade_date STRICTLY BEFORE ``event_date``.
+        It is never on or after the event — a pre-event snapshot dated on/after
+        the catalyst would leak the outcome into the feature.
+      * ``post_date`` is the EARLIEST trade_date STRICTLY AFTER ``event_date``,
+        within ``post_max_days_forward`` days.
+
+    Extracted from ``_process_symbol`` so the invariant is unit-testable rather
+    than asserted only in prose. Returns ``(pre_date, post_date, None)`` on
+    success, or ``(None, None, reason)`` where reason is
+    ``"no_pre_event_trade_date"`` or ``"no_post_event_trade_date"``.
+    """
+    pre_candidates = [d for d in trade_dates if d < event_date]
+    if not pre_candidates:
+        return None, None, "no_pre_event_trade_date"
+    pre_date = max(pre_candidates)
+
+    # For BMO events the same day would also be valid, but we use the
+    # conservative strictly-after rule to avoid AMC/BMO ambiguity for
+    # UNKNOWN-timed events.
+    post_candidates = [
+        d for d in trade_dates
+        if d > event_date and d <= event_date + timedelta(days=post_max_days_forward)
+    ]
+    if not post_candidates:
+        return None, None, "no_post_event_trade_date"
+    post_date = min(post_candidates)
+    return pre_date, post_date, None
+
+
 # ─── Per-symbol pipeline ──────────────────────────────────────────────────────
 
 def _process_symbol(
@@ -1205,9 +1244,12 @@ def _process_symbol(
     for event in events:
         stats.events_attempted += 1
 
-        # Pre-event date: last trade_date strictly before event_date
-        pre_candidates = [d for d in trade_dates if d < event.event_date]
-        if not pre_candidates:
+        # Leakage-safe pre/post date selection (see _select_pre_post_event_dates:
+        # pre_date strictly < event_date, post_date strictly > event_date).
+        pre_date, post_date, reason = _select_pre_post_event_dates(
+            trade_dates, event.event_date, POST_MAX_DAYS_FORWARD
+        )
+        if reason == "no_pre_event_trade_date":
             logger.debug(
                 "%s %s: no pre-event trade_date available — skipping",
                 symbol, event.event_date,
@@ -1218,17 +1260,7 @@ def _process_symbol(
             )
             event_date_info.append((event, None, None))
             continue
-        pre_date = max(pre_candidates)
-
-        # Post-event date: first trade_date strictly after event_date
-        # (for BMO events the same day would also be valid, but we use the conservative
-        # rule to avoid AMC/BMO ambiguity for UNKNOWN-timed events)
-        post_candidates = [
-            d for d in trade_dates
-            if d > event.event_date
-            and d <= event.event_date + timedelta(days=POST_MAX_DAYS_FORWARD)
-        ]
-        if not post_candidates:
+        if reason == "no_post_event_trade_date":
             logger.debug(
                 "%s %s: no post-event trade_date within %d days — skipping",
                 symbol, event.event_date, POST_MAX_DAYS_FORWARD,
@@ -1239,7 +1271,6 @@ def _process_symbol(
             )
             event_date_info.append((event, None, None))
             continue
-        post_date = min(post_candidates)
 
         needed_dates.add(pre_date)
         needed_dates.add(post_date)

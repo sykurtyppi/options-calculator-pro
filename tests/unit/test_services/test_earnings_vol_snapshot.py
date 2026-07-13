@@ -6,7 +6,44 @@ import numpy as np
 import pandas as pd
 
 import web.api.edge_engine as edge_engine
-from services.earnings_vol_snapshot import build_vol_snapshot
+from services.earnings_vol_snapshot import build_vol_snapshot, _data_quality_score, _quality_label
+
+
+class TestDataQualityProviderPenalty(unittest.TestCase):
+    """V2: a delayed/greek-less provider (yfinance) must not score like a clean
+    real-time surface, so the abstention gate can see the downgrade."""
+
+    _CLEAN = dict(
+        price_staleness_minutes=10,
+        chain_staleness_minutes=10,
+        earnings_date=date(2026, 5, 1),
+        earnings_source_confidence=0.9,
+        earnings_source_stale=False,
+        term_point_count=4,
+        rv30_yz=0.4,
+        rv_har_forecast=0.42,
+        historical_move_source="earnings_history",
+        historical_event_count=10,
+    )
+
+    def test_yfinance_scores_below_realtime_and_cannot_reach_high(self):
+        realtime = _data_quality_score(**self._CLEAN, options_provider="marketdata_app")
+        yfin = _data_quality_score(**self._CLEAN, options_provider="yfinance")
+        unknown = _data_quality_score(**self._CLEAN, options_provider=None)
+        # Real-time is a clean "high" surface; the yfinance fallback is penalized
+        # and capped so it can never be labeled "high".
+        assert realtime >= 0.85
+        assert _quality_label(realtime) == "high"
+        assert yfin < realtime
+        assert yfin <= 0.80
+        assert _quality_label(yfin) != "high"
+        # Unknown provider is backward-compatible: no penalty (== real-time here).
+        assert unknown == realtime
+
+    def test_yfinance_fallback_label_variants_are_penalized(self):
+        base = _data_quality_score(**self._CLEAN, options_provider="marketdata_app")
+        for label in ("yfinance", "yfinance_fallback", "YFinance"):
+            assert _data_quality_score(**self._CLEAN, options_provider=label) < base
 
 
 def _make_price_history(as_of: str = "2026-04-20") -> tuple[pd.DataFrame, list[dict[str, object]]]:
