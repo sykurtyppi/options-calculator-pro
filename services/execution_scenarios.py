@@ -124,7 +124,9 @@ def _normalize_legs(raw_legs: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         bid = _finite_float(raw.get("bid"))
         ask = _finite_float(raw.get("ask"))
         mid = _finite_float(raw.get("mid"))
-        if mid is None and bid is not None and ask is not None and ask >= bid:
+        # H3: only derive a mid from a valid two-sided quote — a zero bid is not
+        # an executable market, so it must not be assigned an (0 + ask)/2 mid.
+        if mid is None and bid is not None and ask is not None and bid > 0 and ask >= bid:
             mid = (bid + ask) / 2.0
         result[str(name)] = {
             **dict(raw),

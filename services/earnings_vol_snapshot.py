@@ -1331,8 +1331,12 @@ def _data_quality_score(
     # gate (MIN_DATA_QUALITY_FOR_ANY_TRADE) exactly like real-time MarketData.
     # Penalize + cap so the gate can see the downgrade. (Provider identity is the
     # faithful proxy for greek availability, which the normalized chain drops.)
+    # H7: the cap (0.74) is intentionally just below structure_selector's
+    # MIN_DATA_QUALITY_FOR_BEST (0.75) so a delayed, greek-less yfinance surface
+    # can still trade as a Candidate (> MIN_DATA_QUALITY_FOR_ANY_TRADE = 0.45) but
+    # can never be promoted to the top "Best Candidate" tier on quality alone.
     if options_provider and "yfinance" in str(options_provider).lower():
-        score = min(score * 0.85, 0.80)
+        score = min(score * 0.85, 0.74)
     return float(np.clip(score, 0.0, 1.0))
 
 

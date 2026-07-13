@@ -201,6 +201,11 @@ class YFinanceMarketDataClient:
             dte = np.nan
         bid = pd.to_numeric(legs.get("bid"), errors="coerce")
         ask = pd.to_numeric(legs.get("ask"), errors="coerce")
+        # H3: mid only from a valid two-sided quote — a zero (or missing) bid is
+        # not an executable market, so it must yield NaN rather than a fabricated
+        # (0 + ask)/2 mid that would contaminate downstream implied-move / pricing.
+        _valid_quote = (bid > 0) & (ask > 0) & (ask >= bid)
+        mid = ((bid + ask) / 2.0).where(_valid_quote)
         out = pd.DataFrame({
             "optionSymbol": legs.get("contractSymbol", pd.Series([None] * n)).astype(object),
             "underlying": [symbol] * n,
@@ -208,7 +213,7 @@ class YFinanceMarketDataClient:
             "strike": pd.to_numeric(legs.get("strike"), errors="coerce"),
             "bid": bid,
             "ask": ask,
-            "mid": (bid + ask) / 2.0,
+            "mid": mid,
             "lastPrice": pd.to_numeric(legs.get("lastPrice"), errors="coerce"),
             "volume": pd.to_numeric(legs.get("volume"), errors="coerce"),
             "openInterest": pd.to_numeric(legs.get("openInterest"), errors="coerce"),

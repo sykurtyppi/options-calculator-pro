@@ -5297,16 +5297,34 @@ class InstitutionalMLDatabase:
         base_lr = LogisticRegression(C=0.5, max_iter=1000, random_state=42, class_weight="balanced")
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
-        clf = CalibratedClassifierCV(estimator=base_lr, method="isotonic", cv=cv_folds)
-        clf.fit(X_scaled, y)
-
-        # Honest generalization metrics (audit H3/H4): score the SAME architecture
-        # that ships (scaler + calibrated LR) OUT OF FOLD, split by SYMBOL so a
-        # ticker's multiple earnings events can't leak across folds. The old code
-        # scored the bare *uncalibrated* LR and computed AUC/Brier/precision/recall
-        # IN-SAMPLE (predicting on the data it was fit on) — both optimistic.
+        # H4/H5: the minority-class guard above handles the common case, but a
+        # nested CalibratedClassifierCV(cv=k) evaluated under an outer grouped OOF
+        # split can still be infeasible on pathological label/group distributions
+        # it cannot fully characterize — e.g. an outer training fold left with < 2
+        # minority observations, or class-pure symbols producing single-class
+        # folds where the LR cannot fit. Fail clearly instead of crashing. (Model
+        # artifacts are only saved *after* this block, so a caught failure leaves
+        # no partial state.) Production's balanced ~1,639-event set never trips it.
         _PRED_THRESHOLD = 0.50
-        m = self._crush_oof_metrics(X, y, groups, cv_folds, base_lr, _PRED_THRESHOLD)
+        try:
+            clf = CalibratedClassifierCV(estimator=base_lr, method="isotonic", cv=cv_folds)
+            clf.fit(X_scaled, y)
+            # Honest generalization metrics: score the SAME architecture that ships
+            # (scaler + calibrated LR) OUT OF FOLD, split by SYMBOL so a ticker's
+            # multiple earnings events can't leak across folds.
+            m = self._crush_oof_metrics(X, y, groups, cv_folds, base_lr, _PRED_THRESHOLD)
+        except Exception as exc:
+            self.logger.warning(
+                "Crush model CV infeasible (n=%d, class_counts=%s, cv_folds=%d): %s",
+                n, class_counts.tolist(), cv_folds, exc,
+            )
+            return {
+                "error": "cv_infeasible",
+                "trained": False,
+                "n_events": n,
+                "class_counts": class_counts.tolist(),
+                "detail": str(exc),
+            }
         cv_auc, cv_acc = m["cv_auc"], m["cv_acc"]
         auc, brier = m["oof_auc"], m["oof_brier"]
         precision_at_thresh, recall_at_thresh = m["oof_precision"], m["oof_recall"]

@@ -138,3 +138,27 @@ def test_get_earnings_schema_and_timing():
     # surpriseEPS computed where both EPS present
     past = df[df["reportedEPS"].notna() & df["estimatedEPS"].notna()].iloc[0]
     assert past["surpriseEPS"] == pytest.approx(past["reportedEPS"] - past["estimatedEPS"])
+
+
+class _ZeroBidTicker(_FakeTicker):
+    def option_chain(self, exp: str) -> _FakeChain:
+        def _leg(strike, bid, ask):
+            return {
+                "contractSymbol": f"{self.symbol}{exp}C{strike}",
+                "strike": strike, "bid": bid, "ask": ask,
+                "impliedVolatility": 0.3, "openInterest": 100, "volume": 10,
+                "lastPrice": 9.99, "inTheMoney": False,
+            }
+        # strike 100: valid two-sided quote; strike 105: zero bid (not executable)
+        calls = pd.DataFrame([_leg(100, 3.0, 3.4), _leg(105, 0.0, 2.0)])
+        return _FakeChain(calls, calls.copy())
+
+
+def test_zero_bid_leg_yields_nan_mid_not_fabricated():
+    """H3: a zero-bid leg is not an executable two-sided market — its mid must be
+    NaN, not (0 + ask)/2, so it can't contaminate downstream implied-move/pricing."""
+    client = YFinanceMarketDataClient(ticker_factory=_ZeroBidTicker)
+    df = client.get_option_chain("AAPL", expiration="2026-07-17", side="call")
+    by_strike = {row["strike"]: row for _, row in df.iterrows()}
+    assert by_strike[100.0]["mid"] == pytest.approx(3.2)   # (3.0 + 3.4)/2
+    assert pd.isna(by_strike[105.0]["mid"])                # zero bid -> NaN, not 1.0

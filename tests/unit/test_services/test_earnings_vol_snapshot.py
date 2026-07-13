@@ -35,7 +35,7 @@ class TestDataQualityProviderPenalty(unittest.TestCase):
         assert realtime >= 0.85
         assert _quality_label(realtime) == "high"
         assert yfin < realtime
-        assert yfin <= 0.80
+        assert yfin <= 0.74  # H7: below MIN_DATA_QUALITY_FOR_BEST (0.75)
         assert _quality_label(yfin) != "high"
         # Unknown provider is backward-compatible: no penalty (== real-time here).
         assert unknown == realtime

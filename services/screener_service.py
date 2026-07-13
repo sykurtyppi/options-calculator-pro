@@ -344,7 +344,10 @@ def _collect_yf_option_chain_frame(
                 bid = row.get("bid")
                 ask = row.get("ask")
                 mid = np.nan
-                if pd.notna(bid) and pd.notna(ask) and ask >= bid and ask > 0:
+                # H3: require bid > 0 — a zero bid is not an executable two-sided
+                # market (nobody is bidding), so {bid:0, ask:2} must NOT yield a
+                # mid of 1.0 and contaminate implied-move / straddle pricing.
+                if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask >= bid and ask > 0:
                     mid = (float(bid) + float(ask)) / 2.0
                 # F6: do NOT promote a last trade into mid. Last prints can be
                 # stale and must not drive implied-move / straddle-mid math. The
@@ -406,6 +409,11 @@ def _build_ranked_snapshot(
         symbol,
         today,
         option_chain_data=option_chain_df,
+        # H2 (V2): the ranked screener always sources its chain from yfinance
+        # (_collect_yf_option_chain_frame). Declare the provider so the data-
+        # quality score applies the delayed/greek-less penalty here too — without
+        # this the screener path silently scored yfinance like real-time MarketData.
+        options_provider="yfinance",
         earnings_metadata={
             "earnings_date": earnings_date,
             "release_timing": _timing_label_to_full(release_timing),

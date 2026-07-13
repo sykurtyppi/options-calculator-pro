@@ -931,3 +931,33 @@ class TestPriorLoadersFromTradeLog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_simulated_prior_rank_is_neutral_not_boosted_by_win_return(tmp_path):
+    """H6: a simulated prior's exposed rank must equal the neutral no-data rank —
+    its (simulated) win_rate/avg_return must NOT boost the rank that feeds 30% of
+    the composite. Raw metrics are still retained on the dataclass for display."""
+    import pandas as pd
+    from unittest.mock import patch
+    import services.structure_scorecard as sc
+
+    fake = pd.DataFrame({
+        "structure": ["call_calendar"],
+        "scenario": [sc.PROMOTION_BASELINE_SCENARIO],
+        "simulated_priceable_count": [40],
+        "win_rate": [0.95],           # would strongly boost rank if it counted
+        "avg_return_pct": [50.0],
+    })
+    with patch.object(sc, "_latest_report_file", return_value=tmp_path / "x.csv"), \
+         patch.object(sc.pd, "read_csv", return_value=fake):
+        prior = sc._load_calendar_prior_from_reports("call_calendar")
+
+    neutral_rank = sc._compute_rank_score(
+        win_rate=sc._NEUTRAL_PRIOR_WIN_RATE,
+        avg_return_pct=sc._NEUTRAL_PRIOR_AVG_RETURN_PCT,
+        history_count=sc._NEUTRAL_PRIOR_HISTORY_COUNT,
+    )
+    assert prior.is_simulated is True
+    assert prior.history_count == 40        # raw count retained for display
+    assert prior.win_rate == 0.95           # raw metrics retained for display
+    assert prior.rank_score == neutral_rank  # but rank carries no simulated boost

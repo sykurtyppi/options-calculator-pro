@@ -100,9 +100,11 @@ def _scorecard(
     walk_forward_avg_return_pct: float = 6.0,
     walk_forward_rank_score: float = 0.70,
     composite_structure_score: float = 0.68,
+    walk_forward_is_simulated: bool = False,
 ) -> StructureScorecard:
     return StructureScorecard(
         structure=structure,
+        walk_forward_is_simulated=walk_forward_is_simulated,
         eligible=eligible,
         eligibility_flags=eligibility_flags or [],
         expected_edge_pct=expected_edge_pct,
@@ -122,6 +124,30 @@ def _scorecard(
         composite_structure_score=composite_structure_score,
         rationale_bullets=[],
     )
+
+
+class TestSimulatedPriorNotBest(unittest.TestCase):
+    def _winner_cards(self, *, simulated: bool):
+        return [
+            _scorecard(
+                "call_calendar", expected_edge_pct=6.2, expected_return_pct=9.0,
+                composite_structure_score=0.82, execution_penalty=0.03,
+                sample_confidence=0.74, walk_forward_history_count=40,
+                walk_forward_is_simulated=simulated,
+            ),
+            _scorecard("otm_strangle", expected_edge_pct=2.8, composite_structure_score=0.61),
+            _scorecard("atm_straddle", expected_edge_pct=1.9, composite_structure_score=0.54),
+            _scorecard("put_calendar", expected_edge_pct=1.5, composite_structure_score=0.49),
+        ]
+
+    def test_simulated_top_is_not_promoted_to_best(self):
+        # H1: identical winning card — a real N=40 earns Best, but a SIMULATED
+        # N=40 must not clear the strong-history bar and stays a Candidate.
+        snapshot = _snapshot(historical_vs_implied_move_ratio=1.70, tail_vs_implied_move_ratio=1.95)
+        real = select_best_structure(snapshot, self._winner_cards(simulated=False))
+        simulated = select_best_structure(snapshot, self._winner_cards(simulated=True))
+        assert real.recommendation == RECOMMENDATION_BEST
+        assert simulated.recommendation != RECOMMENDATION_BEST
 
 
 class TestStructureSelector(unittest.TestCase):

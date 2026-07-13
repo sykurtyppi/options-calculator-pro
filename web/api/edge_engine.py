@@ -1846,7 +1846,7 @@ def _smile_curvature_from_mda_chain(
                 oi_by_strike[k] = oi_by_strike.get(k, 0.0) + float(oi)
             bid = _safe_float(row.get("bid"), np.nan)
             ask = _safe_float(row.get("ask"), np.nan)
-            if np.isfinite(bid) and np.isfinite(ask) and ask > 0 and ask > bid:
+            if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0 and ask > bid:  # H3: zero-bid is not executable
                 mid = (bid + ask) / 2.0
                 sp = (ask - bid) / mid * 100.0
                 # average spread across call/put at the same strike
@@ -2115,7 +2115,7 @@ def _smile_curvature_yf(ticker: yf.Ticker, current_price: float) -> Dict[str, An
                     oi_by_strike[k] = oi_by_strike.get(k, 0.0) + float(oi)
                 bid = _safe_float(row.get("bid"), np.nan)
                 ask = _safe_float(row.get("ask"), np.nan)
-                if np.isfinite(bid) and np.isfinite(ask) and ask > 0 and ask > bid:
+                if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0 and ask > bid:  # H3: zero-bid is not executable
                     mid = (bid + ask) / 2.0
                     sp = (ask - bid) / mid * 100.0
                     spread_by_strike[k] = (spread_by_strike.get(k, sp) + sp) / 2.0
@@ -2303,7 +2303,10 @@ def _collect_yf_option_chain_frame(
                 bid = row.get("bid")
                 ask = row.get("ask")
                 mid = np.nan
-                if pd.notna(bid) and pd.notna(ask) and ask >= bid and ask > 0:
+                # H3: require bid > 0 — a zero bid is not an executable two-sided
+                # market, so {bid:0, ask:2} must NOT yield a mid of 1.0 and
+                # contaminate implied-move / straddle pricing.
+                if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask >= bid and ask > 0:
                     mid = (float(bid) + float(ask)) / 2.0
                 # F6: do NOT promote a last trade into mid. Last prints can be
                 # stale and must not drive implied-move / straddle-mid math. The
