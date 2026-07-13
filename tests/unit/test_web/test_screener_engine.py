@@ -96,3 +96,13 @@ class TestNormalizeYfinanceChain(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_mid_from_bid_ask_rejects_zero_bid():
+    """H3: a zero (non-executable) bid must yield None, not (0 + ask)/2."""
+    from web.api.screener_engine import _mid_from_bid_ask
+    assert _mid_from_bid_ask(1.8, 2.2) == 2.0        # valid two-sided quote
+    assert _mid_from_bid_ask(0.0, 2.0) is None       # zero bid -> not 1.0
+    assert _mid_from_bid_ask(0.0, 0.0) is None
+    assert _mid_from_bid_ask(2.5, 2.0) is None       # crossed
+    assert _mid_from_bid_ask(None, 2.0) is None

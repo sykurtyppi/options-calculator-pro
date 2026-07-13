@@ -56,7 +56,9 @@ def _safe_int(value: Any) -> Optional[int]:
 def _mid_from_bid_ask(bid: Any, ask: Any) -> Optional[float]:
     bid_val = _safe_float(bid)
     ask_val = _safe_float(ask)
-    if bid_val is None or ask_val is None or bid_val < 0 or ask_val < 0:
+    # H3: a zero (or negative) bid is not an executable two-sided market, so it
+    # must not produce a mid = (0 + ask)/2.
+    if bid_val is None or ask_val is None or bid_val <= 0 or ask_val <= 0 or ask_val < bid_val:
         return None
     mid_val = (bid_val + ask_val) / 2.0
     return mid_val if mid_val > 0 else None

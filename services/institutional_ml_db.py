@@ -5313,7 +5313,11 @@ class InstitutionalMLDatabase:
             # (scaler + calibrated LR) OUT OF FOLD, split by SYMBOL so a ticker's
             # multiple earnings events can't leak across folds.
             m = self._crush_oof_metrics(X, y, groups, cv_folds, base_lr, _PRED_THRESHOLD)
-        except Exception as exc:
+        except ValueError as exc:
+            # Narrow to ValueError: that is what sklearn raises for infeasible CV
+            # (single-class fold, n_splits > members of a class, isotonic edge
+            # cases). A genuine non-CV bug (AttributeError/KeyError/…) propagates
+            # instead of being mislabeled cv_infeasible.
             self.logger.warning(
                 "Crush model CV infeasible (n=%d, class_counts=%s, cv_folds=%d): %s",
                 n, class_counts.tolist(), cv_folds, exc,

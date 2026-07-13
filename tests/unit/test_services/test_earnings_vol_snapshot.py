@@ -278,6 +278,22 @@ class TestEarningsVolSnapshot(unittest.TestCase):
         self.assertIsNone(snapshot.term_structure_slope)
         self.assertEqual(snapshot.null_reasons["iv30"], "insufficient_term_structure_points")
 
+    def test_zero_bid_chain_does_not_fabricate_implied_move_through_snapshot(self):
+        # H3 (root/canonical): a chain with no executable two-sided quotes (bid=0)
+        # must not fabricate an ATM mid. This drives the case THROUGH
+        # build_vol_snapshot (not just the frame builder) — the canonical
+        # normalizer's fillna previously overrode the NaN mid and manufactured a
+        # (0 + ask)/2 mid, producing a phantom implied move from a non-executable
+        # market. A valid chain (contrast) still yields an implied move.
+        valid = self._build_snapshot(chain_df=_make_chain())
+        self.assertIsNotNone(valid.near_term_implied_move_pct)
+
+        zero_bid = _make_chain()
+        zero_bid["bid"] = 0.0        # nobody bidding -> not an executable market
+        zero_bid["mid"] = np.nan     # frame builder correctly emits NaN for zero-bid
+        snap = self._build_snapshot(chain_df=zero_bid)
+        self.assertIsNone(snap.near_term_implied_move_pct)
+
     def test_stale_prices_degrade_data_quality_without_changing_surface_state(self):
         fresh_price_df, prior_events = _make_price_history()
         stale_price_df = fresh_price_df[fresh_price_df["trade_date"] <= "2026-04-15"].copy()

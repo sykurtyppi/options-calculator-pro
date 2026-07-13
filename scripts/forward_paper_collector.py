@@ -217,9 +217,16 @@ def _live_exit_pricer(pos: Dict[str, Any]) -> Optional[float]:
         pm = ch.puts.loc[ch.puts["strike"] == ps]
         if cm.empty or pm.empty:
             return None
-        c = (float(cm.iloc[0]["bid"]) + float(cm.iloc[0]["ask"])) / 2.0
-        p = (float(pm.iloc[0]["bid"]) + float(pm.iloc[0]["ask"])) / 2.0
-        return c + p if (c > 0 and p > 0) else None
+        # H3: reprice the exit only from executable two-sided quotes — a zero (or
+        # crossed) bid is not a market, so it must not fabricate an exit mid that
+        # would contaminate the paper-trade P&L / forward evidence.
+        cbid, cask = float(cm.iloc[0]["bid"]), float(cm.iloc[0]["ask"])
+        pbid, pask = float(pm.iloc[0]["bid"]), float(pm.iloc[0]["ask"])
+        if cbid <= 0 or pbid <= 0 or cask < cbid or pask < pbid:
+            return None
+        c = (cbid + cask) / 2.0
+        p = (pbid + pask) / 2.0
+        return c + p
     except Exception:
         return None
 

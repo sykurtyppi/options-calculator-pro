@@ -678,7 +678,14 @@ def _normalize_option_chain(option_chain_data: Any) -> Tuple[pd.DataFrame, Optio
     if "mid" not in df.columns:
         df["mid"] = np.nan
     if {"bid", "ask"}.issubset(df.columns):
-        valid_ba = np.isfinite(df["bid"]) & np.isfinite(df["ask"]) & (df["ask"] >= df["bid"]) & (df["ask"] > 0)
+        # H3: require bid > 0 here too — this is the CANONICAL normalizer inside
+        # build_vol_snapshot, and because it fills mid via fillna it would
+        # otherwise OVERRIDE the NaN that the upstream frame builders / clients
+        # now emit for a zero-bid (non-executable) quote, silently reverting the
+        # fix on the production path and fabricating a mid = (0 + ask)/2 that
+        # contaminates implied-move. (mid stays NaN -> valid_spread below also
+        # excludes the row, so spread_pct is likewise not fabricated.)
+        valid_ba = np.isfinite(df["bid"]) & np.isfinite(df["ask"]) & (df["bid"] > 0) & (df["ask"] >= df["bid"]) & (df["ask"] > 0)
         df.loc[valid_ba, "mid"] = df.loc[valid_ba, "mid"].fillna((df.loc[valid_ba, "bid"] + df.loc[valid_ba, "ask"]) / 2.0)
     # Do not promote last trade into mid. Last prints can be stale and should not
     # drive implied-move or term-structure calculations without valid bid/ask.
