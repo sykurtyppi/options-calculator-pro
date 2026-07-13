@@ -115,11 +115,19 @@ def compute_earnings_move_profile(
             idx = idx.tz_localize(None)
         price_series.index = idx.normalize()
     price_series = price_series[~price_series.index.duplicated(keep="last")].sort_index()
+    # F1: enforce the as_of cutoff on the PRICE series, not just the events.
+    # Without this the daily fallback's .tail(126) and an AMC event on the cutoff
+    # date (whose post-event close is the following session) can read closes
+    # dated after as_of_date — future-data leakage into a historical/backtest
+    # profile. Truncating here makes the helper's contract leak-safe regardless
+    # of whether the caller pre-truncated its frame.
+    cutoff = pd.Timestamp(as_of_date).normalize()
+    if isinstance(price_series.index, pd.DatetimeIndex):
+        price_series = price_series[price_series.index <= cutoff]
     index_arr = price_series.index.to_numpy()
     if len(index_arr) < 10:
         return _EMPTY
 
-    cutoff = pd.Timestamp(as_of_date)
     parsed_events: Dict[pd.Timestamp, Dict[str, Any]] = {}
     for item in earnings_events or []:
         try:
