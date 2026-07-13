@@ -10,7 +10,39 @@ from services.structure_scorecard import (
     build_structure_scorecards,
     reload_walk_forward_priors,
     score_atm_straddle,
+    _effective_history_count,
+    _blend_expected_return,
+    _compute_rank_score,
 )
+
+
+def _prior(structure="call_calendar", *, count=40, win=0.60, ret=3.0, rank=0.60, simulated=False):
+    return WalkForwardPrior(
+        structure=structure, history_count=count, win_rate=win,
+        avg_return_pct=ret, rank_score=rank, source="test", is_simulated=simulated,
+    )
+
+
+class TestSimulatedPriorZeroWeight(unittest.TestCase):
+    """V3 (F2): a simulated prior must carry ZERO empirical decision weight."""
+
+    def test_effective_history_count_zeroes_only_simulated(self):
+        assert _effective_history_count(_prior(count=40, simulated=False)) == 40.0
+        assert _effective_history_count(_prior(count=40, simulated=True)) == 0.0
+
+    def test_blend_ignores_simulated_avg_return(self):
+        # wf_weight collapses to 0 → the blend returns the live signal, not the
+        # (simulated) avg_return, however large.
+        assert _blend_expected_return(_prior(count=40, ret=99.0, simulated=True), 2.0) == 2.0
+        # A real prior with the same count blends toward its avg_return.
+        assert _blend_expected_return(_prior(count=40, ret=99.0, simulated=False), 2.0) > 2.0
+
+    def test_rank_history_component_zeroed_for_simulated_load(self):
+        # The load path computes rank with history_count=0 for simulated priors;
+        # confirm that lowers the rank vs the same win/return backed by real N.
+        backed = _compute_rank_score(win_rate=0.60, avg_return_pct=3.0, history_count=40)
+        unbacked = _compute_rank_score(win_rate=0.60, avg_return_pct=3.0, history_count=0)
+        assert unbacked < backed
 
 
 def _base_snapshot(**overrides) -> VolSnapshot:

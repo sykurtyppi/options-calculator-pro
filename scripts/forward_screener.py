@@ -239,9 +239,10 @@ def _compute_crush_gate_signals(
         if prob is not None:
             result["crush_prob"] = round(prob, 4)
     except Exception as exc:
-        # V7: model unavailable — NBR gate still works standalone, but log so a
-        # voided crush prediction is visible rather than silently dropped.
-        logger.debug("crush classifier unavailable, using NBR gate only: %s", exc)
+        # V7 (F3): model unavailable — NBR gate still works standalone, but
+        # WARNING (not debug) so a voided crush prediction is visible at the
+        # default log level rather than being effectively `except: pass`.
+        logger.warning("crush classifier unavailable, using NBR gate only: %s", exc)
 
     return result
 

@@ -79,6 +79,13 @@ export function buildTrustBadges(selectorOutput = null, scorecards = [], snapsho
       title: 'Comparable forward evidence is thin.',
     })
   }
+  if (best && best.walk_forward_is_simulated) {
+    badges.push({
+      label: 'Simulated prior',
+      tone: 'warning',
+      title: 'This structure’s walk-forward prior comes from a simulated scoreboard, not realized trades. It carries zero empirical weight in the score.',
+    })
+  }
   const optionSource = String(snapshot?.option_source || '').toLowerCase()
   const underlyingSource = String(snapshot?.underlying_source || '').toLowerCase()
   if (optionSource.includes('fallback') || underlyingSource.includes('fallback') || optionSource === 'unknown') {
