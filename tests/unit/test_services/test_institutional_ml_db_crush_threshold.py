@@ -58,3 +58,25 @@ def test_meta_label_string_matches_threshold():
     assert '"label": "front_iv_crush_pct < -0.40"' in src, (
         "meta `label` field must match the -0.40 threshold in _build_crush_training_data"
     )
+
+
+def test_training_fails_clearly_on_insufficient_class_support(tmp_path):
+    """F4: n>=30 with a minority class < 2 passes the size gate but would crash
+    CalibratedClassifierCV. The class-support guard must fail clearly instead."""
+    from unittest.mock import patch
+
+    db = InstitutionalMLDatabase(db_path=str(tmp_path / "t.sqlite"))
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({
+        "near_back_ratio": rng.normal(1.0, 0.1, 40),
+        "log_front_iv": rng.normal(-1.0, 0.2, 40),
+        "iv_rv_approx": rng.normal(1.1, 0.2, 40),
+        "crush_happened": np.array([1] + [0] * 39),   # 40 events, minority class = 1
+        "symbol": [f"S{i % 8}" for i in range(40)],
+    })
+    with patch.object(InstitutionalMLDatabase, "_build_crush_training_data", return_value=df):
+        result = db.train_ml_model_on_historical_spreads()
+
+    assert result["trained"] is False
+    assert result["error"] == "insufficient_class_support"
+    assert result["class_counts"] == [39, 1]

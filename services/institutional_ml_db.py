@@ -5263,11 +5263,37 @@ class InstitutionalMLDatabase:
         y = df_clean["crush_happened"].values
         groups = df_clean["symbol"].astype(str).values
         crush_rate = float(y.mean())
+
+        # F4: n>=30 alone is NOT a sufficient training gate. CalibratedClassifierCV(
+        # cv=k) with a class_weight-balanced LR requires BOTH classes present and
+        # each class to have >= k samples (every stratified fold must contain both
+        # classes; the grouped OOF metrics also need >= k distinct symbols). A
+        # 30-event set with 3 crush events passes n>=30 but crashes clf.fit. Fail
+        # clearly on too-few class support, and never request more folds than the
+        # minority class / group count can support.
+        class_counts = np.bincount(y.astype(int), minlength=2)
+        minority = int(class_counts.min())
+        n_groups = len(set(groups.tolist()))
+        if minority < 2 or int((class_counts > 0).sum()) < 2:
+            self.logger.warning(
+                "Crush training needs >=2 examples of BOTH classes; got class counts %s "
+                "(n=%d). Collect more of the minority class before training.",
+                class_counts.tolist(), n,
+            )
+            return {
+                "error": "insufficient_class_support",
+                "trained": False,
+                "n_events": n,
+                "class_counts": class_counts.tolist(),
+            }
         self.logger.info("Training on %d events — crush rate %.1f%%", n, crush_rate * 100)
 
         # Final deployed artifacts: scaler fit on all data + calibrated LR fit on
         # all scaled data (saved separately; serving re-applies the transform).
         cv_folds = min(5, max(3, n // 30))
+        # Adapt so no fold is asked for more of the minority class / more groups
+        # than exist (keeps CalibratedClassifierCV and the grouped OOF split valid).
+        cv_folds = max(2, min(cv_folds, minority, n_groups))
         base_lr = LogisticRegression(C=0.5, max_iter=1000, random_state=42, class_weight="balanced")
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
