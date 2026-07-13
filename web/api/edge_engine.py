@@ -1486,13 +1486,14 @@ def _nearest_atm_option_stats(
     vol = _safe_float(row.get("volume"), 0.0)
     bid = _safe_float(row.get("bid"), np.nan)
     ask = _safe_float(row.get("ask"), np.nan)
-    last = _safe_float(row.get("lastPrice"), np.nan)
 
+    # F6: mid is derived only from a valid two-sided quote. A stale last print
+    # must NOT be promoted into mid here — this mid feeds
+    # near_term_implied_move_pct (the ATM straddle-mid implied move), exactly the
+    # calculation the canonical rule says last prints must not drive.
     mid = np.nan
     if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid:
         mid = (bid + ask) / 2.0
-    elif np.isfinite(last) and last > 0:
-        mid = float(last)
 
     spread_pct = np.nan
     if np.isfinite(bid) and np.isfinite(ask) and ask >= bid and np.isfinite(mid) and mid > 0:
@@ -1565,14 +1566,14 @@ def _nearest_common_strike_pair_stats(
     put_row = _select_row(puts, chosen_strike)
 
     def _mid_and_spread(row: pd.Series) -> Tuple[Optional[float], Optional[float]]:
+        # F6: mid from a valid two-sided quote only. call_mid/put_mid here feed
+        # near_term_implied_move_pct (ATM straddle-mid implied move); a stale last
+        # print must not be promoted into mid and drive that calculation.
         bid = _safe_float(row.get("bid"), np.nan)
         ask = _safe_float(row.get("ask"), np.nan)
-        last = _safe_float(row.get("lastPrice"), np.nan)
         mid = np.nan
         if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid:
             mid = (bid + ask) / 2.0
-        elif np.isfinite(last) and last > 0:
-            mid = last
         spread_pct = np.nan
         if np.isfinite(bid) and np.isfinite(ask) and np.isfinite(mid) and mid > 0 and ask >= bid:
             spread_pct = ((ask - bid) / mid) * 100.0
