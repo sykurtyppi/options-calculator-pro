@@ -2304,10 +2304,11 @@ def _collect_yf_option_chain_frame(
                 mid = np.nan
                 if pd.notna(bid) and pd.notna(ask) and ask >= bid and ask > 0:
                     mid = (float(bid) + float(ask)) / 2.0
-                else:
-                    last_price = row.get("lastPrice")
-                    if pd.notna(last_price):
-                        mid = float(last_price)
+                # F6: do NOT promote a last trade into mid. Last prints can be
+                # stale and must not drive implied-move / straddle-mid math. The
+                # canonical snapshot normalizer (earnings_vol_snapshot) enforces
+                # this same rule but only FILLS a NaN mid — a lastPrice-derived
+                # mid injected here would survive and silently defeat it.
                 rows.append(
                     {
                         "trade_date": as_of_date.isoformat(),

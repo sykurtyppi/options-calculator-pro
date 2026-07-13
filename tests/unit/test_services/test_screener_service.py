@@ -707,3 +707,46 @@ class TestUpcomingPipeline:
         assert row is not None
         assert row["ranking_score"] is not None
         assert row["in_entry_window"] is False  # dte=7 is below dte_min=9
+
+
+# ── F6: last prints must not be promoted into `mid` ───────────────────────────
+
+class _StubChain:
+    def __init__(self, calls, puts):
+        self.calls = calls
+        self.puts = puts
+
+
+class _StubTicker:
+    def __init__(self, expiry, chain):
+        self.options = [expiry]
+        self._chain = chain
+
+    def option_chain(self, expiry):  # noqa: ARG002
+        return self._chain
+
+
+def test_collect_frame_does_not_promote_lastprice_into_mid():
+    """F6: when bid/ask are not a valid two-sided quote, `mid` must be NaN — a
+    stale last print must not be promoted into mid (it would defeat the canonical
+    snapshot rule, which only FILLS a NaN mid)."""
+    from services.screener_service import _collect_yf_option_chain_frame
+
+    calls = pd.DataFrame({
+        # row 0: valid two-sided quote -> mid = 2.0 ; row 1: no market, only a last
+        "strike": [100.0, 105.0],
+        "bid": [1.8, 0.0],
+        "ask": [2.2, 0.0],
+        "lastPrice": [2.05, 9.99],
+        "impliedVolatility": [0.5, 0.5],
+        "openInterest": [10, 10],
+        "volume": [5, 5],
+    })
+    puts = calls.iloc[0:0].copy()
+    ticker = _StubTicker("2026-05-15", _StubChain(calls, puts))
+
+    frame = _collect_yf_option_chain_frame(ticker, as_of=date(2026, 5, 1))
+    by_strike = {row["strike"]: row for _, row in frame.iterrows()}
+
+    assert by_strike[100.0]["mid"] == pytest.approx(2.0)   # from bid/ask
+    assert pd.isna(by_strike[105.0]["mid"])                # NOT 9.99 lastPrice
