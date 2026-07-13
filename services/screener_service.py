@@ -233,8 +233,16 @@ def _get_next_earnings(
                         else:
                             timing = "UNKNOWN"
                         return dte, timing, event_date
-    except Exception:
-        pass
+    except Exception as exc:
+        # V7 (F3): the earnings date anchors the entire thesis — a swallowed
+        # parse error here silently produces "no upcoming event". WARNING (not
+        # debug) so a dropped anchor is actually visible at the default log level
+        # instead of being effectively `except: pass`. Fires only on a genuine
+        # parse exception, not the normal no-earnings path, so it is not noisy.
+        logger.warning(
+            "screener earnings-calendar parse failed for %s: %s",
+            getattr(ticker, "ticker", "?"), exc,
+        )
 
     # Fallback: earnings_dates attribute
     try:
@@ -245,8 +253,13 @@ def _get_next_earnings(
                 if today <= event_date <= cutoff:
                     dte = (event_date - today).days
                     return dte, "UNKNOWN", event_date
-    except Exception:
-        pass
+    except Exception as exc:
+        # V7 (F3): see above — WARNING so the dropped earnings anchor is visible
+        # instead of silently returning "no upcoming event".
+        logger.warning(
+            "screener earnings-dates fallback failed for %s: %s",
+            getattr(ticker, "ticker", "?"), exc,
+        )
 
     return None, "UNKNOWN", None
 

@@ -1,7 +1,7 @@
 // Pure-function tests for the earnings-move-history transform (node --test).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildEarningsMoveHistory, shortDateLabel } from './earningsMoveHistory.js'
+import { buildEarningsMoveHistory, shortDateLabel, MIN_TAKEAWAY_EVENTS } from './earningsMoveHistory.js'
 
 test('shortDateLabel formats ISO dates without TZ drift', () => {
   assert.equal(shortDateLabel('2024-05-02'), "May '24")
@@ -39,6 +39,16 @@ test('exceedRate = fraction of moves >= implied', () => {
   const hist = [2, 4, 6, 8].map((m, i) => ({ date: `2024-0${i + 1}-01`, move_pct: m }))
   const { exceedRate } = buildEarningsMoveHistory(hist, 5) // >=5 → {6,8} => 2/4
   assert.equal(exceedRate, 0.5)
+})
+
+test('FE-2: directional takeaway is withheld below the sample floor', () => {
+  const mk = (n) => Array.from({ length: n }, (_, i) => ({ date: `2024-0${(i % 9) + 1}-01`, move_pct: 3 }))
+  // n=1 exceedRate is a coin flip (0 or 1) — must NOT be called cheap/rich.
+  assert.equal(buildEarningsMoveHistory(mk(1), 5).takeawaySufficient, false)
+  assert.equal(buildEarningsMoveHistory(mk(MIN_TAKEAWAY_EVENTS - 1), 5).takeawaySufficient, false)
+  // At/above the floor the directional call is allowed.
+  assert.equal(buildEarningsMoveHistory(mk(MIN_TAKEAWAY_EVENTS), 5).takeawaySufficient, true)
+  assert.equal(buildEarningsMoveHistory(mk(MIN_TAKEAWAY_EVENTS + 4), 5).takeawaySufficient, true)
 })
 
 test('null implied move yields null reference and null exceedRate', () => {

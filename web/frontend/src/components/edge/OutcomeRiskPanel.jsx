@@ -36,7 +36,7 @@ export default function OutcomeRiskPanel({ selectorOutput, scorecards, volSnapsh
 
         <div className="selector-panel-header outcome-subsection-header">
           <h3>Outcome Scenarios</h3>
-          <span>Simple score-derived stress cases built from IV variability, historical move dispersion, and execution friction.</span>
+          <span>Directional score-derived cases: how the setup shifts if IV, the realized move, and execution land favorably or adversely. Qualitative, not a modeled return distribution.</span>
         </div>
         <div className="outcome-grid">
           {scenarios.map((item) => (
@@ -58,7 +58,7 @@ export default function OutcomeRiskPanel({ selectorOutput, scorecards, volSnapsh
           <span>Edge Durability</span>
           <strong>{durability.label}</strong>
           <em>{durability.detail}</em>
-          <small>Stressed score-derived edge after simple haircut: {durability.stressedEdgeLabel}</small>
+          <small>Under a conservative haircut on costs, IV expansion, and realized move, the modeled edge {durability.stressedEdgeLabel}.</small>
         </div>
 
         <div className="selector-panel-header outcome-subsection-header">

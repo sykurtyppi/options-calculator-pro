@@ -1010,8 +1010,20 @@ def build_record_from_analysis(
             salt=created_at,
         )
 
+    # Honest provenance (V1): the VolSnapshot's ``option_source`` is a generic
+    # "provided" sentinel — the snapshot is built from an already-fetched chain
+    # and cannot see the upstream provider. The real provider label
+    # (marketdata_app / yfinance_fallback / yfinance) is computed in edge_engine
+    # and lives in ``metrics["data_sources"]``. Prefer that so a silent degrade
+    # to delayed yfinance is recorded as yfinance instead of being masked as
+    # "provided"; only fall back to the sentinel when the honest label is absent.
+    _snapshot_option_source = vol_snapshot.get("option_source")
+    if _snapshot_option_source == "provided":
+        _snapshot_option_source = None
     provider_names = {
-        "option_source": vol_snapshot.get("option_source") or (metrics.get("data_sources") or {}).get("options_source"),
+        "option_source": _snapshot_option_source
+        or (metrics.get("data_sources") or {}).get("options_source")
+        or vol_snapshot.get("option_source"),
         "underlying_source": vol_snapshot.get("underlying_source") or (metrics.get("data_sources") or {}).get("price_rv_source"),
         "earnings_source": vol_snapshot.get("earnings_source_primary"),
         "quote_source": quote.get("quote_source"),

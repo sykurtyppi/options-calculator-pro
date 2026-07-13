@@ -19,6 +19,7 @@ export default function SelectorDecisionCard({ selectorOutput, scorecards = [], 
   const edgeTier = getEdgeTier(selectorOutput.expected_edge_pct)
   const trustBadges = buildTrustBadges(selectorOutput, scorecards, volSnapshot)
   const hasStructure = Boolean(selectorOutput.best_structure)
+  const isNoTrade = selectorOutput.recommendation === 'No Trade'
   const title = hasStructure
     ? formatStructureLabel(selectorOutput.best_structure)
     : selectorOutput.recommendation === 'No Trade'
@@ -45,14 +46,27 @@ export default function SelectorDecisionCard({ selectorOutput, scorecards = [], 
             ))}
           </div>
         </div>
-        <div
-          className="selector-score-pill"
-          title="How strongly the available evidence backs this call, 0–100. It is NOT the probability the trade wins."
-        >
-          <span>Decision Quality</span>
-          <strong>{Math.round(Number(selectorOutput.confidence_pct || 0))}%</strong>
-          <em>evidence-backed, not probability</em>
-        </div>
+        {/* FE-4: on an abstain a large "68%" reads as a win probability. Drop the
+            number and de-emphasize the pill so No-Trade isn't dominated by a
+            misleading figure; the qualitative note carries the honest meaning. */}
+        {isNoTrade ? (
+          <div
+            className="selector-score-pill selector-score-pill-muted"
+            title="The engine reviewed the evidence and it did not clear the bar to trade. There is no win probability for a setup that is not being taken."
+          >
+            <span>Evidence strength</span>
+            <em>reviewed — below the bar to trade</em>
+          </div>
+        ) : (
+          <div
+            className="selector-score-pill"
+            title="How strongly the available evidence backs this call, 0–100. It is NOT the probability the trade wins."
+          >
+            <span>Decision Quality</span>
+            <strong>{Math.round(Number(selectorOutput.confidence_pct || 0))}%</strong>
+            <em>evidence-backed, not probability</em>
+          </div>
+        )}
       </div>
 
       <div className="selector-metrics-grid">

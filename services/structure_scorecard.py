@@ -49,6 +49,7 @@ class StructureScorecard:
 
     composite_structure_score: float
 
+    walk_forward_is_simulated: bool = False
     rationale_bullets: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -63,6 +64,11 @@ class WalkForwardPrior:
     avg_return_pct: float
     rank_score: float
     source: str
+    # V3: True when history_count comes from a SIMULATED scoreboard (e.g. the
+    # calendar iv-expansion study) rather than realized trade logs / the
+    # persistent observation store. Lets downstream rank/evidence/UI avoid
+    # reading simulated counts as empirical.
+    is_simulated: bool = False
 
 
 @dataclass(frozen=True)
@@ -264,7 +270,7 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
         _ratio_rationale("historical/implied move", snapshot.historical_vs_implied_move_ratio, favorable="above 1 favors long gamma", cautious="below 1 dampens move capture"),
         _ratio_rationale("tail/implied move", snapshot.tail_vs_implied_move_ratio, favorable="fat historical tails support convex payoff", cautious="tails do not clear current implied move"),
         _execution_rationale(snapshot, execution_penalty),
-        f"Walk-forward prior: {prior.history_count} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
+        f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
     if _using_daily_fallback:
         rationale.append(
@@ -365,7 +371,7 @@ def score_otm_strangle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
         _ratio_rationale("tail/implied move", snapshot.tail_vs_implied_move_ratio, favorable="historical tails support wing exposure", cautious="tails do not justify the wider payoff shape"),
         f"Event-risk score {event_risk:.2f} {'supports' if event_risk >= 0.6 else 'does not strongly support'} a convex wings structure.",
         _execution_rationale(snapshot, execution_penalty),
-        f"Walk-forward prior: {prior.history_count} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
+        f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
     if _using_daily_fallback:
         rationale.append(
@@ -478,7 +484,7 @@ def _score_calendar(
             else "Term-structure slope is unavailable; that component stays neutral."
         ),
         _execution_rationale(snapshot, execution_penalty),
-        f"Walk-forward prior: {prior.history_count} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
+        f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
     if _using_daily_fallback:
         rationale.append(
@@ -554,6 +560,7 @@ def _finalize_scorecard(
         walk_forward_avg_return_pct=float(prior.avg_return_pct),
         walk_forward_rank_score=float(prior.rank_score),
         composite_structure_score=float(composite),
+        walk_forward_is_simulated=bool(prior.is_simulated),
         rationale_bullets=rationale,
     )
 
@@ -580,7 +587,7 @@ def _sample_confidence_and_penalty(
     max_penalty: float,
 ) -> tuple[float, float]:
     hist_conf = _score_high_good(float(snapshot.historical_event_count), 2.0, 10.0)
-    wf_conf = _score_high_good(float(prior.history_count), 8.0, 60.0)
+    wf_conf = _score_high_good(_effective_history_count(prior), 8.0, 60.0)
     quality_conf = _coalesce_unit(snapshot.data_quality_score)
     sample_conf = _clamp01(0.45 * hist_conf + 0.40 * wf_conf + 0.15 * quality_conf)
 
@@ -635,7 +642,9 @@ def _penalty_pct(
 
 
 def _blend_expected_return(prior: WalkForwardPrior, signal_return_pct: float) -> float:
-    wf_weight = _clamp01(prior.history_count / 40.0) * 0.55
+    # V3 (F2): a simulated prior contributes zero empirical weight, so the blend
+    # falls back to the live signal rather than the simulated avg_return.
+    wf_weight = _clamp01(_effective_history_count(prior) / 40.0) * 0.55
     return (wf_weight * prior.avg_return_pct) + ((1.0 - wf_weight) * signal_return_pct)
 
 
@@ -774,6 +783,18 @@ def _compute_rank_score(*, win_rate: Optional[float], avg_return_pct: Optional[f
     return _clamp01(0.45 * return_score + 0.30 * win_score + 0.25 * history_score)
 
 
+def _effective_history_count(prior: WalkForwardPrior) -> float:
+    """Empirical observation count a prior may contribute to DECISION weight.
+
+    V3 (F2): a simulated prior carries ZERO empirical weight — its raw count is
+    kept for display/provenance (``prior.history_count``) but must not inflate
+    sample confidence, the walk-forward return blend, or the history component of
+    the rank. Its win_rate/avg_return still provide a weak directional signal;
+    they just no longer masquerade as N real observations.
+    """
+    return 0.0 if prior.is_simulated else float(prior.history_count)
+
+
 def _avg_return_proxy_from_frame(frame: pd.DataFrame) -> Optional[float]:
     if "avg_return_pct" in frame.columns:
         series = pd.to_numeric(frame["avg_return_pct"], errors="coerce").dropna()
@@ -811,7 +832,11 @@ def _load_calendar_prior_from_reports(structure: str) -> WalkForwardPrior:
     avg_return = _avg_return_proxy_from_frame(subset)
     if avg_return is None:
         avg_return = 0.0
-    rank = _compute_rank_score(win_rate=win_rate, avg_return_pct=avg_return, history_count=history_count)
+    # V3 (F2): zero empirical weight — the rank's history component is computed
+    # with history_count=0 so a simulated scoreboard cannot rank as if backed by
+    # N real observations. The raw simulated count is retained on the dataclass
+    # for display/provenance only; win_rate/avg_return still shape the rank.
+    rank = _compute_rank_score(win_rate=win_rate, avg_return_pct=avg_return, history_count=0)
     return WalkForwardPrior(
         structure=structure,
         history_count=history_count,
@@ -819,6 +844,7 @@ def _load_calendar_prior_from_reports(structure: str) -> WalkForwardPrior:
         avg_return_pct=float(avg_return),
         rank_score=rank,
         source=f"{path.parent.name}:{PROMOTION_BASELINE_SCENARIO}",
+        is_simulated=True,  # V3: iv_expansion_simulated_scoreboard.csv is simulated, not realized
     )
 
 

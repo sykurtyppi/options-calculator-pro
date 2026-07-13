@@ -11,6 +11,14 @@ const HISTORY = [
   { date: '2025-11-01', move_pct: 11.0, release_timing: 'after market close' },
 ]
 
+// FE-2: the directional "cheap/rich" takeaway only fires at/above the sample
+// floor (n >= 6). This set clears it; HISTORY (n = 4) does not.
+const HISTORY_6 = [
+  ...HISTORY,
+  { date: '2024-02-01', move_pct: 8.0, release_timing: 'after market close' },
+  { date: '2024-05-01', move_pct: 10.0, release_timing: 'after market close' },
+]
+
 describe('EarningsMoveHistoryPanel', () => {
   test('renders the chart and a caption with a coherent median / implied / exceed count', () => {
     const { container } = render(<EarningsMoveHistoryPanel history={HISTORY} impliedMove={6} />)
@@ -23,12 +31,19 @@ describe('EarningsMoveHistoryPanel', () => {
     expect(screen.getByText(/8\.0%/)).toBeInTheDocument()
   })
 
-  test('takeaway flips with the exceed rate', () => {
-    const { rerender } = render(<EarningsMoveHistoryPanel history={HISTORY} impliedMove={6} />)
+  test('takeaway flips with the exceed rate (at/above the sample floor)', () => {
+    const { rerender } = render(<EarningsMoveHistoryPanel history={HISTORY_6} impliedMove={6} />)
     expect(screen.getByText(/priced move is on the low side/i)).toBeInTheDocument()
     // Implied above every historical move → priced high.
-    rerender(<EarningsMoveHistoryPanel history={HISTORY} impliedMove={20} />)
+    rerender(<EarningsMoveHistoryPanel history={HISTORY_6} impliedMove={20} />)
     expect(screen.getByText(/priced move is on the high side/i)).toBeInTheDocument()
+  })
+
+  test('FE-2: withholds the cheap/rich takeaway below the sample floor', () => {
+    // n = 4 is too few to call a direction; the verdict must NOT render.
+    render(<EarningsMoveHistoryPanel history={HISTORY} impliedMove={6} />)
+    expect(screen.queryByText(/priced move is on the (low|high) side/i)).toBeNull()
+    expect(screen.getByText(/too few past earnings/i)).toBeInTheDocument()
   })
 
   test('renders nothing when there is no dated history (fallback path)', () => {

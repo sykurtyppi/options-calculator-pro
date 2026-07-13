@@ -1037,6 +1037,13 @@ button:disabled {
   color: var(--accent-2-bright);
 }
 
+/* FE-2: below the sample floor the "cheap/rich" call is withheld; render the
+   note muted (never in the accent color that reads as a confident verdict). */
+.earnings-history-takeaway-insufficient {
+  color: var(--muted);
+  font-style: italic;
+}
+
 /* ── Zoomable payoff charts ── */
 .chart-zoom-hint {
   margin-top: 6px;
@@ -1751,6 +1758,15 @@ button:disabled {
 .selector-score-pill strong {
   font-size: 1.4rem;
   font-family: var(--font-mono);
+}
+
+/* FE-4: abstain variant — no dominant number, quieter surface so a No-Trade
+   card is not led by a figure that reads as a win probability. */
+.selector-score-pill-muted {
+  border-style: dashed;
+  border-color: rgba(82, 112, 132, 0.32);
+  background: transparent;
+  align-content: center;
 }
 
 .selector-inline-evidence {

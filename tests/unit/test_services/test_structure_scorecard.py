@@ -10,7 +10,39 @@ from services.structure_scorecard import (
     build_structure_scorecards,
     reload_walk_forward_priors,
     score_atm_straddle,
+    _effective_history_count,
+    _blend_expected_return,
+    _compute_rank_score,
 )
+
+
+def _prior(structure="call_calendar", *, count=40, win=0.60, ret=3.0, rank=0.60, simulated=False):
+    return WalkForwardPrior(
+        structure=structure, history_count=count, win_rate=win,
+        avg_return_pct=ret, rank_score=rank, source="test", is_simulated=simulated,
+    )
+
+
+class TestSimulatedPriorZeroWeight(unittest.TestCase):
+    """V3 (F2): a simulated prior must carry ZERO empirical decision weight."""
+
+    def test_effective_history_count_zeroes_only_simulated(self):
+        assert _effective_history_count(_prior(count=40, simulated=False)) == 40.0
+        assert _effective_history_count(_prior(count=40, simulated=True)) == 0.0
+
+    def test_blend_ignores_simulated_avg_return(self):
+        # wf_weight collapses to 0 → the blend returns the live signal, not the
+        # (simulated) avg_return, however large.
+        assert _blend_expected_return(_prior(count=40, ret=99.0, simulated=True), 2.0) == 2.0
+        # A real prior with the same count blends toward its avg_return.
+        assert _blend_expected_return(_prior(count=40, ret=99.0, simulated=False), 2.0) > 2.0
+
+    def test_rank_history_component_zeroed_for_simulated_load(self):
+        # The load path computes rank with history_count=0 for simulated priors;
+        # confirm that lowers the rank vs the same win/return backed by real N.
+        backed = _compute_rank_score(win_rate=0.60, avg_return_pct=3.0, history_count=40)
+        unbacked = _compute_rank_score(win_rate=0.60, avg_return_pct=3.0, history_count=0)
+        assert unbacked < backed
 
 
 def _base_snapshot(**overrides) -> VolSnapshot:
@@ -89,6 +121,52 @@ def _neutral_priors() -> dict[str, WalkForwardPrior]:
         )
         for structure in ("atm_straddle", "otm_strangle", "call_calendar", "put_calendar")
     }
+
+
+def _simulated_calendar_priors() -> dict[str, WalkForwardPrior]:
+    priors = _neutral_priors()
+    for structure in ("call_calendar", "put_calendar"):
+        priors[structure] = WalkForwardPrior(
+            structure=structure,
+            history_count=40,
+            win_rate=0.58,
+            avg_return_pct=3.0,
+            rank_score=0.60,
+            source="iv_expansion_study_x:baseline",
+            is_simulated=True,
+        )
+    return priors
+
+
+class TestSimulatedPriorFlag(unittest.TestCase):
+    @patch(
+        "services.structure_scorecard._load_walk_forward_priors",
+        side_effect=lambda as_of_date=None: _simulated_calendar_priors(),
+    )
+    def test_simulated_calendar_prior_is_flagged_and_realized_is_not(self, _mock_priors):
+        # V3: calendar priors come from a simulated scoreboard; straddle/strangle
+        # from realized logs. The scorecard must carry that distinction so a
+        # simulated history_count is never read as empirical.
+        snapshot = _base_snapshot(
+            cheapness_score=0.95,
+            term_structure_slope=0.0034,
+            near_back_iv_ratio=0.82,
+            event_move_share_of_total=0.58,
+            historical_move_anchor_pct=5.6,
+            historical_vs_implied_move_ratio=0.96,
+            tail_vs_implied_move_ratio=1.05,
+            event_risk_score=0.48,
+            iv_rv_yz=0.84,
+            iv_rv_har=0.86,
+            atm_call_spread_pct=1.8,
+            atm_put_spread_pct=1.9,
+        )
+        cards = {c.structure: c for c in build_structure_scorecards(snapshot)}
+        assert cards["call_calendar"].walk_forward_is_simulated is True
+        assert cards["put_calendar"].walk_forward_is_simulated is True
+        assert cards["atm_straddle"].walk_forward_is_simulated is False
+        assert any("SIMULATED" in b for b in cards["call_calendar"].rationale_bullets)
+        assert not any("SIMULATED" in b for b in cards["atm_straddle"].rationale_bullets)
 
 
 class TestStructureScorecards(unittest.TestCase):
