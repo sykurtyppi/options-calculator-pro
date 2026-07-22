@@ -225,7 +225,17 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     _using_daily_fallback = (
         getattr(snapshot, "historical_move_source", "earnings_history") == "daily_fallback"
     )
-    if _using_daily_fallback:
+    # DD-2 (D3): when no event-spanning expiry was quotable the event split is
+    # suppressed (event_implied/ratios None) and the _score_* helpers would
+    # silently substitute neutral 0.50s — quietly minting a passing move_fit
+    # from no data. Degrade LOUDLY instead, via the same sentinel as the
+    # daily-fallback case.
+    _event_split_unavailable = (
+        getattr(snapshot, "event_decomposition_status", "no_earnings_date")
+        in ("no_event_spanning_expiry", "event_expiry_not_quotable")
+    )
+    _move_fit_degraded = _using_daily_fallback or _event_split_unavailable
+    if _move_fit_degraded:
         # Daily-return history cannot reproduce the earnings-day jump distribution.
         # Sentinel 0.15 prevents the move-fit component from driving the scorecard
         # while still allowing execution/cheapness/timing to contribute.
@@ -281,11 +291,18 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
         _execution_rationale(snapshot, execution_penalty),
         f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
-    if _using_daily_fallback:
-        rationale.append(
-            "Warning: historical move profile uses daily returns (no earnings history available). "
-            "Move-fit estimate set to sentinel 0.15 — unreliable for earnings-event sizing."
-        )
+    if _move_fit_degraded:
+        if _event_split_unavailable:
+            rationale.append(
+                "Warning: no quotable option expiry spans the earnings reaction, so the "
+                "event-implied move could not be computed. Move-fit estimate set to "
+                "sentinel 0.15 — no event-pricing evidence exists for this structure."
+            )
+        else:
+            rationale.append(
+                "Warning: historical move profile uses daily returns (no earnings history available). "
+                "Move-fit estimate set to sentinel 0.15 — unreliable for earnings-event sizing."
+            )
     context = _StructureContext(
         move_fit_score=move_fit,
         cheapness_score=cheapness,
@@ -332,7 +349,17 @@ def score_otm_strangle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     _using_daily_fallback = (
         getattr(snapshot, "historical_move_source", "earnings_history") == "daily_fallback"
     )
-    if _using_daily_fallback:
+    # DD-2 (D3): when no event-spanning expiry was quotable the event split is
+    # suppressed (event_implied/ratios None) and the _score_* helpers would
+    # silently substitute neutral 0.50s — quietly minting a passing move_fit
+    # from no data. Degrade LOUDLY instead, via the same sentinel as the
+    # daily-fallback case.
+    _event_split_unavailable = (
+        getattr(snapshot, "event_decomposition_status", "no_earnings_date")
+        in ("no_event_spanning_expiry", "event_expiry_not_quotable")
+    )
+    _move_fit_degraded = _using_daily_fallback or _event_split_unavailable
+    if _move_fit_degraded:
         move_fit = 0.15
     else:
         move_fit = _clamp01(
@@ -382,11 +409,18 @@ def score_otm_strangle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
         _execution_rationale(snapshot, execution_penalty),
         f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
-    if _using_daily_fallback:
-        rationale.append(
-            "Warning: historical move profile uses daily returns (no earnings history available). "
-            "Move-fit estimate set to sentinel 0.15 — unreliable for earnings-event sizing."
-        )
+    if _move_fit_degraded:
+        if _event_split_unavailable:
+            rationale.append(
+                "Warning: no quotable option expiry spans the earnings reaction, so the "
+                "event-implied move could not be computed. Move-fit estimate set to "
+                "sentinel 0.15 — no event-pricing evidence exists for this structure."
+            )
+        else:
+            rationale.append(
+                "Warning: historical move profile uses daily returns (no earnings history available). "
+                "Move-fit estimate set to sentinel 0.15 — unreliable for earnings-event sizing."
+            )
     context = _StructureContext(
         move_fit_score=move_fit,
         cheapness_score=cheapness,
@@ -441,7 +475,17 @@ def _score_calendar(
     _using_daily_fallback = (
         getattr(snapshot, "historical_move_source", "earnings_history") == "daily_fallback"
     )
-    if _using_daily_fallback:
+    # DD-2 (D3): when no event-spanning expiry was quotable the event split is
+    # suppressed (event_implied/ratios None) and the _score_* helpers would
+    # silently substitute neutral 0.50s — quietly minting a passing move_fit
+    # from no data. Degrade LOUDLY instead, via the same sentinel as the
+    # daily-fallback case.
+    _event_split_unavailable = (
+        getattr(snapshot, "event_decomposition_status", "no_earnings_date")
+        in ("no_event_spanning_expiry", "event_expiry_not_quotable")
+    )
+    _move_fit_degraded = _using_daily_fallback or _event_split_unavailable
+    if _move_fit_degraded:
         # Calendar is less move-dependent than straddle/strangle, but moderate_anchor
         # still comes from earnings history. Use sentinel to prevent false confidence.
         move_fit = 0.15
@@ -495,11 +539,18 @@ def _score_calendar(
         _execution_rationale(snapshot, execution_penalty),
         f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
-    if _using_daily_fallback:
-        rationale.append(
-            "Warning: historical move profile uses daily returns (no earnings history available). "
-            "Move-fit estimate set to sentinel 0.15 — unreliable for earnings-event sizing."
-        )
+    if _move_fit_degraded:
+        if _event_split_unavailable:
+            rationale.append(
+                "Warning: no quotable option expiry spans the earnings reaction, so the "
+                "event-implied move could not be computed. Move-fit estimate set to "
+                "sentinel 0.15 — no event-pricing evidence exists for this structure."
+            )
+        else:
+            rationale.append(
+                "Warning: historical move profile uses daily returns (no earnings history available). "
+                "Move-fit estimate set to sentinel 0.15 — unreliable for earnings-event sizing."
+            )
     context = _StructureContext(
         move_fit_score=move_fit,
         cheapness_score=cheapness,

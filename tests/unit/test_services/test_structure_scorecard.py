@@ -961,3 +961,38 @@ def test_simulated_prior_rank_is_neutral_not_boosted_by_win_return(tmp_path):
     assert prior.history_count == 40        # raw count retained for display
     assert prior.win_rate == 0.95           # raw metrics retained for display
     assert prior.rank_score == neutral_rank  # but rank carries no simulated boost
+
+
+class TestEventSplitUnavailableSentinel(unittest.TestCase):
+    """DD-2 (D3): when no quotable expiry spans the earnings reaction the
+    event-derived inputs are None, and the _score_* helpers would silently
+    substitute neutral 0.50s — quietly minting a passing move_fit from no
+    data. The scorecard must degrade LOUDLY via the 0.15 sentinel instead."""
+
+    @patch(
+        "services.structure_scorecard._load_walk_forward_priors",
+        side_effect=lambda as_of_date=None: _neutral_priors(),
+    )
+    def test_event_split_unavailable_sentinels_move_fit(self, _mock_priors):
+        degraded = _base_snapshot(
+            event_implied_move_pct=None,
+            event_move_share_of_total=None,
+            historical_vs_implied_move_ratio=None,
+            tail_vs_implied_move_ratio=None,
+            event_decomposition_status="event_expiry_not_quotable",
+        )
+        card = score_atm_straddle(degraded)
+        self.assertEqual(card.expected_move_fit_score, 0.15)
+        self.assertTrue(
+            any("spans the earnings reaction" in b for b in card.rationale_bullets),
+            card.rationale_bullets,
+        )
+
+    @patch(
+        "services.structure_scorecard._load_walk_forward_priors",
+        side_effect=lambda as_of_date=None: _neutral_priors(),
+    )
+    def test_healthy_event_split_does_not_sentinel(self, _mock_priors):
+        healthy = _base_snapshot(event_decomposition_status="used_event_expiry")
+        card = score_atm_straddle(healthy)
+        self.assertNotEqual(card.expected_move_fit_score, 0.15)

@@ -95,6 +95,65 @@ class TestComputeEarningsMoveProfile:
         assert profile.raw_events == []
         assert profile.raw_moves_pct == []
 
+    def test_unknown_timing_events_are_dropped_not_mismeasured(self):
+        """DD-1: an unknown-timing event must NOT be silently measured with
+        the BMO window. Historically an AMC reporter tagged "unknown" had its
+        pre-announcement day measured instead of the reaction (PYPL 2022-02-01
+        recorded as 2.2% vs the real ≈−25% next-session reaction)."""
+        prices = _price_series()
+        # Five real AMC events with big injected reactions...
+        events = _amc_events_with_moves(prices, [20, 40, 60, 80, 100], [8.0, 9.0, 10.0, 11.0, 12.0])
+        # ...but strip the timing from two of them.
+        events[1]["release_timing"] = None
+        events[3]["release_timing"] = "unknown"
+        profile = compute_earnings_move_profile(
+            close=prices, earnings_events=events, as_of_date=prices.index[-1].date()
+        )
+        assert profile.source == "earnings_history"
+        # The two unknown events are excluded from measurement and counted.
+        assert profile.earnings_event_count == 3
+        assert profile.unknown_timing_event_count == 2
+        # Crucially: no tiny fake moves entered the sample. Every measured move
+        # is a real injected reaction (>= ~8%), not day-before noise (<1%).
+        assert all(m > 5.0 for m in profile.raw_moves_pct)
+        # The known-timing events' measurement is unchanged (AMC bracket).
+        assert {e["release_timing"] for e in profile.raw_events} == {"after market close"}
+
+    def test_all_unknown_timing_falls_back_to_daily_moves(self):
+        """When every event is timing-unknown the profile must degrade to the
+        honest daily_fallback (which the scorecard already sentinels) instead
+        of publishing a mismeasured earnings history."""
+        prices = _price_series()
+        events = _amc_events_with_moves(prices, [20, 40, 60], [8.0, 9.0, 10.0])
+        for e in events:
+            e["release_timing"] = None
+        profile = compute_earnings_move_profile(
+            close=prices, earnings_events=events, as_of_date=prices.index[-1].date()
+        )
+        assert profile.source == "daily_fallback"
+        assert profile.earnings_event_count == 0
+        assert profile.unknown_timing_event_count == 3
+
+    def test_known_timing_behavior_unchanged(self):
+        """Regression pin: BMO and AMC events with explicit timing measure
+        exactly as before the DD-1 change."""
+        prices = _price_series()
+        dates = prices.index
+        bmo_i, amc_i = 30, 70
+        prices.iloc[bmo_i] = float(prices.iloc[bmo_i - 1]) * 1.06   # BMO: reaction on event day
+        prices.iloc[amc_i + 1] = float(prices.iloc[amc_i]) * 1.07   # AMC: reaction next day
+        events = [
+            {"event_date": pd.Timestamp(dates[bmo_i]), "release_timing": "before market open"},
+            {"event_date": pd.Timestamp(dates[amc_i]), "release_timing": "after market close"},
+        ]
+        profile = compute_earnings_move_profile(
+            close=prices, earnings_events=events, as_of_date=dates[-1].date()
+        )
+        assert profile.earnings_event_count == 2
+        assert profile.unknown_timing_event_count == 0
+        moves = sorted(round(m, 1) for m in profile.raw_moves_pct)
+        assert moves == [6.0, 7.0]
+
     def test_as_of_date_cutoff_excludes_future_events(self):
         prices = _price_series()
         events = _amc_events_with_moves(prices, [20, 40, 60, 80, 100], [4.0, 5.0, 6.0, 7.0, 8.0])

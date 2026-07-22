@@ -423,6 +423,127 @@ class TestEarningsVolSnapshot(unittest.TestCase):
         self.assertAlmostEqual(snapshot.historical_move_uncertainty_pct, legacy_uncertainty, places=8)
 
 
+class TestEventSpanningExpiry(unittest.TestCase):
+    """DD-2: the event-vol decomposition must run on an expiry that SPANS the
+    earnings reaction — never on a front expiry that expires before it."""
+
+    def _snapshot(self, *, earnings_date: str, release_timing: str,
+                  expiries: tuple[str, ...] = ("2026-04-24", "2026-05-15", "2026-06-19"),
+                  chain_df: pd.DataFrame | None = None):
+        price_df, prior_events = _make_price_history()
+        if chain_df is None:
+            chain_df = _make_chain(expiries=expiries, base_term_ivs=tuple(0.24 + 0.02 * i for i in range(len(expiries))))
+        return build_vol_snapshot(
+            "AAPL",
+            date.fromisoformat("2026-04-20"),
+            option_chain_data=chain_df,
+            earnings_metadata={
+                "earnings_date": earnings_date,
+                "release_timing": release_timing,
+                "prior_events": prior_events,
+            },
+            price_data=price_df,
+        )
+
+    def test_non_spanning_front_expiry_uses_first_event_expiry(self):
+        # Earnings 4/28 AMC → reaction session 4/29. Front expiry 4/24 does
+        # NOT span; the decomposition must run on 5/15 (25 DTE), not 4/24.
+        snap = self._snapshot(earnings_date="2026-04-28", release_timing="after market close")
+        self.assertEqual(snap.event_decomposition_status, "used_event_expiry")
+        self.assertEqual(snap.event_expiry_dte, 25)
+        self.assertEqual(snap.near_term_dte, 4)  # front-leg fields keep their meaning
+        self.assertIsNotNone(snap.event_implied_move_pct)
+        self.assertIsNotNone(snap.event_expiry_implied_move_pct)
+        # The decomposition's diffusion window must be the EVENT expiry's
+        # horizon (25 DTE → 24 diffusion days), not the front expiry's (4 → 3).
+        import math
+        expected_non_event = snap.rv_har_forecast * math.sqrt((25 - 1) / 365.0) * 100.0
+        self.assertAlmostEqual(snap.non_event_move_pct_har, expected_non_event, places=8)
+
+    def test_front_expiry_spanning_event_is_status_ok_and_unchanged(self):
+        # Earnings 4/23 BMO → reaction session 4/23; front expiry 4/24 spans.
+        snap = self._snapshot(earnings_date="2026-04-23", release_timing="before market open")
+        self.assertEqual(snap.event_decomposition_status, "ok")
+        self.assertEqual(snap.event_expiry_dte, snap.near_term_dte)
+        self.assertEqual(snap.event_expiry_implied_move_pct, snap.near_term_implied_move_pct)
+
+    def test_bmo_same_day_expiry_spans_but_amc_does_not(self):
+        # BMO on the front expiry date itself: the reaction prints pre-open,
+        # a same-day expiry captures it → spans.
+        bmo = self._snapshot(earnings_date="2026-04-24", release_timing="before market open")
+        self.assertEqual(bmo.event_decomposition_status, "ok")
+        self.assertEqual(bmo.event_expiry_dte, 4)
+        # AMC on the same date: reaction lands 4/25 (after the 4/24 expiry) —
+        # a same-day expiry does NOT span; the next expiry must be used.
+        amc = self._snapshot(earnings_date="2026-04-24", release_timing="after market close")
+        self.assertEqual(amc.event_decomposition_status, "used_event_expiry")
+        self.assertEqual(amc.event_expiry_dte, 25)
+
+    def test_unknown_timing_is_conservative_strictly_after(self):
+        unk = self._snapshot(earnings_date="2026-04-24", release_timing="unknown")
+        self.assertEqual(unk.event_decomposition_status, "used_event_expiry")
+        self.assertEqual(unk.event_expiry_dte, 25)
+
+    def test_no_spanning_expiry_suppresses_event_split(self):
+        # Earnings after the LAST listed expiry → no spanning expiry exists.
+        snap = self._snapshot(earnings_date="2026-07-30", release_timing="before market open")
+        self.assertEqual(snap.event_decomposition_status, "no_event_spanning_expiry")
+        self.assertIsNone(snap.event_implied_move_pct)
+        self.assertIsNone(snap.event_move_share_of_total)
+        self.assertIsNone(snap.event_expiry_dte)
+        self.assertEqual(snap.null_reasons.get("event_implied_move_pct"), "no_event_spanning_expiry")
+        # Ratios that divide by the event-implied move must be None too.
+        self.assertIsNone(snap.historical_vs_implied_move_ratio)
+        self.assertIsNone(snap.tail_vs_implied_move_ratio)
+
+    def test_wide_spread_event_expiry_is_not_quotable(self):
+        # The spanning expiry exists but its ATM straddle spread blows through
+        # the quality bar → the guard must refuse it rather than relocate
+        # garbage from a tight non-spanning expiry to a wide spanning one.
+        chain_df = _make_chain(spread_multiplier=12.0)  # ~48% spreads everywhere
+        snap = self._snapshot(
+            earnings_date="2026-04-28", release_timing="after market close", chain_df=chain_df,
+        )
+        self.assertEqual(snap.event_decomposition_status, "event_expiry_not_quotable")
+        self.assertIsNotNone(snap.event_expiry_dte)  # found, but refused
+        self.assertIsNone(snap.event_implied_move_pct)
+        self.assertEqual(snap.null_reasons.get("event_implied_move_pct"), "event_expiry_not_quotable")
+
+    def test_wide_first_spanning_expiry_falls_through_to_tighter_later_one(self):
+        # Earnings 4/28 AMC → reaction session 4/29. The first spanning expiry
+        # (5/15) is WIDE (fails the 12% bar); the next spanning expiry (6/19)
+        # is TIGHT. The decomposition must fall through to 6/19 rather than
+        # suppressing the split (audit finding 2 — the bar is per-expiry, a
+        # wide first spanning expiry does not veto a tighter later one).
+        wide = _make_chain(
+            expiries=("2026-04-24", "2026-05-15"), base_term_ivs=(0.24, 0.28),
+            spread_multiplier=12.0,  # ~48% spreads
+        )
+        tight = _make_chain(
+            expiries=("2026-06-19",), base_term_ivs=(0.31,), spread_multiplier=1.0,
+        )
+        chain = pd.concat([wide, tight], ignore_index=True)
+        snap = self._snapshot(
+            earnings_date="2026-04-28", release_timing="after market close", chain_df=chain,
+        )
+        self.assertEqual(snap.event_decomposition_status, "used_event_expiry")
+        self.assertEqual(snap.event_expiry_dte, 60)  # 6/19 is 60 DTE from 4/20
+        self.assertIsNotNone(snap.event_implied_move_pct)
+
+    def test_no_earnings_date_keeps_legacy_near_expiry_split(self):
+        price_df, _ = _make_price_history()
+        snap = build_vol_snapshot(
+            "AAPL",
+            date.fromisoformat("2026-04-20"),
+            option_chain_data=_make_chain(),
+            earnings_metadata=None,
+            price_data=price_df,
+        )
+        self.assertEqual(snap.event_decomposition_status, "no_earnings_date")
+        # Legacy behavior: decomposition from the near expiry still runs.
+        self.assertIsNotNone(snap.event_implied_move_pct)
+
+
 class TestHARRVHardening(unittest.TestCase):
     """
     Verify HAR-RV minimum-sample hardening (audit precondition 2).

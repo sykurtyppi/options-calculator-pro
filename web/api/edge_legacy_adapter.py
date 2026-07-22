@@ -54,6 +54,13 @@ def snapshot_to_edge_inputs(snapshot: VolSnapshot) -> Dict[str, Any]:
         "move_uncertainty_pct": snapshot.historical_move_uncertainty_pct,
         "event_implied_move_pct": snapshot.event_implied_move_pct,
         "non_event_move_pct": snapshot.non_event_move_pct_har,
+        # DD-2: which expiry the event decomposition actually ran on (may be a
+        # later, event-spanning expiry when the near-term one expires before
+        # the earnings reaction), and the status of that resolution.
+        "event_expiry_dte": snapshot.event_expiry_dte,
+        "event_expiry_implied_move_pct": snapshot.event_expiry_implied_move_pct,
+        "event_expiry_spread_pct": snapshot.event_expiry_spread_pct,
+        "event_decomposition_status": snapshot.event_decomposition_status,
         "iv_rv": snapshot.iv_rv_yz,
         "iv_rv_har": snapshot.iv_rv_har,
         "data_quality": snapshot.data_quality,

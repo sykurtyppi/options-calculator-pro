@@ -540,7 +540,7 @@ export default function App() {
                   {m.earnings_release_time && releaseTimeBadge(m.earnings_release_time)}
                   <VolRegimeBadge regime={m.vol_regime} pct={m.rv_percentile_rank} />
                   <TickerTierBadge tier={m.ticker_tier} />
-                  <MoveRiskBadge level={m.move_risk_level} ratio={m.move_risk_ratio} sampleSize={m.move_risk_sample_size} />
+                  <MoveRiskBadge level={m.move_risk_level} ratio={m.move_risk_ratio} sampleSize={m.move_risk_sample_size} eventExpiryDte={m.event_expiry_dte} />
                 </div>
                 <div className="selector-topbar-right">
                   <button
@@ -650,6 +650,7 @@ export default function App() {
               <EarningsMoveHistoryPanel
                 history={m.earnings_move_history}
                 impliedMove={m.event_implied_move_pct}
+                unknownTimingCount={m.earnings_move_unknown_timing_count}
               />
 
               {m.structure_payoff && (() => {
@@ -937,11 +938,27 @@ export default function App() {
                       : null}
                   />
                   <Metric label="Near-Term Opt DTE" value={m.near_term_dte ?? 'n/a'} />
-                  <Metric label="Implied Move (Total)" value={fmtPp(m.implied_move_pct, 2)} />
+                  <Metric label="Implied Move (Total)" value={fmtPp(m.implied_move_pct, 2)}
+                    sub={m.near_term_dte != null ? `to ${m.near_term_dte}d expiry` : undefined} />
+                  {/* DD-2: the event split is computed from the first expiry that
+                      SPANS the earnings reaction — disclose it, and be honest
+                      when no such expiry is quotable instead of fabricating. */}
+                  {m.event_expiry_dte != null && m.event_expiry_dte !== m.near_term_dte && (
+                    <Metric label="Event-Expiry DTE" value={m.event_expiry_dte}
+                      sub="first expiry spanning earnings" />
+                  )}
                   {/* FIX 10: surface the event vs non-event move split */}
                   {m.event_implied_move_pct != null && (
                     <Metric label="Event-Implied Move" value={fmtPp(m.event_implied_move_pct, 2)}
-                      sub="earnings-specific component" />
+                      sub={m.event_expiry_dte != null ? `earnings-specific · from ${m.event_expiry_dte}d expiry` : 'earnings-specific component'} />
+                  )}
+                  {m.event_decomposition_status === 'no_event_spanning_expiry' && (
+                    <Metric label="Event-Implied Move" value="n/a"
+                      sub="no option expiry spans the earnings reaction" />
+                  )}
+                  {m.event_decomposition_status === 'event_expiry_not_quotable' && (
+                    <Metric label="Event-Implied Move" value="n/a"
+                      sub={`spanning expiry${m.event_expiry_dte != null ? ` (${m.event_expiry_dte}d)` : ''} quotes too wide to trust`} />
                   )}
                   {m.non_event_move_pct != null && m.non_event_move_pct > 0 && (
                     <Metric label="Non-Event Move" value={fmtPp(m.non_event_move_pct, 2)}

@@ -1133,17 +1133,21 @@ def analyze_edge(request: EdgeAnalyzeRequest, http_request: Request = None) -> E
         )
     try:
         snapshot = analyze_single_ticker(request.symbol, mda_client=_get_mda_client())
+        # The free-form dict surfaces (metrics / vol_snapshot) can carry numpy
+        # scalars from data-dependent branches (np.bool_/np.float64), which
+        # pydantic refuses to serialize ("Unable to serialize unknown type").
+        # Sanitize at the boundary so a rare branch can never 500 the endpoint.
         return EdgeAnalyzeResponse(
             generated_at=datetime.now(timezone.utc),
             symbol=snapshot.symbol,
             recommendation=snapshot.recommendation,
             confidence_pct=snapshot.confidence_pct,
             setup_score=snapshot.setup_score,
-            metrics=snapshot.metrics,
+            metrics=_json_safe(snapshot.metrics),
             rationale=snapshot.rationale,
-            selector_output=snapshot.selector_output,
-            structure_scorecards=snapshot.structure_scorecards,
-            vol_snapshot=snapshot.vol_snapshot,
+            selector_output=_json_safe(snapshot.selector_output),
+            structure_scorecards=_json_safe(snapshot.structure_scorecards),
+            vol_snapshot=_json_safe(snapshot.vol_snapshot),
         )
     except Exception as exc:
         _raise_public_error(400, "Analysis failed. Check the ticker, data availability, and provider configuration.", exc)

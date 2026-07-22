@@ -78,6 +78,12 @@ class EarningsMoveProfile:
     std_move_pct: Optional[float]
     raw_moves_pct: List[float] = field(default_factory=list)
     raw_events: List[Dict[str, Any]] = field(default_factory=list)
+    # DD-1: events excluded from measurement because their release timing is
+    # unknown. An unknown-timing event cannot be bracketed to the correct
+    # reaction session (a BMO window on a true AMC reporter measures the day
+    # BEFORE the reaction), so it is dropped rather than silently guessed.
+    # Consumers use this to surface sample degradation.
+    unknown_timing_event_count: int = 0
 
 
 _EMPTY = EarningsMoveProfile(
@@ -158,10 +164,20 @@ def compute_earnings_move_profile(
     # Per-event records (date + actual move) for the "last N earnings" UI panel.
     # Kept UNCLIPPED — this is what the stock actually did, not a stat input.
     event_records: List[Dict[str, Any]] = []
+    unknown_timing_count = 0
 
     for event in past_events[-24:]:
         event_ts = pd.Timestamp(event["event_date"]).normalize()
         release_timing = normalize_release_timing(event.get("release_timing"))
+        # DD-1: an unknown-timing event has two candidate reaction sessions
+        # (event day for BMO, next day for AMC) and no way to pick. The old
+        # behavior fell through to the BMO window, which on an AMC reporter
+        # measures the day BEFORE the reaction (PYPL 2022-02-01 measured as
+        # 2.2% when the real reaction was ≈−25% the next session). Drop the
+        # event from measurement and count it instead of guessing.
+        if release_timing == "unknown":
+            unknown_timing_count += 1
+            continue
         event_loc = int(index_arr.searchsorted(event_ts.to_datetime64(), side="left"))
         if event_loc >= len(index_arr):
             continue
@@ -209,6 +225,7 @@ def compute_earnings_move_profile(
             std_move_pct=float(np.std(moves, ddof=1)) if moves.size > 1 else 0.0,
             raw_moves_pct=[float(x) for x in moves.tolist()],
             raw_events=event_records,
+            unknown_timing_event_count=unknown_timing_count,
         )
 
     # Fallback to recent daily absolute moves.
@@ -228,4 +245,5 @@ def compute_earnings_move_profile(
         p90_move_pct=float(np.percentile(daily_moves, 90)),
         avg_last4_move_pct=float(np.mean(daily_moves[-4:])),
         std_move_pct=float(np.std(daily_moves, ddof=1)) if daily_moves.size > 1 else 0.0,
+        unknown_timing_event_count=unknown_timing_count,
     )
