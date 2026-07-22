@@ -48,10 +48,20 @@ class _FakeTicker:
         return _FakeChain(calls, puts)
 
     def get_earnings_dates(self, limit: int = 24) -> pd.DataFrame:
-        idx = pd.to_datetime(["2026-07-30", "2026-04-30", "2026-01-29"])
+        # Real yfinance shape: tz-aware exchange-local timestamps whose
+        # time-of-day carries the BMO/AMC signal (07:00 = pre-open, 16:05 =
+        # post-close). One date-only (midnight) row models Yahoo's unstamped
+        # entries — the only case that may stay timing-unknown (DD-1).
+        idx = pd.DatetimeIndex([
+            pd.Timestamp("2026-07-30 08:00:00", tz="America/New_York"),  # upcoming
+            pd.Timestamp("2026-04-30 07:00:00", tz="America/New_York"),  # historical BMO
+            pd.Timestamp("2026-01-29 16:05:00", tz="America/New_York"),  # historical AMC
+            pd.Timestamp("2025-10-28 00:00:00", tz="America/New_York"),  # date-only
+        ])
         return pd.DataFrame(
-            {"EPS Estimate": [1.5, 1.4, 1.3], "Reported EPS": [np.nan, 1.48, 1.41],
-             "Surprise(%)": [np.nan, 5.7, 4.6]},
+            {"EPS Estimate": [1.5, 1.4, 1.3, 1.2],
+             "Reported EPS": [np.nan, 1.48, 1.41, 1.35],
+             "Surprise(%)": [np.nan, 5.7, 4.6, 3.9]},
             index=idx,
         )
 
@@ -133,11 +143,39 @@ def test_get_earnings_schema_and_timing():
     # sorted newest first
     dates = [d for d in df["report_date"] if d is not None]
     assert dates == sorted(dates, reverse=True)
-    # historical rows (no upcoming timestamp here) carry reportTime None, never a false BMO/AMC
-    assert df["reportTime"].isna().all() or (df["reportTime"] == None).all()  # noqa: E711
     # surpriseEPS computed where both EPS present
     past = df[df["reportedEPS"].notna() & df["estimatedEPS"].notna()].iloc[0]
     assert past["surpriseEPS"] == pytest.approx(past["reportedEPS"] - past["estimatedEPS"])
+
+
+def test_get_earnings_derives_historical_timing_from_index_timestamps():
+    """DD-1: historical BMO/AMC must come from the index timestamp time-of-day.
+
+    The old behavior pinned reportTime=None for ALL historical rows, which
+    downstream mapped to "unknown" and then silently measured with the BMO
+    window — mismeasuring every AMC-era reaction (PYPL 2022-02-01 shown as
+    2.2% when the real reaction was ≈−25% the next session).
+    """
+    df = _client().get_earnings("AAPL", countback=12)
+    by_date = {str(d): rt for d, rt in zip(df["report_date"], df["reportTime"])}
+    assert by_date["2026-04-30"] == "before market open"   # 07:00 ET stamp
+    assert by_date["2026-01-29"] == "after market close"   # 16:05 ET stamp
+    # Date-only (midnight) rows carry no signal → None, never a false BMO/AMC
+    assert by_date["2025-10-28"] is None
+
+
+def test_report_time_from_index_ts_pins_timezone():
+    """A UTC-encoded stamp must be converted to exchange time before the hour
+    is read: 20:05 UTC == 16:05 ET → AMC, not "during market hours"."""
+    from services.yfinance_market_data_client import _report_time_from_index_ts
+
+    utc_amc = pd.Timestamp("2026-01-29 21:05:00", tz="UTC")  # 16:05 ET (EST)
+    assert _report_time_from_index_ts(utc_amc) == "after market close"
+    naive_bmo = pd.Timestamp("2026-04-30 07:00:00")  # naive = exchange wall-clock
+    assert _report_time_from_index_ts(naive_bmo) == "before market open"
+    midnight = pd.Timestamp("2025-10-28 00:00:00")
+    assert _report_time_from_index_ts(midnight) is None
+    assert _report_time_from_index_ts("not-a-timestamp") is None
 
 
 class _ZeroBidTicker(_FakeTicker):

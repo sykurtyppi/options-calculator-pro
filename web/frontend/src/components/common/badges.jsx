@@ -91,7 +91,7 @@ export function VolRegimeBadge({ regime, pct }) {
  * Move-risk advisory badge. Soft signal only — NOT a hard gate.
  * Reflects the p90-historical / event-implied move ratio.
  */
-export function MoveRiskBadge({ level, ratio, sampleSize }) {
+export function MoveRiskBadge({ level, ratio, sampleSize, eventExpiryDte }) {
   if (!level || level === 'unknown') return null
   const map = {
     low: { label: 'Move Risk: Low', variant: 'move-risk-low' },
@@ -101,14 +101,18 @@ export function MoveRiskBadge({ level, ratio, sampleSize }) {
   const { label, variant } = map[level] || { label: `Move Risk: ${level}`, variant: 'default' }
   const ratioLabel = ratio != null ? ` · P90/Impl ${ratio.toFixed(2)}×` : ''
   const sampleLabel = sampleSize != null ? ` · n=${sampleSize}` : ''
+  // DD-2: disclose which expiry the event-implied side was computed from, so
+  // the ratio is legible as a same-event comparison (the decomposition now
+  // guarantees the expiry spans the earnings reaction).
+  const expiryLabel = eventExpiryDte != null ? ` · to ${eventExpiryDte}d exp` : ''
   return (
     <Badge
       variant={variant}
-      title="Soft advisory: p90 historical move vs. event-implied move. Not a hard gate."
+      title="Soft advisory: p90 historical move vs. event-implied move (computed from the first option expiry that spans the earnings reaction). Not a hard gate."
     >
       {/* FE-5: "advisory" is shown, not hover-only, so the soft-gate nature is
           visible to keyboard/touch/screen-reader users, not just on hover. */}
-      {label}{ratioLabel}{sampleLabel} · advisory
+      {label}{ratioLabel}{expiryLabel}{sampleLabel} · advisory
     </Badge>
   )
 }

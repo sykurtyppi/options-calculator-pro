@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import math
@@ -44,6 +44,12 @@ class VolSnapshotConfig:
     price_staleness_warn_days: int = 3
     chain_staleness_warn_days: int = 1
     exclude_event_contaminated_sessions: bool = True
+    # DD-2: the event-spanning expiry's ATM straddle must clear the same
+    # spread-quality bar as the tradeable front leg before its implied move
+    # may feed the event-vol decomposition — otherwise the spans-event guard
+    # just relocates garbage from a tight non-spanning expiry to a wide
+    # spanning one. Mirrors edge_engine.MAX_NEAR_TERM_SPREAD_PCT_FOR_TRADE.
+    max_event_expiry_spread_pct: float = 12.0
 
 
 @dataclass(frozen=True)
@@ -123,6 +129,25 @@ class VolSnapshot:
 
     # Audit / diagnostics
     historical_move_source: str
+    # DD-1: past events excluded from the move measurement because their
+    # release timing is unknown (cannot bracket the reaction session).
+    historical_unknown_timing_event_count: int = 0
+    # DD-2: the expiry the event decomposition actually ran on. The near-term
+    # expiry does not always span the earnings reaction; when it doesn't, the
+    # decomposition input is the first spanning expiry (these fields), and
+    # `event_decomposition_status` says which case applied:
+    #   "ok"                        — near expiry spans the event (input = near)
+    #   "used_event_expiry"         — later spanning expiry used
+    #   "event_expiry_not_quotable" — a spanning expiry exists but its ATM
+    #                                 straddle fails the spread-quality bar;
+    #                                 event split suppressed (fields None)
+    #   "no_event_spanning_expiry"  — no spanning expiry exists at all;
+    #                                 event split suppressed (fields None)
+    #   "no_earnings_date"          — no known event; legacy near-expiry split
+    event_expiry_dte: Optional[int] = None
+    event_expiry_implied_move_pct: Optional[float] = None
+    event_expiry_spread_pct: Optional[float] = None
+    event_decomposition_status: str = "no_earnings_date"
     null_reasons: Dict[str, str] = field(default_factory=dict)
     earnings_source_primary: Optional[str] = None
     earnings_source_confirmed: Optional[str] = None
@@ -168,6 +193,8 @@ class _HistoricalMoveProfile:
     p90_move_pct: Optional[float]
     std_move_pct: Optional[float]
     source: str
+    # DD-1: events excluded from measurement (unknown release timing).
+    unknown_timing_event_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -352,9 +379,63 @@ def build_vol_snapshot(
     # ── Event-vol decomposition (P-5a, variance-additive on calendar time) ──
     # Single source of truth: services.event_vol_decomposition.decompose_event_vol.
     # See that module for the full math derivation.
+    #
+    # DD-2: the decomposition assumes its input window CONTAINS the earnings
+    # event ("earnings consumes one calendar day of total variance"). The
+    # near-term expiry does not always span the event (PYPL: 2-DTE 7/24
+    # weekly vs 7/28 BMO earnings), and running the split on a non-spanning
+    # expiry fabricates an "event-implied move" from an option holding zero
+    # event variance. The decomposition input is therefore the first expiry
+    # that spans the earnings reaction (timing-aware; searched over the FULL
+    # chain, not the term-chart cap) and that clears the same spread-quality
+    # bar as the tradeable front leg. `decompose_event_vol` itself cannot
+    # self-guard — its signature has no earnings-date input — so the guard
+    # lives here, at the only seam that knows both dates.
+    event_expiry_dte: Optional[int] = None
+    event_expiry_implied_move_pct: Optional[float] = None
+    event_expiry_spread_pct: Optional[float] = None
+    decomp_input_move = term.near_term_implied_move_pct
+    decomp_input_dte = term.near_term_dte
+    if earnings_date is None:
+        # No known event: legacy behavior (near-expiry decomposition), labeled.
+        event_decomposition_status = "no_earnings_date"
+    else:
+        event_stats = _find_event_expiry_stats(
+            chain_frame, underlying_price, as_of_date, earnings_date, earnings.release_timing,
+        )
+        if event_stats is not None:
+            event_expiry_dte = int(event_stats.dte)
+            event_expiry_implied_move_pct = event_stats.implied_move_pct
+            event_expiry_spread_pct = _mean_or_none(
+                [event_stats.call_spread_pct, event_stats.put_spread_pct]
+            )
+        spread_ok = (
+            event_expiry_spread_pct is not None
+            and event_expiry_spread_pct <= cfg.max_event_expiry_spread_pct
+        )
+        if event_stats is not None and event_expiry_implied_move_pct is not None and spread_ok:
+            decomp_input_move = event_expiry_implied_move_pct
+            decomp_input_dte = event_expiry_dte
+            event_decomposition_status = (
+                "ok" if term.near_term_dte is not None and event_expiry_dte == term.near_term_dte
+                else "used_event_expiry"
+            )
+        else:
+            # No spanning expiry with a quotable, quality-passing ATM straddle:
+            # suppress the event split rather than fabricate it. Distinguish
+            # "an expiry spans the event but its quotes fail the quality bar"
+            # from "no spanning expiry exists at all" — different remedies
+            # (better quotes vs a longer-dated chain).
+            decomp_input_move = None
+            decomp_input_dte = None
+            event_decomposition_status = (
+                "event_expiry_not_quotable" if event_stats is not None
+                else "no_event_spanning_expiry"
+            )
+
     _decomp = decompose_event_vol(
-        near_term_implied_move_pct=term.near_term_implied_move_pct,
-        near_term_dte=term.near_term_dte,
+        near_term_implied_move_pct=decomp_input_move,
+        near_term_dte=decomp_input_dte,
         rv_annual_calendar=rv_har_forecast,
     )
     near_term_implied_sigma_pct = _decomp.near_term_implied_sigma_pct
@@ -362,14 +443,17 @@ def build_vol_snapshot(
     event_implied_move_pct = _decomp.event_implied_move_pct
     event_move_share_of_total = _decomp.event_move_share_of_total
     if event_implied_move_pct is None:
-        if term.near_term_implied_move_pct is None:
+        if event_decomposition_status in ("no_event_spanning_expiry", "event_expiry_not_quotable"):
+            null_reasons["event_implied_move_pct"] = event_decomposition_status
+            null_reasons["event_move_share_of_total"] = event_decomposition_status
+        elif decomp_input_move is None:
             null_reasons["near_term_implied_sigma_pct"] = "near_term_implied_move_unavailable"
             null_reasons["event_implied_move_pct"] = "near_term_implied_move_unavailable"
             null_reasons["event_move_share_of_total"] = "near_term_implied_move_unavailable"
         elif rv_har_forecast is None or rv_har_forecast <= 0:
             null_reasons["event_implied_move_pct"] = "rv_har_forecast_unavailable"
             null_reasons["event_move_share_of_total"] = "rv_har_forecast_unavailable"
-        elif term.near_term_dte is None:
+        elif decomp_input_dte is None:
             null_reasons["event_implied_move_pct"] = "near_term_dte_unavailable"
             null_reasons["event_move_share_of_total"] = "near_term_dte_unavailable"
 
@@ -519,6 +603,10 @@ def build_vol_snapshot(
         non_event_move_pct_har=non_event_move_pct_har,
         event_implied_move_pct=event_implied_move_pct,
         event_move_share_of_total=event_move_share_of_total,
+        event_expiry_dte=event_expiry_dte,
+        event_expiry_implied_move_pct=event_expiry_implied_move_pct,
+        event_expiry_spread_pct=event_expiry_spread_pct,
+        event_decomposition_status=event_decomposition_status,
         historical_event_count=move_profile.earnings_event_count,
         historical_median_move_pct=move_profile.median_move_pct,
         historical_avg_last4_move_pct=move_profile.avg_last4_move_pct,
@@ -545,6 +633,7 @@ def build_vol_snapshot(
         execution_score=execution_score,
         timing_score=timing_score,
         historical_move_source=move_profile.source,
+        historical_unknown_timing_event_count=move_profile.unknown_timing_event_count,
         null_reasons=null_reasons,
         earnings_source_primary=earnings.source_primary,
         earnings_source_confirmed=earnings.source_confirmed,
@@ -953,6 +1042,54 @@ def _build_term_structure_snapshot(
     )
 
 
+def _reaction_session_for_event(earnings_date: date, release_timing: str) -> date:
+    """First session on which the earnings reaction can print.
+
+    BMO / intraday: the report lands before/during the event day's session, so
+    an option expiring ON the event date still captures the reaction.
+    AMC: the reaction prints the NEXT session — a same-day expiry expires
+    before it. Unknown timing is treated as AMC (conservative: never claim
+    event coverage that may not exist).
+    """
+    timing = _normalize_release_timing(release_timing)
+    if timing in ("before market open", "during market hours"):
+        return earnings_date
+    return earnings_date + timedelta(days=1)
+
+
+def _find_event_expiry_stats(
+    chain_frame: pd.DataFrame,
+    underlying_price: Optional[float],
+    as_of_date: date,
+    earnings_date: date,
+    release_timing: str,
+) -> Optional[_ExpiryATMStats]:
+    """ATM stats for the first expiry that SPANS the earnings reaction.
+
+    DD-2: searches the FULL expiry set of the chain — deliberately not the
+    max_term_expiries-capped list used for the term-structure chart — so a
+    dense weekly chain whose event expiry sits past the cap is still found.
+    Returns None when the chain has no expiry at/after the reaction session.
+    """
+    if chain_frame.empty or underlying_price is None or not np.isfinite(underlying_price):
+        return None
+    reaction_session = _reaction_session_for_event(earnings_date, release_timing)
+    expiries = sorted({
+        pd.Timestamp(v).date()
+        for v in chain_frame["expiry"].dropna().tolist()
+        if pd.Timestamp(v).date() > as_of_date
+    })
+    for expiry in expiries:
+        if expiry >= reaction_session:
+            grp = chain_frame[pd.to_datetime(chain_frame["expiry"], errors="coerce").dt.date == expiry].copy()
+            stats = _expiry_atm_stats(grp, underlying_price, as_of_date, expiry)
+            if stats.atm_iv is not None or stats.implied_move_pct is not None:
+                return stats
+            # ATM pair unusable on this expiry — try the next spanning one.
+            continue
+    return None
+
+
 def _expiry_atm_stats(
     frame: pd.DataFrame,
     underlying_price: float,
@@ -1118,6 +1255,7 @@ def _historical_earnings_move_profile(
         p90_move_pct=profile.p90_move_pct,
         std_move_pct=profile.std_move_pct,
         source=profile.source,
+        unknown_timing_event_count=profile.unknown_timing_event_count,
     )
 
 
@@ -1160,7 +1298,13 @@ def _event_contaminated_session_dates(
 
     Policy:
       - after market close: exclude the next trading session
-      - before market open / during market hours / unknown: exclude the matching event session
+      - before market open / during market hours: exclude the matching event session
+      - unknown: exclude BOTH candidate sessions (event day AND the next one).
+        DD-1: an unknown-timing event is dropped from the earnings-move
+        measurement (it can't be bracketed), but the reaction still happened
+        on ONE of the two sessions — so both must leave the RV baseline, or a
+        mis-bracketed reaction day inflates the "ordinary background vol"
+        estimate the decomposition subtracts.
 
     This keeps Yang-Zhang and HAR focused on ordinary background volatility instead of
     allowing recent event jumps to pollute the non-event baseline.
@@ -1178,18 +1322,29 @@ def _event_contaminated_session_dates(
             continue
         timing = _normalize_release_timing(item.get("release_timing"))
         loc = hist.index.searchsorted(event_ts, side="left")
+        contam_locs: list[int] = []
         if timing == "after market close":
             if loc < len(hist.index) and pd.Timestamp(hist.index[loc]).normalize() == event_ts:
-                contam_loc = loc + 1
+                contam_locs = [loc + 1]
             else:
-                contam_loc = loc
+                contam_locs = [loc]
+        elif timing == "unknown":
+            # Both candidate reaction sessions: the event session itself (BMO
+            # case) and the session after it (AMC case).
+            if loc < len(hist.index) and pd.Timestamp(hist.index[loc]).normalize() == event_ts:
+                contam_locs = [loc, loc + 1]
+            else:
+                # Event date wasn't a session (holiday/weekend listing); the
+                # first session at/after it covers both conventions.
+                contam_locs = [loc]
         else:
-            contam_loc = loc
-            if contam_loc < len(hist.index) and pd.Timestamp(hist.index[contam_loc]).normalize() != event_ts:
+            if loc < len(hist.index) and pd.Timestamp(hist.index[loc]).normalize() != event_ts:
                 continue
+            contam_locs = [loc]
 
-        if 0 <= contam_loc < len(index_list):
-            drop_dates.add(index_list[contam_loc])
+        for contam_loc in contam_locs:
+            if 0 <= contam_loc < len(index_list):
+                drop_dates.add(index_list[contam_loc])
 
     return drop_dates
 

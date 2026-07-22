@@ -10,11 +10,12 @@ import { buildEarningsMoveHistory } from './earningsMoveHistory'
  * additive evidence panel, not a guaranteed one, so it stays quiet rather than
  * showing an empty frame.
  */
-export default function EarningsMoveHistoryPanel({ history, impliedMove }) {
+export default function EarningsMoveHistoryPanel({ history, impliedMove, unknownTimingCount }) {
   const { data, impliedMove: implied, exceedRate, median, takeawaySufficient } = buildEarningsMoveHistory(history, impliedMove)
   if (data.length < 1) return null
 
   const n = data.length
+  const excluded = Number(unknownTimingCount) || 0
 
   return (
     <div className="selector-panel selector-panel-earnings-history">
@@ -48,6 +49,15 @@ export default function EarningsMoveHistoryPanel({ history, impliedMove }) {
               Too few past earnings ({n}) to call the priced move cheap or rich.
             </span>
           )
+        )}
+        {excluded > 0 && (
+          <>
+            {' '}
+            <span className="earnings-history-takeaway-insufficient">
+              {excluded} past {excluded === 1 ? 'event' : 'events'} excluded — release timing
+              unknown, so the reaction day can’t be measured reliably.
+            </span>
+          </>
         )}
       </p>
     </div>

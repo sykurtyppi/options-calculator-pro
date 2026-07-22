@@ -2208,6 +2208,7 @@ def _historical_earnings_move_profile(
             "raw_moves_pct": list(profile.raw_moves_pct),  # for kurtosis + crush-rate
             "raw_events": profile.raw_events,  # dated per-event moves for the history panel
             "source": "earnings_history",
+            "unknown_timing_event_count": int(profile.unknown_timing_event_count),
         }
     return {
         "event_count": int(profile.sample_size),
@@ -2216,6 +2217,7 @@ def _historical_earnings_move_profile(
         "avg_last4_move_pct": profile.avg_last4_move_pct,
         "std_move_pct": profile.std_move_pct,
         "source": profile.source,
+        "unknown_timing_event_count": int(profile.unknown_timing_event_count),
     }
 
 
@@ -3446,6 +3448,14 @@ def analyze_single_ticker(
         "implied_move_pct": float(implied_move_total_pct) if np.isfinite(implied_move_total_pct) else None,
         "event_implied_move_pct": float(event_implied_move_pct) if np.isfinite(event_implied_move_pct) else None,
         "non_event_move_pct": float(non_event_move_pct) if np.isfinite(non_event_move_pct) else None,
+        # DD-2: which expiry the event decomposition ran on. When the
+        # near-term expiry expires before the earnings reaction, the split is
+        # computed from the first event-spanning expiry instead (status
+        # "used_event_expiry"), or suppressed entirely when none is quotable
+        # (status "no_event_spanning_expiry").
+        "event_expiry_dte": snapshot_inputs.get("event_expiry_dte"),
+        "event_expiry_implied_move_pct": snapshot_inputs.get("event_expiry_implied_move_pct"),
+        "event_decomposition_status": snapshot_inputs.get("event_decomposition_status"),
         "earnings_move_median_pct": float(median_earnings_move_pct) if np.isfinite(median_earnings_move_pct) else None,
         "earnings_move_p90_pct": float(p90_earnings_move_pct) if np.isfinite(p90_earnings_move_pct) else None,
         "earnings_move_avg_last4_pct": float(avg_last4_move_pct) if np.isfinite(avg_last4_move_pct) else None,
@@ -3456,6 +3466,10 @@ def analyze_single_ticker(
         "earnings_move_sample_size": move_sample_size,
         "earnings_move_source": move_source,
         "earnings_move_history": _earnings_move_history if _earnings_move_history else None,
+        # DD-1: events excluded from the move measurement (unknown release
+        # timing — cannot bracket the reaction session). Non-zero means the
+        # sample above is smaller than the raw event list.
+        "earnings_move_unknown_timing_count": int(move_profile.get("unknown_timing_event_count", 0) or 0),
         "sample_confidence": sample_confidence,
         "min_required_earnings_events": MIN_EARNINGS_EVENTS_FOR_FULL_SIGNAL,
         "min_short_leg_dte": MIN_SHORT_LEG_DTE,

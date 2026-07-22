@@ -29,6 +29,9 @@ import pandas as pd
 
 from utils.quotes import safe_mid_series
 
+from services.earnings_move_profile import (
+    normalize_release_timing as _normalize_release_timing_shared,
+)
 from services.option_surface_quality import diagnose_option_surface_quality
 from services.provider_telemetry import record_provider_telemetry
 
@@ -255,9 +258,17 @@ class YFinanceMarketDataClient:
     def get_earnings(self, symbol: str, countback: int = 24) -> pd.DataFrame:
         """Earnings history normalized to the MarketDataClient schema.
 
-        reportTime (BMO/AMC) is best-effort: only the upcoming event carries a
-        reliable timestamp via .info; historical rows get reportTime=None, which
-        downstream treats as UNKNOWN timing rather than a false BMO/AMC.
+        reportTime (BMO/AMC) for HISTORICAL rows is derived from the yfinance
+        index timestamp's time-of-day (16:00 ET → AMC, 07:00 ET → BMO) via the
+        canonical ``normalize_release_timing`` — the same inference the
+        screener's event collector already uses. Rows Yahoo stamps at midnight
+        (date-only) get reportTime=None → "unknown" downstream, and the shared
+        earnings-move profile now DROPS unknown-timing events from measurement
+        rather than guessing a window (DD-1). Residual risk, accepted: a
+        nonzero-but-wrong placeholder stamp (e.g. 10:00 on a true AMC report)
+        classifies confidently wrong and no downstream backstop can catch it.
+        The upcoming event keeps its .info-derived timing, which takes
+        precedence over the index stamp when present.
         """
         symbol = symbol.upper()
         try:
@@ -279,7 +290,9 @@ class YFinanceMarketDataClient:
             reported = _to_float(row.get("Reported EPS"))
             surprise_pct = _to_float(row.get("Surprise(%)"))
             surprise = (reported - estimated) if (reported is not None and estimated is not None) else None
-            report_time = upcoming_time if (report_date is not None and report_date >= today) else None
+            report_time = _report_time_from_index_ts(idx)
+            if report_date is not None and report_date >= today and upcoming_time is not None:
+                report_time = upcoming_time
             rows.append({
                 "symbol": symbol,
                 "fiscalYear": np.nan,      # yfinance does not provide fiscal labels
@@ -327,3 +340,29 @@ def _to_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return f if np.isfinite(f) else None
+
+
+def _report_time_from_index_ts(idx: Any) -> Optional[str]:
+    """Derive BMO/AMC from a yfinance earnings-dates index timestamp.
+
+    The timezone is pinned explicitly: a tz-aware stamp is converted to
+    America/New_York before the wall-clock hour is read, so classification
+    does not depend on whatever tz yfinance happens to return (a UTC-shaped
+    16:00-ET stamp would otherwise land near 20:00 and misclassify). Naive
+    stamps are assumed to already be exchange wall-clock (yfinance's current
+    behavior after tz_localize(None)).
+
+    Midnight (date-only) stamps carry no timing signal → None, which
+    downstream maps to "unknown" and the earnings-move profile excludes from
+    measurement (DD-1).
+    """
+    if not isinstance(idx, pd.Timestamp):
+        return None
+    try:
+        ts = idx.tz_convert("America/New_York").tz_localize(None) if idx.tzinfo is not None else idx
+    except Exception:
+        return None
+    if not any((ts.hour, ts.minute, ts.second, ts.microsecond)):
+        return None
+    timing = _normalize_release_timing_shared(ts)
+    return timing if timing != "unknown" else None
