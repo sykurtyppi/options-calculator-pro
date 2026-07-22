@@ -111,11 +111,11 @@ def _regime_conditioned_iv_rv(
     RV at the 100th percentile made IV/RV_trailing≈0.80 (perfect entry) while
     IV/RV_HAR≈1.42 (rich).
 
-    When trailing RV is in the top decile of its own 1y history
-    (rv_percentile_rank >= 90), take the LESS favorable (higher) of the
-    trailing and forward ratios, so an inflated-regime setup cannot score as
-    cheap. Below the threshold the trailing ratio is used unchanged, so
-    normal-regime rankings are untouched.
+    When trailing RV is in the top quartile of its own 1y history
+    (rv_percentile_rank >= 75, the "High" regime boundary), take the LESS
+    favorable (higher) of the trailing and forward ratios, so an
+    elevated-regime setup cannot score as cheap. Below the threshold the
+    trailing ratio is used unchanged, so normal-regime rankings are untouched.
     """
     if iv_rv_trailing is None or not np.isfinite(iv_rv_trailing):
         return iv_rv_trailing
@@ -249,7 +249,8 @@ def compute_ranking_score(
             condition the entry input when trailing RV is regime-inflated
             (DD-4); None disables the conditioning (backward-compatible).
         rv_percentile_rank: percentile of current trailing RV within its own
-            1y history. >= 90 triggers the regime conditioning above.
+            1y history. >= 75 (the "High" regime boundary) triggers the regime
+            conditioning above.
 
     Returns:
         Scalar in [0, 1]. Higher = stronger setup for pre-earnings long-vega entry.
