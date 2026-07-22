@@ -53,7 +53,9 @@ def safe_mid_series(bid: Any, ask: Any) -> pd.Series:
     executable two-sided market (non-finite, ``bid <= 0``, ``ask <= 0`` or
     crossed). Non-numeric inputs are coerced to ``NaN`` first.
     """
-    b = pd.to_numeric(bid, errors="coerce")
-    a = pd.to_numeric(ask, errors="coerce")
+    # Wrap in pd.Series so array-likes (list / ndarray) work too, not just
+    # Series — pd.to_numeric returns an ndarray for those, which lacks `.where`.
+    b = pd.Series(pd.to_numeric(bid, errors="coerce"))
+    a = pd.Series(pd.to_numeric(ask, errors="coerce"))
     valid = np.isfinite(b) & np.isfinite(a) & (b > 0.0) & (a > 0.0) & (a >= b)
     return ((b + a) / 2.0).where(valid)

@@ -50,3 +50,18 @@ class TestVectorSafeMid:
         out = safe_mid_series(pd.Series(["1.0", "bad"]), pd.Series(["2.0", "2.0"]))
         assert out.iloc[0] == pytest.approx(1.5)
         assert pd.isna(out.iloc[1])
+
+    def test_accepts_lists_and_ndarrays(self):
+        # array-likes (not just Series) must not raise — the helper is the
+        # canonical API and future callers may pass lists/arrays.
+        out = safe_mid_series([1.8, 0.0], [2.2, 2.0])
+        assert out.iloc[0] == pytest.approx(2.0)
+        assert pd.isna(out.iloc[1])
+        out2 = safe_mid_series(np.array([1.0, 2.5]), np.array([2.0, 2.0]))
+        assert out2.iloc[0] == pytest.approx(1.5)
+        assert pd.isna(out2.iloc[1])   # crossed
+
+    def test_series_index_is_preserved(self):
+        idx = pd.Index([10, 20])
+        out = safe_mid_series(pd.Series([1.8, 0.0], index=idx), pd.Series([2.2, 2.0], index=idx))
+        assert list(out.index) == [10, 20]
