@@ -497,8 +497,17 @@ export default function ScreenerConsole({ apiBase, onAnalyzeSymbol }) {
                 rows={visibleRankedRows}
                 selectedSymbol={selectedRankedSymbol}
                 onSelect={(row) => {
+                  // Selecting a ranked row is a CHEAP action: it shows the
+                  // row's calibration + score components in the detail panel
+                  // (fed by row data and the separate /api/calibration
+                  // endpoint — no heavy analyze). The full single-ticker
+                  // analysis (a ~2s live-data /api/edge/analyze call) is
+                  // reserved for the explicit "Full analysis →" button below.
+                  // Previously every row-click auto-fired that heavy call,
+                  // so browsing the list silently drained the per-IP analyze
+                  // rate-limit budget and produced 429s. See "Click a row to
+                  // see details" — selection is detail, not full analysis.
                   setSelectedRankedSymbol(row.symbol)
-                  if (onAnalyzeSymbol) onAnalyzeSymbol(row.symbol)
                 }}
               />
             </div>
