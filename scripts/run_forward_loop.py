@@ -333,7 +333,7 @@ def _mid_from_row(row: Optional[pd.Series]) -> Optional[float]:
         return None
     bid = _safe_float(row.get("bid"))
     ask = _safe_float(row.get("ask"))
-    if bid is None or ask is None or bid < 0 or ask < 0 or ask < bid:
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:  # H3: zero bid not executable
         return None
     mid = (bid + ask) / 2.0
     return float(mid) if mid > 0 else None
@@ -423,7 +423,7 @@ def _quote_invalid_reason(row: Optional[pd.Series], *, leg: str) -> str:
         return f"missing_{leg}_mid"
     bid = _safe_float(row.get("bid"))
     ask = _safe_float(row.get("ask"))
-    if bid is None or ask is None or bid < 0 or ask < 0 or ask < bid:
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:  # H3: zero bid not executable
         return "bad_bid_ask"
     mid = (bid + ask) / 2.0
     if mid <= 0:

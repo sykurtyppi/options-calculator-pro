@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from utils.quotes import safe_mid
 from services.crush_features import crush_feature_vector
 from services.dividend_yields import get_dividend_yield
 from services.iv_term_structure import bounded_interp
@@ -1491,12 +1492,11 @@ def _nearest_atm_option_stats(
     # must NOT be promoted into mid here — this mid feeds
     # near_term_implied_move_pct (the ATM straddle-mid implied move), exactly the
     # calculation the canonical rule says last prints must not drive.
-    mid = np.nan
-    if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid:
-        mid = (bid + ask) / 2.0
+    _m = safe_mid(bid, ask)   # canonical: None unless executable two-sided
+    mid = _m if _m is not None else np.nan
 
     spread_pct = np.nan
-    if np.isfinite(bid) and np.isfinite(ask) and ask >= bid and np.isfinite(mid) and mid > 0:
+    if np.isfinite(mid) and mid > 0:
         spread_pct = ((ask - bid) / mid) * 100.0
 
     if not np.isfinite(iv) or iv <= 0:
@@ -1571,11 +1571,10 @@ def _nearest_common_strike_pair_stats(
         # print must not be promoted into mid and drive that calculation.
         bid = _safe_float(row.get("bid"), np.nan)
         ask = _safe_float(row.get("ask"), np.nan)
-        mid = np.nan
-        if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0 and ask >= bid:
-            mid = (bid + ask) / 2.0
+        _m = safe_mid(bid, ask)   # canonical safe-mid
+        mid = _m if _m is not None else np.nan
         spread_pct = np.nan
-        if np.isfinite(bid) and np.isfinite(ask) and np.isfinite(mid) and mid > 0 and ask >= bid:
+        if np.isfinite(mid) and mid > 0:
             spread_pct = ((ask - bid) / mid) * 100.0
         return (
             float(mid) if np.isfinite(mid) else None,
@@ -1846,8 +1845,9 @@ def _smile_curvature_from_mda_chain(
                 oi_by_strike[k] = oi_by_strike.get(k, 0.0) + float(oi)
             bid = _safe_float(row.get("bid"), np.nan)
             ask = _safe_float(row.get("ask"), np.nan)
-            if np.isfinite(bid) and np.isfinite(ask) and ask > 0 and ask > bid:
-                mid = (bid + ask) / 2.0
+            _m = safe_mid(bid, ask)  # canonical: None unless executable two-sided
+            if _m is not None:
+                mid = _m
                 sp = (ask - bid) / mid * 100.0
                 # average spread across call/put at the same strike
                 spread_by_strike[k] = (spread_by_strike.get(k, sp) + sp) / 2.0
@@ -2115,8 +2115,9 @@ def _smile_curvature_yf(ticker: yf.Ticker, current_price: float) -> Dict[str, An
                     oi_by_strike[k] = oi_by_strike.get(k, 0.0) + float(oi)
                 bid = _safe_float(row.get("bid"), np.nan)
                 ask = _safe_float(row.get("ask"), np.nan)
-                if np.isfinite(bid) and np.isfinite(ask) and ask > 0 and ask > bid:
-                    mid = (bid + ask) / 2.0
+                _m = safe_mid(bid, ask)  # canonical: None unless executable two-sided
+                if _m is not None:
+                    mid = _m
                     sp = (ask - bid) / mid * 100.0
                     spread_by_strike[k] = (spread_by_strike.get(k, sp) + sp) / 2.0
 
@@ -2302,9 +2303,10 @@ def _collect_yf_option_chain_frame(
             for _, row in working.iterrows():
                 bid = row.get("bid")
                 ask = row.get("ask")
-                mid = np.nan
-                if pd.notna(bid) and pd.notna(ask) and ask >= bid and ask > 0:
-                    mid = (float(bid) + float(ask)) / 2.0
+                # Canonical mid (utils.quotes.safe_mid): None -> NaN for a zero
+                # bid / crossed quote, never a fabricated executable mid.
+                _m = safe_mid(bid, ask)
+                mid = _m if _m is not None else np.nan
                 # F6: do NOT promote a last trade into mid. Last prints can be
                 # stale and must not drive implied-move / straddle-mid math. The
                 # canonical snapshot normalizer (earnings_vol_snapshot) enforces

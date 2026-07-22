@@ -80,3 +80,25 @@ def test_training_fails_clearly_on_insufficient_class_support(tmp_path):
     assert result["trained"] is False
     assert result["error"] == "insufficient_class_support"
     assert result["class_counts"] == [39, 1]
+
+
+def test_training_fails_clearly_on_class_pure_groups(tmp_path):
+    """H4/H5: class-pure symbols (one all-crush, one all-no-crush) make grouped
+    CV produce single-class training folds. This must fail clearly (cv_infeasible)
+    rather than crashing sklearn."""
+    from unittest.mock import patch
+
+    db = InstitutionalMLDatabase(db_path=str(tmp_path / "t.sqlite"))
+    rng = np.random.default_rng(1)
+    df = pd.DataFrame({
+        "near_back_ratio": rng.normal(1.0, 0.1, 40),
+        "log_front_iv": rng.normal(-1.0, 0.2, 40),
+        "iv_rv_approx": rng.normal(1.1, 0.2, 40),
+        "crush_happened": np.array([1] * 20 + [0] * 20),
+        "symbol": ["S0"] * 20 + ["S1"] * 20,   # class perfectly aligned with group
+    })
+    with patch.object(InstitutionalMLDatabase, "_build_crush_training_data", return_value=df):
+        result = db.train_ml_model_on_historical_spreads()
+
+    assert result["trained"] is False
+    assert result["error"] == "cv_infeasible"

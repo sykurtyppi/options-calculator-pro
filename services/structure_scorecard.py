@@ -55,6 +55,15 @@ class StructureScorecard:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    @property
+    def effective_walk_forward_history_count(self) -> int:
+        """H1: empirical observation count for DECISION thresholds — 0 when the
+        prior is simulated (zero empirical weight). A simulated scoreboard has no
+        real observations, so it must count as thin history for the selector's
+        weak/thin-evidence and strong-history gates. The raw
+        walk_forward_history_count is kept for display/provenance."""
+        return 0 if self.walk_forward_is_simulated else self.walk_forward_history_count
+
 
 @dataclass(frozen=True)
 class WalkForwardPrior:
@@ -832,11 +841,18 @@ def _load_calendar_prior_from_reports(structure: str) -> WalkForwardPrior:
     avg_return = _avg_return_proxy_from_frame(subset)
     if avg_return is None:
         avg_return = 0.0
-    # V3 (F2): zero empirical weight — the rank's history component is computed
-    # with history_count=0 so a simulated scoreboard cannot rank as if backed by
-    # N real observations. The raw simulated count is retained on the dataclass
-    # for display/provenance only; win_rate/avg_return still shape the rank.
-    rank = _compute_rank_score(win_rate=win_rate, avg_return_pct=avg_return, history_count=0)
+    # V3 (F2 + H6): a simulated prior carries ZERO empirical decision weight, so
+    # its rank is the neutral no-data baseline — the simulated win_rate/avg_return
+    # do NOT shape the exposed rank_score (which feeds 30% of the composite).
+    # Earlier (F2) only the history component was zeroed, but simulated win/return
+    # still leaked into the rank; H6 routes the full rank through neutral inputs.
+    # The raw simulated win_rate/avg_return/count are retained on the dataclass
+    # below for display/provenance only.
+    rank = _compute_rank_score(
+        win_rate=_NEUTRAL_PRIOR_WIN_RATE,
+        avg_return_pct=_NEUTRAL_PRIOR_AVG_RETURN_PCT,
+        history_count=_NEUTRAL_PRIOR_HISTORY_COUNT,
+    )
     return WalkForwardPrior(
         structure=structure,
         history_count=history_count,

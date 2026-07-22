@@ -123,7 +123,7 @@ def pick_next_monthly_opex(expirations: tuple, event_date: date) -> Optional[str
 
 def spread_pct(bid: float, ask: float) -> float:
     mid = (bid + ask) / 2.0
-    if mid <= 0 or bid < 0 or ask < 0:
+    if mid <= 0 or bid <= 0 or ask <= 0:  # H3: zero bid not executable
         return np.nan
     return (ask - bid) / mid
 

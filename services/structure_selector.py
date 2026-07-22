@@ -109,7 +109,7 @@ def select_best_structure(
     runner_up = ranked[1] if len(ranked) > 1 else None
     gap = max(top.composite_structure_score - runner_up.composite_structure_score, 0.0) if runner_up is not None else top.composite_structure_score
     conflicting = _has_conflicting_signals(snapshot, top)
-    weak_history = top.walk_forward_history_count < MIN_WALK_FORWARD_HISTORY and gap < DOMINANT_SCORE_GAP
+    weak_history = top.effective_walk_forward_history_count < MIN_WALK_FORWARD_HISTORY and gap < DOMINANT_SCORE_GAP
     top_penalty = max(top.execution_penalty, top.crowding_penalty, top.concavity_penalty, top.theta_drag_penalty)
 
     # Execution-cost-dominates-edge veto (De Silva et al. 2025).
@@ -142,7 +142,10 @@ def select_best_structure(
         gap >= DOMINANT_SCORE_GAP
         and top.expected_edge_pct >= STRONG_EDGE_THRESHOLD_PCT
         and top.execution_penalty <= 0.04
-        and top.walk_forward_history_count >= STRONG_WALK_FORWARD_HISTORY
+        # H1: use the EFFECTIVE history count (0 for a simulated prior) so a
+        # simulated N=40 cannot clear the strong-history bar and upgrade the
+        # recommendation from Candidate to Best.
+        and top.effective_walk_forward_history_count >= STRONG_WALK_FORWARD_HISTORY
         and snapshot.data_quality_score >= MIN_DATA_QUALITY_FOR_BEST
         and top.sample_confidence >= 0.60
     ):
@@ -227,7 +230,7 @@ def _has_conflicting_signals(snapshot: VolSnapshot, scorecard: StructureScorecar
         or scorecard.crowding_penalty >= HIGH_CONFLICT_PENALTY
         or scorecard.execution_penalty >= WATCH_EXECUTION_PENALTY_THRESHOLD
     )
-    thin_evidence = scorecard.walk_forward_history_count < MIN_WALK_FORWARD_HISTORY and scorecard.sample_confidence < 0.55
+    thin_evidence = scorecard.effective_walk_forward_history_count < MIN_WALK_FORWARD_HISTORY and scorecard.sample_confidence < 0.55
     return bool(high_move_fit and elevated_penalty) or thin_evidence
 
 

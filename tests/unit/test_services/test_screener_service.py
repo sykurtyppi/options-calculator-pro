@@ -733,14 +733,17 @@ def test_collect_frame_does_not_promote_lastprice_into_mid():
     from services.screener_service import _collect_yf_option_chain_frame
 
     calls = pd.DataFrame({
-        # row 0: valid two-sided quote -> mid = 2.0 ; row 1: no market, only a last
-        "strike": [100.0, 105.0],
-        "bid": [1.8, 0.0],
-        "ask": [2.2, 0.0],
-        "lastPrice": [2.05, 9.99],
-        "impliedVolatility": [0.5, 0.5],
-        "openInterest": [10, 10],
-        "volume": [5, 5],
+        # row 0: valid two-sided quote -> mid = 2.0
+        # row 1: no market at all, only a last -> mid must be NaN (F6)
+        # row 2: H3 zero bid (nobody bidding) with a nonzero ask -> NOT executable,
+        #         mid must be NaN (a zero bid is not a two-sided market)
+        "strike": [100.0, 105.0, 110.0],
+        "bid": [1.8, 0.0, 0.0],
+        "ask": [2.2, 0.0, 2.0],
+        "lastPrice": [2.05, 9.99, 3.0],
+        "impliedVolatility": [0.5, 0.5, 0.5],
+        "openInterest": [10, 10, 10],
+        "volume": [5, 5, 5],
     })
     puts = calls.iloc[0:0].copy()
     ticker = _StubTicker("2026-05-15", _StubChain(calls, puts))
@@ -750,3 +753,36 @@ def test_collect_frame_does_not_promote_lastprice_into_mid():
 
     assert by_strike[100.0]["mid"] == pytest.approx(2.0)   # from bid/ask
     assert pd.isna(by_strike[105.0]["mid"])                # NOT 9.99 lastPrice
+    assert pd.isna(by_strike[110.0]["mid"])                # H3: zero-bid -> not 1.0
+
+
+def test_screener_declares_yfinance_provider_to_snapshot():
+    """H2: the ranked screener sources its chain from yfinance, so it must pass
+    options_provider='yfinance' into build_vol_snapshot — otherwise the V2 data-
+    quality penalty is silently bypassed on this path."""
+    from types import SimpleNamespace
+    import services.screener_service as ss
+
+    idx = pd.bdate_range("2024-01-02", periods=60, name="Date")
+    hist = pd.DataFrame(
+        {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 1_000_000.0},
+        index=idx,
+    )
+    ticker = SimpleNamespace(history=lambda period, auto_adjust: hist)
+    resolved = SimpleNamespace(
+        earnings_date=date(2024, 3, 1), release_timing="AMC",
+        primary_source="yfinance", confirmed_source=None, source_confidence=0.8,
+        source_stale=False, release_timing_source="yfinance",
+    )
+    chain = pd.DataFrame({
+        "strike": [100.0], "bid": [1.0], "ask": [1.2],
+        "call_put": ["C"], "expiry": ["2024-03-15"],
+    })
+    spy = MagicMock(return_value="SNAP")
+    with patch.object(ss, "build_vol_snapshot", spy), \
+         patch.object(ss, "_collect_yf_option_chain_frame", return_value=chain), \
+         patch.object(ss, "_collect_yf_past_earnings_events", return_value=[]):
+        ss._build_ranked_snapshot("AAPL", ticker, date(2024, 2, 20), date(2024, 4, 1), resolved_event=resolved)
+
+    assert spy.called
+    assert spy.call_args.kwargs.get("options_provider") == "yfinance"

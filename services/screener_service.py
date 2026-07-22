@@ -40,6 +40,7 @@ import pandas as pd
 import yfinance as yf
 from services.earnings_event_service import _timing_label_to_full, resolve_upcoming_earnings_event
 from services.earnings_vol_snapshot import VolSnapshot, build_vol_snapshot
+from utils.quotes import safe_mid
 
 logger = logging.getLogger(__name__)
 
@@ -343,9 +344,10 @@ def _collect_yf_option_chain_frame(
             for _, row in working.iterrows():
                 bid = row.get("bid")
                 ask = row.get("ask")
-                mid = np.nan
-                if pd.notna(bid) and pd.notna(ask) and ask >= bid and ask > 0:
-                    mid = (float(bid) + float(ask)) / 2.0
+                # Canonical mid (utils.quotes.safe_mid): None -> NaN for a zero
+                # bid / crossed quote, so it never fabricates an executable mid.
+                _m = safe_mid(bid, ask)
+                mid = _m if _m is not None else np.nan
                 # F6: do NOT promote a last trade into mid. Last prints can be
                 # stale and must not drive implied-move / straddle-mid math. The
                 # canonical snapshot normalizer (earnings_vol_snapshot) enforces
@@ -406,6 +408,11 @@ def _build_ranked_snapshot(
         symbol,
         today,
         option_chain_data=option_chain_df,
+        # H2 (V2): the ranked screener always sources its chain from yfinance
+        # (_collect_yf_option_chain_frame). Declare the provider so the data-
+        # quality score applies the delayed/greek-less penalty here too — without
+        # this the screener path silently scored yfinance like real-time MarketData.
+        options_provider="yfinance",
         earnings_metadata={
             "earnings_date": earnings_date,
             "release_timing": _timing_label_to_full(release_timing),

@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from utils.quotes import safe_mid_series
+
 from services.option_surface_quality import diagnose_option_surface_quality
 from services.provider_telemetry import record_provider_telemetry
 
@@ -201,6 +203,9 @@ class YFinanceMarketDataClient:
             dte = np.nan
         bid = pd.to_numeric(legs.get("bid"), errors="coerce")
         ask = pd.to_numeric(legs.get("ask"), errors="coerce")
+        # Canonical mid rule (utils.quotes.safe_mid_series): NaN for a zero/absent
+        # bid or crossed quote, never a fabricated (0 + ask)/2.
+        mid = safe_mid_series(bid, ask)
         out = pd.DataFrame({
             "optionSymbol": legs.get("contractSymbol", pd.Series([None] * n)).astype(object),
             "underlying": [symbol] * n,
@@ -208,7 +213,7 @@ class YFinanceMarketDataClient:
             "strike": pd.to_numeric(legs.get("strike"), errors="coerce"),
             "bid": bid,
             "ask": ask,
-            "mid": (bid + ask) / 2.0,
+            "mid": mid,
             "lastPrice": pd.to_numeric(legs.get("lastPrice"), errors="coerce"),
             "volume": pd.to_numeric(legs.get("volume"), errors="coerce"),
             "openInterest": pd.to_numeric(legs.get("openInterest"), errors="coerce"),

@@ -22,6 +22,7 @@ from services.iv_term_structure import (
     bounded_interp,
 )
 from services.option_surface_quality import diagnose_option_surface_quality
+from utils.quotes import safe_mid_series
 from services.realized_vol import (
     HAR_MIN_OBS as _HAR_MIN_OBS,
     RS_FALLBACK_WINDOW as _RS_FALLBACK_WINDOW,
@@ -678,8 +679,14 @@ def _normalize_option_chain(option_chain_data: Any) -> Tuple[pd.DataFrame, Optio
     if "mid" not in df.columns:
         df["mid"] = np.nan
     if {"bid", "ask"}.issubset(df.columns):
-        valid_ba = np.isfinite(df["bid"]) & np.isfinite(df["ask"]) & (df["ask"] >= df["bid"]) & (df["ask"] > 0)
-        df.loc[valid_ba, "mid"] = df.loc[valid_ba, "mid"].fillna((df.loc[valid_ba, "bid"] + df.loc[valid_ba, "ask"]) / 2.0)
+        # Canonical mid rule via utils.quotes.safe_mid_series: only derive a mid
+        # from an executable two-sided quote (a zero bid -> NaN). This is the
+        # central normalizer inside build_vol_snapshot; because it fills via
+        # fillna, using the safe helper guarantees a zero-bid quote can never be
+        # fabricated into mid = (0 + ask)/2 (which would contaminate implied-move).
+        # A pre-existing valid mid is preserved; mid stays NaN otherwise, so the
+        # spread calc below also excludes the row.
+        df["mid"] = df["mid"].fillna(safe_mid_series(df["bid"], df["ask"]))
     # Do not promote last trade into mid. Last prints can be stale and should not
     # drive implied-move or term-structure calculations without valid bid/ask.
 
@@ -1331,8 +1338,12 @@ def _data_quality_score(
     # gate (MIN_DATA_QUALITY_FOR_ANY_TRADE) exactly like real-time MarketData.
     # Penalize + cap so the gate can see the downgrade. (Provider identity is the
     # faithful proxy for greek availability, which the normalized chain drops.)
+    # H7: the cap (0.74) is intentionally just below structure_selector's
+    # MIN_DATA_QUALITY_FOR_BEST (0.75) so a delayed, greek-less yfinance surface
+    # can still trade as a Candidate (> MIN_DATA_QUALITY_FOR_ANY_TRADE = 0.45) but
+    # can never be promoted to the top "Best Candidate" tier on quality alone.
     if options_provider and "yfinance" in str(options_provider).lower():
-        score = min(score * 0.85, 0.80)
+        score = min(score * 0.85, 0.74)
     return float(np.clip(score, 0.0, 1.0))
 
 
