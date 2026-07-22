@@ -672,13 +672,23 @@ def _strangle_payoff(
 
 
 def _rv_percentile_and_regime(
-    hist_long: pd.DataFrame, current_rv30: float, window_days: int = 252
+    hist_long: pd.DataFrame, current_rv30: Optional[float] = None, window_days: int = 252
 ) -> Tuple[Optional[float], str]:
     """
-    Percentile rank of *current_rv30* within its trailing *window_days* history.
+    Percentile rank of current realized vol within its trailing *window_days*
+    history, on a self-consistent Rogers-Satchell basis.
 
-    Uses the Rogers-Satchell daily vol series (same estimator as HAR-RV input)
-    averaged over rolling 30-day windows.  Consistent estimator family throughout.
+    DD-6: this previously ranked ``current_rv30`` (a Yang-Zhang estimate,
+    passed by the offline backtest study — realized_vol._yang_zhang_rv30) against
+    a Rogers-Satchell rolling history. YZ adds overnight-gap variance and runs
+    systematically ~1.3x higher than RS, so the point exceeded almost the whole
+    RS history and the percentile pinned near 100 / "High" for nearly every
+    symbol — a systematically biased estimate that could never read a low
+    regime. Both the point AND the distribution now come from the SAME RS
+    rolling-30 series (point = latest value). ``current_rv30`` is retained for
+    the existing positional call signature but is no longer used for the
+    comparison. (Mirrors services.earnings_vol_snapshot._rv_percentile_and_regime;
+    a follow-up should dedupe these two copies into one shared helper.)
 
     Returns (percentile_rank: 0–100, regime_label: Low/Normal/Elevated/High).
     Low < 25th ≤ Normal < 50th ≤ Elevated < 75th ≤ High.
@@ -687,13 +697,15 @@ def _rv_percentile_and_regime(
     if len(rs) < 60:
         return None, "unknown"
 
-    rolling_rv30 = rs.rolling(window=30, min_periods=20).mean()
-    hist_vals = rolling_rv30.dropna().tail(window_days).values
-
-    if len(hist_vals) < 30 or not np.isfinite(current_rv30) or current_rv30 <= 0:
+    rolling_rv30 = rs.rolling(window=30, min_periods=20).mean().dropna()
+    if len(rolling_rv30) < 30:
+        return None, "unknown"
+    hist_vals = rolling_rv30.tail(window_days).values
+    current_rs_rv30 = float(rolling_rv30.iloc[-1])
+    if not np.isfinite(current_rs_rv30) or current_rs_rv30 <= 0:
         return None, "unknown"
 
-    pct_rank = float(np.mean(hist_vals <= current_rv30) * 100.0)
+    pct_rank = float(np.mean(hist_vals <= current_rs_rv30) * 100.0)
 
     if pct_rank >= 75:
         regime = "High"

@@ -339,9 +339,11 @@ def build_vol_snapshot(
                 )
 
         if rv30_yz is not None:
+            # DD-6: the regime percentile is computed on a self-consistent
+            # Rogers-Satchell basis inside the helper (not against the YZ
+            # point), so rv30_yz is no longer passed as the comparison value.
             rv_pct, regime = _rv_percentile_and_regime(
                 price_frame[["Open", "High", "Low", "Close"]],
-                rv30_yz,
                 window_days=cfg.regime_window_days,
                 excluded_sessions=excluded_sessions,
             )
@@ -1368,18 +1370,36 @@ def _event_contaminated_session_dates(
 
 def _rv_percentile_and_regime(
     hist: pd.DataFrame,
-    current_rv30: float,
     window_days: int = 252,
     excluded_sessions: Optional[set[pd.Timestamp]] = None,
 ) -> Tuple[Optional[float], str]:
+    """Percentile rank + regime label of current realized vol vs its own history.
+
+    DD-6: the comparison must be LIKE-WITH-LIKE. Previously the current point
+    was the Yang-Zhang rv30 (which adds overnight-gap variance) while the
+    history distribution was the Rogers-Satchell intraday series. YZ runs
+    systematically ~1.3x higher than RS, so the current point exceeded almost
+    the entire RS history and the percentile pinned near 100 / "High" for
+    nearly every symbol regardless of the true regime (Coca-Cola read "High").
+    A systematically biased estimate can never read a genuinely low regime.
+
+    Both the current point AND the distribution now come from the SAME RS
+    rolling-30 series (the current point is that series' latest value), so the
+    percentile is a true self-referential measure of where today's realized
+    vol sits within its own recent history. ``rv30_yang_zhang`` remains the
+    displayed volatility figure — only the regime BASIS changes here.
+    """
     rs = _rs_daily_vol_series(hist, excluded_sessions=excluded_sessions)
     if len(rs) < 60:
         return None, "unknown"
-    rolling_rv30 = rs.rolling(window=30, min_periods=20).mean()
-    hist_vals = rolling_rv30.dropna().tail(window_days).values
-    if len(hist_vals) < 30 or not np.isfinite(current_rv30) or current_rv30 <= 0:
+    rolling_rv30 = rs.rolling(window=30, min_periods=20).mean().dropna()
+    if len(rolling_rv30) < 30:
         return None, "unknown"
-    pct_rank = float(np.mean(hist_vals <= current_rv30) * 100.0)
+    hist_vals = rolling_rv30.tail(window_days).values
+    current_rs_rv30 = float(rolling_rv30.iloc[-1])
+    if not np.isfinite(current_rs_rv30) or current_rs_rv30 <= 0:
+        return None, "unknown"
+    pct_rank = float(np.mean(hist_vals <= current_rs_rv30) * 100.0)
     if pct_rank >= 75:
         return round(pct_rank, 1), "High"
     if pct_rank >= 50:

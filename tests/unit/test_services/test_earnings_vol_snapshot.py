@@ -6,7 +6,53 @@ import numpy as np
 import pandas as pd
 
 import web.api.edge_engine as edge_engine
-from services.earnings_vol_snapshot import build_vol_snapshot, _data_quality_score, _quality_label
+from services.earnings_vol_snapshot import (
+    build_vol_snapshot,
+    _data_quality_score,
+    _quality_label,
+    _rv_percentile_and_regime,
+)
+
+
+def _ohlc_with_daily_range(ranges: list[float]) -> pd.DataFrame:
+    """Build an OHLC frame where each day has open==close==100 and a symmetric
+    high/low band of the given fractional range — a direct handle on the
+    Rogers-Satchell intraday vol of each session."""
+    idx = pd.bdate_range("2024-01-02", periods=len(ranges))
+    close = pd.Series(100.0, index=idx)
+    high = close * (1.0 + np.array(ranges))
+    low = close * (1.0 - np.array(ranges))
+    return pd.DataFrame({"Open": close, "High": high, "Low": low, "Close": close})
+
+
+class TestRegimePercentileDD6(unittest.TestCase):
+    """DD-6: the regime percentile must compare like-with-like (RS point vs RS
+    history), so it can read a genuinely LOW regime. The old code compared a
+    Yang-Zhang point (with overnight-gap variance) against an RS distribution,
+    biasing the percentile up so nearly every symbol pinned at ~100 / 'High'."""
+
+    def test_calm_recent_period_reads_low_not_high(self):
+        # Volatile for most of the window, then a short calm tail → current RV
+        # sits at the BOTTOM of its own history → Low regime. The old
+        # YZ-vs-RS bias could never produce a low reading here.
+        ranges = [0.030] * 250 + [0.004] * 40
+        pct, regime = _rv_percentile_and_regime(_ohlc_with_daily_range(ranges))
+        self.assertIsNotNone(pct)
+        self.assertLess(pct, 25.0)
+        self.assertEqual(regime, "Low")
+
+    def test_volatile_recent_period_reads_high(self):
+        # Calm history, spiking recent window → current RV near the top → High.
+        ranges = [0.004] * 200 + [0.030] * 100
+        pct, regime = _rv_percentile_and_regime(_ohlc_with_daily_range(ranges))
+        self.assertIsNotNone(pct)
+        self.assertGreaterEqual(pct, 75.0)
+        self.assertEqual(regime, "High")
+
+    def test_insufficient_history_is_unknown(self):
+        pct, regime = _rv_percentile_and_regime(_ohlc_with_daily_range([0.01] * 20))
+        self.assertIsNone(pct)
+        self.assertEqual(regime, "unknown")
 
 
 class TestDataQualityProviderPenalty(unittest.TestCase):
