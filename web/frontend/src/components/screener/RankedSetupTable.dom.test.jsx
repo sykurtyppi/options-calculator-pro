@@ -77,6 +77,32 @@ describe('RankedSetupTable', () => {
     expect(onSelect).toHaveBeenCalledWith(upcomingRow)
   })
 
+  test('regime-conditioned row flags its low IV/RV as warn, not green (DD-4)', () => {
+    // A low IV/RV normally reads green ("cheap"); when the cheapness rests on
+    // an elevated-vol regime the ranking discounts, it must be flagged (warn
+    // color + ⚠ marker), not shown as a favorable cheap-vol signal.
+    const conditioned = {
+      ...scoredRow, symbol: 'PYPL', iv_rv_ratio: 0.82, iv_rv_har: 1.45,
+      rv_percentile_rank: 87, iv_regime_conditioned: true,
+    }
+    const { container } = render(
+      <RankedSetupTable rows={[conditioned]} selectedSymbol={null} onSelect={() => {}} />,
+    )
+    expect(container.textContent).toMatch(/0\.82\s*⚠/)
+    const ivrvCell = [...container.querySelectorAll('tbody td')].find((td) => /0\.82/.test(td.textContent))
+    expect(ivrvCell.style.color).toBe('var(--warn)')
+  })
+
+  test('non-conditioned low IV/RV still reads green (no false alarm)', () => {
+    const cheap = { ...scoredRow, iv_rv_ratio: 0.82, iv_regime_conditioned: false }
+    const { container } = render(
+      <RankedSetupTable rows={[cheap]} selectedSymbol={null} onSelect={() => {}} />,
+    )
+    expect(container.textContent).not.toMatch(/⚠/)
+    const ivrvCell = [...container.querySelectorAll('tbody td')].find((td) => /0\.82/.test(td.textContent))
+    expect(ivrvCell.style.color).toBe('var(--pos)')
+  })
+
   test('upcoming row never paints a null metric green (null < 1.0 coercion guard)', () => {
     // Regression: `null < 1.0` is true in JS, which used to color the "—"
     // em-dash cells green (signaling a favorable IV/RV or TS the row doesn't have).

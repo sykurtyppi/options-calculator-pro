@@ -156,6 +156,12 @@ class RankedSetupRow(BaseModel):
     median_earnings_move_pct: Optional[float]
     sample_size: Optional[int] = None
     spread_pct: Optional[float]
+    # DD-4: forward IV/RV (vs HAR forecast) + trailing-RV percentile, so the UI
+    # can flag a top-ranked setup whose "cheap" trailing IV/RV rests on an
+    # elevated-vol regime that the ranking now discounts.
+    iv_rv_har: Optional[float] = None
+    rv_percentile_rank: Optional[float] = None
+    iv_regime_conditioned: bool = False
     ranking_score: Optional[float]
     score_components: Dict[str, Any] = Field(default_factory=dict)
     status: Literal["ranked", "upcoming", "no_earnings", "error"]

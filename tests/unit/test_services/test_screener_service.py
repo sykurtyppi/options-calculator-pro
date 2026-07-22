@@ -12,6 +12,7 @@ from services.screener_service import (
     _iv_entry_score,
     _liquidity_score,
     _move_history_score,
+    _regime_conditioned_iv_rv,
     _sample_score,
     _ts_score,
     _screen_one_symbol_ranked,
@@ -212,6 +213,60 @@ class TestComputeRankingScore:
             spread_pct=0.0,
         )
         assert perfect == pytest.approx(1.0, abs=0.01)
+
+    def test_regime_inflated_trailing_rv_does_not_mint_perfect_entry(self):
+        """DD-4: the PYPL artifact. Trailing IV/RV=0.80 would score a perfect
+        long-vol entry, but with trailing RV at the 100th percentile and a
+        forward IV/RV of 1.42 (rich), the ranking must discount the entry."""
+        common = dict(
+            ts_ratio=0.84, median_earnings_move_pct=8.6, sample_size=20,
+            dte=6, spread_pct=5.0,
+        )
+        # Same trailing IV/RV, but one is in an inflated regime with a rich
+        # forward ratio; that one must rank LOWER.
+        normal = compute_ranking_score(iv_rv_ratio=0.80, iv_rv_har=0.85, rv_percentile_rank=48.0, **common)
+        inflated = compute_ranking_score(iv_rv_ratio=0.80, iv_rv_har=1.42, rv_percentile_rank=100.0, **common)
+        assert inflated < normal
+        # The discount is exactly the IV-entry weight applied to the gap between
+        # a perfect entry (0.80→1.0) and the forward-ratio entry (1.42→~0.225).
+        assert (normal - inflated) == pytest.approx(0.32 * (1.0 - _iv_entry_score(1.42)), abs=1e-9)
+
+    def test_conditioning_inert_below_percentile_threshold(self):
+        """Below the High-regime percentile threshold (75) the trailing ratio is
+        used unchanged — normal-regime rankings are untouched (small blast
+        radius)."""
+        base = dict(ts_ratio=0.90, median_earnings_move_pct=6.0, sample_size=10, dte=6, spread_pct=3.0)
+        without = compute_ranking_score(iv_rv_ratio=0.80, **base)
+        with_low_pct = compute_ranking_score(iv_rv_ratio=0.80, iv_rv_har=1.42, rv_percentile_rank=70.0, **base)
+        assert with_low_pct == pytest.approx(without)
+
+    def test_conditioning_never_rewards_inflated_regime(self):
+        """max(trailing, forward) can only raise the effective IV/RV → only
+        lower or hold the entry score, never inflate it."""
+        base = dict(ts_ratio=0.90, median_earnings_move_pct=6.0, sample_size=10, dte=6, spread_pct=3.0)
+        # Forward ratio BELOW trailing at high percentile: must not improve the score.
+        plain = compute_ranking_score(iv_rv_ratio=1.10, **base)
+        cond = compute_ranking_score(iv_rv_ratio=1.10, iv_rv_har=0.70, rv_percentile_rank=100.0, **base)
+        assert cond == pytest.approx(plain)  # max(1.10, 0.70) == 1.10, unchanged
+
+
+class TestRegimeConditionedIvRv:
+    def test_high_percentile_takes_less_favorable_ratio(self):
+        assert _regime_conditioned_iv_rv(0.80, 1.42, 100.0) == pytest.approx(1.42)
+
+    def test_below_threshold_returns_trailing(self):
+        assert _regime_conditioned_iv_rv(0.80, 1.42, 70.0) == pytest.approx(0.80)
+
+    def test_missing_forward_or_percentile_returns_trailing(self):
+        assert _regime_conditioned_iv_rv(0.80, None, 100.0) == pytest.approx(0.80)
+        assert _regime_conditioned_iv_rv(0.80, 1.42, None) == pytest.approx(0.80)
+
+    def test_trailing_none_passes_through(self):
+        assert _regime_conditioned_iv_rv(None, 1.42, 100.0) is None
+
+    def test_never_lowers_the_ratio(self):
+        # forward < trailing at high pct → keep trailing (max), never reward.
+        assert _regime_conditioned_iv_rv(1.10, 0.70, 100.0) == pytest.approx(1.10)
 
     def test_iv_rv_ratio_dominance(self):
         """iv_rv_ratio has the largest weight (0.32).  Changing it from ideal to
