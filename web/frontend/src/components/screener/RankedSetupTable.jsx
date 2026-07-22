@@ -132,8 +132,23 @@ export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
                 <td style={{ padding: '5px 8px', textAlign: 'center' }}>
                   {releaseTimeBadge(row.release_timing)}
                 </td>
-                <td style={{ padding: '5px 8px', textAlign: 'right', color: row.iv_rv_ratio != null && row.iv_rv_ratio < 1.0 ? 'var(--pos)' : 'var(--text-secondary)' }}>
-                  {fmt(row.iv_rv_ratio)}
+                <td
+                  style={{
+                    padding: '5px 8px', textAlign: 'right',
+                    // DD-4: a low IV/RV normally paints green ("cheap"). Suppress
+                    // that when the row is regime-conditioned — the low trailing
+                    // IV/RV rests on elevated realized vol (top-quartile of its
+                    // own history) that the forward HAR ratio says will revert,
+                    // so "cheap" is a regime artifact, not a durable edge.
+                    color: row.iv_regime_conditioned
+                      ? 'var(--warn)'
+                      : (row.iv_rv_ratio != null && row.iv_rv_ratio < 1.0 ? 'var(--pos)' : 'var(--text-secondary)'),
+                  }}
+                  title={row.iv_regime_conditioned
+                    ? `Trailing IV/RV looks cheap only because realized vol is elevated (${row.rv_percentile_rank != null ? Math.round(row.rv_percentile_rank) + 'th pct' : 'high regime'}); forward IV/RV${row.iv_rv_har != null ? ' ' + row.iv_rv_har.toFixed(2) : ''} is richer. Ranking discounts this.`
+                    : undefined}
+                >
+                  {fmt(row.iv_rv_ratio)}{row.iv_regime_conditioned ? ' ⚠' : ''}
                 </td>
                 <td style={{ padding: '5px 8px', textAlign: 'right', color: 'var(--text-secondary)' }}>
                   {fmt(row.atm_iv, 1, '%')}

@@ -83,6 +83,54 @@ assert abs((_W_IV_ENTRY + _W_MOVE_HISTORY + _W_TS + _W_DTE + _W_SAMPLE + _W_LIQU
 
 # ── Scoring sub-functions (pure, unit-testable) ───────────────────────────────
 
+# DD-4: trailing realized vol at/above this percentile of its own 1y history is
+# treated as elevated (likely to mean-revert) — the trailing IV/RV it produces
+# can no longer mint a perfect long-vol entry on its own (see
+# _regime_conditioned_iv_rv). This is the SAME boundary the vol-regime label
+# uses for "High" (_rv_percentile_and_regime: >=75 → High), so a top-ranked
+# setup flagged here is exactly one the app already calls a High-vol regime.
+# (Set to 75 after DD-6 fixed the percentile: it previously pinned ~100 for
+# every name, so the earlier 90 threshold rode on an inflated signal and, with
+# the corrected percentiles, would miss genuinely-elevated names like PYPL at
+# ~87th percentile.)
+_RV_PERCENTILE_REGIME_THRESHOLD = 75.0
+
+
+def _regime_conditioned_iv_rv(
+    iv_rv_trailing: Optional[float],
+    iv_rv_forward: Optional[float],
+    rv_percentile_rank: Optional[float],
+) -> Optional[float]:
+    """Guard the entry input against regime-inflated trailing realized vol.
+
+    The entry score rewards a LOW IV/RV (IV cheap vs realized). But trailing RV
+    can be transiently inflated — a recent vol spike still sitting in the
+    trailing window — which deflates IV/RV_trailing and mints a spuriously
+    "cheap" long-vol entry, exactly when the FORWARD-looking IV/RV (vs a HAR
+    forecast) says vol is actually rich. This was the PYPL artifact: trailing
+    RV at the 100th percentile made IV/RV_trailing≈0.80 (perfect entry) while
+    IV/RV_HAR≈1.42 (rich).
+
+    When trailing RV is in the top decile of its own 1y history
+    (rv_percentile_rank >= 90), take the LESS favorable (higher) of the
+    trailing and forward ratios, so an inflated-regime setup cannot score as
+    cheap. Below the threshold the trailing ratio is used unchanged, so
+    normal-regime rankings are untouched.
+    """
+    if iv_rv_trailing is None or not np.isfinite(iv_rv_trailing):
+        return iv_rv_trailing
+    if (
+        rv_percentile_rank is not None
+        and np.isfinite(rv_percentile_rank)
+        and rv_percentile_rank >= _RV_PERCENTILE_REGIME_THRESHOLD
+        and iv_rv_forward is not None
+        and np.isfinite(iv_rv_forward)
+        and iv_rv_forward > 0
+    ):
+        return float(max(iv_rv_trailing, iv_rv_forward))
+    return iv_rv_trailing
+
+
 def _iv_entry_score(iv_rv_ratio: Optional[float]) -> float:
     """Reward low IV/RV (IV cheap relative to recent realized vol).
 
@@ -90,6 +138,9 @@ def _iv_entry_score(iv_rv_ratio: Optional[float]) -> float:
     iv_rv = 1.00  → 0.75  (IV at par with RV — decent)
     iv_rv = 1.20  → 0.50  (IV modestly elevated — neutral)
     iv_rv = 1.60  → 0.00  (IV well above RV — avoid long vol here)
+
+    The ratio passed here is the regime-conditioned entry input
+    (see _regime_conditioned_iv_rv), not necessarily the raw trailing IV/RV.
     """
     if iv_rv_ratio is None or not np.isfinite(iv_rv_ratio) or iv_rv_ratio <= 0:
         return 0.25  # neutral fallback when data missing
@@ -178,6 +229,8 @@ def compute_ranking_score(
     sample_size: int,
     dte: Optional[int],
     spread_pct: Optional[float],
+    iv_rv_har: Optional[float] = None,
+    rv_percentile_rank: Optional[float] = None,
 ) -> float:
     """Compute the pre-earnings long-vega ranking score.
 
@@ -192,12 +245,18 @@ def compute_ranking_score(
         sample_size: number of historical earnings events with usable move data.
         dte: calendar days to next earnings announcement.
         spread_pct: ATM call bid-ask spread as % of mid price.
+        iv_rv_har: forward-looking IV / HAR-RV-forecast ratio. Used only to
+            condition the entry input when trailing RV is regime-inflated
+            (DD-4); None disables the conditioning (backward-compatible).
+        rv_percentile_rank: percentile of current trailing RV within its own
+            1y history. >= 90 triggers the regime conditioning above.
 
     Returns:
         Scalar in [0, 1]. Higher = stronger setup for pre-earnings long-vega entry.
     """
+    entry_iv_rv = _regime_conditioned_iv_rv(iv_rv_ratio, iv_rv_har, rv_percentile_rank)
     return (
-        _W_IV_ENTRY     * _iv_entry_score(iv_rv_ratio)
+        _W_IV_ENTRY     * _iv_entry_score(entry_iv_rv)
         + _W_MOVE_HISTORY * _move_history_score(median_earnings_move_pct)
         + _W_TS           * _ts_score(ts_ratio)
         + _W_DTE          * _dte_score(dte)
@@ -538,6 +597,22 @@ def _screen_one_symbol_ranked(
             else None
         )
         sample_size = int(snapshot.historical_event_count or 0)
+        iv_rv_har = round(snapshot.iv_rv_har, 3) if snapshot.iv_rv_har is not None else None
+        rv_percentile_rank = (
+            round(snapshot.rv_percentile_rank, 1)
+            if snapshot.rv_percentile_rank is not None
+            else None
+        )
+        # DD-4: is trailing RV regime-inflated enough that its "cheap" IV/RV is
+        # discounted for ranking? Surfaced so the UI can flag a top-ranked
+        # setup whose cheapness rests on an elevated-vol regime.
+        iv_regime_conditioned = bool(
+            rv_percentile_rank is not None
+            and rv_percentile_rank >= _RV_PERCENTILE_REGIME_THRESHOLD
+            and iv_rv is not None
+            and iv_rv_har is not None
+            and iv_rv_har > iv_rv
+        )
 
         # Ranking score
         ranking_score = compute_ranking_score(
@@ -547,6 +622,8 @@ def _screen_one_symbol_ranked(
             sample_size=sample_size,
             dte=dte,
             spread_pct=spread_pct,
+            iv_rv_har=iv_rv_har,
+            rv_percentile_rank=rv_percentile_rank,
         )
 
         return {
@@ -562,6 +639,9 @@ def _screen_one_symbol_ranked(
             "p90_earnings_move_pct": p90_move_pct,
             "sample_size": sample_size,
             "avg_spread_pct": spread_pct,
+            "iv_rv_har": iv_rv_har,
+            "rv_percentile_rank": rv_percentile_rank,
+            "iv_regime_conditioned": iv_regime_conditioned,
             "ranking_score": round(ranking_score, 4),
             "in_entry_window": (dte_min <= dte <= dte_max),
             "earnings_source_primary": snapshot.earnings_source_primary,
