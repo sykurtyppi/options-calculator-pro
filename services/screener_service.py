@@ -40,6 +40,7 @@ import pandas as pd
 import yfinance as yf
 from services.earnings_event_service import _timing_label_to_full, resolve_upcoming_earnings_event
 from services.earnings_vol_snapshot import VolSnapshot, build_vol_snapshot
+from utils.quotes import safe_mid
 
 logger = logging.getLogger(__name__)
 
@@ -343,12 +344,10 @@ def _collect_yf_option_chain_frame(
             for _, row in working.iterrows():
                 bid = row.get("bid")
                 ask = row.get("ask")
-                mid = np.nan
-                # H3: require bid > 0 — a zero bid is not an executable two-sided
-                # market (nobody is bidding), so {bid:0, ask:2} must NOT yield a
-                # mid of 1.0 and contaminate implied-move / straddle pricing.
-                if pd.notna(bid) and pd.notna(ask) and bid > 0 and ask >= bid and ask > 0:
-                    mid = (float(bid) + float(ask)) / 2.0
+                # Canonical mid (utils.quotes.safe_mid): None -> NaN for a zero
+                # bid / crossed quote, so it never fabricates an executable mid.
+                _m = safe_mid(bid, ask)
+                mid = _m if _m is not None else np.nan
                 # F6: do NOT promote a last trade into mid. Last prints can be
                 # stale and must not drive implied-move / straddle-mid math. The
                 # canonical snapshot normalizer (earnings_vol_snapshot) enforces

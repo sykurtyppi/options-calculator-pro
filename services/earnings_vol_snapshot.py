@@ -22,6 +22,7 @@ from services.iv_term_structure import (
     bounded_interp,
 )
 from services.option_surface_quality import diagnose_option_surface_quality
+from utils.quotes import safe_mid_series
 from services.realized_vol import (
     HAR_MIN_OBS as _HAR_MIN_OBS,
     RS_FALLBACK_WINDOW as _RS_FALLBACK_WINDOW,
@@ -678,15 +679,14 @@ def _normalize_option_chain(option_chain_data: Any) -> Tuple[pd.DataFrame, Optio
     if "mid" not in df.columns:
         df["mid"] = np.nan
     if {"bid", "ask"}.issubset(df.columns):
-        # H3: require bid > 0 here too — this is the CANONICAL normalizer inside
-        # build_vol_snapshot, and because it fills mid via fillna it would
-        # otherwise OVERRIDE the NaN that the upstream frame builders / clients
-        # now emit for a zero-bid (non-executable) quote, silently reverting the
-        # fix on the production path and fabricating a mid = (0 + ask)/2 that
-        # contaminates implied-move. (mid stays NaN -> valid_spread below also
-        # excludes the row, so spread_pct is likewise not fabricated.)
-        valid_ba = np.isfinite(df["bid"]) & np.isfinite(df["ask"]) & (df["bid"] > 0) & (df["ask"] >= df["bid"]) & (df["ask"] > 0)
-        df.loc[valid_ba, "mid"] = df.loc[valid_ba, "mid"].fillna((df.loc[valid_ba, "bid"] + df.loc[valid_ba, "ask"]) / 2.0)
+        # Canonical mid rule via utils.quotes.safe_mid_series: only derive a mid
+        # from an executable two-sided quote (a zero bid -> NaN). This is the
+        # central normalizer inside build_vol_snapshot; because it fills via
+        # fillna, using the safe helper guarantees a zero-bid quote can never be
+        # fabricated into mid = (0 + ask)/2 (which would contaminate implied-move).
+        # A pre-existing valid mid is preserved; mid stays NaN otherwise, so the
+        # spread calc below also excludes the row.
+        df["mid"] = df["mid"].fillna(safe_mid_series(df["bid"], df["ask"]))
     # Do not promote last trade into mid. Last prints can be stale and should not
     # drive implied-move or term-structure calculations without valid bid/ask.
 

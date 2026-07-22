@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import asyncio
 
 from utils.logger import setup_logger as get_logger
+from utils.quotes import safe_mid
 from services import crush_features as _CF
 from services.execution_cost_model import ExecutionCostModel
 
@@ -2523,8 +2524,9 @@ class InstitutionalMLDatabase:
 
         bid = _to_float(row.get("bid"))
         ask = _to_float(row.get("ask"))
-        if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0:
-            return float((bid + ask) / 2.0)
+        _m = safe_mid(bid, ask)  # canonical: None unless executable two-sided (also rejects crossed)
+        if _m is not None:
+            return _m
 
         last_price = _to_float(row.get("lastPrice"))
         if np.isfinite(last_price) and last_price > 0:

@@ -5,6 +5,8 @@ from typing import Any, Mapping
 
 import math
 
+from utils.quotes import safe_mid
+
 
 SCENARIO_LEVELS: tuple[tuple[str, float], ...] = (
     ("mid", 0.0),
@@ -124,10 +126,9 @@ def _normalize_legs(raw_legs: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         bid = _finite_float(raw.get("bid"))
         ask = _finite_float(raw.get("ask"))
         mid = _finite_float(raw.get("mid"))
-        # H3: only derive a mid from a valid two-sided quote — a zero bid is not
-        # an executable market, so it must not be assigned an (0 + ask)/2 mid.
-        if mid is None and bid is not None and ask is not None and bid > 0 and ask >= bid:
-            mid = (bid + ask) / 2.0
+        # Canonical rule: only derive a mid from an executable two-sided quote.
+        if mid is None:
+            mid = safe_mid(bid, ask)
         result[str(name)] = {
             **dict(raw),
             "bid": bid,

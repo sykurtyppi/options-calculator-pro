@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from utils.quotes import safe_mid_series
+
 
 @dataclass(frozen=True)
 class OptionSurfaceQualityDiagnostics:
@@ -52,11 +54,7 @@ def diagnose_option_surface_quality(
         side = df["call_put"].astype(str).str.upper()
         df["side"] = np.where(side.str.startswith("C"), "call", np.where(side.str.startswith("P"), "put", side))
     if "mid" not in df.columns and {"bid", "ask"}.issubset(df.columns):
-        bid = pd.to_numeric(df["bid"], errors="coerce")
-        ask = pd.to_numeric(df["ask"], errors="coerce")
-        valid = bid.notna() & ask.notna() & (bid > 0) & (ask >= bid)  # H3: zero bid not executable
-        df["mid"] = np.nan
-        df.loc[valid, "mid"] = (bid.loc[valid] + ask.loc[valid]) / 2.0
+        df["mid"] = safe_mid_series(df["bid"], df["ask"])  # canonical: NaN unless executable two-sided
     row_count = int(len(df))
     for col in ("strike", "bid", "ask", "mid", "iv", "expiration", "side"):
         if col not in df.columns:
@@ -64,8 +62,7 @@ def diagnose_option_surface_quality(
     for col in ("strike", "bid", "ask", "mid", "iv"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     if "mid" not in df.columns or df["mid"].isna().all():
-        valid = df["bid"].notna() & df["ask"].notna() & (df["bid"] > 0) & (df["ask"] >= df["bid"])  # H3
-        df.loc[valid, "mid"] = (df.loc[valid, "bid"] + df.loc[valid, "ask"]) / 2.0
+        df["mid"] = safe_mid_series(df["bid"], df["ask"])  # canonical safe-mid
 
     crossed = int(((df["bid"].notna()) & (df["ask"].notna()) & (df["ask"] < df["bid"])).sum())
     zero_bid = int(((df["bid"].fillna(np.nan) == 0) & (df["ask"].fillna(0) > 0)).sum())
