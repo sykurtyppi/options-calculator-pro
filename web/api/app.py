@@ -1145,8 +1145,8 @@ def analyze_edge(request: EdgeAnalyzeRequest, http_request: Request = None) -> E
             setup_score=snapshot.setup_score,
             metrics=_json_safe(snapshot.metrics),
             rationale=snapshot.rationale,
-            selector_output=snapshot.selector_output,
-            structure_scorecards=snapshot.structure_scorecards,
+            selector_output=_json_safe(snapshot.selector_output),
+            structure_scorecards=_json_safe(snapshot.structure_scorecards),
             vol_snapshot=_json_safe(snapshot.vol_snapshot),
         )
     except Exception as exc:

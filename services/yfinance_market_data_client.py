@@ -285,7 +285,14 @@ class YFinanceMarketDataClient:
         today = _dt.date.today()
         rows: List[Dict[str, Any]] = []
         for idx, row in raw.iterrows():
-            report_date = idx.date() if isinstance(idx, pd.Timestamp) else None
+            # DD-1 (audit finding 1): derive the calendar date from the SAME
+            # America/New_York-normalized timestamp the timing derivation uses,
+            # not the raw index. If yfinance ever returns a UTC-tz index, a
+            # late-AMC stamp (e.g. 02:00 UTC = 21:00 ET prior day... or the
+            # reverse) would otherwise put report_date one session off from the
+            # AMC/BMO classification, and the two must agree.
+            report_date = _ny_normalized_ts(idx)
+            report_date = report_date.date() if report_date is not None else None
             estimated = _to_float(row.get("EPS Estimate"))
             reported = _to_float(row.get("Reported EPS"))
             surprise_pct = _to_float(row.get("Surprise(%)"))
@@ -342,25 +349,37 @@ def _to_float(value: Any) -> Optional[float]:
     return f if np.isfinite(f) else None
 
 
+def _ny_normalized_ts(idx: Any) -> Optional[pd.Timestamp]:
+    """Normalize a yfinance index timestamp to America/New_York wall-clock.
+
+    A tz-aware stamp is converted to NY then made naive; a naive stamp is
+    assumed to already be exchange wall-clock (yfinance's behavior after
+    tz_localize(None)). Both the calendar date and the BMO/AMC classification
+    read off THIS value so they can never disagree on which session an event
+    belongs to (audit finding 1). Returns None for non-timestamps.
+    """
+    if not isinstance(idx, pd.Timestamp):
+        return None
+    try:
+        return idx.tz_convert("America/New_York").tz_localize(None) if idx.tzinfo is not None else idx
+    except Exception:
+        return None
+
+
 def _report_time_from_index_ts(idx: Any) -> Optional[str]:
     """Derive BMO/AMC from a yfinance earnings-dates index timestamp.
 
-    The timezone is pinned explicitly: a tz-aware stamp is converted to
-    America/New_York before the wall-clock hour is read, so classification
-    does not depend on whatever tz yfinance happens to return (a UTC-shaped
-    16:00-ET stamp would otherwise land near 20:00 and misclassify). Naive
-    stamps are assumed to already be exchange wall-clock (yfinance's current
-    behavior after tz_localize(None)).
+    The timezone is pinned via :func:`_ny_normalized_ts` before the wall-clock
+    hour is read, so classification does not depend on whatever tz yfinance
+    happens to return (a UTC-shaped 16:00-ET stamp would otherwise land near
+    20:00 and misclassify).
 
     Midnight (date-only) stamps carry no timing signal → None, which
     downstream maps to "unknown" and the earnings-move profile excludes from
     measurement (DD-1).
     """
-    if not isinstance(idx, pd.Timestamp):
-        return None
-    try:
-        ts = idx.tz_convert("America/New_York").tz_localize(None) if idx.tzinfo is not None else idx
-    except Exception:
+    ts = _ny_normalized_ts(idx)
+    if ts is None:
         return None
     if not any((ts.hour, ts.minute, ts.second, ts.microsecond)):
         return None

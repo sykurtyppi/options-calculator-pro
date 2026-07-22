@@ -2872,6 +2872,16 @@ def analyze_single_ticker(
     # eliminating it keeps the decomposition in a single source of truth.
     event_implied_move_pct = _safe_float(snapshot_inputs.get("event_implied_move_pct"), np.nan)
     non_event_move_pct = _safe_float(snapshot_inputs.get("non_event_move_pct"), np.nan)
+    # DD-2 (audit finding 4): the event-implied split may be decomposed from a
+    # later EVENT-SPANNING expiry, not the near/total-implied expiry. Disclose
+    # which expiry it came from so the rationale doesn't claim
+    # "event-implied X% from total-implied Y%" across two different expiries.
+    _event_decomp_status = snapshot_inputs.get("event_decomposition_status")
+    _event_expiry_dte = snapshot_inputs.get("event_expiry_dte")
+    if _event_decomp_status == "used_event_expiry" and _event_expiry_dte is not None:
+        _event_implied_source = f"from the {int(_event_expiry_dte)}-day expiry spanning earnings"
+    else:
+        _event_implied_source = f"from total-implied={implied_move_total_pct:.2f}%"
 
     raw_gross_edge_pct = (
         float(event_implied_move_pct - move_anchor_pct_val)
@@ -3319,7 +3329,7 @@ def analyze_single_ticker(
         (
             f"Expected net edge={expected_net_edge_pct:+.2f}% "
             f"(gross {expected_gross_edge_pct:+.2f}% after sample/uncertainty adjustment - cost {tx_cost_pct:.2f}%; "
-            f"event-implied={event_implied_move_pct:.2f}% from total-implied={implied_move_total_pct:.2f}%"
+            f"event-implied={event_implied_move_pct:.2f}% {_event_implied_source}"
             + (
                 f" minus non-event={non_event_move_pct:.2f}%; "
                 if np.isfinite(non_event_move_pct)

@@ -509,6 +509,27 @@ class TestEventSpanningExpiry(unittest.TestCase):
         self.assertIsNone(snap.event_implied_move_pct)
         self.assertEqual(snap.null_reasons.get("event_implied_move_pct"), "event_expiry_not_quotable")
 
+    def test_wide_first_spanning_expiry_falls_through_to_tighter_later_one(self):
+        # Earnings 4/28 AMC → reaction session 4/29. The first spanning expiry
+        # (5/15) is WIDE (fails the 12% bar); the next spanning expiry (6/19)
+        # is TIGHT. The decomposition must fall through to 6/19 rather than
+        # suppressing the split (audit finding 2 — the bar is per-expiry, a
+        # wide first spanning expiry does not veto a tighter later one).
+        wide = _make_chain(
+            expiries=("2026-04-24", "2026-05-15"), base_term_ivs=(0.24, 0.28),
+            spread_multiplier=12.0,  # ~48% spreads
+        )
+        tight = _make_chain(
+            expiries=("2026-06-19",), base_term_ivs=(0.31,), spread_multiplier=1.0,
+        )
+        chain = pd.concat([wide, tight], ignore_index=True)
+        snap = self._snapshot(
+            earnings_date="2026-04-28", release_timing="after market close", chain_df=chain,
+        )
+        self.assertEqual(snap.event_decomposition_status, "used_event_expiry")
+        self.assertEqual(snap.event_expiry_dte, 60)  # 6/19 is 60 DTE from 4/20
+        self.assertIsNotNone(snap.event_implied_move_pct)
+
     def test_no_earnings_date_keeps_legacy_near_expiry_split(self):
         price_df, _ = _make_price_history()
         snap = build_vol_snapshot(

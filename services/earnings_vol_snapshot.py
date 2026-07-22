@@ -400,20 +400,16 @@ def build_vol_snapshot(
         # No known event: legacy behavior (near-expiry decomposition), labeled.
         event_decomposition_status = "no_earnings_date"
     else:
-        event_stats = _find_event_expiry_stats(
-            chain_frame, underlying_price, as_of_date, earnings_date, earnings.release_timing,
+        chosen_stats, first_spanning_stats = _find_event_expiry_stats(
+            chain_frame, underlying_price, as_of_date, earnings_date,
+            earnings.release_timing, cfg.max_event_expiry_spread_pct,
         )
-        if event_stats is not None:
-            event_expiry_dte = int(event_stats.dte)
-            event_expiry_implied_move_pct = event_stats.implied_move_pct
+        if chosen_stats is not None:
+            event_expiry_dte = int(chosen_stats.dte)
+            event_expiry_implied_move_pct = chosen_stats.implied_move_pct
             event_expiry_spread_pct = _mean_or_none(
-                [event_stats.call_spread_pct, event_stats.put_spread_pct]
+                [chosen_stats.call_spread_pct, chosen_stats.put_spread_pct]
             )
-        spread_ok = (
-            event_expiry_spread_pct is not None
-            and event_expiry_spread_pct <= cfg.max_event_expiry_spread_pct
-        )
-        if event_stats is not None and event_expiry_implied_move_pct is not None and spread_ok:
             decomp_input_move = event_expiry_implied_move_pct
             decomp_input_dte = event_expiry_dte
             event_decomposition_status = (
@@ -421,17 +417,22 @@ def build_vol_snapshot(
                 else "used_event_expiry"
             )
         else:
-            # No spanning expiry with a quotable, quality-passing ATM straddle:
-            # suppress the event split rather than fabricate it. Distinguish
-            # "an expiry spans the event but its quotes fail the quality bar"
-            # from "no spanning expiry exists at all" — different remedies
-            # (better quotes vs a longer-dated chain).
+            # No spanning expiry cleared the quality bar: suppress the event
+            # split rather than fabricate it. Report the first spanning
+            # expiry's dte/spread (if one existed at all) so the UI can say
+            # "spanning expiry too wide" vs "no spanning expiry" — different
+            # remedies (better quotes vs a longer-dated chain).
             decomp_input_move = None
             decomp_input_dte = None
-            event_decomposition_status = (
-                "event_expiry_not_quotable" if event_stats is not None
-                else "no_event_spanning_expiry"
-            )
+            if first_spanning_stats is not None:
+                event_expiry_dte = int(first_spanning_stats.dte)
+                event_expiry_implied_move_pct = first_spanning_stats.implied_move_pct
+                event_expiry_spread_pct = _mean_or_none(
+                    [first_spanning_stats.call_spread_pct, first_spanning_stats.put_spread_pct]
+                )
+                event_decomposition_status = "event_expiry_not_quotable"
+            else:
+                event_decomposition_status = "no_event_spanning_expiry"
 
     _decomp = decompose_event_vol(
         near_term_implied_move_pct=decomp_input_move,
@@ -1063,31 +1064,47 @@ def _find_event_expiry_stats(
     as_of_date: date,
     earnings_date: date,
     release_timing: str,
-) -> Optional[_ExpiryATMStats]:
-    """ATM stats for the first expiry that SPANS the earnings reaction.
+    max_spread_pct: float,
+) -> Tuple[Optional[_ExpiryATMStats], Optional[_ExpiryATMStats]]:
+    """Locate the expiry to run the event-vol decomposition on.
 
-    DD-2: searches the FULL expiry set of the chain — deliberately not the
-    max_term_expiries-capped list used for the term-structure chart — so a
-    dense weekly chain whose event expiry sits past the cap is still found.
-    Returns None when the chain has no expiry at/after the reaction session.
+    Returns ``(chosen, first_spanning)``:
+      * ``chosen`` — the first expiry that SPANS the earnings reaction, has a
+        quotable ATM straddle, AND whose ATM spread clears ``max_spread_pct``.
+        This is the expiry the decomposition runs on; ``None`` if no spanning
+        expiry passes the quality bar.
+      * ``first_spanning`` — the first spanning expiry with a quotable ATM
+        straddle regardless of spread, for reporting (dte/spread) when
+        ``chosen`` is ``None``; ``None`` only when NO expiry spans the event.
+
+    DD-2: searches the FULL expiry set of the chain (not the max_term_expiries
+    cap used for the term-structure chart) so a spanning expiry past the cap is
+    still found. The spread bar is applied per-expiry INSIDE the loop — a wide
+    first spanning expiry does not veto a tighter later one (audit finding 2).
     """
     if chain_frame.empty or underlying_price is None or not np.isfinite(underlying_price):
-        return None
+        return None, None
     reaction_session = _reaction_session_for_event(earnings_date, release_timing)
     expiries = sorted({
         pd.Timestamp(v).date()
         for v in chain_frame["expiry"].dropna().tolist()
         if pd.Timestamp(v).date() > as_of_date
     })
+    first_spanning: Optional[_ExpiryATMStats] = None
     for expiry in expiries:
-        if expiry >= reaction_session:
-            grp = chain_frame[pd.to_datetime(chain_frame["expiry"], errors="coerce").dt.date == expiry].copy()
-            stats = _expiry_atm_stats(grp, underlying_price, as_of_date, expiry)
-            if stats.atm_iv is not None or stats.implied_move_pct is not None:
-                return stats
-            # ATM pair unusable on this expiry — try the next spanning one.
+        if expiry < reaction_session:
             continue
-    return None
+        grp = chain_frame[pd.to_datetime(chain_frame["expiry"], errors="coerce").dt.date == expiry].copy()
+        stats = _expiry_atm_stats(grp, underlying_price, as_of_date, expiry)
+        if stats.implied_move_pct is None:
+            # No quotable ATM straddle on this expiry — can't decompose it.
+            continue
+        if first_spanning is None:
+            first_spanning = stats
+        spread = _mean_or_none([stats.call_spread_pct, stats.put_spread_pct])
+        if spread is not None and spread <= max_spread_pct:
+            return stats, first_spanning
+    return None, first_spanning
 
 
 def _expiry_atm_stats(
