@@ -686,3 +686,27 @@ class TestHARRVHardening(unittest.TestCase):
         snap1 = self._snap(price_df)
         snap2 = self._snap(price_df)
         self.assertEqual(snap1.rv_har_forecast, snap2.rv_har_forecast)
+
+
+class TestPriceFrameAsOfGuard(unittest.TestCase):
+    """Audit finding 5: build_vol_snapshot must enforce as_of on the price
+    history itself — a full frame ending after as_of must not leak a future
+    close into the underlying-price resolution."""
+
+    def test_underlying_price_ignores_post_as_of_rows(self):
+        idx = pd.bdate_range("2024-01-02", periods=400)
+        close = pd.Series(100.0, index=idx)
+        close.iloc[-1] = 999.0  # a far-future close well after the as-of date
+        price_df = pd.DataFrame({
+            "Open": close, "High": close * 1.001, "Low": close * 0.999,
+            "Close": close, "Volume": 1_000_000.0,
+        }, index=idx)
+        as_of = idx[200].date()  # 199 sessions before the 999.0 row
+        snap = build_vol_snapshot(
+            "AAPL", as_of, option_chain_data=pd.DataFrame(),
+            earnings_metadata=None, price_data=price_df,
+        )
+        # The underlying price must come from on-or-before the as-of date (100),
+        # never the future 999 close.
+        self.assertIsNotNone(snap.underlying_price)
+        self.assertAlmostEqual(snap.underlying_price, 100.0, places=6)

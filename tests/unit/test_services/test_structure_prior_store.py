@@ -184,3 +184,28 @@ def test_unknown_structure_is_silently_dropped(tmp_path: Path) -> None:
         observation_date=date(2024, 1, 1),
     )
     assert "iron_condor" not in store.diagnostics()["structures"]
+
+
+def test_get_prior_dict_excludes_future_observations(tmp_path):
+    """Audit finding 1 (temporal leak): a replay/backtest dated BEFORE a set of
+    observations must not receive a prior computed from those FUTURE
+    observations. The unfiltered (as_of=None) aggregate path sees them all —
+    which is exactly why every historical caller must pass its as-of date."""
+    store = _store(tmp_path)
+    _add(store, "atm_straddle", n=6, win=True, source="replay", base_date=date(2026, 1, 1))
+
+    # Unfiltered: the aggregate cache counts all 6 future observations (the leak
+    # path historical callers previously hit by omitting as_of_date).
+    unfiltered = store.get_prior_dict("atm_straddle")
+    assert unfiltered is not None
+    assert unfiltered["history_count"] == 6
+
+    # As-of a date strictly BEFORE the observations → none are point-in-time
+    # visible → below MIN_OBS_FOR_OVERRIDE → neutral (None). No future leak.
+    filtered = store.get_prior_dict("atm_straddle", as_of_date=date(2025, 6, 1))
+    assert filtered is None
+
+    # As-of AFTER them → visible again (sanity: the filter is date-directional,
+    # not a blanket suppression).
+    later = store.get_prior_dict("atm_straddle", as_of_date=date(2026, 12, 31))
+    assert later is not None and later["history_count"] == 6

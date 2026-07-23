@@ -256,6 +256,15 @@ def build_vol_snapshot(
     null_reasons: Dict[str, str] = {}
 
     price_frame, underlying_source = _normalize_price_frame(price_data)
+    # Temporal-integrity guard (audit finding 5): enforce the as-of boundary on
+    # the price history INSIDE this primitive. A caller that supplies a full
+    # history (instead of pre-truncating) must not leak a post-as-of close into
+    # the underlying-price resolution, staleness, or the RV baseline. Drop
+    # future-dated rows once here, so every downstream consumer sees a
+    # point-in-time-correct frame. For the live path as_of_date is today, so
+    # this keeps every real (never-future) row including today's bar.
+    if isinstance(price_frame.index, pd.DatetimeIndex) and not price_frame.empty:
+        price_frame = price_frame[price_frame.index <= pd.Timestamp(as_of_date)]
     chain_frame, option_source = _normalize_option_chain(option_chain_data)
     earnings = _resolve_earnings_metadata(earnings_metadata, as_of_date)
 

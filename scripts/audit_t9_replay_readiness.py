@@ -453,7 +453,7 @@ def _smoke_replay(frame_by_symbol: dict[str, pd.DataFrame], *, start_date: str) 
                     price_data=price_data,
                     earnings_metadata=earnings_metadata,
                 )
-                cards = build_structure_scorecards(snapshot)
+                cards = build_structure_scorecards(snapshot, as_of_date=snapshot.as_of_date)
                 selected = select_best_structure(snapshot, cards)
                 valid += 1
                 if selected.recommendation == "No Trade":

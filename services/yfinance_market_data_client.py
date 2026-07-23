@@ -317,6 +317,13 @@ class YFinanceMarketDataClient:
         df = pd.DataFrame(rows)
         if df.empty:
             return df
+        # A missing historical reportTime is a genuine None (→ "unknown"
+        # downstream), NOT a float NaN. DataFrame construction can coerce None
+        # to NaN in an object column on some pandas versions, so normalize the
+        # column contract explicitly and version-independently. (Both None and
+        # NaN normalize to "unknown", so this is a contract/stability fix, not
+        # a classification change.)
+        df["reportTime"] = df["reportTime"].astype(object).where(df["reportTime"].notna(), None)
         df.sort_values("report_date", ascending=False, inplace=True, na_position="last")
         df.reset_index(drop=True, inplace=True)
         return df

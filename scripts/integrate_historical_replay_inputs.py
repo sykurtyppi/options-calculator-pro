@@ -665,7 +665,7 @@ def _snapshot_reconstruction_check(
                         price_data=price_frame,
                         earnings_metadata=metadata,
                     )
-                    cards = build_structure_scorecards(snapshot)
+                    cards = build_structure_scorecards(snapshot, as_of_date=snapshot.as_of_date)
                     selected = select_best_structure(snapshot, cards)
                     required = {
                         "rv30_yang_zhang": snapshot.rv30_yang_zhang,

@@ -154,9 +154,13 @@ def build_structure_scorecards(
     snapshot : VolSnapshot
     as_of_date : date, optional
         If provided, the walk-forward priors are filtered to observations
-        recorded on or before this date.  Use snapshot.as_of_date from the
-        backtest evaluation loop (#18).  None preserves current production
-        behavior (all observations included, O(1) aggregate cache).
+        recorded on or before this date, and the raising leakage sentinel runs.
+        HISTORICAL / REPLAY callers MUST pass their as-of date (use
+        ``snapshot.as_of_date``): audit finding 1 found that omitting it made
+        the persistent store's unfiltered aggregate cache silently consume
+        observations dated AFTER the replay date — a look-ahead leak. None
+        preserves the live-path behavior (all observations, O(1) aggregate
+        cache, no fail-closed sentinel).
 
     Raises
     ------

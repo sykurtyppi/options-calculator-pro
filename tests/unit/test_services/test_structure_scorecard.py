@@ -996,3 +996,37 @@ class TestEventSplitUnavailableSentinel(unittest.TestCase):
         healthy = _base_snapshot(event_decomposition_status="used_event_expiry")
         card = score_atm_straddle(healthy)
         self.assertNotEqual(card.expected_move_fit_score, 0.15)
+
+
+class TestBuildScorecardsTemporalIntegrity(unittest.TestCase):
+    """Audit finding 1: when a historical caller passes its as-of date (as the
+    replay scripts now do), build_structure_scorecards must reject a persistent
+    store that contains observations dated AFTER that date. Uses a fully
+    isolated store so it never touches the shared prior file."""
+
+    def _isolated_store_with_future_paper_obs(self, tmpdir):
+        from services.structure_prior_store import StructurePriorStore
+        store = StructurePriorStore(store_path=Path(tmpdir) / "priors.json")
+        for i in range(5):
+            store.update(
+                structure="atm_straddle",
+                realized_return_pct=9.0, realized_expansion_pct=4.0,
+                source_type="paper",
+                observation_date=date(2026, 6, 1 + i),  # AFTER as_of 2026-04-20
+                observation_id=f"future-paper-{i}",
+            )
+        return store
+
+    def test_explicit_as_of_rejects_future_paper_observations(self):
+        import tempfile
+        from unittest.mock import patch
+        from services.structure_prior_store import BacktestLeakageError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            iso = self._isolated_store_with_future_paper_obs(tmpdir)
+            snapshot = _base_snapshot()  # as_of_date = date(2026, 4, 20)
+            # The historical/replay contract: pass the as-of date (as the fixed
+            # scripts now do) → future paper obs are rejected, not consumed.
+            with patch("services.structure_prior_store.get_structure_prior_store", return_value=iso):
+                with self.assertRaises(BacktestLeakageError):
+                    build_structure_scorecards(snapshot, as_of_date=snapshot.as_of_date)
