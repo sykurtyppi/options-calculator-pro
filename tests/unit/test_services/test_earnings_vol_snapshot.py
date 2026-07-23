@@ -710,3 +710,45 @@ class TestPriceFrameAsOfGuard(unittest.TestCase):
         # never the future 999 close.
         self.assertIsNotNone(snap.underlying_price)
         self.assertAlmostEqual(snap.underlying_price, 100.0, places=6)
+
+
+class TestChainFrameAsOfGuard(unittest.TestCase):
+    """Audit re-review (finding 2): build_vol_snapshot must also enforce as_of
+    on the OPTION CHAIN — a future-dated chain row must not set the underlying
+    price (via the no-price-frame chain fallback) or yield negative staleness."""
+
+    def _chain_row(self, trade_date, underlying=999.0, expiry="2025-02-21"):
+        return {
+            "trade_date": trade_date, "expiry": expiry, "call_put": "C",
+            "strike": 100.0, "bid": 5.0, "ask": 5.4, "mid": 5.2, "iv": 0.3,
+            "open_interest": 100, "volume": 50, "underlying_price": underlying,
+        }
+
+    def test_future_only_chain_is_dropped_not_priced(self):
+        chain = pd.DataFrame([self._chain_row("2025-01-10")])
+        snap = build_vol_snapshot(
+            "AAPL", date(2024, 12, 31), option_chain_data=chain,
+            earnings_metadata=None, price_data=None,
+        )
+        # The future chain must NOT set the underlying price, and staleness must
+        # not go negative.
+        self.assertIsNone(snap.underlying_price)
+        self.assertIsNone(snap.chain_staleness_minutes)
+        self.assertEqual(snap.null_reasons.get("option_chain"), "future_only_chain_dropped_for_as_of")
+
+    def test_mixed_date_chain_keeps_only_on_or_before_as_of(self):
+        chain = pd.DataFrame([
+            self._chain_row("2024-12-30", underlying=100.0, expiry="2025-02-21"),  # valid, both legs
+            {**self._chain_row("2024-12-30", underlying=100.0, expiry="2025-02-21"), "call_put": "P"},
+            self._chain_row("2025-01-10", underlying=999.0, expiry="2025-02-21"),   # future — must drop
+        ])
+        snap = build_vol_snapshot(
+            "AAPL", date(2024, 12, 31), option_chain_data=chain,
+            earnings_metadata=None, price_data=None,
+        )
+        # Underlying comes from the on-or-before row (100), never the future 999.
+        self.assertIsNotNone(snap.underlying_price)
+        self.assertAlmostEqual(snap.underlying_price, 100.0, places=6)
+        # Staleness is a real, non-negative age (as_of 12/31 vs 12/30 = 1 day).
+        self.assertIsNotNone(snap.chain_staleness_minutes)
+        self.assertGreaterEqual(snap.chain_staleness_minutes, 0)
