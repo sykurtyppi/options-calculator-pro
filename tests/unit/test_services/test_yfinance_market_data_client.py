@@ -156,12 +156,19 @@ def test_get_earnings_derives_historical_timing_from_index_timestamps():
     window — mismeasuring every AMC-era reaction (PYPL 2022-02-01 shown as
     2.2% when the real reaction was ≈−25% the next session).
     """
+    from services.earnings_move_profile import normalize_release_timing
+
     df = _client().get_earnings("AAPL", countback=12)
     by_date = {str(d): rt for d, rt in zip(df["report_date"], df["reportTime"])}
     assert by_date["2026-04-30"] == "before market open"   # 07:00 ET stamp
     assert by_date["2026-01-29"] == "after market close"   # 16:05 ET stamp
-    # Date-only (midnight) rows carry no signal → None, never a false BMO/AMC
-    assert by_date["2025-10-28"] is None
+    # Date-only (midnight) rows carry no signal — the column contract is an
+    # explicit None (not a float NaN), and either way it must normalize to
+    # "unknown" downstream, never a false BMO/AMC. Assert both the contract and
+    # the downstream behavior so this can't flake on pandas None/NaN coercion.
+    missing = by_date["2025-10-28"]
+    assert missing is None
+    assert normalize_release_timing(missing) == "unknown"
 
 
 def test_report_time_from_index_ts_pins_timezone():
