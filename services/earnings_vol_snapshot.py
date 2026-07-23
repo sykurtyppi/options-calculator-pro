@@ -266,6 +266,21 @@ def build_vol_snapshot(
     if isinstance(price_frame.index, pd.DatetimeIndex) and not price_frame.empty:
         price_frame = price_frame[price_frame.index <= pd.Timestamp(as_of_date)]
     chain_frame, option_source = _normalize_option_chain(option_chain_data)
+    # Temporal-integrity guard (audit finding 5, chain half): the option chain
+    # must also honor the as-of boundary. Without this, a future-dated chain row
+    # can set the underlying price (via _resolve_underlying_price's chain
+    # fallback when no price frame is supplied) and produce a negative
+    # "staleness". Drop chain rows whose trade_date is after as_of_date. If that
+    # empties a previously-populated chain (a future-only frame), flag it — the
+    # snapshot then abstains rather than pricing off future data.
+    if not chain_frame.empty and "trade_date" in chain_frame.columns:
+        _chain_dates = pd.to_datetime(chain_frame["trade_date"], errors="coerce")
+        _future_mask = _chain_dates > pd.Timestamp(as_of_date)
+        if bool(_future_mask.any()):
+            chain_frame = chain_frame[~_future_mask.fillna(False)].reset_index(drop=True)
+            if chain_frame.empty:
+                option_source = None
+                null_reasons["option_chain"] = "future_only_chain_dropped_for_as_of"
     earnings = _resolve_earnings_metadata(earnings_metadata, as_of_date)
 
     earnings_date = earnings.earnings_date
@@ -942,7 +957,15 @@ def _frame_staleness_minutes(frame: pd.DataFrame, as_of_date: date) -> Optional[
     else:
         return None
     latest_date = pd.Timestamp(latest).date()
-    return int((as_of_date - latest_date).days * 1440)
+    minutes = int((as_of_date - latest_date).days * 1440)
+    # A negative staleness means the frame's latest row is AFTER the as-of date
+    # — a temporal-integrity violation (future data), not "fresh". The callers
+    # of build_vol_snapshot now truncate both frames to <= as_of before this
+    # runs, so this is a defensive backstop: surface it as unknown rather than
+    # report a misleading negative freshness.
+    if minutes < 0:
+        return None
+    return minutes
 
 
 def _build_term_structure_snapshot(
