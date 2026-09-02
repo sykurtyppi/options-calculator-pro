@@ -85,7 +85,11 @@ def _anchor_expected_abs_move_pct(move_anchor_pct: Optional[float]) -> float:
     anchor = _safe_float(move_anchor_pct, np.nan)
     if not np.isfinite(anchor):
         return float("nan")
-    return float(anchor / ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE)
+    # Read the blend weight at CALL time, exactly as _compute_move_anchor does,
+    # so the two can never diverge if the weight is retuned after import. The
+    # module-level ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE is kept as the documented
+    # reference value, not as the runtime source of truth.
+    return float(anchor / _anchor_blend_to_expected_abs_scale())
 
 
 def _event_implied_expected_abs_move_pct(

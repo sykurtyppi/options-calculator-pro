@@ -790,6 +790,28 @@ class EventEdgeUnitsConsistencyTest(unittest.TestCase):
         # w=1.0 (pure mean) would need no correction at all.
         self.assertLess(ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE, 1.0)
 
+    def test_restated_anchor_reads_weight_at_call_time(self):
+        """_compute_move_anchor reads the weight per call; the restatement must too.
+
+        A frozen import-time factor would silently diverge from the anchor the
+        moment the weight is retuned, re-introducing a bias in one direction or
+        the other. With w=1.0 (pure mean) no correction is needed at all, so
+        the restated anchor must equal the raw anchor exactly.
+        """
+        from unittest.mock import patch
+
+        from web.api import edge_constants
+
+        patched = dict(edge_constants._HEURISTIC_THRESHOLDS)
+        patched["move_anchor_avg_last4_weight"] = {
+            **edge_constants._HEURISTIC_THRESHOLDS["move_anchor_avg_last4_weight"],
+            "value": 1.0,
+        }
+        with patch.dict(edge_constants._HEURISTIC_THRESHOLDS, patched, clear=True):
+            self.assertAlmostEqual(_anchor_expected_abs_move_pct(5.0), 5.0, places=12)
+        # And back at the real weight the correction is active again.
+        self.assertGreater(_anchor_expected_abs_move_pct(5.0), 5.0)
+
     def test_p90_conversion_matches_expected(self):
         self.assertAlmostEqual(
             _event_implied_p90_abs_move_pct(8.0), 8.0 * SIGMA_TO_P90_ABS_MOVE, places=9
