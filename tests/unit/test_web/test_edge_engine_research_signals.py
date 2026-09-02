@@ -11,8 +11,11 @@ from services.structure_scorecard import StructureScorecard
 from services.structure_selector import SelectorOutput
 import web.api.edge_engine as edge_engine
 from web.api.edge_math import (
+    ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE,
+    MEDIAN_TO_MEAN_ABS_MOVE,
     SIGMA_TO_EXPECTED_ABS_MOVE,
     SIGMA_TO_P90_ABS_MOVE,
+    _anchor_expected_abs_move_pct,
     _event_implied_expected_abs_move_pct,
     _event_implied_p90_abs_move_pct,
 )
@@ -745,6 +748,47 @@ class EventEdgeUnitsConsistencyTest(unittest.TestCase):
         level, ratio = _classify_move_risk(fair_p90, implied_sigma_pct, sample_size=8)
         self.assertAlmostEqual(ratio, 1.0, places=6)
         self.assertEqual(level, "moderate")
+
+    def test_blended_anchor_is_restated_on_expected_abs_basis(self):
+        """The anchor blends a mean with a median, so it sits below E|move|.
+
+        Regression for the residual bias left after the sigma-vs-absolute fix:
+        `_compute_move_anchor` mixes mean|last 4| (an E|X| estimator) with
+        median|all| (only ~0.845 E|X|), landing at ~0.9459 E|move| for w=0.65.
+        Differencing a pure-E|move| implied term against that still booked ~+5.7%
+        of spurious richness, putting the ratio's fair-value point at 1.057 —
+        which the UI's tone thresholds (good >= 1.05) painted green.
+        """
+        import math
+
+        sigma = 8.0
+        mean_abs = sigma * SIGMA_TO_EXPECTED_ABS_MOVE
+        median_abs = mean_abs * MEDIAN_TO_MEAN_ABS_MOVE
+        # A fairly priced event, measured with the REAL blended anchor.
+        anchor = _compute_move_anchor(
+            median_move_pct=median_abs, avg_last4_move_pct=mean_abs
+        )
+        self.assertAlmostEqual(anchor, sigma * SIGMA_TO_EXPECTED_ABS_MOVE
+                               * ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE, places=9)
+
+        implied = _event_implied_expected_abs_move_pct(sigma)
+        # Pre-fix: differencing against the raw blend booked positive edge.
+        self.assertGreater(implied - anchor, 0.05 * sigma * SIGMA_TO_EXPECTED_ABS_MOVE)
+        # Post-fix: restated on the same E|move| basis, a fair event is flat.
+        restated = _anchor_expected_abs_move_pct(anchor)
+        self.assertAlmostEqual(implied - restated, 0.0, places=9)
+        self.assertAlmostEqual(implied / restated, 1.0, places=9)
+
+    def test_anchor_scale_tracks_the_live_blend_weight(self):
+        """Retuning the blend weight must not silently decalibrate the ratio."""
+        from web.api.edge_constants import _HEURISTIC_THRESHOLDS
+        from web.api.edge_math import _anchor_blend_to_expected_abs_scale
+
+        w = float(_HEURISTIC_THRESHOLDS["move_anchor_avg_last4_weight"]["value"])
+        expected = w + (1.0 - w) * MEDIAN_TO_MEAN_ABS_MOVE
+        self.assertAlmostEqual(_anchor_blend_to_expected_abs_scale(), expected, places=12)
+        # w=1.0 (pure mean) would need no correction at all.
+        self.assertLess(ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE, 1.0)
 
     def test_p90_conversion_matches_expected(self):
         self.assertAlmostEqual(

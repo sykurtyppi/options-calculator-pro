@@ -1448,6 +1448,7 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
 # unchanged. Internal callers (e.g. analyze_single_ticker) resolve these names
 # through this module's namespace via the re-export below.
 from web.api.edge_math import (  # noqa: E402,F401
+    _anchor_expected_abs_move_pct,
     _classify_move_risk,
     _event_implied_expected_abs_move_pct,
     _event_implied_p90_abs_move_pct,
@@ -2922,15 +2923,20 @@ def analyze_single_ticker(
     # web.api.edge_math.SIGMA_TO_EXPECTED_ABS_MOVE / SIGMA_TO_P90_ABS_MOVE.
     event_implied_expected_move_pct = _event_implied_expected_abs_move_pct(event_implied_move_pct)
     event_implied_p90_move_pct = _event_implied_p90_abs_move_pct(event_implied_move_pct)
+    # The anchor is a mean/median BLEND and so sits ~5.4% below a true E|move|.
+    # Restate it on the E|move| basis before differencing/dividing, otherwise a
+    # fairly priced event still books positive edge and a fair-value ratio of
+    # 1.057 instead of 1.0. Display keeps the raw anchor (see metrics below).
+    move_anchor_expected_pct = _anchor_expected_abs_move_pct(move_anchor_pct_val)
     raw_gross_edge_pct = (
-        float(event_implied_expected_move_pct - move_anchor_pct_val)
-        if np.isfinite(event_implied_expected_move_pct) and np.isfinite(move_anchor_pct_val)
+        float(event_implied_expected_move_pct - move_anchor_expected_pct)
+        if np.isfinite(event_implied_expected_move_pct) and np.isfinite(move_anchor_expected_pct)
         else np.nan
     )
     implied_vs_anchor_ratio = (
-        float(event_implied_expected_move_pct / move_anchor_pct_val)
+        float(event_implied_expected_move_pct / move_anchor_expected_pct)
         if np.isfinite(event_implied_expected_move_pct)
-        and np.isfinite(move_anchor_pct_val) and move_anchor_pct_val > 0
+        and np.isfinite(move_anchor_expected_pct) and move_anchor_expected_pct > 0
         else np.nan
     )
     confidence_adjusted_gross_edge_pct = (
