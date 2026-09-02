@@ -63,8 +63,8 @@ describe('App — decision-first result tabs', () => {
     expect(screen.getByRole('tab', { name: /^Decision$/i })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('tab', { name: /Evidence & regime/i })).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /Full metrics/i })).toBeInTheDocument()
-    // The dense legacy block (e.g. "Edge & Expectancy") is NOT in the default view.
-    expect(document.body.textContent).not.toMatch(/Edge & Expectancy/i)
+    // The dense legacy block (e.g. "Implied Richness & Expectancy") is NOT in the default view.
+    expect(document.body.textContent).not.toMatch(/Richness & Expectancy/i)
     // The live forward-evidence strip is surfaced in the Decision view.
     await waitFor(() => expect(document.body.textContent).toMatch(/Live forward evidence/i))
     // With selector_output null (this mock), the Decision tab is not silently
@@ -76,7 +76,7 @@ describe('App — decision-first result tabs', () => {
     await _runAnalysis()
     fireEvent.click(screen.getByRole('tab', { name: /Full metrics/i }))
     // The legacy panel must render OPEN (no nested <details> to click again).
-    await waitFor(() => expect(document.body.textContent).toMatch(/Edge & Expectancy/i))
+    await waitFor(() => expect(document.body.textContent).toMatch(/Richness & Expectancy/i))
     expect(document.querySelector('.legacy-analysis-panel')).not.toBeNull()
     expect(document.querySelector('.legacy-analysis-panel details')).toBeNull()
   })

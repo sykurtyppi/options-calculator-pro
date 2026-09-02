@@ -47,7 +47,7 @@
         2.0
       ],
       "calendar_is_theoretical": true,
-      "calendar_note": "Priced from interpolated IV30/IV45; back leg = near + 28d. Not guaranteed to match a live quoted chain.",
+      "calendar_note": "Front leg priced at the near-term expiry's ATM IV (iv30 fallback); back leg = near + 28d at iv45 (iv30 x 0.88 fallback). Not guaranteed to match a live quoted chain.",
       "calendar_scenario_source": "small_sample_estimate",
       "entry_back_premium": 3.7959,
       "entry_debit": 2.6639,

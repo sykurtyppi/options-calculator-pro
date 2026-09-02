@@ -757,24 +757,35 @@ export default function App() {
 
               {/* Main metrics grid */}
               <div className="metrics-group">
-                <div className="metrics-group-label">Edge &amp; Expectancy</div>
+                <div className="metrics-group-label">Implied Richness &amp; Expectancy (legacy)</div>
                 <div className="metrics-grid">
-                  <Metric label="Expected Net Edge" value={fmtSpp(m.expected_net_edge_pct)}
+                  {/* Codex audit F7: this legacy block is implied MINUS historical.
+                      Positive = the market prices a bigger event move than history
+                      delivered = the event is RICH. That is favorable only for
+                      short-event-vol structures (calendars short the front leg,
+                      sold straddles) and is a COST for a long straddle/strangle.
+                      Because best_structure varies, a single-signed "edge" is
+                      structure-ambiguous, so it is labelled as richness and the
+                      captions state the sign convention. It does not drive the
+                      selector — recommendations come from selector_output. */}
+                  <Metric label="Net Richness (short-vol edge)" value={fmtSpp(m.expected_net_edge_pct)}
+                    sub="implied − historical, net of cost · positive favors short-event-vol; a cost for long-vol"
                     tone={tonePos(m.expected_net_edge_pct, 0.25, 0)} provenance="modeled" />
-                  <Metric label="Expected Gross Edge" value={fmtSpp(m.expected_gross_edge_pct)}
+                  <Metric label="Gross Richness" value={fmtSpp(m.expected_gross_edge_pct)}
+                    sub="before transaction cost · same sign convention"
                     tone={tonePos(m.expected_gross_edge_pct, 0.5, 0)} provenance="modeled" />
                   <Metric label="Expectancy Ratio" value={fmtSn(m.expectancy_ratio, 2)}
+                    sub="net richness / drawdown risk"
                     tone={tonePos(m.expectancy_ratio, 0.2, 0)} provenance="modeled" />
-                  {/* 1.0 is the FAIR-VALUE point by construction: the backend
-                      restates both sides on an E|move| basis before dividing
-                      (edge_math.ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE), so a fairly
-                      priced event scores exactly 1.00. Do not "recentre" these
-                      thresholds — before that fix fair value sat at 1.057 and
-                      good>=1.05 painted a fairly priced event green. >=1.05 is
-                      therefore ~5% richer than history; <=1.0 is no edge, toned
-                      'bad' to match Expected Net Edge at zero. */}
-                  <Metric label="Implied / Anchor" value={fmtNum(m.implied_vs_anchor_ratio, 2)}
-                    tone={tonePos(m.implied_vs_anchor_ratio, 1.05, 1.0)} />
+                  {/* 1.0 is the FAIR-VALUE point by construction: both sides are
+                      restated on an E|move| basis before dividing
+                      (edge_math.ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE). The tone is
+                      deliberately NEUTRAL: >1 is good for short-event-vol and bad
+                      for long-vol, so colouring it "good" would assert a direction
+                      the structure may not share (Codex audit F7). */}
+                  <Metric label="Implied Richness" value={fmtNum(m.implied_vs_anchor_ratio, 2)}
+                    sub="implied ÷ historical expected move · 1.00 = fairly priced · >1 richer than history"
+                    tone="default" provenance="modeled" />
                   <Metric label="Drawdown Risk" value={fmtPp(m.drawdown_risk_pct, 2)}
                     tone={toneNeg(m.drawdown_risk_pct, 1.25, 2.0)} provenance="modeled" />
                   {/* FIX 7: clarify this is a model-derived friction score, not a broker-quoted cost */}
@@ -997,7 +1008,9 @@ export default function App() {
               </div>
 
               <div className="metrics-group">
-                <div className="metrics-group-label">ATM Greeks (BSM · tenor = earnings DTE · σ = IV30)</div>
+                {/* Stale since PR #137 (greeks moved to the near-term expiry's own tenor and ATM IV);
+                    atm_greeks_tenor_days / atm_greeks_iv_basis carry the exact provenance. */}
+                <div className="metrics-group-label">ATM Greeks (BSM · near-term expiry tenor · σ = near-term ATM IV, IV30 fallback)</div>
                 <div className="metrics-grid">
                   <Metric label="Delta (Call)" value={fmtNum(m.atm_delta_call, 3)}
                     sub="directional exposure"

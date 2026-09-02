@@ -514,7 +514,8 @@ def _calendar_spread_payoff(
             "payoff_scenarios_per_contract": payoff_rows_per_contract,
             "calendar_is_theoretical":    True,
             "calendar_note":              (
-                "Priced from interpolated IV30/IV45; back leg = near + 28d. "
+                "Front leg priced at the near-term expiry's ATM IV (iv30 fallback); "
+                "back leg = near + 28d at iv45 (iv30 x 0.88 fallback). "
                 "Not guaranteed to match a live quoted chain."
             ),
             "calendar_scenario_source":   _scenario_source,

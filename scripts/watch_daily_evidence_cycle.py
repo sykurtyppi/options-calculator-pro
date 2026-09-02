@@ -19,7 +19,11 @@ try:
 except ImportError:
     pass
 
-from services.evidence_health import EvidenceHealthConfig, build_candidate_exit_resolver_health
+from services.evidence_health import (
+    EvidenceHealthConfig,
+    build_candidate_exit_resolver_health,
+    build_launchd_job_freshness,
+)
 from services.automation_watchdog import (
     DEFAULT_LOG_PATH,
     DEFAULT_MAX_REPORT_AGE_HOURS,
@@ -40,6 +44,7 @@ def _build_combined_watchdog_status(
     *,
     watchdog_status: Mapping[str, Any],
     resolver_health: Mapping[str, Any],
+    job_freshness: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge the daily-cycle watchdog status with the candidate exit
     resolver health into a single payload suitable for
@@ -88,13 +93,19 @@ def _build_combined_watchdog_status(
         for issue in resolver_issues
         if not issue.get("alertable", True)
     ]
+    # Codex audit F5: state-backup + screener-alert freshness/exit status use
+    # the same alertable/non-alertable contract as the resolver issues.
+    job_issues = list((job_freshness or {}).get("issues", []))
+    job_alertable = [i for i in job_issues if i.get("alertable", True) and i.get("severity") in {"FAIL", "WARN"}]
+    job_non_alertable = [i for i in job_issues if not i.get("alertable", True)]
 
     return {
         **watchdog_status,
-        "ok": bool(watchdog_status.get("ok")) and not resolver_alertable,
+        "ok": bool(watchdog_status.get("ok")) and not resolver_alertable and not job_alertable,
         "errors": (
             list(watchdog_status.get("errors", []))
             + [str(i.get("message")) for i in resolver_alertable]
+            + [str(i.get("message")) for i in job_alertable]
         ),
         # Daily-cycle warnings + resolver non-alertable warnings.
         # Resolver alertable WARNs have been escalated to `errors`
@@ -103,8 +114,10 @@ def _build_combined_watchdog_status(
         "warnings": (
             list(watchdog_status.get("warnings", []))
             + [str(i.get("message")) for i in resolver_non_alertable]
+            + [str(i.get("message")) for i in job_non_alertable]
         ),
         "candidate_exit_resolver": resolver_health.get("summary", {}),
+        "launchd_jobs": (job_freshness or {}).get("summary", {}),
     }
 
 
@@ -205,9 +218,13 @@ def main() -> int:
         ),
         now=now,
     )
+    job_freshness = build_launchd_job_freshness(
+        config=EvidenceHealthConfig(expected_date=expected), now=now,
+    )
     combined_status = _build_combined_watchdog_status(
         watchdog_status=status,
         resolver_health=resolver_health,
+        job_freshness=job_freshness,
     )
     alert = maybe_send_watchdog_alert(
         combined_status,
@@ -219,6 +236,7 @@ def main() -> int:
         "generated_at": datetime.now().astimezone().isoformat(),
         "watchdog": combined_status,
         "candidate_exit_resolver": resolver_health,
+        "launchd_jobs": job_freshness,
         "alert": alert,
     }
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))

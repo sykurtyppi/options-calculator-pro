@@ -42,6 +42,15 @@ DEFAULT_HOME = Path.home() / ".options_calculator_pro"
 DEFAULT_STRUCTURED_RUN_LOG = DEFAULT_HOME / "logs" / "evidence_cycle_runs.jsonl"
 DEFAULT_CANDIDATE_RESOLVER_JSONL = DEFAULT_HOME / "logs" / "candidate_exit_resolutions.jsonl"
 DEFAULT_CANDIDATE_RESOLVER_LAUNCHD_LOG = DEFAULT_HOME / "logs" / "candidate_exit_resolver_launchd.log"
+
+# Codex audit F5: the state-backup and screener-alert jobs were unmonitored —
+# a failing off-host backup or a repeatedly crashing alert could stay unnoticed
+# indefinitely. Freshness/exit-status are read from each wrapper's own launchd
+# log markers ("<job> complete|failed|skipped").
+DEFAULT_STATE_BACKUP_LAUNCHD_LOG = DEFAULT_LAUNCHD_LOG_PATH.parent / "state_backup_launchd.log"
+DEFAULT_SCREENER_ALERT_LAUNCHD_LOG = DEFAULT_LAUNCHD_LOG_PATH.parent / "premarket_screener_alert_launchd.log"
+DEFAULT_MAX_STATE_BACKUP_AGE_HOURS = 48.0     # daily job; one missed night is a WARN
+DEFAULT_MAX_SCREENER_ALERT_AGE_DAYS = 4       # weekday job; survives a weekend + one holiday
 DEFAULT_WEEKLY_REPORT_DIR = DEFAULT_REPORT_DIR / "weekly"
 DEFAULT_MAX_DAILY_REPORT_AGE_HOURS = 36.0
 DEFAULT_MAX_WEEKLY_REPORT_AGE_DAYS = 8
@@ -108,6 +117,10 @@ class EvidenceHealthConfig:
     resolver_due_hour_utc: int = DEFAULT_RESOLVER_DUE_HOUR_UTC
     resolver_due_minute_utc: int = DEFAULT_RESOLVER_DUE_MINUTE_UTC
     resolver_due_grace_minutes: int = DEFAULT_RESOLVER_DUE_GRACE_MINUTES
+    state_backup_launchd_log_path: Path = DEFAULT_STATE_BACKUP_LAUNCHD_LOG
+    screener_alert_launchd_log_path: Path = DEFAULT_SCREENER_ALERT_LAUNCHD_LOG
+    max_state_backup_age_hours: float = DEFAULT_MAX_STATE_BACKUP_AGE_HOURS
+    max_screener_alert_age_days: int = DEFAULT_MAX_SCREENER_ALERT_AGE_DAYS
 
 
 def build_evidence_health_status(
@@ -602,6 +615,94 @@ def _check_sqlite_store(name: str, path: Path) -> dict[str, Any]:
         "issues": issues,
     }
 
+
+
+
+def _launchd_job_freshness(
+    *,
+    job: str,
+    marker_prefix: str,
+    log_path: Path,
+    max_age: timedelta,
+    now: datetime,
+    fix: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Freshness + exit status of one launchd wrapper from its own log markers.
+
+    Wrapper convention (all run_*.sh): ``===== <UTC> <job> start =====`` then
+    exactly one of ``complete`` / ``failed exit_code=N`` / ``skipped``. A job
+    that ran and found nothing to do still writes ``complete`` (the screener
+    alert with no qualifying setups exits 0), so "quiet" is healthy by
+    construction — only a ``failed`` marker or a missing/stale ``complete``
+    is an issue.
+    """
+    lines = _read_text_tail(log_path)
+    latest_complete = _latest_log_marker(lines, f"{marker_prefix} complete")
+    latest_failed = _latest_log_marker(lines, f"{marker_prefix} failed")
+    latest_skipped = _latest_log_marker(lines, f"{marker_prefix} skipped")
+    issues: list[dict[str, Any]] = []
+    summary: dict[str, Any] = {
+        "job": job,
+        "log_path": str(log_path),
+        "latest_complete": latest_complete.isoformat() if latest_complete else None,
+        "latest_failed": latest_failed.isoformat() if latest_failed else None,
+        "latest_skipped": latest_skipped.isoformat() if latest_skipped else None,
+        "verdict": "OK",
+    }
+    if not log_path.exists():
+        # Fresh install: never fired. Informational until the first window
+        # has elapsed; there is no "expected first run" to anchor to, so this
+        # stays non-alertable and simply surfaces in the payload.
+        summary["verdict"] = "NEVER_RAN"
+        issues.append(_issue("WARN", job, f"{job} launchd log does not exist yet; the job has never run.", fix, alertable=False))
+        return summary, issues
+    if latest_failed and (latest_complete is None or latest_failed > latest_complete):
+        summary["verdict"] = "FAILED"
+        issues.append(_issue("FAIL", job, f"{job} last run FAILED at {latest_failed.isoformat()} (no later successful run).", fix))
+        return summary, issues
+    if latest_complete is None:
+        summary["verdict"] = "NO_COMPLETION"
+        issues.append(_issue("WARN", job, f"{job} log exists but contains no completion marker.", fix))
+        return summary, issues
+    age = now - latest_complete
+    summary["age_hours"] = round(age.total_seconds() / 3600.0, 1)
+    if age > max_age:
+        summary["verdict"] = "STALE"
+        issues.append(_issue("WARN", job, f"{job} last completed {summary['age_hours']}h ago (limit {max_age.total_seconds()/3600:.0f}h); the job may not be firing.", fix))
+    return summary, issues
+
+
+def build_launchd_job_freshness(
+    *,
+    config: EvidenceHealthConfig,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Health of the launchd jobs the evidence watchdog did not previously cover.
+
+    Returns the same shape as ``build_candidate_exit_resolver_health`` so the
+    watchdog's combiner can merge it: ``{ok, status, issues, summary}``. FAIL
+    and alertable WARN issues page the operator; non-alertable ones are
+    forensics-only.
+    """
+    now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    issues: list[dict[str, Any]] = []
+    jobs: dict[str, Any] = {}
+    for job, prefix, path, max_age, fix in (
+        ("state_backup", "state backup", config.state_backup_launchd_log_path,
+         timedelta(hours=config.max_state_backup_age_hours),
+         "Run scripts/automation/run_state_backup.sh manually and inspect ~/.options_calculator_pro/logs/state_backup_launchd.log."),
+        ("screener_alert", "premarket alert", config.screener_alert_launchd_log_path,
+         timedelta(days=config.max_screener_alert_age_days),
+         "Run scripts/premarket_screener_alert.py --dry-run and inspect ~/.options_calculator_pro/logs/premarket_screener_alert_launchd.log."),
+    ):
+        summary, job_issues = _launchd_job_freshness(
+            job=job, marker_prefix=prefix, log_path=path, max_age=max_age, now=now_utc, fix=fix,
+        )
+        jobs[job] = summary
+        issues.extend(job_issues)
+    alertable = [i for i in issues if i.get("alertable", True)]
+    status = "FAIL" if any(i["severity"] == "FAIL" for i in alertable) else ("WARN" if alertable else "OK")
+    return {"ok": status == "OK", "status": status, "checked_at": now_utc.isoformat(), "issues": issues, "summary": jobs}
 
 
 def _candidate_resolver_log_summary(cfg: EvidenceHealthConfig, now: datetime) -> dict[str, Any]:
