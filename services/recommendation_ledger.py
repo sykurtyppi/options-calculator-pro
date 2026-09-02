@@ -257,7 +257,7 @@ def _open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    # PR-T: consistency with trading_system/database.py. The module-level
+    # PR-T: the module-level
     # _WRITE_LOCK serializes in-process writers and WAL handles concurrent
     # readers, but cross-process writers (a future worker pool or a manual
     # sqlite3 CLI session against the file) would otherwise fail with
