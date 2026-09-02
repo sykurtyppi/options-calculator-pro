@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optionscalculator.premarket-screener-alert</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/scripts/automation/run_premarket_screener_alert.sh</string>
+  </array>
+  <!--
+    Weekdays at 14:30 LOCAL (= UTC on this host) = 10:30 ET in EDT / 09:30 ET
+    in EST — i.e. INSIDE the US options session.
+
+    This deliberately is NOT a pre-open job. The ranked screener sources its
+    chain from yfinance (services/screener_service._collect_yf_option_chain_frame),
+    and before the US open yfinance returns bid=ask=0 with a placeholder
+    impliedVolatility around 1e-5 for every contract. Running at 09:00 ET
+    produced an alert built entirely on absent quotes (ORCL, 2026-09-02:
+    ATM IV 0.0039 -> IV/RV 0.002 -> rank 0.71). MIN_PLAUSIBLE_ATM_IV now makes
+    that abstain instead of alerting, but abstaining every morning is not a
+    working alert — the job has to run when quotes exist.
+
+    Entry timing within the session is not critical for this strategy (3-10 DTE
+    pre-earnings), so mid-morning is chosen for quote quality, not urgency.
+
+    Clear of every other job: exit resolver (12:30), forward collector (19:30),
+    evidence cycle (21:30), watchdog (22:15), rotation (03:00), backup (04:00).
+  -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Weekday</key><integer>1</integer>
+      <key>Hour</key><integer>14</integer>
+      <key>Minute</key><integer>30</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key><integer>2</integer>
+      <key>Hour</key><integer>14</integer>
+      <key>Minute</key><integer>30</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key><integer>3</integer>
+      <key>Hour</key><integer>14</integer>
+      <key>Minute</key><integer>30</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key><integer>4</integer>
+      <key>Hour</key><integer>14</integer>
+      <key>Minute</key><integer>30</integer>
+    </dict>
+    <dict>
+      <key>Weekday</key><integer>5</integer>
+      <key>Hour</key><integer>14</integer>
+      <key>Minute</key><integer>30</integer>
+    </dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/premarket_screener_alert_launchd_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/premarket_screener_alert_launchd_stderr.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
