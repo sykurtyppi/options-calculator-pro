@@ -18,9 +18,9 @@ Checks (all read-only, none mutate state):
   2. ``${PROJECT_ROOT}/.venv311/bin/python`` is present and executable.
   3. Frontend ``web/frontend/dist/`` exists (WARN if missing — dev mode
      is fine, production-same-origin needs the built bundle).
-  4. All 5 launchd wrapper scripts (``scripts/automation/run_*.sh``)
+  4. Every launchd wrapper the installer references (``scripts/automation/run_*.sh``)
      exist and are executable.
-  5. All 5 plist templates exist and contain the placeholders the
+  5. Every plist template the installer lists exists and contains the placeholders the
      install script substitutes.
   6. LaunchAgents installed under ``~/Library/LaunchAgents`` — PASS if
      all 5; WARN if partial; SKIP if none (likely a fresh checkout or
@@ -53,6 +53,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
+import re
 import sqlite3
 import subprocess
 import sys
@@ -78,26 +80,46 @@ _KNOWN_SQLITE_STORES: tuple[Path, ...] = (
     _OPTIONS_HOME / "telemetry" / "provider_telemetry.sqlite",
 )
 
-# The full set of launchd plists this project ships. The install
-# script (``scripts/automation/install_launchd_jobs.sh``) and
-# uninstall script must stay in sync with this list — if you add a
-# new launchd job to the install script, add it here too or the
-# preflight will silently ignore it.
-_PLIST_NAMES: tuple[str, ...] = (
-    "com.optionscalculator.candidate-exit-resolver.plist",
-    "com.optionscalculator.evidence-cycle.plist",
-    "com.optionscalculator.evidence-watchdog.plist",
-    "com.optionscalculator.weekly-evidence-report.plist",
-    "com.optionscalculator.log-rotation.plist",
-)
+# The launchd job list is DERIVED from the installer rather than duplicated
+# here. A hand-maintained copy drifted to 5 while the installer grew to 8, and
+# preflight kept reporting "All 5 LaunchAgents installed" with three jobs
+# absent (Codex audit F4). The installer is the single source of truth; the
+# plist templates then say which wrapper each job runs.
+_INSTALLER_REL = Path("scripts") / "automation" / "install_launchd_jobs.sh"
+_PLIST_RE = re.compile(r"(com\.optionscalculator\.[\w.-]+\.plist)")
 
-_WRAPPER_NAMES: tuple[str, ...] = (
-    "run_candidate_exit_resolver.sh",
-    "run_daily_evidence_cycle.sh",
-    "run_daily_evidence_watchdog.sh",
-    "run_weekly_evidence_report.sh",
-    "run_launchd_log_rotation.sh",
-)
+
+def installer_plist_names(project_root: Path = _PROJECT_ROOT) -> tuple[str, ...]:
+    """Every plist the installer will render+load, in installer order.
+
+    Raises rather than returning a partial list: a preflight that cannot see the
+    job list must not certify the install.
+    """
+    installer = project_root / _INSTALLER_REL
+    text = installer.read_text(encoding="utf-8")
+    match = re.search(r"for\s+plist\s+in\s*\\?\s*\n(.*?)\n\s*do\b", text, re.S)
+    names = _PLIST_RE.findall(match.group(1)) if match else []
+    if not names:
+        raise RuntimeError(f"preflight could not parse the launchd job list from {installer}")
+    return tuple(dict.fromkeys(names))  # de-dupe, keep order
+
+
+def wrapper_names_for(
+    plist_names: tuple[str, ...], project_root: Path = _PROJECT_ROOT
+) -> tuple[str, ...]:
+    """Basename of ``ProgramArguments[0]`` from each plist template."""
+    auto = project_root / "scripts" / "automation"
+    wrappers: list[str] = []
+    for name in plist_names:
+        path = auto / name
+        if not path.exists():
+            continue  # check_plist_templates reports the missing template itself
+        with path.open("rb") as fh:
+            data = plistlib.load(fh)
+        args = data.get("ProgramArguments") or []
+        if args:
+            wrappers.append(Path(str(args[0])).name)
+    return tuple(dict.fromkeys(wrappers))
 
 
 class Status(str, Enum):
@@ -208,15 +230,22 @@ def check_frontend_dist(project_root: Path = _PROJECT_ROOT) -> CheckResult:
     )
 
 
-def check_wrapper_scripts(project_root: Path = _PROJECT_ROOT) -> CheckResult:
-    """All five launchd wrappers must exist and be executable. The
+def check_wrapper_scripts(
+    project_root: Path = _PROJECT_ROOT,
+    wrapper_names: tuple[str, ...] | None = None,
+) -> CheckResult:
+    """Every launchd wrapper the installer references must exist and be executable. The
     install script copies their absolute paths into the rendered
     plists, so a missing or non-executable wrapper means launchd will
     silently log permission errors."""
     auto = project_root / "scripts" / "automation"
+    # `wrapper_names` is a test seam only. Production derives the list from the
+    # installer so it cannot drift (Codex F4).
+    if wrapper_names is None:
+        wrapper_names = wrapper_names_for(installer_plist_names(project_root), project_root)
     missing: list[str] = []
     not_exec: list[str] = []
-    for name in _WRAPPER_NAMES:
+    for name in wrapper_names:
         p = auto / name
         if not p.exists():
             missing.append(name)
@@ -239,21 +268,26 @@ def check_wrapper_scripts(project_root: Path = _PROJECT_ROOT) -> CheckResult:
     return CheckResult(
         name="wrapper_scripts",
         status=Status.PASS,
-        message=f"All {len(_WRAPPER_NAMES)} launchd wrappers present and executable.",
-        details={"count": len(_WRAPPER_NAMES)},
+        message=f"All {len(wrapper_names)} launchd wrappers present and executable.",
+        details={"count": len(wrapper_names), "wrappers": list(wrapper_names)},
     )
 
 
-def check_plist_templates(project_root: Path = _PROJECT_ROOT) -> CheckResult:
-    """All five plists exist and contain the placeholders the install
+def check_plist_templates(
+    project_root: Path = _PROJECT_ROOT,
+    plist_names: tuple[str, ...] | None = None,
+) -> CheckResult:
+    """Every plist the installer lists exists and contains the placeholders the install
     script substitutes (``__PROJECT_ROOT__`` and ``__HOME__``).
     Detects the case where someone hand-edited a plist and removed
     the placeholders — the install script would then leave the wrong
     paths in the rendered output, but everything LOOKS fine.
     """
     auto = project_root / "scripts" / "automation"
+    if plist_names is None:  # test seam; production derives from the installer
+        plist_names = installer_plist_names(project_root)
     issues: dict[str, str] = {}
-    for name in _PLIST_NAMES:
+    for name in plist_names:
         p = auto / name
         if not p.exists():
             issues[name] = "missing"
@@ -273,21 +307,25 @@ def check_plist_templates(project_root: Path = _PROJECT_ROOT) -> CheckResult:
     return CheckResult(
         name="plist_templates",
         status=Status.PASS,
-        message=f"All {len(_PLIST_NAMES)} plists present with placeholders intact.",
-        details={"count": len(_PLIST_NAMES)},
+        message=f"All {len(plist_names)} plists present with placeholders intact.",
+        details={"count": len(plist_names), "plists": list(plist_names)},
     )
 
 
 def check_launchagents_installed(
     launch_agents_dir: Path = _LAUNCH_AGENTS,
+    project_root: Path = _PROJECT_ROOT,
+    plist_names: tuple[str, ...] | None = None,
 ) -> CheckResult:
-    """How many of the 5 plists are installed to ``~/Library/LaunchAgents``.
+    """How many of the installer's plists are installed to ``~/Library/LaunchAgents``.
 
     Zero installed → SKIP (likely a fresh checkout or dev box). Partial
     → WARN (operator probably forgot to re-run installer after a
     PR-added job — that was the case for the log-rotation job after
-    PR #61). All five → PASS.
+    PR #61). Every job listed by the installer present → PASS.
     """
+    if plist_names is None:  # test seam; production derives from the installer
+        plist_names = installer_plist_names(project_root)
     if not launch_agents_dir.exists():
         return CheckResult(
             name="launchagents_installed",
@@ -297,10 +335,10 @@ def check_launchagents_installed(
                 "this machine). Run scripts/automation/install_launchd_jobs.sh "
                 "to install."
             ),
-            details={"installed_count": 0, "total": len(_PLIST_NAMES)},
+            details={"installed_count": 0, "total": len(plist_names)},
         )
     installed = [
-        name for name in _PLIST_NAMES if (launch_agents_dir / name).exists()
+        name for name in plist_names if (launch_agents_dir / name).exists()
     ]
     if not installed:
         return CheckResult(
@@ -310,29 +348,29 @@ def check_launchagents_installed(
                 f"No LaunchAgents installed. Run "
                 "scripts/automation/install_launchd_jobs.sh when ready."
             ),
-            details={"installed_count": 0, "total": len(_PLIST_NAMES)},
+            details={"installed_count": 0, "total": len(plist_names)},
         )
-    if len(installed) < len(_PLIST_NAMES):
-        missing = sorted(set(_PLIST_NAMES) - set(installed))
+    if len(installed) < len(plist_names):
+        missing = sorted(set(plist_names) - set(installed))
         return CheckResult(
             name="launchagents_installed",
             status=Status.WARN,
             message=(
-                f"Partial install: {len(installed)} of {len(_PLIST_NAMES)} "
+                f"Partial install: {len(installed)} of {len(plist_names)} "
                 f"LaunchAgents present. Re-run install_launchd_jobs.sh to "
                 f"pick up: {missing}"
             ),
             details={
                 "installed_count": len(installed),
-                "total": len(_PLIST_NAMES),
+                "total": len(plist_names),
                 "missing": missing,
             },
         )
     return CheckResult(
         name="launchagents_installed",
         status=Status.PASS,
-        message=f"All {len(_PLIST_NAMES)} LaunchAgents installed.",
-        details={"installed_count": len(installed), "total": len(_PLIST_NAMES)},
+        message=f"All {len(plist_names)} LaunchAgents installed.",
+        details={"installed_count": len(installed), "total": len(plist_names)},
     )
 
 

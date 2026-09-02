@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from datetime import date, datetime, timezone
@@ -72,6 +73,20 @@ def _row_dte(row: Mapping[str, Any]) -> Optional[int]:
     return None
 
 
+def _finite(value: Any) -> Optional[float]:
+    """float(value) if it is a real, finite number; else None."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+# Below this, an "ATM IV" is a provider placeholder, not a quote. Mirrors
+# services.earnings_vol_snapshot.MIN_PLAUSIBLE_ATM_IV so the two layers agree.
+MIN_PLAUSIBLE_ATM_IV = 0.01
+
+
 def select_qualifying_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -82,27 +97,59 @@ def select_qualifying_rows(
 ) -> List[Dict[str, Any]]:
     """Filter the screener table down to setups worth interrupting someone for.
 
-    A row qualifies when it actually scored (no error / not merely "upcoming"),
-    sits inside the entry window, and clears ``min_score``.
+    FAIL-CLOSED. This job runs unattended and texts a human, so a row must
+    prove its evidence rather than merely avoid tripping an error:
+
+      * a finite ``ranking_score`` — ``NaN`` compares False against every
+        threshold and ``inf`` beats every threshold, so both used to qualify;
+      * a finite, positive ``iv_rv_ratio`` — the 32%-weight IV-entry component
+        falls back to a "neutral" 0.25 when IV/RV is missing, and the other
+        68% of weight can carry a row over the threshold with no volatility
+        evidence at all;
+      * a plausible near-term ATM IV (``iv30`` / ``atm_iv``) — proves a real
+        chain was read; sub-1% values are pre-open placeholders;
+      * a finite spread IF one is reported (absence is tolerated — yfinance
+        often omits it — but a reported ``NaN`` is a broken quote).
+
+    ``min_score`` itself must be finite; ``--min-score nan`` previously admitted
+    every scored row.
     """
+    if _finite(min_score) is None:
+        raise ValueError(f"min_score must be a finite number, got {min_score!r}")
+
     qualifying: List[Dict[str, Any]] = []
+    dropped: Dict[str, int] = {}
+
+    def _drop(reason: str) -> None:
+        dropped[reason] = dropped.get(reason, 0) + 1
+
     for row in rows:
         if row.get("error") or row.get("error_note"):
-            continue
-        score = row.get("ranking_score")
+            _drop("error"); continue
+        score = _finite(row.get("ranking_score"))
         if score is None:
-            continue
-        try:
-            score = float(score)
-        except (TypeError, ValueError):
-            continue
+            _drop("non_finite_score"); continue
         dte = _row_dte(row)
         if dte is None or not (dte_min <= dte <= dte_max):
+            _drop("outside_entry_window"); continue
+        iv_rv = _finite(row.get("iv_rv_ratio"))
+        if iv_rv is None or iv_rv <= 0:
+            _drop("missing_iv_rv"); continue
+        atm_iv = _finite(row.get("iv30")) or _finite(row.get("atm_iv"))
+        if atm_iv is None or atm_iv < MIN_PLAUSIBLE_ATM_IV:
+            _drop("implausible_or_missing_atm_iv"); continue
+        for spread_key in ("avg_spread_pct", "spread_pct"):
+            if spread_key in row and row[spread_key] is not None and _finite(row[spread_key]) is None:
+                _drop("non_finite_spread"); break
+        else:
+            if score < min_score:
+                _drop("below_threshold"); continue
+            qualifying.append(dict(row))
             continue
-        if score < min_score:
-            continue
-        qualifying.append(dict(row))
+        continue
 
+    if dropped:
+        logger.info("rows dropped by fail-closed filter: %s", dropped)
     qualifying.sort(key=lambda r: float(r.get("ranking_score") or 0.0), reverse=True)
     return qualifying[: max(int(top_n), 0)]
 
@@ -165,11 +212,23 @@ def _save_state(path: Path, payload: Mapping[str, Any]) -> None:
     tmp.replace(path)  # atomic swap; a torn write can't poison the state file
 
 
+def _finite_float_arg(text: str) -> float:
+    """argparse type: a finite float. Rejects nan/inf, which would otherwise
+    disable the threshold entirely (``score < nan`` is always False)."""
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from exc
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"threshold must be finite, got {text!r}")
+    return value
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the ranked earnings screener and alert on qualifying setups.",
     )
-    parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE,
+    parser.add_argument("--min-score", type=_finite_float_arg, default=DEFAULT_MIN_SCORE,
                         help=f"Minimum ranking_score to alert (default {DEFAULT_MIN_SCORE}).")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP_N,
                         help=f"Max setups per alert (default {DEFAULT_TOP_N}).")

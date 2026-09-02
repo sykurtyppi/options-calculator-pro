@@ -47,7 +47,8 @@ from scripts.premarket_screener_alert import (  # noqa: E402
 def _row(symbol, score, dte=7, **extra):
     row = {
         "symbol": symbol, "ranking_score": score, "days_to_earnings": dte,
-        "release_timing": "AMC", "iv_rv_ratio": 1.10, "status": "ranked",
+        "release_timing": "AMC", "iv_rv_ratio": 1.10, "iv30": 0.35,
+        "avg_spread_pct": 3.0, "status": "ranked",
     }
     row.update(extra)
     return row
@@ -69,6 +70,44 @@ def test_selection_filters_by_score_window_and_errors():
     assert [r["symbol"] for r in picked] == ["AAA"]
 
 
+def test_selection_fails_closed_on_nonfinite_scores_and_missing_evidence():
+    """Codex F2: NaN/inf scores and evidence-less rows used to qualify."""
+    rows = [
+        _row("NAN", float("nan")),
+        _row("INF", float("inf")),
+        _row("NOIVRV", 0.90, iv_rv_ratio=None),          # no IV/RV -> neutral 0.25 fallback
+        _row("ZEROIVRV", 0.90, iv_rv_ratio=0.0),
+        _row("NOATM", 0.90, iv30=None, atm_iv=None),     # no chain evidence at all
+        _row("PLACEHOLDERIV", 0.90, iv30=0.0039),       # pre-open yfinance placeholder
+        _row("NANSPREAD", 0.90, avg_spread_pct=float("nan")),
+        _row("GOOD", 0.90),
+        _row("NOSPREAD", 0.88, avg_spread_pct=None),    # absent spread is tolerated
+    ]
+    picked = select_qualifying_rows(rows, min_score=0.65, top_n=9, dte_min=3, dte_max=10)
+    assert [r["symbol"] for r in picked] == ["GOOD", "NOSPREAD"]
+
+
+def test_selection_rejects_nonfinite_threshold():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        select_qualifying_rows([_row("A", 0.9)], min_score=float("nan"), top_n=5, dte_min=3, dte_max=10)
+
+
+def test_cli_rejects_nan_min_score():
+    """``--min-score nan`` must be a usage error, not "alert on everything"."""
+    import pytest as _pytest
+
+    from scripts.premarket_screener_alert import parse_args
+
+    with _pytest.raises(SystemExit) as exc:
+        parse_args(["--min-score", "nan"])
+    assert exc.value.code == 2
+    with _pytest.raises(SystemExit):
+        parse_args(["--min-score", "inf"])
+    assert parse_args(["--min-score", "0.7"]).min_score == 0.7
+
+
 def test_selection_sorts_by_score_and_caps_at_top_n():
     rows = [_row("AAA", 0.70), _row("BBB", 0.90), _row("CCC", 0.80), _row("DDD", 0.75)]
     picked = select_qualifying_rows(rows, min_score=0.65, top_n=2, dte_min=3, dte_max=10)
@@ -77,7 +116,8 @@ def test_selection_sorts_by_score_and_caps_at_top_n():
 
 def test_selection_accepts_api_shaped_dte_alias():
     """The service emits days_to_earnings; the API row calls it dte."""
-    row = {"symbol": "AAA", "ranking_score": 0.80, "dte": 7, "release_timing": "AMC"}
+    row = {"symbol": "AAA", "ranking_score": 0.80, "dte": 7, "release_timing": "AMC",
+           "iv_rv_ratio": 1.1, "atm_iv": 0.35}  # API-shaped evidence keys too
     assert select_qualifying_rows([row], min_score=0.65, top_n=5, dte_min=3, dte_max=10)
 
 
@@ -180,9 +220,10 @@ def test_plist_parses_and_has_expected_structure():
     assert data["RunAtLoad"] is False, "must fire on schedule only, never on load"
     schedule = data["StartCalendarInterval"]
     assert [e["Weekday"] for e in schedule] == [1, 2, 3, 4, 5], "weekdays only"
-    # Must run INSIDE the session: yfinance has no real option quotes pre-open,
-    # and a pre-open run scores placeholder IV as maximally cheap vol.
-    assert all(e["Hour"] == 14 and e["Minute"] == 30 for e in schedule)
+    # Must run >=30 min AFTER the 09:30 ET open in BOTH DST regimes (Codex F6):
+    # 15:00 UTC = 11:00 EDT / 10:00 EST. 14:30 was the opening bell in EST, and
+    # 13:00 was pre-open — yfinance returns placeholder IV before the bell.
+    assert all(e["Hour"] == 15 and e["Minute"] == 0 for e in schedule)
 
 
 def test_install_and_uninstall_lists_include_the_job():

@@ -169,3 +169,76 @@ def test_wrapper_produces_a_valid_archive(tmp_path: Path):
         archives = list(out_dir.glob("*.tar.gz"))
         assert archives, "successful backup must leave an archive"
         assert tarfile.is_tarfile(archives[0]), "archive must be a valid tar file"
+
+
+# ── Codex F3: the off-host destination must reach the job under launchd ─────
+
+
+def test_wrapper_reads_env_file_without_sourcing_it():
+    body = WRAPPER.read_text()
+    assert "OPTIONS_CALCULATOR_ENV_FILE" in body
+    assert "_env_file_value" in body
+    # Must never execute the env file as shell — parse it.
+    import re
+    assert not re.search(r"^\s*(source|\.)\s+\"?\$\{?ENV_FILE", body, re.M), (
+        "wrapper must parse the env file, not `source` it"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bash wrapper not supported on Windows")
+def test_backup_dir_from_env_file_reaches_job_in_minimal_launchd_environment(tmp_path: Path):
+    """Reproduce launchd: an env with only PATH/HOME. The destination lives in
+    the .env file and nowhere else. Before the fix the archive silently landed
+    in the same-disk default.
+    """
+    python = REPO / ".venv311" / "bin" / "python"
+    if not python.exists():
+        pytest.skip("project venv not available in this environment")
+    home = tmp_path / "home"
+    (home / ".options_calculator_pro" / "state").mkdir(parents=True)
+    (home / ".options_calculator_pro" / "state" / "seed.txt").write_text("x")
+    external = tmp_path / "external_backups"
+    env_file = tmp_path / "test.env"
+    env_file.write_text(
+        "# comment\nOPTIONS_CALCULATOR_BACKUP_DIR=\"%s\"\nOPTIONS_CALCULATOR_BACKUP_RETENTION=2\n" % external
+    )
+    minimal_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(home),
+        "OPTIONS_CALCULATOR_ENV_FILE": str(env_file),
+    }
+    result = subprocess.run(
+        ["bash", str(WRAPPER)], capture_output=True, text=True, timeout=120, env=minimal_env,
+    )
+    assert result.returncode == 0, f"wrapper failed: rc={result.returncode} {result.stderr!r}"
+    assert list(external.glob("*.tar.gz")), "archive must land in the .env-configured directory"
+    default_dir = home / ".options_calculator_pro" / "backups"
+    assert not (default_dir.exists() and list(default_dir.glob("*.tar.gz"))), (
+        "archive must NOT fall back to the same-disk default"
+    )
+    log = (home / ".options_calculator_pro" / "logs" / "state_backup_launchd.log").read_text()
+    assert "output_dir_source=env_file" in log
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bash wrapper not supported on Windows")
+def test_process_env_overrides_env_file(tmp_path: Path):
+    """Process env beats the .env file — AND the .env here deliberately lacks
+    BACKUP_RETENTION. That absence made `grep` exit 1 inside a pipefail pipeline
+    inside a `$(...)` assignment under `set -e`, aborting the wrapper before it
+    logged a byte (rc=1, empty log). Keep the file minimal so this stays covered.
+    """
+    python = REPO / ".venv311" / "bin" / "python"
+    if not python.exists():
+        pytest.skip("project venv not available in this environment")
+    home = tmp_path / "home"
+    (home / ".options_calculator_pro" / "state").mkdir(parents=True)
+    (home / ".options_calculator_pro" / "state" / "seed.txt").write_text("x")
+    from_file = tmp_path / "from_file"; from_env = tmp_path / "from_env"
+    env_file = tmp_path / "test.env"
+    env_file.write_text(f"OPTIONS_CALCULATOR_BACKUP_DIR={from_file}\n")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home),
+           "OPTIONS_CALCULATOR_ENV_FILE": str(env_file),
+           "OPTIONS_CALCULATOR_BACKUP_DIR": str(from_env)}
+    result = subprocess.run(["bash", str(WRAPPER)], capture_output=True, text=True, timeout=120, env=env)
+    assert result.returncode == 0, result.stderr
+    assert list(from_env.glob("*.tar.gz")) and not from_file.exists()

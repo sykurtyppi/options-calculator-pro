@@ -58,14 +58,14 @@ exposure without additional review.
                           │  daily writes
                           │
             ┌─────────────┴──────────────┐
-            │  5 launchd jobs (macOS)    │
+            │  8 launchd jobs (macOS)    │
             │  resolver, cycle, watchdog,│
             │  weekly, log-rotation      │
             └────────────────────────────┘
 ```
 
 The backend serves the API and (in production) the built React frontend
-from the same origin. The five launchd jobs run on schedule to produce
+from the same origin. The launchd jobs (listed in `scripts/automation/install_launchd_jobs.sh`) run on schedule to produce
 evidence reports, resolve candidate exits, and rotate logs.
 
 ---
@@ -211,7 +211,7 @@ cd web/frontend && npm install && npm run build && cd ../..
 # Expected on a clean install: 9 PASS, 1 SKIP (launchagents not yet
 # installed), 0 FAIL. If you see any FAIL, fix it before step 4.
 
-# 4. Install all five launchd jobs. The script template-renders each
+# 4. Install all launchd jobs. The script template-renders each
 #    plist (substituting __PROJECT_ROOT__ and __HOME__), drops the
 #    rendered version into ~/Library/LaunchAgents/, and launchctl-loads
 #    it.
@@ -237,7 +237,7 @@ Expected `launchctl list` output:
 ```
 
 The first column is PID (`-` = not currently running). Second is the last
-exit status. `RunAtLoad=false` is set on every plist, so all five sit
+exit status. `RunAtLoad=false` is set on every plist, so all of them sit
 quiet until their `StartCalendarInterval` fires.
 
 ---
@@ -515,7 +515,7 @@ Access to fetch at '<...>' has been blocked by CORS policy
 
 | Likely cause | Check |
 |---|---|
-| Job not installed | `launchctl list \| grep optionscalculator` — must show all five. Re-run `scripts/automation/install_launchd_jobs.sh`. |
+| Job not installed | `launchctl list \| grep optionscalculator` — must show every job listed in `install_launchd_jobs.sh` (8 today); `scripts/preflight_check.py` derives the expected set from the installer. Re-run `scripts/automation/install_launchd_jobs.sh`. |
 | Plist points at a venv path that no longer exists | Wrappers hardcode `${PROJECT_ROOT}/.venv311/bin/python`. If you renamed or moved `.venv311`, reinstall the jobs. |
 | Repo moved after install | Same: plists capture absolute paths at install time. Reinstall. |
 | launchd exit non-zero last run | `launchctl list \| grep optionscalculator` — second column is last exit code. Inspect the wrapper log (`*_launchd.log`) for the matching `===== … failed exit_code=N =====` line. |
@@ -699,7 +699,7 @@ Exit code 2 on a restore is the "you got most of your data back but a DB is corr
 ## Uninstall
 
 ```sh
-# Stop and remove all five launchd jobs.
+# Stop and remove all launchd jobs.
 scripts/automation/uninstall_launchd_jobs.sh
 
 # Confirm none remain.

@@ -102,35 +102,42 @@ def test_frontend_dist_present_is_pass(tmp_path: Path) -> None:
     assert r.status == Status.PASS
 
 
+# Codex audit F4: preflight derives the job list from the installer; these
+# tests use the same derived lists (8 jobs today) and pass them through the
+# explicit test seams so tmp roots don't need a copy of the installer.
+_PLISTS = pf.installer_plist_names()
+_WRAPPERS = pf.wrapper_names_for(_PLISTS)
+
+
 # ── wrapper_scripts ───────────────────────────────────────────────────────
 
 
 def test_wrapper_scripts_all_missing_is_fail(tmp_path: Path) -> None:
     (tmp_path / "scripts" / "automation").mkdir(parents=True)
-    r = pf.check_wrapper_scripts(project_root=tmp_path)
+    r = pf.check_wrapper_scripts(project_root=tmp_path, wrapper_names=_WRAPPERS)
     assert r.status == Status.FAIL
-    assert len(r.details["missing"]) == len(pf._WRAPPER_NAMES)
+    assert len(r.details["missing"]) == len(_WRAPPERS)
 
 
 def test_wrapper_scripts_present_but_not_executable_is_fail(tmp_path: Path) -> None:
     auto = tmp_path / "scripts" / "automation"
     auto.mkdir(parents=True)
-    for name in pf._WRAPPER_NAMES:
+    for name in _WRAPPERS:
         (auto / name).write_text("#!/bin/sh\n", encoding="utf-8")
         (auto / name).chmod(0o600)  # not exec
-    r = pf.check_wrapper_scripts(project_root=tmp_path)
+    r = pf.check_wrapper_scripts(project_root=tmp_path, wrapper_names=_WRAPPERS)
     assert r.status == Status.FAIL
-    assert len(r.details["not_executable"]) == len(pf._WRAPPER_NAMES)
+    assert len(r.details["not_executable"]) == len(_WRAPPERS)
 
 
 def test_wrapper_scripts_all_present_executable_is_pass(tmp_path: Path) -> None:
     auto = tmp_path / "scripts" / "automation"
     auto.mkdir(parents=True)
-    for name in pf._WRAPPER_NAMES:
+    for name in _WRAPPERS:
         p = auto / name
         p.write_text("#!/bin/sh\n", encoding="utf-8")
         p.chmod(0o755)
-    r = pf.check_wrapper_scripts(project_root=tmp_path)
+    r = pf.check_wrapper_scripts(project_root=tmp_path, wrapper_names=_WRAPPERS)
     assert r.status == Status.PASS
 
 
@@ -143,22 +150,22 @@ def test_plist_templates_missing_placeholder_is_fail(tmp_path: Path) -> None:
     Catch it here."""
     auto = tmp_path / "scripts" / "automation"
     auto.mkdir(parents=True)
-    for name in pf._PLIST_NAMES:
+    for name in _PLISTS:
         # Valid in every other respect, but missing __PROJECT_ROOT__.
         (auto / name).write_text(
             "<plist><string>__HOME__/foo</string></plist>\n",
             encoding="utf-8",
         )
-    r = pf.check_plist_templates(project_root=tmp_path)
+    r = pf.check_plist_templates(project_root=tmp_path, plist_names=_PLISTS)
     assert r.status == Status.FAIL
-    for name in pf._PLIST_NAMES:
+    for name in _PLISTS:
         assert r.details["issues"][name] == "missing __PROJECT_ROOT__ placeholder"
 
 
 def test_plist_templates_all_present_with_placeholders_is_pass(tmp_path: Path) -> None:
     auto = tmp_path / "scripts" / "automation"
     auto.mkdir(parents=True)
-    for name in pf._PLIST_NAMES:
+    for name in _PLISTS:
         (auto / name).write_text(
             "<plist>\n"
             "<string>__PROJECT_ROOT__/foo</string>\n"
@@ -166,7 +173,7 @@ def test_plist_templates_all_present_with_placeholders_is_pass(tmp_path: Path) -
             "</plist>\n",
             encoding="utf-8",
         )
-    r = pf.check_plist_templates(project_root=tmp_path)
+    r = pf.check_plist_templates(project_root=tmp_path, plist_names=_PLISTS)
     assert r.status == Status.PASS
 
 
@@ -181,7 +188,7 @@ def test_launchagents_no_dir_is_skip(tmp_path: Path) -> None:
 def test_launchagents_zero_installed_is_skip(tmp_path: Path) -> None:
     """Dir exists but empty (fresh checkout) → SKIP, not FAIL — the
     operator may be running preflight before installing."""
-    r = pf.check_launchagents_installed(launch_agents_dir=tmp_path)
+    r = pf.check_launchagents_installed(launch_agents_dir=tmp_path, plist_names=_PLISTS)
     assert r.status == Status.SKIP
 
 
@@ -189,19 +196,19 @@ def test_launchagents_partial_install_is_warn(tmp_path: Path) -> None:
     """The exact case the user hit after PR #61 merged but jobs hadn't
     been reinstalled yet — 4 of 5 installed. WARN with the missing
     list so the operator knows what to re-install."""
-    for name in pf._PLIST_NAMES[:-1]:  # all but the last
+    for name in _PLISTS[:-1]:  # all but the last
         (tmp_path / name).write_text("<plist/>", encoding="utf-8")
-    r = pf.check_launchagents_installed(launch_agents_dir=tmp_path)
+    r = pf.check_launchagents_installed(launch_agents_dir=tmp_path, plist_names=_PLISTS)
     assert r.status == Status.WARN
     assert "Partial install" in r.message
-    assert r.details["installed_count"] == len(pf._PLIST_NAMES) - 1
-    assert r.details["missing"] == [pf._PLIST_NAMES[-1]]
+    assert r.details["installed_count"] == len(_PLISTS) - 1
+    assert r.details["missing"] == [_PLISTS[-1]]
 
 
 def test_launchagents_all_installed_is_pass(tmp_path: Path) -> None:
-    for name in pf._PLIST_NAMES:
+    for name in _PLISTS:
         (tmp_path / name).write_text("<plist/>", encoding="utf-8")
-    r = pf.check_launchagents_installed(launch_agents_dir=tmp_path)
+    r = pf.check_launchagents_installed(launch_agents_dir=tmp_path, plist_names=_PLISTS)
     assert r.status == Status.PASS
 
 
