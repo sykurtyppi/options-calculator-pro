@@ -765,6 +765,14 @@ export default function App() {
                     tone={tonePos(m.expected_gross_edge_pct, 0.5, 0)} provenance="modeled" />
                   <Metric label="Expectancy Ratio" value={fmtSn(m.expectancy_ratio, 2)}
                     tone={tonePos(m.expectancy_ratio, 0.2, 0)} provenance="modeled" />
+                  {/* 1.0 is the FAIR-VALUE point by construction: the backend
+                      restates both sides on an E|move| basis before dividing
+                      (edge_math.ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE), so a fairly
+                      priced event scores exactly 1.00. Do not "recentre" these
+                      thresholds — before that fix fair value sat at 1.057 and
+                      good>=1.05 painted a fairly priced event green. >=1.05 is
+                      therefore ~5% richer than history; <=1.0 is no edge, toned
+                      'bad' to match Expected Net Edge at zero. */}
                   <Metric label="Implied / Anchor" value={fmtNum(m.implied_vs_anchor_ratio, 2)}
                     tone={tonePos(m.implied_vs_anchor_ratio, 1.05, 1.0)} />
                   <Metric label="Drawdown Risk" value={fmtPp(m.drawdown_risk_pct, 2)}

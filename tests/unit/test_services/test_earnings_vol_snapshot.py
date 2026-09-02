@@ -450,7 +450,7 @@ class TestEarningsVolSnapshot(unittest.TestCase):
             },
         )
         close = price_df.set_index("trade_date")["close"]
-        with patch.object(edge_engine, "_utc_today_date", return_value=date.fromisoformat("2026-04-20")):
+        with patch.object(edge_engine, "_market_today_date", return_value=date.fromisoformat("2026-04-20")):
             legacy_profile = edge_engine._historical_earnings_move_profile(close=close, earnings_events=prior_events)
         legacy_anchor = edge_engine._compute_move_anchor(
             legacy_profile.get("median_move_pct"),

@@ -43,8 +43,20 @@ launchctl list | grep optionscalculator
 | `com.optionscalculator.weekly-evidence-report` | Mondays at 22:45 |
 | `com.optionscalculator.log-rotation` | Daily at 03:00 |
 | `com.optionscalculator.forward-paper-collector` | Daily at 19:30 |
+| `com.optionscalculator.premarket-screener-alert` | Weekdays at 14:30 |
+| `com.optionscalculator.state-backup` | Daily at 04:00 |
 
 All jobs use `RunAtLoad=false`; they fire only on the calendar schedule, never on `launchctl load`.
+
+The state-backup job runs at 04:00 local — offset from the 03:00 log rotation so the two don't contend for the SQLite files. It calls `scripts/backup_state.py` to write a hot, consistent `.tar.gz` snapshot of `~/.options_calculator_pro` (SQLite files via the Online Backup API, everything else byte-copied) with newest-N retention. By default the archive lands in `~/.options_calculator_pro/backups/`, which guards against `rm -rf` typos and SQLite corruption but **not disk loss** (same disk as the source). For real disaster recovery, set `OPTIONS_CALCULATOR_BACKUP_DIR` to an external sync folder (iCloud Drive / Dropbox / external mount) — the wrapper passes it through as `--output-dir`. Tunables: `OPTIONS_CALCULATOR_BACKUP_DIR` (default in-tree `backups/`), `OPTIONS_CALCULATOR_BACKUP_RETENTION` (default 14), `STATE_BACKUP_TIMEOUT_SECONDS` (default 900), `STATE_BACKUP_LOCK_MAX_AGE_SECONDS` (default 3600). Restore via `scripts/restore_state.py <archive.tar.gz>`; see [../../docs/DEPLOYMENT.md](../../docs/DEPLOYMENT.md#backup-and-restore).
+
+The screener alert runs weekdays at 14:30 local — on this Atlantic/Reykjavik (GMT) machine that is **10:30 ET in EDT / 09:30 ET in EST**, i.e. inside the US options session. It is deliberately NOT pre-open: the ranked screener reads yfinance, which returns bid=ask=0 and a placeholder IV (~1e-5) before the open, so a pre-open run scores absent quotes as maximally cheap vol. It runs `scripts/premarket_screener_alert.py`, which calls the canonical ranked screener (`services.screener_service.build_ranked_screener`, the same path behind `/api/screener/ranked`) in-process — **the backend does not need to be running** — and sends an iMessage only when a setup inside the entry window clears the score threshold. Silence is the expected default: qualifying setups are rare (~10-40/year), and a daily "nothing today" message would train the operator to ignore the channel. The job is idempotent per `(date, qualifying-symbol-set)` via `~/.options_calculator_pro/state/premarket_alert_state.json`, so a manual re-run the same day will not double-send (override with `--force`). The message carries setup-quality ordering only — `ranking_score` is **not** a calibrated win probability and the payload says so. Recipient comes from `WATCHDOG_IMESSAGE_TO` (shared with the evidence watchdog); with no recipient set the job exits non-zero rather than failing silently. Tunables: `PREMARKET_ALERT_MIN_SCORE` (default 0.65), `PREMARKET_ALERT_TOP` (default 5), `PREMARKET_ALERT_EXTRA_ARGS`, `PREMARKET_ALERT_TIMEOUT_SECONDS` (default 600), `PREMARKET_ALERT_LOCK_MAX_AGE_SECONDS` (default 3600). Preview without sending:
+
+```sh
+.venv311/bin/python scripts/premarket_screener_alert.py --dry-run
+```
+
+Operators in other timezones: change `Hour=13` in `com.optionscalculator.premarket-screener-alert.plist` to your local equivalent of "~30-90 minutes before the 09:30 ET open", then reinstall.
 
 The log-rotation job runs at 03:00 local — chosen to be safely away from every other launchd job so no other job has an active handle on the `.log` files we rotate. Rotation is size-based (default 5 MB threshold) with gzip + 7-archive retention per file; see `scripts/rotate_launchd_logs.py --help` for the exact contract and tunables. Only `*_launchd*.log` shapes are touched — the Python-logger files (`__main__.log`, `services.*.log`) manage their own rotation via `RotatingFileHandler`.
 

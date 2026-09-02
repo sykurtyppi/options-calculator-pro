@@ -27,6 +27,94 @@ from web.api.edge_constants import (
 logger = logging.getLogger(__name__)
 
 
+# ── Lognormal/normal shape factors (dimensional-consistency fix) ───────────
+# The event-vol decomposition (services.event_vol_decomposition) yields the
+# implied event move in **1σ form**. Historical earnings moves, by contrast,
+# are realized ABSOLUTE moves |Δ|/S — a different statistic of the same
+# distribution. Comparing a 1σ implied move directly against a historical
+# absolute-move anchor or percentile biases every edge/tail metric upward,
+# because for X ~ N(0, σ²):
+#     E|X|       = σ·√(2/π)      ≈ 0.798·σ   (mean absolute move)
+#     median|X|  = σ·Φ⁻¹(0.75)   ≈ 0.674·σ
+#     P90 of |X| = σ·Φ⁻¹(0.95)   ≈ 1.645·σ
+# A 1σ implied move must therefore be converted to the matching absolute-move
+# statistic before comparison. Historically this was NOT done, so a fairly
+# priced event still registered ~+0.20–0.33·σ of spurious "edge" and the tail
+# classifier over-fired "elevated" (ratio ≈ 1.645 for a fair event).
+SIGMA_TO_EXPECTED_ABS_MOVE = math.sqrt(2.0 / math.pi)  # E|X|/σ ≈ 0.79788
+SIGMA_TO_P90_ABS_MOVE = 1.6448536269514722             # Φ⁻¹(0.95); P90 of |X| / σ
+# median|X| / E|X| for X ~ N(0, σ²) = Φ⁻¹(0.75) / √(2/π).
+MEDIAN_TO_MEAN_ABS_MOVE = 0.6744897501960817 / SIGMA_TO_EXPECTED_ABS_MOVE  # ≈ 0.845348
+
+
+def _anchor_blend_to_expected_abs_scale() -> float:
+    """Scale of the historical move ANCHOR relative to a true E|move|.
+
+    ``_compute_move_anchor`` blends two different statistics:
+        anchor = w·mean|last 4| + (1-w)·median|all|
+    The mean term estimates E|X|, but the median term estimates only
+    ≈0.845·E|X|, so the blend sits systematically BELOW E|move| — at w=0.65,
+    about 0.9459·E|move|.
+
+    Comparing a pure-E|move| implied term against that blend therefore still
+    books ~+5.7% of spurious richness on a fairly priced event: the ratio's
+    fair-value point lands at 1.057 rather than 1.0, and the UI's tone
+    thresholds (good ≥1.05) paint a fairly priced event green. Dividing the
+    anchor by this scale expresses it on the same E|move| basis as the implied
+    side, which is the completion of the σ-vs-absolute fix above.
+
+    Derived from the live weight rather than hard-coded, so retuning
+    ``move_anchor_avg_last4_weight`` cannot silently decalibrate the ratio.
+    The 0.845 factor assumes a normal null; real earnings moves are fatter-
+    tailed, which would push the true scale slightly lower still.
+    """
+    w = float(_HEURISTIC_THRESHOLDS["move_anchor_avg_last4_weight"]["value"])
+    return float(w + (1.0 - w) * MEDIAN_TO_MEAN_ABS_MOVE)
+
+
+ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE = _anchor_blend_to_expected_abs_scale()
+
+
+def _anchor_expected_abs_move_pct(move_anchor_pct: Optional[float]) -> float:
+    """Restate the blended historical anchor on an E|move| basis.
+
+    Use this ONLY where the anchor is compared against the implied side. The
+    raw ``move_anchor_pct`` stays as-is for display — it is a "typical realized
+    move" figure and belongs in absolute-move units.
+    """
+    anchor = _safe_float(move_anchor_pct, np.nan)
+    if not np.isfinite(anchor):
+        return float("nan")
+    # Read the blend weight at CALL time, exactly as _compute_move_anchor does,
+    # so the two can never diverge if the weight is retuned after import. The
+    # module-level ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE is kept as the documented
+    # reference value, not as the runtime source of truth.
+    return float(anchor / _anchor_blend_to_expected_abs_scale())
+
+
+def _event_implied_expected_abs_move_pct(
+    event_implied_sigma_pct: Optional[float],
+) -> float:
+    """Convert a 1σ implied event move (pct) to the expected ABSOLUTE move E|move|.
+
+    This is the like-for-like counterpart to the historical mean/median
+    absolute-move anchor produced by ``_compute_move_anchor``.
+    """
+    sigma = _safe_float(event_implied_sigma_pct, np.nan)
+    return float(sigma * SIGMA_TO_EXPECTED_ABS_MOVE) if np.isfinite(sigma) else float("nan")
+
+
+def _event_implied_p90_abs_move_pct(
+    event_implied_sigma_pct: Optional[float],
+) -> float:
+    """Convert a 1σ implied event move (pct) to its 90th-percentile absolute move.
+
+    Like-for-like counterpart to the historical ``p90_move_pct`` tail.
+    """
+    sigma = _safe_float(event_implied_sigma_pct, np.nan)
+    return float(sigma * SIGMA_TO_P90_ABS_MOVE) if np.isfinite(sigma) else float("nan")
+
+
 def _classify_move_risk(
     p90_earnings_move_pct: Optional[float],
     event_implied_move_pct: Optional[float],
@@ -35,13 +123,20 @@ def _classify_move_risk(
     """
     Soft advisory for how stressed the historical earnings tail is relative to the
     event-implied move currently priced by the market.
+
+    ``event_implied_move_pct`` is a **1σ** implied move; the historical input is
+    a **P90 absolute** move. They are compared like-for-like by converting the
+    implied σ to its own P90 (σ·Φ⁻¹(0.95)) first — otherwise the ratio is
+    inflated by ~1.645 and the classifier reports "elevated" for a fairly
+    priced event.
     """
     p90_val = _safe_float(p90_earnings_move_pct, np.nan)
-    impl_val = _safe_float(event_implied_move_pct, np.nan)
-    if not np.isfinite(p90_val) or not np.isfinite(impl_val) or impl_val <= 0:
+    impl_sigma = _safe_float(event_implied_move_pct, np.nan)
+    if not np.isfinite(p90_val) or not np.isfinite(impl_sigma) or impl_sigma <= 0:
         return "unknown", None
 
-    ratio = float(p90_val / impl_val)
+    impl_p90 = impl_sigma * SIGMA_TO_P90_ABS_MOVE
+    ratio = float(p90_val / impl_p90)
     if ratio > 1.15:
         level = "elevated"
     elif ratio >= 0.90:

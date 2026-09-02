@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -23,7 +24,7 @@ import yfinance as yf
 from utils.quotes import safe_mid
 from services.crush_features import crush_feature_vector
 from services.dividend_yields import get_dividend_yield
-from services.iv_term_structure import bounded_interp
+from services.iv_term_structure import bounded_interp, select_tenor_spanning_expiries
 from services.earnings_event_service import resolve_upcoming_earnings_event
 from services.earnings_vol_snapshot import build_vol_snapshot
 from services.provider_telemetry import classify_error, record_provider_telemetry
@@ -190,8 +191,19 @@ class EdgeSnapshot:
 
 # ─── Utility helpers ──────────────────────────────────────────────────────────
 
-def _utc_today_date():
-    return datetime.now(timezone.utc).date()
+_MARKET_TZ = ZoneInfo("America/New_York")
+
+
+def _market_today_date():
+    """Return today's date in the US market session timezone (America/New_York).
+
+    Previously this used ``datetime.now(timezone.utc).date()``. After ~19:00 ET
+    the UTC calendar date has already rolled to tomorrow, so evening runs
+    computed DTE one day short and set an ``as_of_date`` in the *future*
+    relative to the live US session — the exact boundary the temporal-integrity
+    work protects. Anchoring "today" to the market session removes that skew.
+    """
+    return datetime.now(_MARKET_TZ).date()
 
 
 # PR-AE C2: extracted to services/candidate_shadow_outcome.py so the
@@ -672,7 +684,7 @@ def _summarize_pre_earnings_expansion(
         return summary
 
     parsed_events: List[pd.Timestamp] = []
-    today = pd.Timestamp(_utc_today_date())
+    today = pd.Timestamp(_market_today_date())
     for item in earnings_events or []:
         event_raw = item.get("event_date") if isinstance(item, dict) else item
         if event_raw is None:
@@ -1436,7 +1448,10 @@ def _aggregate_experimental_candidate_evidence(trades: List[Dict[str, Any]]) -> 
 # unchanged. Internal callers (e.g. analyze_single_ticker) resolve these names
 # through this module's namespace via the re-export below.
 from web.api.edge_math import (  # noqa: E402,F401
+    _anchor_expected_abs_move_pct,
     _classify_move_risk,
+    _event_implied_expected_abs_move_pct,
+    _event_implied_p90_abs_move_pct,
     _score_expectancy,
     _estimate_transaction_cost_pct,
     _compute_move_anchor,
@@ -1648,7 +1663,7 @@ def _term_structure_from_mda_chain(
     if chain_df is None or chain_df.empty or "expiration_date" not in chain_df.columns:
         return empty_return
 
-    today = _utc_today_date()
+    today = _market_today_date()
     days: List[float] = []
     ivs: List[float] = []
     oi_values: List[float] = []
@@ -1807,7 +1822,7 @@ def _smile_curvature_from_mda_chain(
     if chain_df is None or chain_df.empty or "expiration_date" not in chain_df.columns:
         return empty
 
-    today = _utc_today_date()
+    today = _market_today_date()
     sorted_expiries = sorted(chain_df["expiration_date"].dropna().unique())
 
     for exp_str in sorted_expiries[:3]:
@@ -1899,7 +1914,7 @@ def _next_earnings_from_mda(
     if earnings_df is None or earnings_df.empty:
         return None, None
 
-    today = _utc_today_date()
+    today = _market_today_date()
     for _, row in earnings_df.iterrows():
         rd = row.get("report_date")
         if rd is None:
@@ -1928,7 +1943,7 @@ def _earnings_dates_from_mda(earnings_df: pd.DataFrame) -> List[Dict[str, Any]]:
     if earnings_df is None or earnings_df.empty:
         return []
 
-    today = pd.Timestamp(_utc_today_date())
+    today = pd.Timestamp(_market_today_date())
     event_by_date: Dict[pd.Timestamp, Dict[str, Any]] = {}
     for _, row in earnings_df.iterrows():
         rd = row.get("report_date")
@@ -1970,7 +1985,7 @@ def _term_structure_points_yf(
     near_term_dte: Optional[int] = None
     near_term_liquidity_proxy: Optional[float] = None
 
-    today = _utc_today_date()
+    today = _market_today_date()
     expirations = list(getattr(ticker, "options", []) or [])
     for exp in expirations[:max_expiries]:
         try:
@@ -2155,7 +2170,7 @@ def _smile_curvature_yf(ticker: yf.Ticker, current_price: float) -> Dict[str, An
 
 def _next_earnings_days_yf(ticker: yf.Ticker) -> Optional[int]:
     """Resolve next earnings DTE through the shared event service, then fall back safely."""
-    today = _utc_today_date()
+    today = _market_today_date()
     symbol = getattr(ticker, "ticker", None) or getattr(ticker, "symbol", None)
     if symbol:
         try:
@@ -2196,7 +2211,7 @@ def _historical_earnings_move_profile(
     profile = _compute_earnings_move_profile(
         close=close,
         earnings_events=earnings_events,
-        as_of_date=_utc_today_date(),
+        as_of_date=_market_today_date(),
     )
     if profile.source == "earnings_history":
         return {
@@ -2270,7 +2285,11 @@ def _collect_yf_option_chain_frame(
 ) -> pd.DataFrame:
     expirations = list(getattr(ticker, "options", []) or [])
     rows: List[Dict[str, Any]] = []
-    for expiry in expirations[:max_expiries]:
+    # Tenor-spanning selection (same fetch count) so the yfinance fallback
+    # still brackets the 30D/45D interpolation targets on weekly-heavy names.
+    for expiry in select_tenor_spanning_expiries(
+        expirations, as_of_date, max_expiries=max_expiries
+    ):
         start = time.perf_counter()
         try:
             chain = ticker.option_chain(expiry)
@@ -2577,8 +2596,8 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     try:
         resolved_earnings_event = resolve_upcoming_earnings_event(
             clean_symbol,
-            _utc_today_date(),
-            _utc_today_date() + timedelta(days=120),
+            _market_today_date(),
+            _market_today_date() + timedelta(days=120),
             ticker=ticker,
             mda_client=client if use_provider else None,
         )
@@ -2591,7 +2610,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     #      history on this plan tier), always try yfinance for the move-profile events regardless
     #      of whether MDApp already provided the next-DTE.
     if dte is None and resolved_earnings_event is not None and resolved_earnings_event.earnings_date is not None:
-        dte = int((resolved_earnings_event.earnings_date - _utc_today_date()).days)
+        dte = int((resolved_earnings_event.earnings_date - _market_today_date()).days)
     if dte is None:
         dte = _next_earnings_days_yf(ticker)
     if (not earnings_release_time or earnings_release_time == "unknown") and resolved_earnings_event is not None:
@@ -2603,7 +2622,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
             try:
                 edf = get_dates_fn(limit=24)
                 if edf is not None and not edf.empty:
-                    today_ts = pd.Timestamp(_utc_today_date())
+                    today_ts = pd.Timestamp(_market_today_date())
                     parsed_events: List[Dict[str, Any]] = []
                     for ts in edf.index:
                         ts_raw = pd.Timestamp(ts).tz_localize(None)
@@ -2622,7 +2641,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
             fallback_edates = getattr(ticker, "earnings_dates", None)
             if fallback_edates is not None and not fallback_edates.empty:
                 try:
-                    today_ts = pd.Timestamp(_utc_today_date())
+                    today_ts = pd.Timestamp(_market_today_date())
                     parsed_events = []
                     for ts in fallback_edates.index:
                         ts_raw = pd.Timestamp(ts).tz_localize(None)
@@ -2642,7 +2661,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
         resolved_earnings_event.earnings_date
         if resolved_earnings_event is not None and resolved_earnings_event.earnings_date is not None
         else (
-            _utc_today_date() + timedelta(days=int(dte))
+            _market_today_date() + timedelta(days=int(dte))
             if dte is not None and dte >= 0
             else None
         )
@@ -2670,7 +2689,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
         }
     )
     option_snapshot_frame = chain_df if chain_df is not None else _collect_yf_option_chain_frame(
-        ticker, as_of_date=_utc_today_date()
+        ticker, as_of_date=_market_today_date()
     )
     # V2: same honest provenance the term-structure path reports (see options_source
     # below) — when the provider supplied the chain, use its name; otherwise the
@@ -2679,7 +2698,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     snapshot_options_provider = data_source if chain_df is not None else "yfinance"
     vol_snapshot = build_vol_snapshot(
         clean_symbol,
-        _utc_today_date(),
+        _market_today_date(),
         option_chain_data=option_snapshot_frame,
         earnings_metadata=earnings_metadata_for_snapshot,
         price_data=price_snapshot_frame,
@@ -2773,6 +2792,7 @@ def analyze_single_ticker(
     vol_regime = snapshot_inputs["vol_regime"]
     iv30 = _safe_float(snapshot_inputs["iv30"], np.nan)
     iv45 = _safe_float(snapshot_inputs["iv45"], np.nan)
+    near_term_atm_iv = _safe_float(snapshot_inputs.get("near_term_atm_iv"), np.nan)
     ts_slope_0_45 = _safe_float(snapshot_inputs["ts_slope_0_45"], np.nan)
     implied_move_pct = _safe_float(snapshot_inputs["implied_move_pct"], np.nan)
     near_term_spread_pct = snapshot_inputs["near_term_spread_pct"]
@@ -2819,16 +2839,29 @@ def analyze_single_ticker(
     # any lookup failure, so non-dividend names and yfinance hiccups
     # both produce byte-identical-to-legacy pricing.
     pricing_dividend_yield, pricing_dividend_yield_source = get_dividend_yield(clean_symbol)
-    _bsm_T = float(dte) if dte is not None and dte > 0 else np.nan
+    # Tenor/vol coherence: the near-term legs (greeks below, and the theoretical
+    # straddle/strangle/calendar-front payoffs) live at ~near_term_dte (3-14
+    # days around earnings). Pricing a ~5-day option with 30-day IV makes
+    # gamma/theta magnitudes materially wrong, so price them with the near-term
+    # ATM IV and fall back to iv30 only when it is unavailable. (The crush-model
+    # `near_iv` FEATURE deliberately stays on iv30 to avoid train/serve skew.)
+    _near_iv_ok = np.isfinite(near_term_atm_iv) and near_term_atm_iv > 0
+    near_leg_iv = float(near_term_atm_iv) if _near_iv_ok else iv30
+    near_leg_iv_basis = "near_term_atm_iv" if _near_iv_ok else "iv30_fallback"
+    # Greeks describe the near-term ATM option, so evaluate them at its tenor.
+    _greeks_T = (
+        float(near_term_dte) if (near_term_dte is not None and near_term_dte > 0)
+        else (float(dte) if dte is not None and dte > 0 else np.nan)
+    )
     greeks = (
         _bsm_greeks(
             S=current_price,
-            T_days=_bsm_T,
-            sigma=float(iv30) if np.isfinite(iv30) else np.nan,
+            T_days=_greeks_T,
+            sigma=float(near_leg_iv) if np.isfinite(near_leg_iv) else np.nan,
             r=pricing_risk_free_rate,
             q=pricing_dividend_yield,
         )
-        if np.isfinite(_bsm_T) and np.isfinite(iv30)
+        if np.isfinite(_greeks_T) and np.isfinite(near_leg_iv) and near_leg_iv > 0
         else {k: None for k in ("delta_call", "delta_put", "gamma", "vega", "theta_call", "theta_put")}
     )
 
@@ -2883,15 +2916,27 @@ def analyze_single_ticker(
     else:
         _event_implied_source = f"from total-implied={implied_move_total_pct:.2f}%"
 
+    # Dimensional-consistency fix: event_implied_move_pct is a 1σ move, while
+    # the historical anchor/p90 are ABSOLUTE-move statistics. Convert the
+    # implied σ to the matching absolute-move statistic before comparing, or a
+    # fairly priced event books ~+0.20–0.33σ of spurious edge. See
+    # web.api.edge_math.SIGMA_TO_EXPECTED_ABS_MOVE / SIGMA_TO_P90_ABS_MOVE.
+    event_implied_expected_move_pct = _event_implied_expected_abs_move_pct(event_implied_move_pct)
+    event_implied_p90_move_pct = _event_implied_p90_abs_move_pct(event_implied_move_pct)
+    # The anchor is a mean/median BLEND and so sits ~5.4% below a true E|move|.
+    # Restate it on the E|move| basis before differencing/dividing, otherwise a
+    # fairly priced event still books positive edge and a fair-value ratio of
+    # 1.057 instead of 1.0. Display keeps the raw anchor (see metrics below).
+    move_anchor_expected_pct = _anchor_expected_abs_move_pct(move_anchor_pct_val)
     raw_gross_edge_pct = (
-        float(event_implied_move_pct - move_anchor_pct_val)
-        if np.isfinite(event_implied_move_pct) and np.isfinite(move_anchor_pct_val)
+        float(event_implied_expected_move_pct - move_anchor_expected_pct)
+        if np.isfinite(event_implied_expected_move_pct) and np.isfinite(move_anchor_expected_pct)
         else np.nan
     )
     implied_vs_anchor_ratio = (
-        float(event_implied_move_pct / move_anchor_pct_val)
-        if np.isfinite(event_implied_move_pct)
-        and np.isfinite(move_anchor_pct_val) and move_anchor_pct_val > 0
+        float(event_implied_expected_move_pct / move_anchor_expected_pct)
+        if np.isfinite(event_implied_expected_move_pct)
+        and np.isfinite(move_anchor_expected_pct) and move_anchor_expected_pct > 0
         else np.nan
     )
     confidence_adjusted_gross_edge_pct = (
@@ -2912,8 +2957,8 @@ def analyze_single_ticker(
         if np.isfinite(expected_gross_edge_pct) else np.nan
     )
     base_drawdown_risk_pct = (
-        float(max(p90_earnings_move_pct - event_implied_move_pct, 0.0) + tx_cost_pct)
-        if np.isfinite(p90_earnings_move_pct) and np.isfinite(event_implied_move_pct)
+        float(max(p90_earnings_move_pct - event_implied_p90_move_pct, 0.0) + tx_cost_pct)
+        if np.isfinite(p90_earnings_move_pct) and np.isfinite(event_implied_p90_move_pct)
         else float(0.75 + tx_cost_pct)
     )
     concavity_risk_surcharge_pct = float(
@@ -3001,7 +3046,7 @@ def analyze_single_ticker(
     calendar_payoff: Optional[Dict[str, Any]] = (
         _calendar_spread_payoff(
             S=current_price,
-            iv_near=float(iv30),
+            iv_near=float(near_leg_iv),
             iv_back=float(_cal_iv_back),
             T_near_days=float(_cal_T_near),
             T_back_days=float(_cal_T_back),
@@ -3012,7 +3057,7 @@ def analyze_single_ticker(
             implied_move_pct=float(implied_move_total_pct) if np.isfinite(implied_move_total_pct) else None,
         )
         if (np.isfinite(_cal_T_near) and np.isfinite(_cal_T_back)
-            and np.isfinite(iv30) and iv30 > 0
+            and np.isfinite(near_leg_iv) and near_leg_iv > 0
             and np.isfinite(_cal_iv_back) and _cal_iv_back > 0)
         else None
     )
@@ -3047,30 +3092,30 @@ def analyze_single_ticker(
     # Drives the main-view diagram; distinct from calendar_payoff (legacy panel).
     _best_structure = getattr(selector_output, "best_structure", None)
     _sp_near_dte = float(near_term_dte) if (near_term_dte is not None and near_term_dte > 0) else None
-    _sp_iv30_ok  = np.isfinite(iv30) and iv30 > 0
+    _sp_near_iv_ok = np.isfinite(near_leg_iv) and near_leg_iv > 0
     _sp_move_ok  = np.isfinite(implied_move_total_pct) and implied_move_total_pct > 0
     _sp_raw      = _raw_moves if _raw_moves else None
     _sp_impl     = float(implied_move_total_pct) if _sp_move_ok else None
 
     if _best_structure == "call_calendar":
         structure_payoff: Optional[Dict[str, Any]] = calendar_payoff
-    elif _best_structure == "put_calendar" and _sp_iv30_ok and _sp_near_dte and np.isfinite(_cal_iv_back) and _cal_iv_back > 0:
+    elif _best_structure == "put_calendar" and _sp_near_iv_ok and _sp_near_dte and np.isfinite(_cal_iv_back) and _cal_iv_back > 0:
         structure_payoff = _calendar_spread_payoff(
-            S=current_price, iv_near=float(iv30), iv_back=float(_cal_iv_back),
+            S=current_price, iv_near=float(near_leg_iv), iv_back=float(_cal_iv_back),
             T_near_days=_sp_near_dte, T_back_days=_sp_near_dte + 28.0,
             r=pricing_risk_free_rate, q=pricing_dividend_yield,  # PR #68
             raw_moves_pct=_sp_raw,
             implied_move_pct=_sp_impl, side="put",
         )
-    elif _best_structure == "atm_straddle" and _sp_iv30_ok and _sp_near_dte:
+    elif _best_structure == "atm_straddle" and _sp_near_iv_ok and _sp_near_dte:
         structure_payoff = _straddle_payoff(
-            S=current_price, iv=float(iv30), T_near_days=_sp_near_dte,
+            S=current_price, iv=float(near_leg_iv), T_near_days=_sp_near_dte,
             r=pricing_risk_free_rate, q=pricing_dividend_yield,  # PR #68
             raw_moves_pct=_sp_raw, implied_move_pct=_sp_impl,
         )
-    elif _best_structure == "otm_strangle" and _sp_iv30_ok and _sp_near_dte and _sp_move_ok:
+    elif _best_structure == "otm_strangle" and _sp_near_iv_ok and _sp_near_dte and _sp_move_ok:
         structure_payoff = _strangle_payoff(
-            S=current_price, iv=float(iv30), T_near_days=_sp_near_dte,
+            S=current_price, iv=float(near_leg_iv), T_near_days=_sp_near_dte,
             wing_pct=float(implied_move_total_pct),
             r=pricing_risk_free_rate, q=pricing_dividend_yield,  # PR #68
             raw_moves_pct=_sp_raw, implied_move_pct=_sp_impl,
@@ -3557,13 +3602,17 @@ def analyze_single_ticker(
         # ── Vol regime (percentile rank within 252-day rolling history) ───────
         "rv_percentile_rank": rv_percentile_rank,
         "vol_regime": vol_regime,
-        # ── BSM ATM greeks (tenor = earnings DTE, σ = iv30) ──────────────────
+        # ── BSM ATM greeks (near-term ATM option: tenor = near_term_dte, σ =
+        #    near-term ATM IV with iv30 fallback). Provenance disclosed below so
+        #    a fallback to 30-day vol is visible rather than silent. ──────────
         "atm_delta_call": greeks.get("delta_call"),
         "atm_delta_put": greeks.get("delta_put"),
         "atm_gamma": greeks.get("gamma"),
         "atm_vega": greeks.get("vega"),
         "atm_theta_call": greeks.get("theta_call"),
         "atm_theta_put": greeks.get("theta_put"),
+        "atm_greeks_iv_basis": near_leg_iv_basis,
+        "atm_greeks_tenor_days": (int(_greeks_T) if np.isfinite(_greeks_T) else None),
         # ── Position sizing ───────────────────────────────────────────────────
         # Kelly sizing removed — requires calibrated edge (see comment near _kelly_sizing).
         "position_sizing_note": (

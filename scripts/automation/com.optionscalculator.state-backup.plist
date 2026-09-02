@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optionscalculator.state-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/scripts/automation/run_state_backup.sh</string>
+  </array>
+  <!--
+    Daily at 04:00 LOCAL. Offset from the 03:00 log rotation so the two
+    jobs don't contend for the SQLite files, and clear of the evidence
+    cycle (~21:30) / watchdog (~22:15) / forward collector (19:30).
+    The SQLite Online Backup API holds only a shared read lock, so a
+    concurrent writer would see brief BUSY retries rather than deadlock —
+    but keeping the schedule quiet avoids even that.
+  -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>4</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/state_backup_launchd_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/state_backup_launchd_stderr.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

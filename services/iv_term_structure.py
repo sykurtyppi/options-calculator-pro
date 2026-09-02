@@ -34,7 +34,8 @@ design note ever gets written for this PR.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from datetime import date, datetime
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -140,8 +141,75 @@ def bounded_interp(
     return float(np.interp(target_days, days_sorted, ivs_sorted)), INTERP_OK
 
 
+def select_tenor_spanning_expiries(
+    expirations: Sequence[Any],
+    as_of_date: date,
+    *,
+    max_expiries: int = 6,
+    targets: Sequence[float] = (30.0, 45.0),
+) -> List[Any]:
+    """Pick up to *max_expiries* expiries that BRACKET the interpolation targets.
+
+    "The first N expiries by date" is the wrong window for weekly-heavy
+    names. NVDA lists its first 6 expiries inside 16 days, so a 30D/45D
+    interpolation has nothing to bracket it: ``bounded_interp`` honestly
+    returns ``None`` and ``iv30``/``iv45`` — and with them ``iv_rv``,
+    ``cheapness_score`` and the 32%-weight IV-entry rank component — go dark
+    on exactly the most liquid, most tradeable symbols.
+
+    This spends the SAME budget differently. The yfinance collectors pay one
+    HTTP round-trip per expiry, so the fetch cost is the length of the
+    returned list, not how far out it reaches. Every target therefore gets
+    the first expiry at or beyond it (bracketing from above), and whatever
+    budget remains is filled with the nearest-dated expiries, which supply
+    the near/back ratio and the slope origin.
+
+    Expiries at or before ``as_of_date`` are dropped. Unparseable entries are
+    skipped rather than raising — a malformed expiry string from a provider
+    should cost one tenor, not the whole snapshot. Returns the surviving
+    entries in their ORIGINAL form (callers pass them straight back to the
+    provider), ordered by expiry date.
+    """
+    parsed: List[Tuple[int, Any]] = []
+    for raw in expirations or []:
+        try:
+            if isinstance(raw, datetime):
+                exp = raw.date()
+            elif isinstance(raw, date):
+                exp = raw
+            else:
+                exp = datetime.strptime(str(raw), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        dte = (exp - as_of_date).days
+        if dte <= 0:
+            continue
+        parsed.append((dte, raw))
+
+    if not parsed or max_expiries <= 0:
+        return []
+
+    parsed.sort(key=lambda item: item[0])
+
+    keep: set[int] = set()
+    # Targets first — they are the whole point of the selection and must not
+    # be crowded out by near-dated fill.
+    for target in targets:
+        idx = next((i for i, (dte, _) in enumerate(parsed) if float(dte) >= float(target)), None)
+        if idx is not None and len(keep) < max_expiries:
+            keep.add(idx)
+    # Then fill with the nearest-dated expiries.
+    for i in range(len(parsed)):
+        if len(keep) >= max_expiries:
+            break
+        keep.add(i)
+
+    return [parsed[i][1] for i in sorted(keep)]
+
+
 __all__ = [
     "bounded_interp",
+    "select_tenor_spanning_expiries",
     "INTERP_OK",
     "INTERP_TARGET_BELOW_RANGE",
     "INTERP_TARGET_ABOVE_RANGE",

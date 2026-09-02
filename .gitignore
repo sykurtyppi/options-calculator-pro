@@ -66,3 +66,7 @@ reports/
 
 # Stray .tmp files (mirrors origin/main's pre-existing ignore; PM-1 conflict resolution)
 *.tmp
+
+# Vite local dev overrides (machine-specific, never committed)
+.env.local
+*.env.local

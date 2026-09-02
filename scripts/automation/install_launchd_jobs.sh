@@ -13,7 +13,9 @@ for plist in \
   com.optionscalculator.evidence-watchdog.plist \
   com.optionscalculator.weekly-evidence-report.plist \
   com.optionscalculator.log-rotation.plist \
-  com.optionscalculator.forward-paper-collector.plist
+  com.optionscalculator.forward-paper-collector.plist \
+  com.optionscalculator.premarket-screener-alert.plist \
+  com.optionscalculator.state-backup.plist
 do
   src="${TEMPLATE_DIR}/${plist}"
   dst="${LAUNCH_AGENTS_DIR}/${plist}"

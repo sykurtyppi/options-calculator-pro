@@ -40,6 +40,7 @@ import pandas as pd
 import yfinance as yf
 from services.earnings_event_service import _timing_label_to_full, resolve_upcoming_earnings_event
 from services.earnings_vol_snapshot import VolSnapshot, build_vol_snapshot
+from services.iv_term_structure import select_tenor_spanning_expiries
 from utils.quotes import safe_mid
 
 logger = logging.getLogger(__name__)
@@ -389,7 +390,13 @@ def _collect_yf_option_chain_frame(
 ) -> pd.DataFrame:
     expirations = list(getattr(ticker, "options", []) or [])
     rows: List[Dict[str, Any]] = []
-    for expiry in expirations[:max_expiries]:
+    # Same fetch budget (one HTTP round-trip per expiry), spent on a
+    # tenor-SPANNING set instead of the first N by date — otherwise a
+    # weekly-heavy name never reaches 30D/45D and iv_rv / cheapness_score
+    # (32% of the rank via _iv_entry_score) come back None.
+    for expiry in select_tenor_spanning_expiries(
+        expirations, as_of, max_expiries=max_expiries
+    ):
         try:
             chain = ticker.option_chain(expiry)
         except Exception:
