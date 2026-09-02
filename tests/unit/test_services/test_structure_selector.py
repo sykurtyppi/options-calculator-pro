@@ -55,8 +55,8 @@ def _snapshot(**overrides) -> VolSnapshot:
         historical_move_std_pct=2.0,
         historical_move_anchor_pct=7.6,
         historical_move_uncertainty_pct=0.8,
-        historical_vs_implied_move_ratio=1.30,
-        tail_vs_implied_move_ratio=1.72,
+        historical_vs_implied_move_ratio=1.7225,
+        tail_vs_implied_move_ratio=1.0457,
         smile_curvature=0.18,
         smile_concavity_flag=False,
         smile_points=6,
@@ -143,7 +143,7 @@ class TestSimulatedPriorNotBest(unittest.TestCase):
     def test_simulated_top_is_not_promoted_to_best(self):
         # H1: identical winning card — a real N=40 earns Best, but a SIMULATED
         # N=40 must not clear the strong-history bar and stays a Candidate.
-        snapshot = _snapshot(historical_vs_implied_move_ratio=1.70, tail_vs_implied_move_ratio=1.95)
+        snapshot = _snapshot(historical_vs_implied_move_ratio=2.2526, tail_vs_implied_move_ratio=1.1855)
         real = select_best_structure(snapshot, self._winner_cards(simulated=False))
         simulated = select_best_structure(snapshot, self._winner_cards(simulated=True))
         assert real.recommendation == RECOMMENDATION_BEST
@@ -152,7 +152,7 @@ class TestSimulatedPriorNotBest(unittest.TestCase):
 
 class TestStructureSelector(unittest.TestCase):
     def test_clear_winner_returns_best_candidate(self):
-        snapshot = _snapshot(historical_vs_implied_move_ratio=1.70, tail_vs_implied_move_ratio=1.95)
+        snapshot = _snapshot(historical_vs_implied_move_ratio=2.2526, tail_vs_implied_move_ratio=1.1855)
         cards = [
             _scorecard("atm_straddle", expected_edge_pct=6.2, expected_return_pct=9.0, composite_structure_score=0.82, execution_penalty=0.03, sample_confidence=0.74, walk_forward_history_count=28),
             _scorecard("otm_strangle", expected_edge_pct=2.8, composite_structure_score=0.61),

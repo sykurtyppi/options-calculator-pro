@@ -140,8 +140,8 @@ def _make_snapshot(*, historical_move_source: str = "earnings_history", **overri
         historical_move_std_pct=2.0,
         historical_move_anchor_pct=7.0,
         historical_move_uncertainty_pct=0.9,
-        historical_vs_implied_move_ratio=1.28,
-        tail_vs_implied_move_ratio=1.50,
+        historical_vs_implied_move_ratio=1.6960,
+        tail_vs_implied_move_ratio=0.9119,
         smile_curvature=0.15,
         smile_concavity_flag=False,
         smile_points=5,
@@ -216,8 +216,8 @@ class TestFix3MoveSourcePropagation:
     def test_earnings_history_move_fit_exceeds_sentinel_in_straddle(self):
         snap = _make_snapshot(
             historical_move_source="earnings_history",
-            historical_vs_implied_move_ratio=1.40,
-            tail_vs_implied_move_ratio=1.70,
+            historical_vs_implied_move_ratio=1.8551,
+            tail_vs_implied_move_ratio=1.0335,
         )
         prior = _make_prior()
         scorecard = score_atm_straddle(snap, prior=prior)

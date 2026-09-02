@@ -7,12 +7,48 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from services.move_statistics import ANCHOR_RATIO_UNIT_SCALE, TAIL_RATIO_UNIT_SCALE
 import numpy as np
 import pandas as pd
 
 from services.earnings_vol_snapshot import VolSnapshot
 
 logger = logging.getLogger(__name__)
+
+# ── Move-ratio scorecard bounds (Codex F1) ────────────────────────────────
+# The historical/implied and tail/implied ratios used to be computed on an
+# unlabelled scale (absolute-move ÷ 1σ); services.move_statistics restates
+# them so 1.0 == fairly priced. The bounds below were calibrated on the
+# post-P5c-v2 real corpus in the OLD units, so they are restated by the SAME
+# constant. Because _score_high_good is linear in (value-lo)/(hi-lo), a bound
+# and a ratio divided by one constant yield byte-identical scores — the
+# calibration is preserved without touching any score.
+#
+# Provenance, reproduced from
+# reports/p5c_real_corpus_v2/iv_expansion_study_20260505T010758Z/iv_expansion_trade_log.csv
+# deduped by (symbol, event_date) → 743 events with both ratios:
+#   legacy anchor ratio  p10=0.123 p90=1.143          (code used 0.12 / 1.14)
+#   legacy tail ratio    p10=0.239 p25=0.418 p75=1.218 p90=1.534 p95=1.797
+#                                                     (code used 0.24/0.42/1.22/1.53/1.80)
+# Regenerating the same percentiles in corrected units equals legacy ÷ scale
+# to ≤2.2e-16, so the division IS the regeneration. The rounded legacy
+# literals are kept (÷ scale) so current behaviour is preserved exactly; a
+# future *re*-calibration should adopt the measured corrected-unit values:
+#   anchor p10=0.1633 p90=1.5140 · tail p10=0.1453 p25=0.2540 p75=0.7407
+#   p90=0.9325 p95=1.0925.
+# Note the corpus medians on the honest scale are anchor≈0.69 / tail≈0.50:
+# realized moves ran well below implied on this universe and period.
+_LEGACY_MOVE_RATIO_P10, _LEGACY_MOVE_RATIO_P90 = 0.12, 1.14
+_LEGACY_TAIL_RATIO_P10, _LEGACY_TAIL_RATIO_P25 = 0.24, 0.42
+_LEGACY_TAIL_RATIO_P75, _LEGACY_TAIL_RATIO_P90, _LEGACY_TAIL_RATIO_P95 = 1.22, 1.53, 1.80
+MOVE_RATIO_P10 = _LEGACY_MOVE_RATIO_P10 / ANCHOR_RATIO_UNIT_SCALE   # ≈ 0.1590
+MOVE_RATIO_P90 = _LEGACY_MOVE_RATIO_P90 / ANCHOR_RATIO_UNIT_SCALE   # ≈ 1.5105
+TAIL_RATIO_P10 = _LEGACY_TAIL_RATIO_P10 / TAIL_RATIO_UNIT_SCALE     # ≈ 0.1459
+TAIL_RATIO_P25 = _LEGACY_TAIL_RATIO_P25 / TAIL_RATIO_UNIT_SCALE     # ≈ 0.2553
+TAIL_RATIO_P75 = _LEGACY_TAIL_RATIO_P75 / TAIL_RATIO_UNIT_SCALE     # ≈ 0.7417
+TAIL_RATIO_P90 = _LEGACY_TAIL_RATIO_P90 / TAIL_RATIO_UNIT_SCALE     # ≈ 0.9302
+TAIL_RATIO_P95 = _LEGACY_TAIL_RATIO_P95 / TAIL_RATIO_UNIT_SCALE     # ≈ 1.0943
+
 
 
 SUPPORTED_STRUCTURES: tuple[str, ...] = (
@@ -214,11 +250,12 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     # distribution (743 distinct events, 2024-01-01 → 2025-06-30) generated
     # with σ_HAR computed over earnings-excluded sessions (production
     # parity). Using p10/p90 of:
-    #   historical_vs_implied_move_ratio: p10=0.12, p90=1.14
-    #   tail_vs_implied_move_ratio:       p10=0.24, p90=1.53
+    #   historical_vs_implied_move_ratio: p10=0.12, p90=1.14   (legacy units)
+    #   tail_vs_implied_move_ratio:       p10=0.24, p90=1.53   (legacy units)
     # calibration_basis="post_p5c_v2_real_corpus_743_events_2024_2025_h1"
-    move_ratio_score = _score_high_good(snapshot.historical_vs_implied_move_ratio, 0.12, 1.14)
-    tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, 0.24, 1.53)
+    # F1: ratios and bounds are both restated ÷ unit scale (see module header).
+    move_ratio_score = _score_high_good(snapshot.historical_vs_implied_move_ratio, MOVE_RATIO_P10, MOVE_RATIO_P90)
+    tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, TAIL_RATIO_P10, TAIL_RATIO_P90)
     # P-5b: peak bounds anchored on the post-P-5a real-corpus distribution
     # (747 distinct events, 2024-01-01 → 2025-06-30). Using p10/p50/p90 from
     # the canonical /tmp/p5_post_iv_expansion_v2 trade log:
@@ -338,12 +375,12 @@ def score_otm_strangle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     # P-5c v2: tail ratio bound for OTM strangle uses (p25, p90) of the
     # post-Finding-A real-corpus distribution (743 events, 2024-01-01 →
     # 2025-06-30) generated with earnings-excluded σ_HAR:
-    #   tail_vs_implied_move_ratio: p25=0.42, p90=1.53
+    #   tail_vs_implied_move_ratio: p25=0.42, p90=1.53   (legacy units; F1 restates ÷ scale)
     # Tighter lower bound than calendar (which uses p10) preserves the
     # prior relative ordering — this structure was always less permissive
     # on tail support.
     # calibration_basis="post_p5c_v2_real_corpus_743_events_2024_2025_h1"
-    tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, 0.42, 1.53)
+    tail_score = _score_high_good(snapshot.tail_vs_implied_move_ratio, TAIL_RATIO_P25, TAIL_RATIO_P90)
     event_risk = _coalesce_unit(snapshot.event_risk_score)
     move_anchor = _score_high_good(snapshot.historical_move_anchor_pct, 4.0, 10.0)
     execution = _coalesce_unit(snapshot.execution_score)
@@ -506,12 +543,12 @@ def _score_calendar(
     # P-5c v2: tail-risk penalty uses (p75, p95) of the post-Finding-A
     # real-corpus distribution (743 events, 2024-01-01 → 2025-06-30)
     # generated with earnings-excluded σ_HAR:
-    #   tail_vs_implied_move_ratio: p75=1.22, p95=1.80
+    #   tail_vs_implied_move_ratio: p75=1.22, p95=1.80   (legacy units; F1 restates ÷ scale)
     # Penalty engages only when tail ratio sits in the upper quartile of
     # the empirical distribution — preserves the prior intent that this
     # term fires for unusually fat historical tails.
     # calibration_basis="post_p5c_v2_real_corpus_743_events_2024_2025_h1"
-    tail_risk_penalty = 0.06 * _score_high_good(snapshot.tail_vs_implied_move_ratio, 1.22, 1.80)
+    tail_risk_penalty = 0.06 * _score_high_good(snapshot.tail_vs_implied_move_ratio, TAIL_RATIO_P75, TAIL_RATIO_P95)
     theta_penalty = 0.05 * (1.0 - timing)
     execution_penalty = _execution_penalty(snapshot, leg_spread_pct=leg_spread_pct, structure=structure)
     crowding_penalty = elevated_front_end_penalty

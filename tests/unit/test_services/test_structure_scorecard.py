@@ -84,8 +84,8 @@ def _base_snapshot(**overrides) -> VolSnapshot:
         historical_move_std_pct=2.1,
         historical_move_anchor_pct=7.4,
         historical_move_uncertainty_pct=0.85,
-        historical_vs_implied_move_ratio=1.28,
-        tail_vs_implied_move_ratio=1.72,
+        historical_vs_implied_move_ratio=1.6960,
+        tail_vs_implied_move_ratio=1.0457,
         smile_curvature=0.18,
         smile_concavity_flag=False,
         smile_points=7,
@@ -153,8 +153,8 @@ class TestSimulatedPriorFlag(unittest.TestCase):
             near_back_iv_ratio=0.82,
             event_move_share_of_total=0.58,
             historical_move_anchor_pct=5.6,
-            historical_vs_implied_move_ratio=0.96,
-            tail_vs_implied_move_ratio=1.05,
+            historical_vs_implied_move_ratio=1.2720,
+            tail_vs_implied_move_ratio=0.6384,
             event_risk_score=0.48,
             iv_rv_yz=0.84,
             iv_rv_har=0.86,
@@ -173,8 +173,8 @@ class TestStructureScorecards(unittest.TestCase):
     @patch("services.structure_scorecard._load_walk_forward_priors", side_effect=lambda as_of_date=None: _neutral_priors())
     def test_structure_differentiation_by_regime(self, _mock_priors):
         straddle_snapshot = _base_snapshot(
-            historical_vs_implied_move_ratio=1.72,
-            tail_vs_implied_move_ratio=1.95,
+            historical_vs_implied_move_ratio=2.2791,
+            tail_vs_implied_move_ratio=1.1855,
             historical_move_anchor_pct=8.8,
             event_implied_move_pct=6.2,
             cheapness_score=0.56,
@@ -196,8 +196,8 @@ class TestStructureScorecards(unittest.TestCase):
             near_back_iv_ratio=0.82,
             event_move_share_of_total=0.58,
             historical_move_anchor_pct=5.6,
-            historical_vs_implied_move_ratio=0.96,
-            tail_vs_implied_move_ratio=1.05,
+            historical_vs_implied_move_ratio=1.2720,
+            tail_vs_implied_move_ratio=0.6384,
             event_risk_score=0.48,
             iv_rv_yz=0.84,
             iv_rv_har=0.86,
@@ -211,10 +211,10 @@ class TestStructureScorecards(unittest.TestCase):
         )
 
         strangle_snapshot = _base_snapshot(
-            tail_vs_implied_move_ratio=2.30,
+            tail_vs_implied_move_ratio=1.3983,
             event_risk_score=0.94,
             historical_move_anchor_pct=10.4,
-            historical_vs_implied_move_ratio=1.08,
+            historical_vs_implied_move_ratio=1.4310,
             cheapness_score=0.44,
             near_back_iv_ratio=0.92,
             term_structure_slope=0.0016,
