@@ -432,3 +432,274 @@ def test_backtest_signal_snapshot_signal_ready_false_when_iv30_unbracketed() -> 
         f"Expected 'target_below_listed_expiries' in "
         f"signal_fail_reasons; got {fail_reasons!r}."
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Expiry-window coverage: the term structure must BRACKET 30D/45D when the
+# chain actually lists those expiries.
+#
+# Regression for the weekly-heavy starvation bug. bounded_interp was doing
+# its job correctly, but the caller only ever handed it the first
+# `max_term_expiries` (6) expiries BY DATE. On weekly-heavy names that
+# window closes inside ~2 weeks, so 30D/45D fell above the bracket and
+# iv30/iv45 came back None — even though the same single already-fetched
+# chain (expiration="all") carried 30D, 44D and 58D expiries. Observed live
+# on NVDA: first 6 future expiries at DTE 2/5/9/12/14/16, killing iv_rv,
+# cheapness_score and the 32%-weight IV-entry signal.
+# ──────────────────────────────────────────────────────────────────────────
+
+def _weekly_chain(as_of, dtes, iv_by_dte=None):
+    """Build a minimal ATM chain listing one expiry per entry in *dtes*."""
+    from datetime import timedelta
+
+    import pandas as pd
+
+    as_of_str = as_of.strftime("%Y-%m-%d")
+    rows = []
+    for dte in dtes:
+        expiry = (as_of + timedelta(days=int(dte))).strftime("%Y-%m-%d")
+        iv = float(iv_by_dte(dte)) if iv_by_dte else 0.30
+        for side, mid in (("C", 3.5), ("P", 3.4)):
+            rows.append({
+                "trade_date": as_of_str, "expiry": expiry, "call_put": side,
+                "strike": 100.0, "bid": mid - 0.1, "ask": mid + 0.1, "mid": mid,
+                "iv": iv, "open_interest": 1000, "volume": 500,
+                "spread_pct": 3.0, "underlying_price": 100.0,
+            })
+    return pd.DataFrame(rows)
+
+
+def _price_history(as_of):
+    import pandas as pd
+
+    dates = pd.bdate_range("2024-01-02", periods=140)
+    prices = pd.Series(100.0 + np.linspace(0, 1.0, len(dates)), index=dates)
+    return pd.DataFrame({
+        "trade_date": dates,
+        "open": prices.shift(1).fillna(prices.iloc[0] / 1.001).values,
+        "high": (prices * 1.01).values,
+        "low": (prices * 0.99).values,
+        "close": prices.values,
+    })
+
+
+def _snapshot_for(chain_df, as_of):
+    from services.earnings_vol_snapshot import build_vol_snapshot
+
+    return build_vol_snapshot(
+        "TEST",
+        as_of,
+        option_chain_data=chain_df,
+        earnings_metadata={
+            "earnings_date": (as_of.date().replace(day=min(as_of.day + 7, 28))).strftime("%Y-%m-%d"),
+            "release_timing": "after market close",
+            "prior_events": [],
+        },
+        price_data=_price_history(as_of),
+    )
+
+
+def test_weekly_heavy_chain_still_reaches_iv30_and_iv45():
+    """The live NVDA shape: 6 expiries inside 16D, then 30D/44D/58D."""
+    from datetime import datetime
+
+    as_of = datetime(2024, 7, 1)
+    # Mirrors the observed NVDA ladder (DTE 2/5/9/12/14/16 then monthlies).
+    dtes = [2, 5, 9, 12, 14, 16, 23, 30, 37, 44, 58, 93]
+    chain = _weekly_chain(as_of, dtes, iv_by_dte=lambda d: 0.45 - 0.001 * d)
+    snapshot = _snapshot_for(chain, as_of)
+
+    assert snapshot.iv30 is not None, (
+        "iv30 must interpolate when the chain lists a 30D expiry. Got None "
+        f"with null_reason={snapshot.null_reasons.get('iv30')!r}. The expiry "
+        "window in _build_term_structure_snapshot stopped short of the "
+        "interpolation target again."
+    )
+    assert snapshot.iv45 is not None, (
+        "iv45 must interpolate when the chain brackets 45D (44D and 58D are "
+        f"both listed). Got None with "
+        f"null_reason={snapshot.null_reasons.get('iv45')!r}."
+    )
+    assert "iv30" not in snapshot.null_reasons
+    assert "iv45" not in snapshot.null_reasons
+    # Near-term density is preserved: the nearest expiry still leads.
+    assert snapshot.near_term_dte == 2
+
+
+def test_short_chain_still_refuses_to_extrapolate():
+    """PR #72 discipline preserved: no far expiries => honest None."""
+    from datetime import datetime
+
+    as_of = datetime(2024, 7, 1)
+    # Genuinely short ladder — nothing at or beyond 30D exists.
+    chain = _weekly_chain(as_of, [2, 5, 9, 12, 14, 16])
+    snapshot = _snapshot_for(chain, as_of)
+
+    assert snapshot.iv30 is None, (
+        "iv30 must stay None when the chain genuinely lists nothing near 30D "
+        f"— extending the window must not start extrapolating. Got {snapshot.iv30!r}."
+    )
+    assert snapshot.null_reasons.get("iv30") == "target_above_listed_expiries"
+    assert snapshot.iv45 is None
+    assert snapshot.null_reasons.get("iv45") == "target_above_listed_expiries"
+
+
+def test_expiry_window_stops_once_target_is_covered():
+    """Extension is bounded — it must not drag in the LEAPS tail."""
+    from datetime import datetime
+
+    from services.earnings_vol_snapshot import VolSnapshotConfig
+
+    from services.earnings_vol_snapshot import _build_term_structure_snapshot
+
+    as_of = datetime(2024, 7, 1)
+    dtes = [2, 5, 9, 12, 14, 16, 23, 30, 37, 44, 58, 93, 121, 302, 485, 849]
+    chain = _weekly_chain(as_of, dtes)
+    cfg = VolSnapshotConfig()
+    term = _build_term_structure_snapshot(chain, 100.0, as_of.date(), cfg)
+
+    assert term.iv30 is not None and term.iv45 is not None
+    # Stops at the first expiry at/beyond the 45D target (58D here), so the
+    # 93D..849D LEAPS tail is never processed.
+    assert term.point_count == 11, (
+        f"Expected to stop right after covering 45D (11 expiries: 2..58), "
+        f"got point_count={term.point_count}."
+    )
+    assert term.point_count <= cfg.max_term_expiries_extended, (
+        "Expiry extension must respect max_term_expiries_extended."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# select_tenor_spanning_expiries — the FETCH-side half of the same bug.
+#
+# The yfinance collectors pay one HTTP round-trip per expiry, so they cap the
+# count. Taking "the first N by date" spends that budget entirely inside two
+# weeks on weekly-heavy names, so the chain handed to the snapshot layer
+# physically cannot bracket 30D/45D. Same budget, spanning selection.
+# ──────────────────────────────────────────────────────────────────────────
+
+_NVDA_LADDER = [
+    "2026-08-19", "2026-08-21", "2026-08-24", "2026-08-28", "2026-08-31",
+    "2026-09-02", "2026-09-04", "2026-09-11", "2026-09-18", "2026-09-25",
+    "2026-10-02", "2026-10-16", "2026-11-20", "2027-06-17",
+]
+
+
+def _dtes(selected, as_of):
+    from datetime import date as _d
+    return [(_d.fromisoformat(e) - as_of).days for e in selected]
+
+
+def test_spanning_selection_brackets_targets_within_same_budget():
+    from datetime import date
+
+    from services.iv_term_structure import select_tenor_spanning_expiries
+
+    as_of = date(2026, 8, 19)
+    selected = select_tenor_spanning_expiries(_NVDA_LADDER, as_of, max_expiries=6)
+
+    assert len(selected) == 6, "must not increase the fetch budget"
+    dtes = _dtes(selected, as_of)
+    # The naive window would have been [2, 5, 9, 12, 14, 16] — nothing >= 30.
+    assert max(dtes) >= 45, f"selection must reach the 45D target; got {dtes}"
+    assert any(d >= 30 for d in dtes), f"selection must bracket 30D; got {dtes}"
+    # Near-term density is still present for the near/back ratio.
+    assert min(dtes) == 2, f"nearest expiry must survive; got {dtes}"
+
+
+def test_spanning_selection_drops_past_and_current_expiries():
+    from datetime import date
+
+    from services.iv_term_structure import select_tenor_spanning_expiries
+
+    as_of = date(2026, 8, 19)
+    selected = select_tenor_spanning_expiries(_NVDA_LADDER, as_of, max_expiries=6)
+    # 2026-08-19 is as_of itself (DTE 0) and must not be fetched.
+    assert "2026-08-19" not in selected
+    assert all(d > 0 for d in _dtes(selected, as_of))
+
+
+def test_spanning_selection_handles_short_and_malformed_input():
+    from datetime import date
+
+    from services.iv_term_structure import select_tenor_spanning_expiries
+
+    as_of = date(2026, 8, 19)
+    # Nothing reaches the targets — take what exists, never raise.
+    short = select_tenor_spanning_expiries(
+        ["2026-08-21", "2026-08-24"], as_of, max_expiries=6
+    )
+    assert short == ["2026-08-21", "2026-08-24"]
+    # Malformed entries cost one tenor, not the whole snapshot.
+    mixed = select_tenor_spanning_expiries(
+        ["not-a-date", "2026-08-21", None, "2026-09-18"], as_of, max_expiries=6
+    )
+    assert mixed == ["2026-08-21", "2026-09-18"]
+    assert select_tenor_spanning_expiries([], as_of) == []
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Implausible ATM IV must ABSTAIN, not read as "cheap vol".
+#
+# Regression for the ORCL 2026-09-02 pre-open alert. yfinance returns
+# bid=ask=0 and an impliedVolatility placeholder (~1e-5..4e-3) for every
+# contract before the US open. A bare `> 0` filter let that through, so
+# iv30 came out at 0.0039, IV/RV at 0.002, and _iv_entry_score clipped ANY
+# ratio below 0.80 to its maximum — ranking a chain with no quotes at all as
+# the single most attractive long-vega entry (rank 0.71, alert fired).
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_placeholder_iv_is_rejected_rather_than_scored_as_cheap():
+    from datetime import datetime
+
+    from services.earnings_vol_snapshot import (
+        MIN_PLAUSIBLE_ATM_IV,
+        _build_term_structure_snapshot,
+        VolSnapshotConfig,
+    )
+
+    as_of = datetime(2026, 9, 2)
+    # The exact shape observed live: quotes absent, IV a placeholder.
+    chain = _weekly_chain(as_of, [2, 9, 16, 23, 30, 79], iv_by_dte=lambda d: 0.0039)
+    term = _build_term_structure_snapshot(chain, 100.0, as_of.date(), VolSnapshotConfig())
+
+    assert term.iv30 is None, (
+        f"A 0.39% ATM IV is an absent quote, not cheap vol; iv30 must abstain. "
+        f"Got {term.iv30!r} — MIN_PLAUSIBLE_ATM_IV ({MIN_PLAUSIBLE_ATM_IV}) was bypassed."
+    )
+    assert term.near_term_atm_iv is None
+    assert term.point_count == 0
+
+    # A real vol surface at the same tenors still works.
+    good = _weekly_chain(as_of, [2, 9, 16, 23, 30, 79], iv_by_dte=lambda d: 0.35)
+    good_term = _build_term_structure_snapshot(good, 100.0, as_of.date(), VolSnapshotConfig())
+    assert good_term.iv30 is not None and good_term.point_count >= 5
+
+
+def test_expiry_walk_is_bounded_when_every_atm_iv_is_rejected():
+    """The break conditions only engage after max_term_expiries usable points."""
+    from datetime import datetime
+    from unittest.mock import patch
+
+    import services.earnings_vol_snapshot as evs
+
+    as_of = datetime(2026, 9, 2)
+    many = list(range(2, 200, 2))  # 99 listed expiries
+    chain = _weekly_chain(as_of, many, iv_by_dte=lambda d: 0.0001)  # all rejected
+    cfg = evs.VolSnapshotConfig()
+
+    real = evs._expiry_atm_stats
+    calls = {"n": 0}
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    with patch.object(evs, "_expiry_atm_stats", side_effect=counting):
+        evs._build_term_structure_snapshot(chain, 100.0, as_of.date(), cfg)
+
+    assert calls["n"] <= cfg.max_term_expiries_extended, (
+        f"Walked {calls['n']} expiries with no usable stats; must stay bounded by "
+        f"max_term_expiries_extended ({cfg.max_term_expiries_extended})."
+    )

@@ -31,6 +31,7 @@ def snapshot_to_edge_inputs(snapshot: VolSnapshot) -> Dict[str, Any]:
         "vol_regime": snapshot.vol_regime_label,
         "iv30": snapshot.iv30,
         "iv45": snapshot.iv45,
+        "near_term_atm_iv": snapshot.near_term_atm_iv,
         "ts_slope_0_45": snapshot.term_structure_slope,
         "implied_move_pct": snapshot.near_term_implied_move_pct,
         "near_term_spread_pct": snapshot.near_term_spread_pct,

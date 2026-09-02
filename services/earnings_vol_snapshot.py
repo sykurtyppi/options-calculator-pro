@@ -33,9 +33,22 @@ from services.realized_vol import (
 )
 
 
+# Floor for a believable annualised ATM implied vol. Quotes below this are
+# provider placeholders (notably yfinance pre-open, where bid=ask=0 and IV is
+# reported as ~1e-5), not tradeable vol. See _expiry_atm_stats.
+MIN_PLAUSIBLE_ATM_IV = 0.01
+
+
 @dataclass(frozen=True)
 class VolSnapshotConfig:
     max_term_expiries: int = 6
+    # Furthest tenor the term structure is interpolated at (iv45). Expiry
+    # selection must BRACKET this or bounded_interp honestly refuses to
+    # produce iv30/iv45. See _build_term_structure_snapshot.
+    term_interp_target_days: float = 45.0
+    # Hard cap when extending past max_term_expiries to reach that target.
+    # Bounds the work on chains with very dense near-dated expiries.
+    max_term_expiries_extended: int = 16
     max_smile_expiries: int = 3
     smile_max_abs_moneyness: float = 0.20
     smile_min_points: int = 5
@@ -999,8 +1012,35 @@ def _build_term_structure_snapshot(
 
     expiry_stats: List[_ExpiryATMStats] = []
     expiries = sorted({pd.Timestamp(v).date() for v in chain_frame["expiry"].dropna().tolist() if pd.Timestamp(v).date() > as_of_date})
-    for expiry in expiries[: cfg.max_term_expiries]:
-        grp = chain_frame[pd.to_datetime(chain_frame["expiry"], errors="coerce").dt.date == expiry].copy()
+    # Expiry selection must BRACKET the tenors we interpolate (30D, 45D).
+    # A plain "first N by date" window silently starves weekly-heavy names:
+    # NVDA lists its first 6 expiries inside 16 days, so bounded_interp
+    # correctly returned None ("target_above_listed_expiries") for iv30/iv45
+    # even though the SAME already-fetched chain carried 30D, 44D and 58D
+    # expiries. That killed iv_rv, cheapness_score and the IV-entry signal
+    # on exactly the liquid names the screener cares about.
+    #
+    # Rule: always take the base near-term window (it supplies the near/back
+    # ratio and the slope origin), then keep walking out in date order ONLY
+    # until the covered range reaches the furthest interpolation target,
+    # bounded by a hard cap. The chain is fetched once with
+    # expiration="all", so the extra expiries cost CPU only — no additional
+    # provider credits. Chains that genuinely stop short still yield None
+    # plus an honest status code (PR #72 discipline is preserved).
+    expiry_dates = pd.to_datetime(chain_frame["expiry"], errors="coerce").dt.date
+    # Absolute bound: the break conditions below only engage once
+    # max_term_expiries usable points exist, so a chain whose ATM stats all come
+    # back None (illiquid, or every quote rejected by MIN_PLAUSIBLE_ATM_IV)
+    # would otherwise walk EVERY listed expiry. Pre-fix this loop was a flat
+    # expiries[:max_term_expiries] slice and could never do that.
+    for expiry in expiries[: max(cfg.max_term_expiries_extended, cfg.max_term_expiries)]:
+        if len(expiry_stats) >= cfg.max_term_expiries:
+            covered_dte = expiry_stats[-1].dte if expiry_stats else None
+            if covered_dte is not None and float(covered_dte) >= float(cfg.term_interp_target_days):
+                break
+            if len(expiry_stats) >= cfg.max_term_expiries_extended:
+                break
+        grp = chain_frame[expiry_dates == expiry].copy()
         stats = _expiry_atm_stats(grp, underlying_price, as_of_date, expiry)
         if stats.atm_iv is not None:
             expiry_stats.append(stats)
@@ -1160,7 +1200,22 @@ def _expiry_atm_stats(
         _safe_float((row or {}).get("iv"), np.nan)
         for row in (call_row, put_row)
     ]
-    iv_candidates = [val for val in iv_candidates if np.isfinite(val) and val > 0]
+    # A positive-but-implausible ATM IV is WORSE than a missing one. Before the
+    # US open, yfinance returns bid=ask=0 for every contract and an
+    # impliedVolatility placeholder in the 1e-5..4e-3 range. That is not a cheap
+    # option, it is an absent quote — but it survives a bare `val > 0` filter,
+    # propagates into iv30, and lands as an IV/RV near zero. `_iv_entry_score`
+    # then clips ANY ratio below 0.80 to its maximum, so garbage scores as the
+    # single most attractive long-vega entry available and can rank #1.
+    # Observed live: ORCL 2026-09-02 pre-open, ATM IV 0.0039 -> IV/RV 0.002 ->
+    # rank 0.71 -> alert fired on a chain with no quotes at all.
+    # No listed equity option trades at an annualised ATM IV below 1%, so treat
+    # anything under the floor as absent and let the caller's null_reasons say
+    # so — the same refuse-rather-than-fabricate rule as bounded_interp (PR #72).
+    iv_candidates = [
+        val for val in iv_candidates
+        if np.isfinite(val) and val >= MIN_PLAUSIBLE_ATM_IV
+    ]
     atm_iv = float(np.mean(iv_candidates)) if iv_candidates else None
 
     call_mid = _safe_float((call_row or {}).get("mid"), np.nan)

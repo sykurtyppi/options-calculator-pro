@@ -10,6 +10,12 @@ from services.screener_service import compute_ranking_score
 from services.structure_scorecard import StructureScorecard
 from services.structure_selector import SelectorOutput
 import web.api.edge_engine as edge_engine
+from web.api.edge_math import (
+    SIGMA_TO_EXPECTED_ABS_MOVE,
+    SIGMA_TO_P90_ABS_MOVE,
+    _event_implied_expected_abs_move_pct,
+    _event_implied_p90_abs_move_pct,
+)
 from web.api.edge_engine import (
     _classify_move_risk,
     _compute_move_uncertainty_pct,
@@ -457,7 +463,7 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
             ]
         )
 
-        with patch.object(edge_engine, "_utc_today_date", return_value=datetime(2024, 7, 1).date()):
+        with patch.object(edge_engine, "_market_today_date", return_value=datetime(2024, 7, 1).date()):
             legacy_profile = _historical_earnings_move_profile(close=prices, earnings_events=earnings_events)
 
         snapshot = build_vol_snapshot(
@@ -667,30 +673,83 @@ class TestEdgeEngineResearchSignals(unittest.TestCase):
         self.assertEqual(source_2, "yfinance_^IRX")
         ticker_ctor.assert_called_once_with("^IRX")
 
+    # NOTE: the second arg is a 1σ implied move; the classifier compares the
+    # historical P90 against the implied P90 (σ·Φ⁻¹(0.95)). A fairly priced
+    # event (P90_hist ≈ σ·1.645) is "moderate", not "elevated".
     def test_classify_move_risk_elevated(self):
-        level, ratio = _classify_move_risk(9.2, 7.0, sample_size=8)
+        # P90_hist well above the implied P90 (7.0·1.645 ≈ 11.51).
+        level, ratio = _classify_move_risk(14.0, 7.0, sample_size=8)
         self.assertEqual(level, "elevated")
-        self.assertAlmostEqual(ratio, 9.2 / 7.0, places=6)
+        self.assertAlmostEqual(ratio, 14.0 / (7.0 * SIGMA_TO_P90_ABS_MOVE), places=6)
 
     def test_classify_move_risk_moderate(self):
-        level, ratio = _classify_move_risk(7.0, 7.0, sample_size=8)
+        # Fairly priced: historical P90 ≈ implied P90 → ratio ≈ 1.0.
+        p90 = 7.0 * SIGMA_TO_P90_ABS_MOVE
+        level, ratio = _classify_move_risk(p90, 7.0, sample_size=8)
         self.assertEqual(level, "moderate")
         self.assertAlmostEqual(ratio, 1.0, places=6)
 
     def test_classify_move_risk_low(self):
-        level, ratio = _classify_move_risk(5.5, 7.0, sample_size=8)
+        level, ratio = _classify_move_risk(9.0, 7.0, sample_size=8)
         self.assertEqual(level, "low")
-        self.assertAlmostEqual(ratio, 5.5 / 7.0, places=6)
+        self.assertAlmostEqual(ratio, 9.0 / (7.0 * SIGMA_TO_P90_ABS_MOVE), places=6)
 
     def test_classify_move_risk_low_downgrades_on_thin_sample(self):
-        level, ratio = _classify_move_risk(5.5, 7.0, sample_size=4)
+        level, ratio = _classify_move_risk(9.0, 7.0, sample_size=4)
         self.assertEqual(level, "moderate")
-        self.assertAlmostEqual(ratio, 5.5 / 7.0, places=6)
+        self.assertAlmostEqual(ratio, 9.0 / (7.0 * SIGMA_TO_P90_ABS_MOVE), places=6)
 
     def test_classify_move_risk_unknown_without_inputs(self):
         level, ratio = _classify_move_risk(None, 7.0, sample_size=8)
         self.assertEqual(level, "unknown")
         self.assertIsNone(ratio)
+
+
+class EventEdgeUnitsConsistencyTest(unittest.TestCase):
+    """Regression guard for the σ-vs-absolute-move estimator mismatch.
+
+    The event-implied move is a 1σ statistic; the historical anchor/P90 are
+    absolute-move statistics. A *fairly priced* event — one whose implied event
+    σ equals the realized event σ — must book ~0 gross edge and a ~1.0 tail
+    ratio once both sides are expressed in the same statistic. Before the fix,
+    comparing 1σ directly against E|move| booked ~+0.20–0.33σ of phantom edge.
+    """
+
+    def test_sigma_shape_factors(self):
+        # E|X|/σ = √(2/π); P90(|X|)/σ = Φ⁻¹(0.95).
+        self.assertAlmostEqual(SIGMA_TO_EXPECTED_ABS_MOVE, 0.7978845608, places=9)
+        self.assertAlmostEqual(SIGMA_TO_P90_ABS_MOVE, 1.6448536270, places=9)
+
+    def test_fairly_priced_event_has_zero_gross_edge(self):
+        # A fair event: implied event σ = 8.0%. Under N(0, σ²) the realized
+        # absolute moves have mean E|X| = σ·√(2/π). Build a symmetric historical
+        # profile whose anchor equals exactly that, so median == avg_last4 and
+        # the mean/median blend is irrelevant.
+        implied_sigma_pct = 8.0
+        fair_mean_abs = implied_sigma_pct * SIGMA_TO_EXPECTED_ABS_MOVE
+        move_anchor_pct = _compute_move_anchor(
+            median_move_pct=fair_mean_abs, avg_last4_move_pct=fair_mean_abs
+        )
+        implied_expected = _event_implied_expected_abs_move_pct(implied_sigma_pct)
+        gross_edge = implied_expected - move_anchor_pct
+        self.assertAlmostEqual(gross_edge, 0.0, places=9)
+
+        # Contrast: the pre-fix comparison (raw σ vs absolute anchor) would book
+        # ~+0.20σ of phantom edge on the very same fair event.
+        legacy_biased_edge = implied_sigma_pct - move_anchor_pct
+        self.assertGreater(legacy_biased_edge, 0.20 * implied_sigma_pct)
+
+    def test_fairly_priced_event_tail_ratio_is_moderate(self):
+        implied_sigma_pct = 8.0
+        fair_p90 = implied_sigma_pct * SIGMA_TO_P90_ABS_MOVE
+        level, ratio = _classify_move_risk(fair_p90, implied_sigma_pct, sample_size=8)
+        self.assertAlmostEqual(ratio, 1.0, places=6)
+        self.assertEqual(level, "moderate")
+
+    def test_p90_conversion_matches_expected(self):
+        self.assertAlmostEqual(
+            _event_implied_p90_abs_move_pct(8.0), 8.0 * SIGMA_TO_P90_ABS_MOVE, places=9
+        )
 
     def test_max_near_term_spread_threshold_matches_scorecard_eligibility(self):
         """Edge-engine hard gate must mirror scorecard eligibility threshold.

@@ -168,7 +168,7 @@ class TestAnalyzeSingleTickerGolden(unittest.TestCase):
     def test_golden_pins_full_metrics_surface(self):
         """Guard against the golden silently shrinking — pins the key count."""
         golden = json.loads(_FIXTURE.read_text())
-        self.assertEqual(len(golden["metrics"]), 155,
+        self.assertEqual(len(golden["metrics"]), 157,
                          "golden metrics key count changed; confirm intentional")
 
 
