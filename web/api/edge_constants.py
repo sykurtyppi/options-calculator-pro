@@ -7,6 +7,8 @@ existing `from web.api.edge_engine import <CONST>` paths keep working.
 """
 from __future__ import annotations
 
+from services.move_statistics import MOVE_ANCHOR_AVG_LAST4_WEIGHT
+
 from typing import Any, Dict
 
 
@@ -64,7 +66,10 @@ LOW_EVENT_COUNT_CONFIDENCE_CAP_PCT = 60.0  # 1–7 earnings events (real but thi
 _HEURISTIC_THRESHOLDS: Dict[str, Any] = {
     # ── Move anchor blend ─────────────────────────────────────────────────────
     "move_anchor_avg_last4_weight": {
-        "value": 0.65,
+        # Single definition lives in services.move_statistics (the snapshot
+        # layer uses it and cannot import web/). This registry entry is the
+        # documented, tunable mirror; a test asserts the two agree.
+        "value": MOVE_ANCHOR_AVG_LAST4_WEIGHT,
         "assumption": True,
         "rationale": "Weight on avg(last 4 earnings moves) vs median. "
                      "Recency bias intentional but magnitude (65/35) is subjective.",

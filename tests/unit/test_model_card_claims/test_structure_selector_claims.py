@@ -49,7 +49,7 @@ def _snapshot(**overrides) -> VolSnapshot:
         historical_median_move_pct=7.4, historical_avg_last4_move_pct=7.8,
         historical_p90_move_pct=10.2, historical_move_std_pct=2.0,
         historical_move_anchor_pct=7.6, historical_move_uncertainty_pct=0.8,
-        historical_vs_implied_move_ratio=1.30, tail_vs_implied_move_ratio=1.72,
+        historical_vs_implied_move_ratio=1.7225, tail_vs_implied_move_ratio=1.0457,
         smile_curvature=0.18, smile_concavity_flag=False, smile_points=6,
         near_term_spread_pct=2.4, near_term_liquidity_proxy=4200.0,
         atm_call_spread_pct=2.3, atm_put_spread_pct=2.5,

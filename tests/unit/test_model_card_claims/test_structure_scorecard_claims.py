@@ -55,7 +55,7 @@ def _snapshot(**overrides) -> VolSnapshot:
         historical_median_move_pct=7.4, historical_avg_last4_move_pct=7.8,
         historical_p90_move_pct=10.2, historical_move_std_pct=2.0,
         historical_move_anchor_pct=7.6, historical_move_uncertainty_pct=0.8,
-        historical_vs_implied_move_ratio=1.30, tail_vs_implied_move_ratio=1.72,
+        historical_vs_implied_move_ratio=1.7225, tail_vs_implied_move_ratio=1.0457,
         smile_curvature=0.18, smile_concavity_flag=False, smile_points=6,
         near_term_spread_pct=2.4, near_term_liquidity_proxy=4200.0,
         atm_call_spread_pct=2.3, atm_put_spread_pct=2.5,
@@ -73,9 +73,9 @@ def test_structure_differentiation() -> None:
     """Cheap options (low IV/RV → low crowding penalty) score better for straddle; scores differ across structures."""
     # High iv_rv_har drives crowding_intensity up → bigger crowding_penalty → lower composite score.
     snap_expensive = _snapshot(iv_rv_yz=1.40, iv_rv_har=1.45, iv30=0.30,
-                               historical_vs_implied_move_ratio=1.55)
+                               historical_vs_implied_move_ratio=2.0538)
     snap_cheap = _snapshot(iv_rv_yz=0.85, iv_rv_har=0.80, iv30=0.18,
-                           historical_vs_implied_move_ratio=1.10)
+                           historical_vs_implied_move_ratio=1.4575)
     with patch("services.structure_scorecard._load_walk_forward_priors", return_value=_neutral_priors()):
         straddle_expensive = score_atm_straddle(snap_expensive).composite_structure_score
         straddle_cheap = score_atm_straddle(snap_cheap).composite_structure_score

@@ -27,6 +27,7 @@ try:
 except ImportError:
     pass
 
+from services.move_statistics import MOVE_RATIO_UNITS_VERSION
 from services.learning_diagnostics import build_learning_diagnostics
 from services.baseline_evidence_store import (
     BASELINE_STRUCTURES,
@@ -1354,6 +1355,7 @@ def run_forward_screener(
                 iv_rv_yz=_get(vol_snapshot, "iv_rv_yz"),
                 iv_rv_har=_get(vol_snapshot, "iv_rv_har"),
                 historical_vs_implied_move_ratio=_get(vol_snapshot, "historical_vs_implied_move_ratio"),
+                move_ratio_units_version=MOVE_RATIO_UNITS_VERSION,  # F1: 1.0-fair basis
                 term_structure_slope=_get(vol_snapshot, "term_structure_slope"),
                 near_term_spread_pct=_get(vol_snapshot, "near_term_spread_pct"),
                 liquidity_tier=_get(vol_snapshot, "liquidity_tier"),

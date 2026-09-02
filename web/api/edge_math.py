@@ -27,49 +27,29 @@ from web.api.edge_constants import (
 logger = logging.getLogger(__name__)
 
 
-# ── Lognormal/normal shape factors (dimensional-consistency fix) ───────────
-# The event-vol decomposition (services.event_vol_decomposition) yields the
-# implied event move in **1σ form**. Historical earnings moves, by contrast,
-# are realized ABSOLUTE moves |Δ|/S — a different statistic of the same
-# distribution. Comparing a 1σ implied move directly against a historical
-# absolute-move anchor or percentile biases every edge/tail metric upward,
-# because for X ~ N(0, σ²):
-#     E|X|       = σ·√(2/π)      ≈ 0.798·σ   (mean absolute move)
-#     median|X|  = σ·Φ⁻¹(0.75)   ≈ 0.674·σ
-#     P90 of |X| = σ·Φ⁻¹(0.95)   ≈ 1.645·σ
-# A 1σ implied move must therefore be converted to the matching absolute-move
-# statistic before comparison. Historically this was NOT done, so a fairly
-# priced event still registered ~+0.20–0.33·σ of spurious "edge" and the tail
-# classifier over-fired "elevated" (ratio ≈ 1.645 for a fair event).
-SIGMA_TO_EXPECTED_ABS_MOVE = math.sqrt(2.0 / math.pi)  # E|X|/σ ≈ 0.79788
-SIGMA_TO_P90_ABS_MOVE = 1.6448536269514722             # Φ⁻¹(0.95); P90 of |X| / σ
-# median|X| / E|X| for X ~ N(0, σ²) = Φ⁻¹(0.75) / √(2/π).
-MEDIAN_TO_MEAN_ABS_MOVE = 0.6744897501960817 / SIGMA_TO_EXPECTED_ABS_MOVE  # ≈ 0.845348
+# ── Move-statistic unit conversions ───────────────────────────────────────
+# Single source of truth is services.move_statistics (the snapshot layer needs
+# it and must not import upward from web/). Every name below is re-exported so
+# existing `from web.api.edge_math import …` call sites and tests keep working.
+from services.move_statistics import (  # noqa: E402
+    ANCHOR_RATIO_UNIT_SCALE,
+    MEDIAN_TO_MEAN_ABS_MOVE,
+    SIGMA_TO_EXPECTED_ABS_MOVE,
+    SIGMA_TO_P90_ABS_MOVE,
+    TAIL_RATIO_UNIT_SCALE,
+    anchor_blend_to_expected_abs_scale as _services_anchor_blend_scale,
+)
 
 
 def _anchor_blend_to_expected_abs_scale() -> float:
     """Scale of the historical move ANCHOR relative to a true E|move|.
 
-    ``_compute_move_anchor`` blends two different statistics:
-        anchor = w·mean|last 4| + (1-w)·median|all|
-    The mean term estimates E|X|, but the median term estimates only
-    ≈0.845·E|X|, so the blend sits systematically BELOW E|move| — at w=0.65,
-    about 0.9459·E|move|.
-
-    Comparing a pure-E|move| implied term against that blend therefore still
-    books ~+5.7% of spurious richness on a fairly priced event: the ratio's
-    fair-value point lands at 1.057 rather than 1.0, and the UI's tone
-    thresholds (good ≥1.05) paint a fairly priced event green. Dividing the
-    anchor by this scale expresses it on the same E|move| basis as the implied
-    side, which is the completion of the σ-vs-absolute fix above.
-
-    Derived from the live weight rather than hard-coded, so retuning
-    ``move_anchor_avg_last4_weight`` cannot silently decalibrate the ratio.
-    The 0.845 factor assumes a normal null; real earnings moves are fatter-
-    tailed, which would push the true scale slightly lower still.
+    Reads the blend weight from the edge_constants registry at CALL time (so a
+    retuned weight can never diverge from _compute_move_anchor, which reads the
+    same registry) and delegates the math to services.move_statistics.
     """
     w = float(_HEURISTIC_THRESHOLDS["move_anchor_avg_last4_weight"]["value"])
-    return float(w + (1.0 - w) * MEDIAN_TO_MEAN_ABS_MOVE)
+    return _services_anchor_blend_scale(w)
 
 
 ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE = _anchor_blend_to_expected_abs_scale()
@@ -85,10 +65,6 @@ def _anchor_expected_abs_move_pct(move_anchor_pct: Optional[float]) -> float:
     anchor = _safe_float(move_anchor_pct, np.nan)
     if not np.isfinite(anchor):
         return float("nan")
-    # Read the blend weight at CALL time, exactly as _compute_move_anchor does,
-    # so the two can never diverge if the weight is retuned after import. The
-    # module-level ANCHOR_BLEND_TO_EXPECTED_ABS_MOVE is kept as the documented
-    # reference value, not as the runtime source of truth.
     return float(anchor / _anchor_blend_to_expected_abs_scale())
 
 

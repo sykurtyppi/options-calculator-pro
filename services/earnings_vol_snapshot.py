@@ -14,6 +14,11 @@ from services.earnings_move_profile import (
     normalize_release_timing as _normalize_release_timing,
 )
 from services.event_vol_decomposition import decompose_event_vol
+from services.move_statistics import (
+    MOVE_ANCHOR_AVG_LAST4_WEIGHT,
+    historical_vs_implied_ratio,
+    tail_vs_implied_ratio,
+)
 from services.iv_term_structure import (
     INTERP_INSUFFICIENT_POINTS,
     INTERP_NO_DATA,
@@ -516,14 +521,24 @@ def build_vol_snapshot(
     if historical_move_uncertainty_pct is None:
         null_reasons["historical_move_uncertainty_pct"] = "insufficient_historical_move_data"
 
+    # Codex F1: event_implied_move_pct is a 1σ move; the anchor and p90 are
+    # ABSOLUTE-move statistics. Dividing them directly put a fairly priced
+    # event at 0.755 (anchor) and 1.645 (tail), and every "above 1" reading —
+    # rationale text, the UI gates, _event_risk_score — was on an unlabelled
+    # scale. Both ratios are now on a common basis so 1.0 == fairly priced:
+    #   anchor ratio: (anchor / blend-shrink) / (σ·√(2/π))
+    #   tail ratio:   p90 / (σ·Φ⁻¹(0.95))
+    # See services.move_statistics for the derivation and the exact scales.
     historical_vs_implied_move_ratio: Optional[float] = None
     tail_vs_implied_move_ratio: Optional[float] = None
     if historical_move_anchor_pct is not None and event_implied_move_pct is not None and event_implied_move_pct > 0:
-        historical_vs_implied_move_ratio = float(historical_move_anchor_pct / event_implied_move_pct)
+        historical_vs_implied_move_ratio = historical_vs_implied_ratio(
+            historical_move_anchor_pct, event_implied_move_pct, weight=MOVE_ANCHOR_AVG_LAST4_WEIGHT,
+        )
     else:
         null_reasons["historical_vs_implied_move_ratio"] = "historical_move_anchor_or_event_implied_move_unavailable"
     if move_profile.p90_move_pct is not None and event_implied_move_pct is not None and event_implied_move_pct > 0:
-        tail_vs_implied_move_ratio = float(move_profile.p90_move_pct / event_implied_move_pct)
+        tail_vs_implied_move_ratio = tail_vs_implied_ratio(move_profile.p90_move_pct, event_implied_move_pct)
     else:
         null_reasons["tail_vs_implied_move_ratio"] = "historical_p90_or_event_implied_move_unavailable"
 
@@ -1369,7 +1384,8 @@ def _compute_move_anchor(median_move_pct: Optional[float], avg_last4_move_pct: O
     median_val = _safe_float(median_move_pct, np.nan)
     avg4_val = _safe_float(avg_last4_move_pct, np.nan)
     if np.isfinite(median_val) and np.isfinite(avg4_val):
-        return float(0.65 * avg4_val + 0.35 * median_val)
+        w = MOVE_ANCHOR_AVG_LAST4_WEIGHT  # single definition (services.move_statistics)
+        return float(w * avg4_val + (1.0 - w) * median_val)
     if np.isfinite(avg4_val):
         return float(avg4_val)
     if np.isfinite(median_val):
@@ -1513,6 +1529,15 @@ def _event_risk_score(
     components: List[float] = []
     if event_move_share_of_total is not None and np.isfinite(event_move_share_of_total):
         components.append(float(np.clip(event_move_share_of_total, 0.0, 1.0)))
+    # These offsets are hand-set (no calibration_basis) and read as "0.5 = no
+    # excess risk … 1.5 = full", i.e. they assume ~1.0 is fair. Until Codex F1
+    # the ratios fed here were on an unlabelled scale where a FAIR event sat at
+    # 0.755 (anchor) and 1.645 (tail): the anchor component under-read and the
+    # tail component was pinned at ≈0.95 for every symbol. With the ratios now
+    # on the 1.0-fair basis the literals mean what they say; a fair event
+    # scores 0.5 / 0.3 here instead of 0.255 / 0.945. This is the ONE intended
+    # behaviour change of F1 (the corpus-calibrated scorecard bounds rescale
+    # exactly and their scores do not move).
     if historical_vs_implied_move_ratio is not None and np.isfinite(historical_vs_implied_move_ratio):
         components.append(float(np.clip((historical_vs_implied_move_ratio - 0.5) / 1.0, 0.0, 1.0)))
     if tail_vs_implied_move_ratio is not None and np.isfinite(tail_vs_implied_move_ratio):
