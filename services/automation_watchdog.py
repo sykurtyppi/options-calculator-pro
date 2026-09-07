@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from services import external_io_gate
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_HOME = Path.home() / ".options_calculator_pro"
@@ -193,8 +196,15 @@ def send_imessage(
     message: str,
     *,
     config: IMessageConfig,
-    timeout_seconds: float = 10.0,
+    timeout_seconds: float = 30.0,
+    retries: int = 1,
 ) -> dict[str, Any]:
+    # osascript's hand-off to Messages.app can briefly stall when the app is
+    # cold or busy — observed in production as a run of TimeoutExpired at the
+    # old 10s ceiling (Aug 2026), which dropped that day's alert entirely. Give
+    # it 30s and one retry on timeout so a slow-to-wake Messages.app costs a few
+    # seconds, not a missed alert. Only timeouts retry; a real osascript error
+    # (bad recipient, Messages not signed in) still fails fast.
     external_io_gate.assert_allowed(external_io_gate.Category.IMESSAGE)
     script = """
 on run argv
@@ -207,13 +217,25 @@ on run argv
   end tell
 end run
 """
-    subprocess.run(
-        ["osascript", "-e", script, config.to_address, message[:1500]],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-    )
+    argv = ["osascript", "-e", script, config.to_address, message[:1500]]
+    attempts = max(1, retries + 1)
+    for attempt in range(attempts):
+        try:
+            subprocess.run(
+                argv,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            break
+        except subprocess.TimeoutExpired:
+            if attempt + 1 >= attempts:
+                raise
+            logger.warning(
+                "iMessage send timed out after %.0fs (attempt %d/%d); retrying.",
+                timeout_seconds, attempt + 1, attempts,
+            )
     return {
         "sent": True,
         "provider": "imessage",
