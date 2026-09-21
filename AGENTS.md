@@ -13,7 +13,7 @@ These rules apply to the entire repository.
 
 - Python: `pytest -q`
 - Golden product cases: `pytest -q tests/golden/test_frozen_product_cases.py tests/unit/test_web/test_analyze_single_ticker_golden.py`
-- Frontend: `cd web/frontend && npm ci && npm run lint && npm run build`
+- Frontend: `cd web/frontend && npm ci && npm test && npm run test:dom && npm run build`
 - Run the CI workflow's security and policy checks before a merge claim; a subset does not clear the repository.
 
 ## Quantitative and data boundaries

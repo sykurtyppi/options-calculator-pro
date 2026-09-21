@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import services.structure_prior_store as prior_store_module
+import services.structure_scorecard as scorecard_module
 from services.earnings_vol_snapshot import build_vol_snapshot
 from services.structure_prior_store import StructurePriorStore
 from services.structure_scorecard import build_structure_scorecards
@@ -29,14 +30,23 @@ def _snapshot(chain):
 
 def _decision(snapshot, monkeypatch, tmp_path):
     store = StructurePriorStore(tmp_path / "isolated-priors.json")
-    monkeypatch.setattr(prior_store_module, "get_structure_prior_store", lambda: store)
-    cards = build_structure_scorecards(snapshot, as_of_date=snapshot.as_of_date)
-    output = select_best_structure(snapshot, cards)
-    ranked = sorted(
-        (card for card in cards if card.eligible),
-        key=lambda card: (card.composite_structure_score, card.expected_edge_pct),
-        reverse=True,
-    )
+    with monkeypatch.context() as isolated:
+        isolated.setattr(
+            prior_store_module,
+            "get_structure_prior_store",
+            lambda *_args, **_kwargs: store,
+        )
+        scorecard_module._load_walk_forward_priors.cache_clear()
+        try:
+            cards = build_structure_scorecards(snapshot, as_of_date=snapshot.as_of_date)
+            output = select_best_structure(snapshot, cards)
+            ranked = sorted(
+                (card for card in cards if card.eligible),
+                key=lambda card: (card.composite_structure_score, card.expected_edge_pct),
+                reverse=True,
+            )
+        finally:
+            scorecard_module._load_walk_forward_priors.cache_clear()
     return output, ranked
 
 
@@ -91,3 +101,56 @@ def test_provider_outage_degrades_to_real_selector_no_trade(monkeypatch, tmp_pat
     assert decision.recommendation == expected["recommendation"]
     assert decision.best_structure is None
     assert "failed a hard eligibility rule" in decision.why_this_structure[0]
+
+
+def test_decision_ignores_priors_cached_before_store_isolation(monkeypatch, tmp_path):
+    warmed_store = StructurePriorStore(tmp_path / "warmed-priors.json")
+    for idx in range(5):
+        warmed_store.update(
+            structure="atm_straddle",
+            realized_return_pct=10.0,
+            realized_expansion_pct=5.0,
+            source_type="paper",
+            observation_date=date(2026, 4, idx + 1),
+            observation_id=f"warmed-{idx}",
+        )
+
+    monkeypatch.setattr(
+        prior_store_module, "get_structure_prior_store", lambda *_args, **_kwargs: warmed_store,
+    )
+    scorecard_module._load_walk_forward_priors.cache_clear()
+    warmed = scorecard_module._load_walk_forward_priors(
+        as_of_date=date.fromisoformat(CASE["as_of_date"]),
+    )
+    assert warmed["atm_straddle"].source.startswith("persistent_store:")
+
+    snapshot = _snapshot(CASE["option_chain"])
+    _decision(snapshot, monkeypatch, tmp_path)
+
+    restored = scorecard_module._load_walk_forward_priors(
+        as_of_date=snapshot.as_of_date,
+    )
+    assert restored["atm_straddle"].source.startswith("persistent_store:")
+
+
+def test_decision_isolation_does_not_cache_values_after_real_getter_restored(
+    monkeypatch, tmp_path,
+):
+    real_getter = prior_store_module.get_structure_prior_store
+    snapshot = _snapshot(CASE["option_chain"])
+
+    _decision(snapshot, monkeypatch, tmp_path)
+
+    calls = 0
+
+    def tracked_real_getter(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_getter(*args, **kwargs)
+
+    monkeypatch.setattr(
+        prior_store_module, "get_structure_prior_store", tracked_real_getter,
+    )
+    scorecard_module._load_walk_forward_priors(as_of_date=snapshot.as_of_date)
+
+    assert calls == 1, "same-date lookup reused priors cached from the isolated store"
