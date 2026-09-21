@@ -10,6 +10,19 @@ Selector-first event-volatility decision platform for earnings setups.
 > README covers what the project IS; the runbook covers how to operate
 > it.
 
+> **Research tool, not a trading system.** Scores, rankings, "expected edge",
+> "expected return" and "confidence" are score-derived diagnostics from heuristic
+> rules and small samples — not calibrated probabilities, not return forecasts,
+> and not evidence of a demonstrated edge. Not financial advice. See
+> **[DISCLAIMER.md](DISCLAIMER.md)**.
+
+## License
+
+Proprietary — all rights reserved. The source is public to read, but publication
+grants no licence to use, modify, or redistribute it. See **[LICENSE](LICENSE)**.
+Third-party market data is governed by each provider's own terms, not by this
+licence.
+
 ## Scope
 - Single-ticker event-volatility analysis and structure selection.
 - Ranked earnings screener and walk-forward OOS report card generation.
