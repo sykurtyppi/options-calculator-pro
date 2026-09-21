@@ -313,6 +313,23 @@ class TestEarningsVolSnapshot(unittest.TestCase):
         self.assertIsNone(prices.index.tz)
         self.assertEqual(prices["Close"].tolist(), [100.0, 101.0, 102.0])
 
+    def test_duplicate_intraday_prices_keep_final_bar_for_displayed_date(self):
+        prices, _ = _normalize_price_frame(
+            pd.DataFrame(
+                {
+                    "trade_date": [
+                        "2026-04-20 15:59:00",
+                        "2026-04-20 09:30:00",
+                        "2026-04-20 12:00:00",
+                    ],
+                    "close": [101.0, 99.0, 100.0],
+                }
+            )
+        )
+
+        self.assertEqual(prices.index.tolist(), [pd.Timestamp("2026-04-20")])
+        self.assertEqual(prices["Close"].tolist(), [101.0])
+
     def test_mixed_timestamp_chain_drops_future_and_invalid_trade_date_poison(self):
         base_chain = _make_chain()
         expected = self._build_snapshot(

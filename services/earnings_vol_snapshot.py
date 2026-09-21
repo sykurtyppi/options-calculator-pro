@@ -736,21 +736,26 @@ def _safe_float(value: Any, default: float = np.nan) -> float:
 # (canonical single source of truth) at the top of this module.
 
 
-def _normalize_provider_calendar_dates(values: pd.Series) -> pd.Series:
-    """Parse provider dates independently, preserving each displayed date."""
-    normalized: List[pd.Timestamp | pd.NaTType] = []
+def _parse_provider_timestamps(values: pd.Series) -> pd.Series:
+    """Parse provider timestamps independently, preserving displayed local time."""
+    parsed_values: List[Any] = []
     for value in values:
         try:
             parsed = pd.Timestamp(value)
         except (TypeError, ValueError):
             parsed = pd.NaT
         if pd.isna(parsed):
-            normalized.append(pd.NaT)
+            parsed_values.append(pd.NaT)
             continue
         if parsed.tzinfo is not None:
             parsed = parsed.tz_localize(None)
-        normalized.append(parsed.normalize())
-    return pd.Series(normalized, index=values.index, dtype="datetime64[ns]")
+        parsed_values.append(parsed)
+    return pd.Series(parsed_values, index=values.index, dtype="datetime64[ns]")
+
+
+def _normalize_provider_calendar_dates(values: pd.Series) -> pd.Series:
+    """Parse provider dates independently, preserving each displayed date."""
+    return _parse_provider_timestamps(values).dt.normalize()
 
 
 def _normalize_price_frame(price_data: Any) -> Tuple[pd.DataFrame, Optional[str]]:
@@ -782,7 +787,7 @@ def _normalize_price_frame(price_data: Any) -> Tuple[pd.DataFrame, Optional[str]
             date_col = candidate
             break
     if date_col is not None:
-        df[date_col] = _normalize_provider_calendar_dates(df[date_col])
+        df[date_col] = _parse_provider_timestamps(df[date_col])
         df = df.dropna(subset=[date_col]).set_index(date_col)
 
     return _finalize_price_frame(df), "provided"
@@ -791,8 +796,9 @@ def _normalize_price_frame(price_data: Any) -> Tuple[pd.DataFrame, Optional[str]
 def _finalize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     index_values = pd.Series(out.index, index=range(len(out)))
-    out.index = pd.DatetimeIndex(_normalize_provider_calendar_dates(index_values))
-    out = out[~out.index.isna()].sort_index()
+    out.index = pd.DatetimeIndex(_parse_provider_timestamps(index_values))
+    out = out[~out.index.isna()].sort_index(kind="stable")
+    out.index = out.index.normalize()
     out = out[~out.index.duplicated(keep="last")]
     for col in ("Open", "High", "Low", "Close", "Volume"):
         if col in out.columns:
