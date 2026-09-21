@@ -250,6 +250,11 @@ def _primary_thesis(snapshot: VolSnapshot, scorecard: StructureScorecard, recomm
             f"OTM strangle leads because the snapshot shows elevated event-tail risk that is better monetized by wings "
             f"than by an ATM or calendar structure."
         )
+    if scorecard.structure == "iron_condor":
+        return (
+            "Iron condor leads because implied looks rich versus realized (a high crush signal with contained "
+            "historical tails), so the defined-risk sale of both wings is favored over buying the move."
+        )
     return (
         f"{scorecard.structure.replace('_', ' ').title()} leads because front-end pricing still looks relatively cheap "
         f"versus the back term, with a term structure that supports carrying longer-dated vega."
@@ -266,6 +271,8 @@ def _common_risks(snapshot: VolSnapshot, scorecard: Optional[StructureScorecard]
         risks.append("Data quality is not perfect, so the snapshot should be treated as an auditable estimate rather than ground truth.")
     if scorecard is None or scorecard.structure in {"atm_straddle", "otm_strangle"}:
         risks.append("A muted earnings reaction can still overwhelm IV expansion if theta decay dominates before the event.")
+    elif scorecard.structure == "iron_condor":
+        risks.append("As a short-vol sale, the defining risk is inverted: an outsized move that breaches a short strike caps out the loss, and an overnight gap can jump straight to it.")
     else:
         risks.append("Large historical tails still matter because a calendar can lag if the front-end premium is already elevated.")
     return risks[:4]
@@ -295,6 +302,12 @@ def _explain_selected(
         bullets.append(
             f"Move-fit is supported by historical/implied ratio {snapshot.historical_vs_implied_move_ratio if snapshot.historical_vs_implied_move_ratio is not None else 0.0:.2f} "
             f"and tail/implied ratio {snapshot.tail_vs_implied_move_ratio if snapshot.tail_vs_implied_move_ratio is not None else 0.0:.2f}."
+        )
+    elif scorecard.structure == "iron_condor":
+        bullets.append(
+            f"Sell-side fit is inverted: historical/implied ratio {snapshot.historical_vs_implied_move_ratio if snapshot.historical_vs_implied_move_ratio is not None else 0.0:.2f} "
+            f"and tail/implied ratio {snapshot.tail_vs_implied_move_ratio if snapshot.tail_vs_implied_move_ratio is not None else 0.0:.2f} "
+            "below 1 favor the seller, and a rich IV/RV funds the credit."
         )
     else:
         bullets.append(

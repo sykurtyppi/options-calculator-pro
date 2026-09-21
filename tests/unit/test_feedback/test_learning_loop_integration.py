@@ -106,11 +106,12 @@ def test_finalize_updates_priors_and_invalidates_cache(paths) -> None:
     """After finalize(), the prior store has a new observation AND the scorecard
     cache is cleared so the next _load_walk_forward_priors() sees the update.
 
-    Design: seed MIN_OBS_FOR_OVERRIDE-1 observations so the cache primes with
-    neutral priors (below threshold).  Finalizing the threshold-crossing trade
-    must both persist the observation AND evict the stale cache entry — verified
-    by asserting the post-finalize call returns a *new* dict with history_count
-    equal to the full observation count.
+    The cache-invalidation contract is what this test exists to protect.
+    It used to observe the update via the MIN_OBS_FOR_OVERRIDE cliff (prior
+    flipping wholesale to the persistent store on the 5th observation). That
+    cliff was replaced by a continuous shrinkage blend, so the update is now
+    observed the way it actually manifests: the blended prior's live_n rises by
+    one and its evidence count rises by one, on a NEW (non-cached) object.
     """
     store_path, prior_path, cal_path = paths
 
@@ -129,12 +130,12 @@ def test_finalize_updates_priors_and_invalidates_cache(paths) -> None:
                 observation_id=f"pre-seed-{i}",
             )
 
-        # Prime the cache.  With 4 obs < MIN_OBS_FOR_OVERRIDE the persistent-store
-        # overlay does NOT fire, so the prior is still report-based (history_count > 0
-        # from the static reports, source does NOT start with "persistent_store:").
+        # Prime the cache. The 4 seeded observations are blended into the report
+        # prior (shrinkage weights them down; they no longer replace it).
         priors_before = _sc._load_walk_forward_priors()
-        assert not priors_before["atm_straddle"].source.startswith("persistent_store:"), (
-            "pre-finalize prior should come from the static reports, not the persistent store"
+        assert "live_n=4" in priors_before["atm_straddle"].source, (
+            f"pre-finalize prior should blend the 4 seeded observations, "
+            f"got source={priors_before['atm_straddle'].source}"
         )
         # Confirm it's actually cached — same dict object on repeated call.
         assert _sc._load_walk_forward_priors() is priors_before, (
@@ -156,15 +157,16 @@ def test_finalize_updates_priors_and_invalidates_cache(paths) -> None:
             "finalize_trade_and_update_learning() must clear the prior cache; "
             "_load_walk_forward_priors() returned the stale cached object"
         )
-        # … and that new object must reflect the persistent-store overlay
-        # (history_count == MIN_OBS_FOR_OVERRIDE, source starts with "persistent_store:").
-        assert priors_after["atm_straddle"].history_count == MIN_OBS_FOR_OVERRIDE, (
-            f"post-finalize prior must reflect {MIN_OBS_FOR_OVERRIDE} observations, "
-            f"got {priors_after['atm_straddle'].history_count}"
+        # … and that new object must reflect the newly persisted observation:
+        # one more live observation in the blend, and one more unit of evidence.
+        assert "live_n=5" in priors_after["atm_straddle"].source, (
+            f"post-finalize prior must reflect the 5th observation, "
+            f"got source={priors_after['atm_straddle'].source}"
         )
-        assert priors_after["atm_straddle"].source.startswith("persistent_store:"), (
-            "post-finalize prior must come from the persistent store overlay"
-        )
+        assert (
+            priors_after["atm_straddle"].history_count
+            == priors_before["atm_straddle"].history_count + 1
+        ), "post-finalize evidence count must rise by exactly the one new observation"
 
     assert result["status"] == "finalized"
     assert result["prior_observation_count"] == MIN_OBS_FOR_OVERRIDE

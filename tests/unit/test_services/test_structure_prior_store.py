@@ -177,13 +177,13 @@ def test_unknown_structure_is_silently_dropped(tmp_path: Path) -> None:
     """update() with an unrecognised structure name does not raise and adds no entry."""
     store = _store(tmp_path)
     store.update(
-        structure="iron_condor",
+        structure="jade_lizard",  # not in SUPPORTED_STRUCTURES
         realized_return_pct=5.0,
         realized_expansion_pct=2.0,
         source_type="paper",
         observation_date=date(2024, 1, 1),
     )
-    assert "iron_condor" not in store.diagnostics()["structures"]
+    assert "jade_lizard" not in store.diagnostics()["structures"]
 
 
 def test_get_prior_dict_excludes_future_observations(tmp_path):
@@ -209,3 +209,19 @@ def test_get_prior_dict_excludes_future_observations(tmp_path):
     # not a blanket suppression).
     later = store.get_prior_dict("atm_straddle", as_of_date=date(2026, 12, 31))
     assert later is not None and later["history_count"] == 6
+
+
+def test_iron_condor_observations_are_accepted(tmp_path: Path) -> None:
+    """The sell-side condor must be able to accrue a real track record, so the
+    store has to accept it as a supported structure (it is the counterpart to
+    test_unknown_structure_is_silently_dropped above)."""
+    store = _store(tmp_path)
+    store.update(
+        structure="iron_condor",
+        realized_return_pct=8.0,
+        realized_expansion_pct=-40.0,  # condor premium decayed — a win for the seller
+        source_type="paper",
+        observation_date=date(2026, 5, 1),
+    )
+    entry = store.diagnostics()["structures"]["iron_condor"]
+    assert entry["observation_count"] == 1

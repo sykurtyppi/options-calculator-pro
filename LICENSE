@@ -1,0 +1,53 @@
+Copyright (c) 2026 Tristan Alejandro. All rights reserved.
+
+PROPRIETARY — ALL RIGHTS RESERVED
+
+This source code is made publicly viewable for reference, transparency, and
+discussion. Publication does not grant a license.
+
+No permission is granted to any person to use, copy, modify, merge, publish,
+distribute, sublicense, sell, or create derivative works from this software or
+any portion of it, in source or binary form, for any purpose, commercial or
+non-commercial, except as follows:
+
+  1. You may view and read the source code.
+  2. You may quote short excerpts for commentary, review, teaching, security
+     research, or academic citation, with attribution.
+  3. You may fork the repository where a hosting platform's terms of service
+     require that capability in order to browse or propose changes, provided
+     the fork is not used to run, distribute, or build upon the software.
+
+All other rights are reserved. For any use beyond the above, including
+evaluation inside an organization, contact the copyright holder for written
+permission.
+
+Contributions: unless a separate written agreement says otherwise, any
+contribution intentionally submitted for inclusion in this project is provided
+under these same terms, and the contributor assigns to the copyright holder the
+rights necessary to relicense the project in the future.
+
+THIRD-PARTY DATA
+This software retrieves data from third-party market-data providers. That data
+is owned by those providers and is governed by their own terms, not by this
+license. Nothing here grants any right to redistribute provider data. Cached,
+derived, or exported market data may carry redistribution restrictions, and it
+is the operator's responsibility to comply with the applicable provider terms.
+
+NO WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+NOT FINANCIAL ADVICE
+This software is a research and decision-support tool. It is not investment
+advice, and it is not a validated trading system. Its scores, rankings,
+"expected edge", "expected return", and "confidence" figures are score-derived
+diagnostics produced by heuristic rules and small samples. They are NOT
+calibrated probabilities, NOT return forecasts, and NOT evidence of a
+demonstrated trading edge. Options trading involves substantial risk of loss
+and is not suitable for every investor. Any decision to trade is solely the
+user's own, made at the user's own risk. See DISCLAIMER.md.

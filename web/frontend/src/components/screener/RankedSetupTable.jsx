@@ -10,6 +10,21 @@ function fmt(value, digits = 2, suffix = '') {
   return `${num.toFixed(digits)}${suffix}`
 }
 
+// Percent fields on this row arrive in TWO different units, so they must not
+// share one formatter:
+//   - already-percent (median_earnings_move_pct = 7.2 means 7.2%) -> fmt(x, 1, '%')
+//   - decimal         (atm_iv = 0.3407 means 34.1%)               -> fmtDecimalAsPercent
+// Appending '%' to a decimal rendered 0.3407 as "0.3%", turning a realistic
+// 34% implied vol into an impossible one. Every other IV render in the app
+// already multiplies by 100 (see SetupDetailPanel, TermStructureChart, App);
+// this table was the outlier. Named explicitly so the unit is part of the call.
+function fmtDecimalAsPercent(value, digits = 1) {
+  if (value == null || value === '') return NA
+  const num = Number(value)
+  if (!Number.isFinite(num)) return NA
+  return `${(num * 100).toFixed(digits)}%`
+}
+
 function scoreBar(score) {
   if (score == null) return null
   const pct = Math.round(Math.min(Math.max(Number(score), 0), 1) * 100)
@@ -151,7 +166,7 @@ export default function RankedSetupTable({ rows, selectedSymbol, onSelect }) {
                   {fmt(row.iv_rv_ratio)}{row.iv_regime_conditioned ? ' ⚠' : ''}
                 </td>
                 <td style={{ padding: '5px 8px', textAlign: 'right', color: 'var(--text-secondary)' }}>
-                  {fmt(row.atm_iv, 1, '%')}
+                  {fmtDecimalAsPercent(row.atm_iv)}
                 </td>
                 <td style={{ padding: '5px 8px', textAlign: 'right', color: row.ts_ratio != null && row.ts_ratio < 1.0 ? 'var(--pos)' : 'var(--text-secondary)' }}>
                   {fmt(row.ts_ratio)}

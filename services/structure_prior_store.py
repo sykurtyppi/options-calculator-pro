@@ -83,6 +83,10 @@ SUPPORTED_STRUCTURES: tuple = (
     "otm_strangle",
     "call_calendar",
     "put_calendar",
+    # Sell-side defined-risk structure. Listed here so the forward loop can
+    # persist real condor outcomes and, after MIN_OBS_FOR_OVERRIDE of them,
+    # override its neutral report prior. Mirror of structure_scorecard.SUPPORTED_STRUCTURES.
+    "iron_condor",
 )
 
 # The persistent store only overrides report-based priors once a structure
@@ -450,6 +454,7 @@ class StructurePriorStore:
         self,
         structure: str,
         as_of_date: Optional[date] = None,
+        min_observations: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Return a dict with WalkForwardPrior-compatible keys, or None.
@@ -460,10 +465,17 @@ class StructurePriorStore:
         as_of_date : date, optional
             If provided, only observations with observation_date <= as_of_date
             are counted.  If None, uses the aggregate cache (O(1), no filtering).
+        min_observations : int, optional
+            Minimum observation count required to return a dict. Defaults to
+            MIN_OBS_FOR_OVERRIDE, preserving the historical all-or-nothing
+            contract for existing callers. The shrinkage blend in
+            structure_scorecard passes 1, because it weights a small live sample
+            down continuously instead of discarding it (and instead of letting it
+            wholly replace the report prior the moment it crosses a threshold).
 
         Returns None when:
           - no observations have been recorded for this structure, OR
-          - observation_count (possibly filtered) < MIN_OBS_FOR_OVERRIDE (5)
+          - observation_count (possibly filtered) < min_observations
 
         Dict keys: structure, history_count, win_rate, avg_return_pct,
                    rank_score, source
@@ -471,11 +483,12 @@ class StructurePriorStore:
         entry = self._data.get(structure)
         if entry is None:
             return None
+        threshold = MIN_OBS_FOR_OVERRIDE if min_observations is None else int(min_observations)
 
         if as_of_date is None:
             # Fast path: use the denormalized aggregate cache
             n = entry.get("observation_count", 0)
-            if n < MIN_OBS_FOR_OVERRIDE:
+            if n < threshold:
                 return None
             last = (entry.get("last_updated") or "unknown")[:10]
             return {
@@ -520,7 +533,7 @@ class StructurePriorStore:
 
         agg = _recompute_aggregates(filtered)
         n = agg["observation_count"]
-        if n < MIN_OBS_FOR_OVERRIDE:
+        if n < threshold:
             return None
 
         return {
@@ -535,15 +548,17 @@ class StructurePriorStore:
     def get_all_prior_dicts(
         self,
         as_of_date: Optional[date] = None,
+        min_observations: Optional[int] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """
-        Return dicts for all structures meeting MIN_OBS_FOR_OVERRIDE.
+        Return dicts for all structures meeting ``min_observations``
+        (default MIN_OBS_FOR_OVERRIDE).
 
         Returns an empty dict if none qualify.
         """
         result = {}
         for s in SUPPORTED_STRUCTURES:
-            d = self.get_prior_dict(s, as_of_date=as_of_date)
+            d = self.get_prior_dict(s, as_of_date=as_of_date, min_observations=min_observations)
             if d is not None:
                 result[s] = d
         return result
@@ -667,17 +682,25 @@ def get_structure_prior_store(
 def load_all_structure_priors(
     store_path: Optional[Path] = None,
     as_of_date: Optional[date] = None,
+    min_observations: Optional[int] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Module-level convenience used by structure_scorecard._load_walk_forward_priors().
 
-    Returns a dict of structure → prior_dict for structures that have
-    >= MIN_OBS_FOR_OVERRIDE observations.  Empty dict if none qualify.
+    Returns a dict of structure → prior_dict for structures with at least
+    ``min_observations`` observations (default MIN_OBS_FOR_OVERRIDE).
+    Empty dict if none qualify.
 
     Parameters
     ----------
     as_of_date : date, optional
         If provided, only observations on or before this date are counted.
         Pass snapshot.as_of_date from the backtest evaluation loop.
+    min_observations : int, optional
+        Lower the qualifying count so a small live sample can be blended rather
+        than discarded. structure_scorecard passes 1 and shrinks the live weight
+        continuously; see LIVE_PRIOR_SHRINKAGE_STRENGTH there.
     """
-    return get_structure_prior_store(store_path).get_all_prior_dicts(as_of_date=as_of_date)
+    return get_structure_prior_store(store_path).get_all_prior_dicts(
+        as_of_date=as_of_date, min_observations=min_observations
+    )

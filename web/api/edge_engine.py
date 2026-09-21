@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from utils.quotes import safe_mid
-from services.crush_features import crush_feature_vector
+from services.crush_features import NO_RV_IV_RV_RATIO, crush_feature_vector
 from services.dividend_yields import get_dividend_yield
 from services.iv_term_structure import bounded_interp, select_tenor_spanning_expiries
 from services.earnings_event_service import resolve_upcoming_earnings_event
@@ -2704,7 +2704,29 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
         price_data=price_snapshot_frame,
         options_provider=snapshot_options_provider,
     )
-    structure_scorecards = build_structure_scorecards(vol_snapshot)
+    # Crush-classifier probability for the sell-side iron_condor scorecard. Uses
+    # the SAME patchable inference path as the surfaced ml_crush_prob (below), so
+    # tests that disable the model via _crush_clf=None keep the condor
+    # deterministic (None → neutral crush component). Features are read from the
+    # snapshot's canonical term-structure / IV-RV fields.
+    # Features MUST match the basis the classifier was trained on and the basis
+    # the surfaced ml_crush_prob uses below, or the two probabilities diverge and
+    # the model is served a feature it never saw:
+    #   near_iv  -> iv30                (training's front IV; same 0.30 fallback)
+    #   iv_rv    -> iv_rv_yz = iv30/rv30_yz  (TRAILING realized vol, as trained)
+    # iv_rv_har is the forward HAR forecast, a different quantity — using it here
+    # was train/serve skew on the condor's primary signal.
+    _condor_crush_prob, _ = _ml_crush_probability(
+        near_iv=_safe_float(vol_snapshot.iv30, 0.30),
+        near_back_ratio=_safe_float(vol_snapshot.near_back_iv_ratio, 1.10),
+        # NO_RV_IV_RV_RATIO (1/0.75) is the ratio training itself synthesises for
+        # RV-absent rows (crush_features.RV_FALLBACK_FACTOR); 1.10 is a value the
+        # model never saw for that case.
+        iv_rv=_safe_float(vol_snapshot.iv_rv_yz, NO_RV_IV_RV_RATIO),
+    )
+    structure_scorecards = build_structure_scorecards(
+        vol_snapshot, crush_probability=_condor_crush_prob
+    )
     selector_output = select_best_structure(vol_snapshot, structure_scorecards)
     return AnalysisInputs(
         clean_symbol=clean_symbol,
