@@ -23,7 +23,12 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from services.outcome_recorder import OutcomeStore, _DEFAULT_STORE, is_outcome_evidence_valid
+from services.outcome_recorder import (
+    OutcomeStore,
+    _DEFAULT_STORE,
+    is_outcome_evidence_valid,
+    outcome_invalidation_reason,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
                     "status": row.get("status"),
                     "realized_return_pct": row.get("realized_return_pct"),
                     "evidence_valid": is_outcome_evidence_valid(row),
-                    "invalidation_reason": row.get("invalidation_reason"),
+                    "invalidation_reason": outcome_invalidation_reason(row),
                 }))
             return 0
         if not args.trade_id:

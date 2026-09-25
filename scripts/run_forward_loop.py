@@ -35,6 +35,7 @@ from services.baseline_evidence_store import (
     COHORT_UNIVERSE,
     EXIT_REPRICING_BOOKED,
     EXIT_REPRICING_LEGACY,
+    EXIT_REPRICING_UNVERIFIABLE,
     BaselineEvidenceStore,
     get_baseline_evidence_store,
     make_universe_baseline_id,
@@ -1560,13 +1561,37 @@ def _record_universe_shadow_entries(
     )
 
 
-# Context keys that identify each leg of a booked structure. The expiry is
-# checked separately.
+# Context keys that identify each leg of a booked structure: its strike and,
+# when recorded, its contract symbol. Every strike key AND the expiry must be
+# present at entry for the position to be verifiable at all.
 _BOOKED_LEG_KEYS: Dict[str, tuple[str, ...]] = {
     "atm_straddle": ("strike", "straddle_put_strike"),
     "otm_strangle": ("call_strike", "put_strike"),
     "iron_condor": ("short_call_strike", "long_call_strike", "short_put_strike", "long_put_strike"),
 }
+_BOOKED_CONTRACT_KEYS: Dict[str, tuple[str, ...]] = {
+    "atm_straddle": ("call_contract", "put_contract"),
+    "otm_strangle": ("call_contract", "put_contract"),
+    "iron_condor": ("short_call_contract", "long_call_contract", "short_put_contract", "long_put_contract"),
+}
+
+
+def _contract_symbol(value: Any) -> Optional[str]:
+    text = str(value or "").strip().replace(" ", "").upper()
+    return None if text in {"", "NONE", "NAN", "NULL"} else text
+
+
+def _entry_context_verifiable(structure: str, entry_context: Dict[str, Any]) -> bool:
+    """True when the entry recorded every leg strike and the expiry.
+
+    Anything less cannot be verified: e.g. straddles entered before
+    ``straddle_put_strike`` existed recorded only the call's strike, while the
+    put actually bought may have been a different strike.
+    """
+    keys = _BOOKED_LEG_KEYS.get(structure)
+    if not keys or not entry_context.get("front_expiry"):
+        return False
+    return all(_safe_float(entry_context.get(key)) is not None for key in keys)
 
 
 def _booked_contracts_match(
@@ -1578,34 +1603,26 @@ def _booked_contracts_match(
 ) -> bool:
     """True only when every leg of the exit quote is a contract booked at entry.
 
-    A key the ENTRY context lacks cannot be checked (straddle entries written
-    before ``straddle_put_strike`` existed) and is skipped; the exit quote
-    itself must then carry the same value for every key the entry has. An
-    unknown structure is never verified.
+    Requires a verifiable entry context (every leg strike and the expiry), the
+    same expiry and every strike on the exit quote, and - wherever BOTH sides
+    recorded a contract symbol - the same symbol. A missing key never counts as
+    a match; an unknown structure is never verified.
     """
-    keys = _BOOKED_LEG_KEYS.get(structure)
-    if not keys:
+    if not _entry_context_verifiable(structure, entry_context):
         return False
-    checked = 0
-    for key in keys:
-        booked = _safe_float(entry_context.get(key))
-        if booked is None:
-            continue
+    if str(exit_context.get("front_expiry") or "") != str(entry_context.get("front_expiry")):
+        return False
+    for key in _BOOKED_LEG_KEYS[structure]:
+        booked = float(_safe_float(entry_context.get(key)))
         quoted = _safe_float(exit_context.get(key))
         if quoted is None or abs(quoted - booked) > tolerance:
             return False
-        checked += 1
-    if structure == "atm_straddle":
-        # Old straddle entries only stored "strike"; the exit must still quote
-        # the put at that same strike.
-        put_strike = _safe_float(exit_context.get("straddle_put_strike"))
-        booked = _safe_float(entry_context.get("strike"))
-        if put_strike is None or booked is None or abs(put_strike - booked) > tolerance:
+    for key in _BOOKED_CONTRACT_KEYS.get(structure, ()):
+        booked_symbol = _contract_symbol(entry_context.get(key))
+        quoted_symbol = _contract_symbol(exit_context.get(key))
+        if booked_symbol and quoted_symbol and booked_symbol != quoted_symbol:
             return False
-    booked_expiry = entry_context.get("front_expiry")
-    if booked_expiry and str(exit_context.get("front_expiry") or "") != str(booked_expiry):
-        return False
-    return checked > 0
+    return True
 
 
 def _finalize_baseline_exits(
@@ -1617,7 +1634,9 @@ def _finalize_baseline_exits(
     dry_run: bool,
     mda_client: Any,
 ) -> Dict[str, int]:
-    summary = {"baseline_exits": 0, "baseline_skipped": 0}
+    summary = {"baseline_exits": 0, "baseline_skipped": 0, "baseline_exit_missing": 0}
+    if not dry_run:
+        summary["baseline_exit_missing"] = len(baseline_store.mark_missing_exits(as_of))
     for row in baseline_store.baselines_due_for_exit(as_of):
         entry_mid = _safe_float(row.get("entry_mid"))
         earnings_date = _parse_date(row.get("earnings_date"))
@@ -1628,8 +1647,15 @@ def _finalize_baseline_exits(
         # the context was persisted can only re-discover strikes; they are
         # flagged so the report keeps them out of the comparison.
         entry_context = row.get("entry_pricing_context_json") or {}
-        exit_repricing = EXIT_REPRICING_BOOKED if entry_context else EXIT_REPRICING_LEGACY
         structure = str(row.get("structure"))
+        if not entry_context:
+            exit_repricing = EXIT_REPRICING_LEGACY
+        elif _entry_context_verifiable(structure, entry_context):
+            exit_repricing = EXIT_REPRICING_BOOKED
+        else:
+            # Priced from the stored context, but the entry did not record
+            # enough to prove the exit is the same position: never comparable.
+            exit_repricing = EXIT_REPRICING_UNVERIFIABLE
         quote = _fetch_quote_for_forward_loop(
             price_fetcher,
             symbol=str(row.get("symbol")),
@@ -1650,7 +1676,7 @@ def _finalize_baseline_exits(
         exit_unusable = exit_mid is None or (
             exit_mid < 0 if structure in CREDIT_STRUCTURES else exit_mid <= 0
         )
-        if not exit_unusable and entry_context and not _booked_contracts_match(
+        if not exit_unusable and exit_repricing == EXIT_REPRICING_BOOKED and not _booked_contracts_match(
             structure, entry_context, quote.get("context") or {},
         ):
             # Fail closed: a quote on any contract other than the one entered
@@ -2165,7 +2191,29 @@ def run_exit_detection(
 ) -> Dict[str, int]:
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
-    summary = {"exits": 0, "skipped": 0, "baseline_exits": 0, "baseline_skipped": 0}
+    summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "baseline_exits": 0, "baseline_skipped": 0}
+
+    # Trades whose T-1 exit day has passed without a price become terminal
+    # 'exit_missing' attrition instead of staying open forever.
+    if not dry_run:
+        for missing in trade_store.mark_missing_exits(as_of):
+            summary["exit_missing"] += 1
+            _append_learning_log(
+                log_path,
+                {
+                    "event_type": "exit_missing",
+                    "symbol": missing.get("symbol"),
+                    "structure": missing.get("structure"),
+                    "source": "paper",
+                    "trade_id": missing.get("trade_id"),
+                    "reason": missing.get("exit_missing_reason"),
+                },
+                dry_run=dry_run,
+            )
+
+    def _record_failed_exit(trade_id: str, reason: str) -> None:
+        if not dry_run:
+            trade_store.record_exit_attempt_failure(trade_id, reason=reason, attempted_on=as_of)
 
     for row in trade_store.trades_due_for_exit(as_of):
         trade_id = str(row["trade_id"])
@@ -2189,6 +2237,7 @@ def run_exit_detection(
                 },
                 dry_run=dry_run,
             )
+            _record_failed_exit(trade_id, "missing_entry_context")
             continue
 
         note_payload: Dict[str, Any] = {}
@@ -2214,8 +2263,26 @@ def run_exit_detection(
             phase="exit",
         ).to_dict()
         exit_mid = quote.get("mid")
+        entry_pricing_context = note_payload.get("pricing_context") or {}
+        if structure in _BOOKED_LEG_KEYS:
+            contract_verification = (
+                "verified"
+                if _entry_context_verifiable(structure, entry_pricing_context)
+                else "unverifiable_entry_context"
+            )
+        else:
+            contract_verification = "not_checked_for_structure"
+        if (
+            exit_mid is not None
+            and contract_verification == "verified"
+            and not _booked_contracts_match(structure, entry_pricing_context, quote.get("context") or {})
+        ):
+            # Fail closed: a price for other contracts is not this trade's exit.
+            exit_mid = None
+            quote = {**quote, "mid": None, "reason": "booked_contract_mismatch"}
         if exit_mid is None:
             summary["skipped"] += 1
+            _record_failed_exit(trade_id, str(quote.get("reason", "missing_exit_mid")))
             _append_learning_log(
                 log_path,
                 {
@@ -2237,7 +2304,6 @@ def run_exit_detection(
         # Credit structures (iron condor) invert the P&L sign and use the defined
         # max loss recorded at ENTRY as the return base; long debit structures are
         # unchanged. See _realized_trade_math.
-        entry_pricing_context = note_payload.get("pricing_context") or {}
         gross_return_pct, realized_pnl, realized_expansion_pct = _realized_trade_math(
             structure=structure,
             entry_mid=entry_mid,
@@ -2259,6 +2325,7 @@ def run_exit_detection(
         exit_execution_scenarios = {
             **exit_execution_scenarios,
             "scenario_outcomes": scenario_outcomes,
+            "contract_verification": contract_verification,
         }
 
         if not dry_run:

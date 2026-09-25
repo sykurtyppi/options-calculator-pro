@@ -199,7 +199,7 @@ def test_exit_reprices_booked_contracts_and_condor_uses_return_on_risk(tmp_path)
         mda_client=None,
     )
 
-    assert summary == {"baseline_exits": 3, "baseline_skipped": 0}
+    assert summary == {"baseline_exits": 3, "baseline_skipped": 0, "baseline_exit_missing": 0}
     by_structure = {call["structure"]: call["context"] for call in exit_fetcher.calls}
     assert by_structure["atm_straddle"] == ENTRY_CONTEXTS["atm_straddle"]
     assert by_structure["iron_condor"]["short_call_strike"] == 105.0
@@ -361,7 +361,7 @@ def test_exit_quote_on_other_strikes_fails_closed(tmp_path):
     assert straddle["status"] == "exit_skipped"
     assert straddle["skip_reason"] == "booked_contract_mismatch"
     assert straddle["realized_return_pct"] is None
-    assert summary == {"baseline_exits": 2, "baseline_skipped": 1}
+    assert summary == {"baseline_exits": 2, "baseline_skipped": 1, "baseline_exit_missing": 0}
 
 
 @pytest.mark.parametrize(

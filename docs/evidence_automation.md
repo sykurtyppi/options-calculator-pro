@@ -18,6 +18,9 @@ What it does:
 - finalizes due paper outcomes at T-1 when quotes are available
 - finalizes due shadow baselines by repricing the contracts booked at entry, without updating calibration or priors. Baselines resolved before booked-strike exits existed re-discovered strikes at exit; they are reported only under `legacy_repriced_baselines` and excluded from comparisons
 - because exits are at T-1, the iron condor baseline measures shorting the pre-earnings IV run-up, not the post-earnings crush
+- an exit is valued only on T-1 and only on the booked contracts (every leg strike, the expiry, and the contract symbol where both sides recorded one). Running the loop again the same day retries a failed exit; once T-1 has passed, a trade or baseline that was never priced moves to the terminal status `exit_missing` (never re-priced on a later date or a nearby contract). The Evidence Report counts this under `exit_attrition` by reason and structure
+- baselines whose entry context lacks a leg strike or the expiry resolve as `unverifiable_entry_context` and are excluded from comparisons
+- outcomes invalidated as evidence (`scripts/invalidate_outcome.py`, or a `notes.evidence_invalidated` flag) are refused by every exit/finalize/learning write and excluded from reports before the row limit; invalidating a trade while its learning updates run is refused, so retry once it is finalized
 - writes a daily evidence snapshot to `~/.options_calculator_pro/reports/evidence/`
 
 Safe dry run:
