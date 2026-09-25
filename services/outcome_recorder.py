@@ -39,7 +39,7 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
 
@@ -176,6 +176,13 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "surface_sparse_atm_count": "INTEGER",
     "surface_iv_anomaly_count": "INTEGER",
     "learning_update_status": "TEXT",
+    # Evidence invalidation. NULL = never reviewed (valid); 0 = invalidated.
+    # An invalidated row stays in the table for audit but is excluded from
+    # every performance, calibration and maturity calculation, and is never
+    # exited or finalized into the learning stores.
+    "evidence_valid": "INTEGER",
+    "invalidated_at": "TEXT",
+    "invalidation_reason": "TEXT",
 }
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
@@ -591,7 +598,53 @@ class OutcomeStore:
             """,
             (target_earnings_date,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [dict(row) for row in rows if is_outcome_evidence_valid(dict(row))]
+
+    # ── Evidence invalidation ─────────────────────────────────────────────────
+
+    def invalidate(
+        self,
+        trade_id: str,
+        *,
+        reason: str,
+        invalidated_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Mark an outcome as invalid evidence, keeping the row for audit.
+
+        Returns what changed and whether the outcome had ALREADY reached the
+        calibration/prior stores. Those stores cannot drop a single observation
+        (calibration keeps parallel arrays with no per-trade ids), so invalidate
+        before finalization wherever possible; after it, the caller must treat
+        the learning stores as contaminated by this trade.
+        """
+        reason = str(reason or "").strip()
+        if not reason:
+            raise ValueError("invalidate: a non-empty reason is required")
+        row = self.get_trade(trade_id)
+        if row is None:
+            raise ValueError(f"invalidate: trade_id={trade_id!r} not found")
+        stamp = (invalidated_at or datetime.now(timezone.utc)).isoformat()
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    """
+                    UPDATE outcome_trades
+                    SET evidence_valid = 0,
+                        invalidated_at = ?,
+                        invalidation_reason = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE trade_id = ?
+                    """,
+                    (stamp, reason, trade_id),
+                )
+        return {
+            "trade_id": trade_id,
+            "status": row.get("status"),
+            "already_invalidated": not is_outcome_evidence_valid(row),
+            "learning_already_applied": str(row.get("learning_update_status") or "") == "complete",
+            "invalidated_at": stamp,
+            "invalidation_reason": reason,
+        }
 
     def diagnostics(self) -> Dict[str, Any]:
         total = self.count()
@@ -626,6 +679,28 @@ class OutcomeStore:
 
 
 # ── Utility functions ──────────────────────────────────────────────────────────
+
+
+def is_outcome_evidence_valid(row: Dict[str, Any]) -> bool:
+    """False for an outcome invalidated as evidence.
+
+    Honors the first-class ``evidence_valid`` column, and also the
+    ``evidence_invalidated`` flag that earlier manual invalidations wrote into
+    the ``notes`` JSON, so rows marked before the column existed are excluded
+    without a data migration.
+    """
+    flag = row.get("evidence_valid")
+    if flag is not None and str(flag).strip().lower() in {"0", "false"}:
+        return False
+    notes = row.get("notes")
+    if notes:
+        try:
+            parsed = json.loads(str(notes)) if not isinstance(notes, dict) else notes
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("evidence_invalidated"):
+            return False
+    return True
 
 
 def make_trade_id(
@@ -838,6 +913,14 @@ def finalize_trade_and_update_learning(
     row = s.get_trade(trade_id)
     if row is None:
         raise ValueError(f"finalize_trade_and_update_learning: trade_id={trade_id!r} not found")
+    if not is_outcome_evidence_valid(row):
+        # Fail closed: an invalidated outcome must never reach calibration or
+        # priors, and neither store can remove an observation afterwards.
+        raise ValueError(
+            f"finalize_trade_and_update_learning: trade_id={trade_id!r} is invalidated "
+            f"evidence ({row.get('invalidation_reason') or 'notes.evidence_invalidated'}); "
+            "refusing to update learning stores"
+        )
 
     structure = row["structure"]
     setup_score = float(row["setup_score"])

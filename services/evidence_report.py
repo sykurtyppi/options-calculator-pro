@@ -21,7 +21,7 @@ from services.baseline_evidence_store import (
 from services.data_quality_diagnostics import build_data_quality_diagnostics
 from services.evidence_maturity import build_evidence_maturity
 from services.forward_performance_diagnostics import build_forward_performance_diagnostics
-from services.outcome_recorder import OutcomeStore, get_outcome_store
+from services.outcome_recorder import OutcomeStore, get_outcome_store, is_outcome_evidence_valid
 from services.provider_telemetry import build_provider_telemetry_diagnostics
 
 MIN_COMMERCIAL_EVIDENCE_DAYS = 60
@@ -48,7 +48,11 @@ def build_evidence_report(
         max_rows=max_rows,
         recent_limit=recent_limit,
     )
-    outcomes = outcome_obj.list_for_diagnostics(limit=max_rows)
+    all_outcomes = outcome_obj.list_for_diagnostics(limit=max_rows)
+    # Invalidated outcomes stay in the store for audit but never count as
+    # evidence: not in performance, quality, realism or maturity figures.
+    invalidated = [row for row in all_outcomes if not is_outcome_evidence_valid(row)]
+    outcomes = [row for row in all_outcomes if is_outcome_evidence_valid(row)]
     selected = [row for row in outcomes if _is_resolved(row)]
     resolved_baselines = [row for row in baselines if str(row.get("status") or "") == "resolved"]
     open_baselines = [row for row in baselines if str(row.get("status") or "") == "open"]
@@ -103,15 +107,26 @@ def build_evidence_report(
             ),
         },
         "selector_summary": selector_stats,
+        "invalidated_outcomes": {
+            "n": len(invalidated),
+            "resolved_n": sum(1 for row in invalidated if _is_resolved(row)),
+            "by_reason": _count_by(
+                invalidated,
+                lambda row: row.get("invalidation_reason") or "notes.evidence_invalidated",
+            ),
+            "note": "Excluded from every performance, calibration and maturity figure; kept for audit.",
+        },
         "baseline_comparison": baseline_stats,
         "universe_shadow": _universe_shadow_summary(baselines),
         "legacy_repriced_baselines": {
             "n": len(legacy_repriced),
+            "by_exit_repricing": _count_by(legacy_repriced, lambda row: row.get("exit_repricing") or "unlabelled"),
             "by_baseline": _group_by(legacy_repriced, lambda row: row.get("baseline_name") or "unknown_baseline"),
             "note": (
-                "Excluded from every comparison: the exit re-discovered strikes instead of "
-                "repricing the contracts booked at entry, so these returns are not the "
-                "position's P&L."
+                "Excluded from every comparison: the exit was not verified to reprice the "
+                "contracts booked at entry (rediscovered_legacy re-discovered strikes; "
+                "booked_strikes was labelled without checking each leg), so these returns "
+                "may not be the position's P&L."
             ),
         },
         "structure_breakdown": forward.get("by_structure", {}),
@@ -282,16 +297,34 @@ def _universe_shadow_summary(baselines: Iterable[Dict[str, Any]]) -> Dict[str, A
                 row for row in members if row.get("selector_recommendation") not in ACTIONABLE_RECOMMENDATIONS
             ),
         }
+    entered = [row for row in rows if str(row.get("status") or "") != "entry_skipped"]
+    never_entered = [row for row in rows if str(row.get("status") or "") == "entry_skipped"]
+    entry_attrition = {
+        # Failed entries are retried daily while the event is in the DTE
+        # window; rows still entry_skipped after the window closes are the
+        # attrition. Compare its reasons against the resolved sample before
+        # trusting universe results: attrition correlated with outcome biases them.
+        "entered": len(entered),
+        "entered_after_retry": sum(1 for row in entered if int(row.get("entry_attempt_count") or 1) > 1),
+        "not_entered": len(never_entered),
+        "not_entered_by_reason": _count_by(never_entered, lambda row: row.get("skip_reason") or "unknown"),
+        "failed_attempts_by_reason": _count_by(
+            (attempt for row in rows for attempt in (row.get("failed_entry_attempts_json") or []) if isinstance(attempt, dict)),
+            lambda attempt: attempt.get("reason") or "unknown",
+        ),
+    }
     return {
         "events_recorded": len({(row.get("symbol"), row.get("earnings_date")) for row in rows}),
+        "entry_attrition": entry_attrition,
         "entries": len(rows),
         "open": sum(1 for row in rows if str(row.get("status") or "") == "open"),
         "resolved": len(resolved),
         "skipped": sum(1 for row in rows if "skipped" in str(row.get("status") or "")),
         "by_baseline": by_baseline,
         "rule": (
-            "Every eligible earnings event is shadow-entered once, on its first day in the "
-            "DTE window, for each baseline structure, whatever the selector recommended. "
+            "Every eligible earnings event is shadow-entered once per baseline structure, "
+            "whatever the selector recommended: on its first day in the DTE window, or on a "
+            "later day if earlier quotes failed (see entry_attrition). "
             "If selector_not_actionable returns are no worse than selector_actionable, the "
             "selector's skips are not adding value."
         ),

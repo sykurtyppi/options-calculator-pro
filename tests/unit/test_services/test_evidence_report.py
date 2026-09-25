@@ -83,7 +83,7 @@ def test_evidence_report_compares_selector_to_baselines(tmp_path):
         realized_expansion_pct=5.0,
         quote_source_at_exit="marketdata_app",
         quote_quality_at_exit="marketdata_app_paper_research_mid_not_execution_grade",
-        exit_repricing="booked_strikes",
+        exit_repricing="booked_entry_contracts",
     )
 
     report = build_evidence_report(baseline_store=baselines, outcome_store=outcomes)

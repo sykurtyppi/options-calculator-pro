@@ -912,15 +912,32 @@ def fetch_structure_quote(
     )
 
     if structure == "atm_straddle":
-        strike = float(pricing_context.get("strike") or spot)
-        call_row = _nearest_row(front_calls, strike)
-        put_row = _nearest_row(front_puts, strike)
+        booked_strike = _safe_float(pricing_context.get("strike"))
+        if booked_strike is not None:
+            # RE-PRICE an open straddle: both legs must be the booked strike.
+            # Nearest-row per leg let a thin chain return e.g. a 95 call + 105
+            # put for a booked 100 straddle - a position that was never held.
+            call_row = _row_at_strike(front_calls, booked_strike)
+            put_row = _row_at_strike(front_puts, booked_strike)
+            if call_row is None or put_row is None:
+                reason = "booked_contract_unavailable"
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(surface_quality=front_surface_quality, final_reason=reason)}
+        else:
+            call_row = _nearest_row(front_calls, float(spot))
+            if call_row is None:
+                _record_quote(False, "missing_atm_pair")
+                return {"mid": None, "reason": "missing_atm_pair", **_payload(surface_quality=front_surface_quality)}
+            # Discovery: the put must sit at the SAME strike as the call, or
+            # the "straddle" is really a strangle of unknown width.
+            put_row = _row_at_strike(front_puts, float(call_row["strike"]))
         if call_row is None or put_row is None:
             _record_quote(False, "missing_atm_pair")
             return {"mid": None, "reason": "missing_atm_pair", **_payload(surface_quality=front_surface_quality)}
         pricing_context.update(
             {
                 "strike": float(call_row["strike"]),
+                "straddle_put_strike": float(put_row["strike"]),
                 "call_contract": str(call_row.get("contractSymbol")),
                 "put_contract": str(put_row.get("contractSymbol")),
             }
@@ -1543,6 +1560,54 @@ def _record_universe_shadow_entries(
     )
 
 
+# Context keys that identify each leg of a booked structure. The expiry is
+# checked separately.
+_BOOKED_LEG_KEYS: Dict[str, tuple[str, ...]] = {
+    "atm_straddle": ("strike", "straddle_put_strike"),
+    "otm_strangle": ("call_strike", "put_strike"),
+    "iron_condor": ("short_call_strike", "long_call_strike", "short_put_strike", "long_put_strike"),
+}
+
+
+def _booked_contracts_match(
+    structure: str,
+    entry_context: Dict[str, Any],
+    exit_context: Dict[str, Any],
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    """True only when every leg of the exit quote is a contract booked at entry.
+
+    A key the ENTRY context lacks cannot be checked (straddle entries written
+    before ``straddle_put_strike`` existed) and is skipped; the exit quote
+    itself must then carry the same value for every key the entry has. An
+    unknown structure is never verified.
+    """
+    keys = _BOOKED_LEG_KEYS.get(structure)
+    if not keys:
+        return False
+    checked = 0
+    for key in keys:
+        booked = _safe_float(entry_context.get(key))
+        if booked is None:
+            continue
+        quoted = _safe_float(exit_context.get(key))
+        if quoted is None or abs(quoted - booked) > tolerance:
+            return False
+        checked += 1
+    if structure == "atm_straddle":
+        # Old straddle entries only stored "strike"; the exit must still quote
+        # the put at that same strike.
+        put_strike = _safe_float(exit_context.get("straddle_put_strike"))
+        booked = _safe_float(entry_context.get("strike"))
+        if put_strike is None or booked is None or abs(put_strike - booked) > tolerance:
+            return False
+    booked_expiry = entry_context.get("front_expiry")
+    if booked_expiry and str(exit_context.get("front_expiry") or "") != str(booked_expiry):
+        return False
+    return checked > 0
+
+
 def _finalize_baseline_exits(
     *,
     baseline_store: BaselineEvidenceStore,
@@ -1585,6 +1650,13 @@ def _finalize_baseline_exits(
         exit_unusable = exit_mid is None or (
             exit_mid < 0 if structure in CREDIT_STRUCTURES else exit_mid <= 0
         )
+        if not exit_unusable and entry_context and not _booked_contracts_match(
+            structure, entry_context, quote.get("context") or {},
+        ):
+            # Fail closed: a quote on any contract other than the one entered
+            # is not this position's exit, however plausible its price.
+            exit_unusable = True
+            quote = {**quote, "reason": "booked_contract_mismatch"}
         if exit_unusable:
             summary["baseline_skipped"] += 1
             if not dry_run:

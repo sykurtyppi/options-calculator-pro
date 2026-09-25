@@ -55,21 +55,40 @@ def _analysis(symbol: str, recommendation: str, structure, as_of: date = TODAY) 
     )
 
 
-class _Fetcher:
-    """Records every quote request; returns a structure-specific context."""
+ENTRY_CONTEXTS = {
+    "atm_straddle": {"strike": 100.0, "straddle_put_strike": 100.0, "front_expiry": "2026-05-01"},
+    "otm_strangle": {"call_strike": 103.0, "put_strike": 97.0, "front_expiry": "2026-05-01"},
+    "iron_condor": {
+        "short_call_strike": 105.0, "long_call_strike": 110.0,
+        "short_put_strike": 95.0, "long_put_strike": 90.0,
+        "front_expiry": "2026-05-01", "max_loss_per_unit": 4.0,
+    },
+}
 
-    def __init__(self, exit_mids: dict | None = None) -> None:
+
+class _Fetcher:
+    """Records every quote request; returns a structure-specific context.
+
+    At exit a real quote echoes the booked context back; ``exit_context``
+    overrides that per structure to simulate a quote on different contracts.
+    """
+
+    def __init__(self, exit_mids: dict | None = None, exit_context: dict | None = None, fail_entry: set | None = None) -> None:
         self.calls: list[dict] = []
         self.exit_mids = exit_mids or {}
+        self.exit_context = exit_context or {}
+        self.fail_entry = fail_entry if fail_entry is not None else set()
 
     def __call__(self, *, symbol, structure, earnings_date, as_of_date, context=None):
-        self.calls.append({"symbol": symbol, "structure": structure, "context": context})
+        self.calls.append({"symbol": symbol, "structure": structure, "context": context, "as_of": as_of_date})
         if context is not None or as_of_date == EARNINGS - timedelta(days=1):
             mid = self.exit_mids.get(structure, 1.0)
-            return {"mid": mid, "context": context or {"rediscovered": True}}
-        if structure == "iron_condor":
-            return {"mid": 1.0, "context": {"short_call_strike": 105.0, "max_loss_per_unit": 4.0}}
-        return {"mid": 5.0, "context": {"strike": 100.0, "front_expiry": "2026-05-01"}}
+            quoted = self.exit_context.get(structure, context or {"rediscovered": True})
+            return {"mid": mid, "context": quoted}
+        if as_of_date in self.fail_entry:
+            return {"mid": None, "reason": "no_option_expiries"}
+        mid = 1.0 if structure == "iron_condor" else 5.0
+        return {"mid": mid, "context": dict(ENTRY_CONTEXTS[structure])}
 
 
 def _run(tmp_path: Path, *, recommendation: str, structure, fetcher, baseline_store, as_of=TODAY, dry_run=False):
@@ -182,7 +201,7 @@ def test_exit_reprices_booked_contracts_and_condor_uses_return_on_risk(tmp_path)
 
     assert summary == {"baseline_exits": 3, "baseline_skipped": 0}
     by_structure = {call["structure"]: call["context"] for call in exit_fetcher.calls}
-    assert by_structure["atm_straddle"] == {"strike": 100.0, "front_expiry": "2026-05-01"}
+    assert by_structure["atm_straddle"] == ENTRY_CONTEXTS["atm_straddle"]
     assert by_structure["iron_condor"]["short_call_strike"] == 105.0
 
     rows = {row["baseline_name"]: row for row in baselines.list_for_diagnostics()}
@@ -311,3 +330,165 @@ def test_report_keeps_cohorts_and_legacy_rows_apart(tmp_path):
     assert universe["selector_not_actionable"]["n"] == 2
     assert universe["selector_not_actionable"]["avg_realized_return_pct"] == 10.0
     assert report["universe_shadow"]["entries"] == 3
+
+
+def _enter_all(tmp_path):
+    baselines = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
+    _run(tmp_path, recommendation="No Trade", structure=None, fetcher=_Fetcher(), baseline_store=baselines)
+    return baselines
+
+
+def _exit(tmp_path, baselines, fetcher):
+    return forward_loop._finalize_baseline_exits(
+        baseline_store=baselines,
+        price_fetcher=fetcher,
+        as_of=EARNINGS - timedelta(days=1),
+        log_path=tmp_path / "log.jsonl",
+        dry_run=False,
+        mda_client=None,
+    )
+
+
+def test_exit_quote_on_other_strikes_fails_closed(tmp_path):
+    baselines = _enter_all(tmp_path)
+    # The quote comes back "successful" but on a 95 call + 105 put.
+    wrong = {"atm_straddle": {"strike": 95.0, "straddle_put_strike": 105.0, "front_expiry": "2026-05-01"}}
+
+    summary = _exit(tmp_path, baselines, _Fetcher(exit_mids={"atm_straddle": 22.0}, exit_context=wrong))
+
+    rows = {row["baseline_name"]: row for row in baselines.list_for_diagnostics()}
+    straddle = rows["always_atm_straddle"]
+    assert straddle["status"] == "exit_skipped"
+    assert straddle["skip_reason"] == "booked_contract_mismatch"
+    assert straddle["realized_return_pct"] is None
+    assert summary == {"baseline_exits": 2, "baseline_skipped": 1}
+
+
+@pytest.mark.parametrize(
+    ("structure", "exit_context"),
+    [
+        ("otm_strangle", {"call_strike": 104.0, "put_strike": 97.0, "front_expiry": "2026-05-01"}),
+        ("iron_condor", {**ENTRY_CONTEXTS["iron_condor"], "long_put_strike": 85.0}),
+        ("atm_straddle", {**ENTRY_CONTEXTS["atm_straddle"], "front_expiry": "2026-05-08"}),
+        ("atm_straddle", {"strike": 100.0, "front_expiry": "2026-05-01"}),  # put leg unverifiable
+    ],
+)
+def test_booked_contract_check_rejects_any_leg_or_expiry_change(structure, exit_context):
+    assert forward_loop._booked_contracts_match(structure, ENTRY_CONTEXTS[structure], ENTRY_CONTEXTS[structure])
+    assert not forward_loop._booked_contracts_match(structure, ENTRY_CONTEXTS[structure], exit_context)
+    assert not forward_loop._booked_contracts_match("call_calendar", {"strike": 100.0}, {"strike": 100.0})
+
+
+def test_straddle_reprice_requires_booked_strike_on_both_legs(monkeypatch):
+    from tests.unit.test_scripts.test_run_forward_loop import _install_fake_option_chain, _option_frame
+
+    calls = _option_frame([{"contractSymbol": "C95", "strike": 95.0, "bid": 9.0, "ask": 10.0, "lastPrice": 9.5}])
+    puts = _option_frame([{"contractSymbol": "P105", "strike": 105.0, "bid": 12.0, "ask": 13.0, "lastPrice": 12.5}])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=100.0)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL",
+        structure="atm_straddle",
+        earnings_date=EARNINGS,
+        as_of_date=EARNINGS - timedelta(days=1),
+        context={"strike": 100.0, "front_expiry": "2026-05-01"},
+    )
+
+    assert quote["mid"] is None
+    assert quote["reason"] == "booked_contract_unavailable"
+
+
+def test_straddle_discovery_pairs_call_and_put_at_one_strike(monkeypatch):
+    from tests.unit.test_scripts.test_run_forward_loop import _install_fake_option_chain, _option_frame
+
+    calls = _option_frame([{"contractSymbol": "C100", "strike": 100.0, "bid": 2.0, "ask": 2.2, "lastPrice": 2.1}])
+    puts = _option_frame([
+        {"contractSymbol": "P100", "strike": 100.0, "bid": 1.9, "ask": 2.1, "lastPrice": 2.0},
+        {"contractSymbol": "P101", "strike": 101.0, "bid": 2.4, "ask": 2.6, "lastPrice": 2.5},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=100.6)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="atm_straddle", earnings_date=EARNINGS, as_of_date=TODAY,
+    )
+
+    assert quote["context"]["strike"] == quote["context"]["straddle_put_strike"] == 100.0
+
+
+def test_failed_universe_entry_is_retried_and_attempts_are_kept(tmp_path):
+    baselines = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
+    fetcher = _Fetcher(fail_entry={TODAY, TODAY + timedelta(days=1)})
+
+    for offset in range(4):
+        _run(
+            tmp_path,
+            recommendation="No Trade",
+            structure=None,
+            fetcher=fetcher,
+            baseline_store=baselines,
+            as_of=TODAY + timedelta(days=offset),
+        )
+
+    rows = baselines.list_for_diagnostics()
+    assert len(rows) == 3
+    assert {row["status"] for row in rows} == {"open"}
+    assert {row["entry_date"] for row in rows} == {(TODAY + timedelta(days=2)).isoformat()}
+    assert {row["entry_attempt_count"] for row in rows} == {3}
+    for row in rows:
+        assert row["failed_entry_attempts_json"] == [
+            {"date": TODAY.isoformat(), "reason": "no_option_expiries"},
+            {"date": (TODAY + timedelta(days=1)).isoformat(), "reason": "no_option_expiries"},
+        ]
+    # 3 structures x (2 failed days + 1 success); day 4 costs nothing.
+    assert len(fetcher.calls) == 9
+
+    report = build_evidence_report(
+        baseline_store=baselines,
+        outcome_store=OutcomeStore(store_path=tmp_path / "outcomes.sqlite"),
+    )
+    attrition = report["universe_shadow"]["entry_attrition"]
+    assert attrition["entered_after_retry"] == 3
+    assert attrition["failed_attempts_by_reason"] == {"no_option_expiries": 6}
+
+
+def test_event_that_never_quotes_is_counted_as_attrition(tmp_path):
+    baselines = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
+    fetcher = _Fetcher(fail_entry={TODAY + timedelta(days=offset) for offset in range(2)})
+    for offset in range(2):
+        _run(tmp_path, recommendation="No Trade", structure=None, fetcher=fetcher,
+             baseline_store=baselines, as_of=TODAY + timedelta(days=offset))
+
+    report = build_evidence_report(
+        baseline_store=baselines,
+        outcome_store=OutcomeStore(store_path=tmp_path / "outcomes.sqlite"),
+    )
+    attrition = report["universe_shadow"]["entry_attrition"]
+    assert attrition["not_entered"] == 3
+    assert attrition["not_entered_by_reason"] == {"no_option_expiries": 3}
+
+
+def test_paired_rows_are_never_replaced(tmp_path):
+    baselines = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
+    kwargs = dict(
+        recommendation_id="rec", symbol="AAPL", baseline_name="always_atm_straddle", structure="atm_straddle",
+        entry_date=TODAY, earnings_date=EARNINGS, selector_structure="atm_straddle", modeled_cost_pct=0.0,
+        execution_penalty_at_entry=0.0, data_quality_score_at_entry=0.9, iv_rv_har_at_entry=1.0,
+        iv_rv_yz_at_entry=1.0, quote_source_at_entry="yfinance", quote_quality_at_entry="paper",
+    )
+    assert baselines.insert_entry(entry_mid=None, status="entry_skipped", skip_reason="x", **kwargs) is True
+    assert baselines.insert_entry(entry_mid=5.0, **kwargs) is False
+    assert baselines.list_for_diagnostics()[0]["status"] == "entry_skipped"
+
+
+def test_unverified_143_label_is_not_comparable(tmp_path):
+    baselines = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
+    _resolved(baselines, baseline_id=make_baseline_id("p1", "always_iron_condor"), recommendation_id="p1",
+              cohort="paired", repricing="booked_strikes", ret=50.0)
+
+    report = build_evidence_report(
+        baseline_store=baselines,
+        outcome_store=OutcomeStore(store_path=tmp_path / "outcomes.sqlite"),
+    )
+
+    assert "always_iron_condor" not in report["baseline_comparison"]
+    assert report["legacy_repriced_baselines"]["by_exit_repricing"] == {"booked_strikes": 1}
