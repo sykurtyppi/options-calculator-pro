@@ -38,11 +38,16 @@ BASELINE_STRUCTURES = {
 COHORT_PAIRED = "paired"
 COHORT_UNIVERSE = "universe"
 
-# How the exit quote was obtained. Rows resolved before booked-strike exits
-# existed re-discovered strikes at exit (a different contract than the one
-# bought), so their returns are not comparable and are reported separately.
-EXIT_REPRICING_BOOKED = "booked_strikes"
+# How the exit quote was obtained. Only EXIT_REPRICING_BOOKED rows are
+# comparable: every leg of the exit quote was checked against the contracts
+# stored at entry. Everything else is reported separately:
+# * rediscovered_legacy - entered before the entry context was stored, so the
+#   exit re-discovered strikes (a different contract than the one bought).
+# * booked_strikes - the #143 label, applied WITHOUT checking the exit legs;
+#   an ATM straddle exit could pair a different call and put strike.
+EXIT_REPRICING_BOOKED = "booked_entry_contracts"
 EXIT_REPRICING_LEGACY = "rediscovered_legacy"
+EXIT_REPRICING_UNVERIFIED = "booked_strikes"
 
 _TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS baseline_trades (
@@ -122,6 +127,8 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "exit_repricing": "TEXT",
     "selector_recommendation": "TEXT",
     "days_to_earnings_at_entry": "INTEGER",
+    "entry_attempt_count": "INTEGER",
+    "failed_entry_attempts_json": "TEXT",
 }
 
 
@@ -190,7 +197,7 @@ class BaselineEvidenceStore:
     ) -> bool:
         baseline_id = baseline_id or make_baseline_id(recommendation_id, baseline_name)
         sql = """
-            INSERT OR IGNORE INTO baseline_trades (
+            INSERT INTO baseline_trades (
                 baseline_id, recommendation_id, symbol, baseline_name, structure,
                 entry_date, earnings_date, selector_structure, entry_mid,
                 modeled_cost_pct, execution_penalty_at_entry,
@@ -204,10 +211,11 @@ class BaselineEvidenceStore:
                 surface_iv_anomaly_count,
                 status, skip_reason, metadata_json,
                 cohort, entry_pricing_context_json, capital_at_risk,
-                selector_recommendation, days_to_earnings_at_entry
+                selector_recommendation, days_to_earnings_at_entry,
+                entry_attempt_count, failed_entry_attempts_json
             ) VALUES (
                 ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                ?,?,?,?,?
+                ?,?,?,?,?,?,?
             )
         """
         surface_quality = surface_quality or {}
@@ -253,20 +261,45 @@ class BaselineEvidenceStore:
         )
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
-                cur.execute(sql, params)
+                prior = cur.execute(
+                    "SELECT status, skip_reason, entry_date, entry_attempt_count, failed_entry_attempts_json"
+                    " FROM baseline_trades WHERE baseline_id = ?",
+                    (baseline_id,),
+                ).fetchone()
+                failed_attempts: list[Dict[str, Any]] = []
+                attempt_count = 1
+                if prior is not None:
+                    # Only a failed universe entry may be retried. Anything that
+                    # entered keeps its first entry; paired rows never retry.
+                    if cohort != COHORT_UNIVERSE or str(prior["status"]) != "entry_skipped":
+                        return False
+                    failed_attempts = _loads_list(prior["failed_entry_attempts_json"])
+                    if not failed_attempts:
+                        # Rows skipped before attempts were logged: the row
+                        # itself is the only record of the first attempt.
+                        failed_attempts = [{"date": prior["entry_date"], "reason": prior["skip_reason"]}]
+                    attempt_count = int(prior["entry_attempt_count"] or len(failed_attempts)) + 1
+                    cur.execute("DELETE FROM baseline_trades WHERE baseline_id = ?", (baseline_id,))
+                if status == "entry_skipped":
+                    failed_attempts = failed_attempts + [{"date": _fmt_date(entry_date), "reason": skip_reason}]
+                cur.execute(sql, params + (attempt_count, _json(failed_attempts)))
                 return cur.rowcount > 0
 
     def recorded_universe_baselines(self, symbol: str, earnings_date: Any) -> set[str]:
-        """Baseline names already recorded for this event in the universe cohort.
+        """Baseline names already ENTERED for this event in the universe cohort.
 
         Checked BEFORE quoting so an event that stays in the DTE window for ten
-        days costs one set of quotes, not ten.
+        days costs one set of quotes, not ten. A failed entry (entry_skipped) is
+        not counted, so it is retried on the event's next day in the window;
+        otherwise a one-day provider outage would silently drop the event and
+        the resolved sample would be selected by first-day data availability.
         """
         rows = self._conn.execute(
             """
             SELECT baseline_name
             FROM baseline_trades
             WHERE cohort = ? AND symbol = ? AND earnings_date = ?
+              AND status != 'entry_skipped'
             """,
             (COHORT_UNIVERSE, str(symbol).upper(), _fmt_date(earnings_date)),
         ).fetchall()
@@ -409,6 +442,8 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     ):
         if key in result:
             result[key] = _loads(result.get(key))
+    if "failed_entry_attempts_json" in result:
+        result["failed_entry_attempts_json"] = _loads_list(result.get("failed_entry_attempts_json"))
     return result
 
 
@@ -420,6 +455,16 @@ def _loads(value: Any) -> Dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+
+def _loads_list(value: Any) -> list[Any]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
 
 
 def _json(value: Any) -> str:
