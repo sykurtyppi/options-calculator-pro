@@ -294,11 +294,16 @@ def build_vol_snapshot(
     if not chain_frame.empty and "trade_date" in chain_frame.columns:
         _chain_dates = pd.to_datetime(chain_frame["trade_date"], errors="coerce")
         _future_mask = _chain_dates > pd.Timestamp(as_of_date)
-        if bool(_future_mask.any()):
-            chain_frame = chain_frame[~_future_mask.fillna(False)].reset_index(drop=True)
+        _invalid_mask = _chain_dates.isna()
+        if bool((_future_mask | _invalid_mask).any()):
+            chain_frame = chain_frame[~(_future_mask | _invalid_mask)].reset_index(drop=True)
             if chain_frame.empty:
                 option_source = None
-                null_reasons["option_chain"] = "future_only_chain_dropped_for_as_of"
+                null_reasons["option_chain"] = (
+                    "future_only_chain_dropped_for_as_of"
+                    if bool(_future_mask.any()) and not bool(_invalid_mask.any())
+                    else "no_valid_as_of_trade_dates"
+                )
     earnings = _resolve_earnings_metadata(earnings_metadata, as_of_date)
 
     earnings_date = earnings.earnings_date
@@ -731,6 +736,28 @@ def _safe_float(value: Any, default: float = np.nan) -> float:
 # (canonical single source of truth) at the top of this module.
 
 
+def _parse_provider_timestamps(values: pd.Series) -> pd.Series:
+    """Parse provider timestamps independently, preserving displayed local time."""
+    parsed_values: List[Any] = []
+    for value in values:
+        try:
+            parsed = pd.Timestamp(value)
+        except (TypeError, ValueError):
+            parsed = pd.NaT
+        if pd.isna(parsed):
+            parsed_values.append(pd.NaT)
+            continue
+        if parsed.tzinfo is not None:
+            parsed = parsed.tz_localize(None)
+        parsed_values.append(parsed)
+    return pd.Series(parsed_values, index=values.index, dtype="datetime64[ns]")
+
+
+def _normalize_provider_calendar_dates(values: pd.Series) -> pd.Series:
+    """Parse provider dates independently, preserving each displayed date."""
+    return _parse_provider_timestamps(values).dt.normalize()
+
+
 def _normalize_price_frame(price_data: Any) -> Tuple[pd.DataFrame, Optional[str]]:
     if price_data is None:
         return pd.DataFrame(), None
@@ -760,7 +787,7 @@ def _normalize_price_frame(price_data: Any) -> Tuple[pd.DataFrame, Optional[str]
             date_col = candidate
             break
     if date_col is not None:
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df[date_col] = _parse_provider_timestamps(df[date_col])
         df = df.dropna(subset=[date_col]).set_index(date_col)
 
     return _finalize_price_frame(df), "provided"
@@ -768,10 +795,9 @@ def _normalize_price_frame(price_data: Any) -> Tuple[pd.DataFrame, Optional[str]
 
 def _finalize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    if not isinstance(out.index, pd.DatetimeIndex):
-        out.index = pd.to_datetime(out.index, errors="coerce")
-    out = out[~out.index.isna()].sort_index()
-    out.index = out.index.tz_localize(None) if out.index.tz is not None else out.index
+    index_values = pd.Series(out.index, index=range(len(out)))
+    out.index = pd.DatetimeIndex(_parse_provider_timestamps(index_values))
+    out = out[~out.index.isna()].sort_index(kind="stable")
     out.index = out.index.normalize()
     out = out[~out.index.duplicated(keep="last")]
     for col in ("Open", "High", "Low", "Close", "Volume"):
@@ -809,7 +835,11 @@ def _normalize_option_chain(option_chain_data: Any) -> Tuple[pd.DataFrame, Optio
 
     for col in ("trade_date", "expiry"):
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce").dt.normalize()
+            # Provider timestamps are normalized to timezone-naive calendar
+            # dates at this trust boundary.  Snapshot cutoffs are dates (not
+            # instants), so preserving the provider's calendar date matches the
+            # price-frame policy and keeps naive/aware inputs comparable.
+            df[col] = _normalize_provider_calendar_dates(df[col])
 
     if "call_put" in df.columns:
         normalized_side = df["call_put"].astype(str).str.strip().str.upper()

@@ -9,6 +9,8 @@ import web.api.edge_engine as edge_engine
 from services.earnings_vol_snapshot import (
     build_vol_snapshot,
     _data_quality_score,
+    _normalize_option_chain,
+    _normalize_price_frame,
     _quality_label,
     _rv_percentile_and_regime,
 )
@@ -204,6 +206,168 @@ class TestEarningsVolSnapshot(unittest.TestCase):
         snapshot_1 = self._build_snapshot()
         snapshot_2 = self._build_snapshot()
         self.assertEqual(snapshot_1.to_dict(), snapshot_2.to_dict())
+
+    def test_naive_and_aware_provider_timestamps_preserve_as_of_filtering(self):
+        base_prices, prior_events = _make_price_history()
+        base_chain = _make_chain()
+        earnings = {
+            "earnings_date": "2026-04-28",
+            "release_timing": "after market close",
+            "prior_events": prior_events,
+        }
+        expected = self._build_snapshot(
+            price_df=base_prices,
+            chain_df=base_chain,
+            earnings_metadata=earnings,
+        ).to_dict()
+
+        for timezone in (None, "UTC"):
+            with self.subTest(timezone=timezone or "naive"):
+                prices = base_prices.copy()
+                chain = base_chain.copy()
+                if timezone is not None:
+                    prices["trade_date"] = prices["trade_date"].dt.tz_localize(timezone)
+                    chain["trade_date"] = pd.to_datetime(chain["trade_date"]).dt.tz_localize(timezone)
+
+                future_price = prices.iloc[-1].copy()
+                future_price["trade_date"] = pd.Timestamp("2026-04-21", tz=timezone)
+                future_price["close"] = 999.0
+                prices = pd.concat([prices, future_price.to_frame().T], ignore_index=True)
+
+                future_chain = chain.iloc[0].copy()
+                future_chain["trade_date"] = pd.Timestamp("2026-04-21", tz=timezone)
+                future_chain["underlying_price"] = 999.0
+                future_chain["mid"] = 999.0
+                chain = pd.concat([chain, future_chain.to_frame().T], ignore_index=True)
+
+                actual = self._build_snapshot(
+                    price_df=prices,
+                    chain_df=chain,
+                    earnings_metadata=earnings,
+                ).to_dict()
+                self.assertEqual(actual, expected)
+
+    def test_mixed_timezone_values_preserve_displayed_calendar_dates(self):
+        raw = pd.DataFrame(
+            {
+                "trade_date": [
+                    "2026-04-18 15:30:00",
+                    "2026-04-19T23:30:00Z",
+                    "2026-04-20T00:30:00+14:00",
+                    "not-a-date",
+                    "2026-04-20T12:00:00Z",
+                ],
+                "expiry": [
+                    "2026-05-01 16:00:00",
+                    "2026-05-02T23:00:00Z",
+                    "2026-05-03T00:30:00-07:00",
+                    "2026-05-04",
+                    "also-not-a-date",
+                ],
+                "call_put": ["C"] * 5,
+                "strike": [100.0] * 5,
+                "bid": [1.0] * 5,
+                "ask": [1.2] * 5,
+            }
+        )
+
+        normalized, _ = _normalize_option_chain(raw)
+
+        self.assertEqual(
+            normalized["trade_date"].iloc[:3].tolist(),
+            [
+                pd.Timestamp("2026-04-18"),
+                pd.Timestamp("2026-04-19"),
+                pd.Timestamp("2026-04-20"),
+            ],
+        )
+        self.assertEqual(
+            normalized["expiry"].iloc[:3].tolist(),
+            [
+                pd.Timestamp("2026-05-01"),
+                pd.Timestamp("2026-05-02"),
+                pd.Timestamp("2026-05-03"),
+            ],
+        )
+        self.assertTrue(pd.isna(normalized["trade_date"].iloc[3]))
+        self.assertEqual(len(normalized), 4)
+        self.assertIsNone(normalized["trade_date"].dt.tz)
+        self.assertIsNone(normalized["expiry"].dt.tz)
+
+        prices, _ = _normalize_price_frame(
+            pd.DataFrame(
+                {
+                    "trade_date": raw["trade_date"].iloc[:4],
+                    "close": [100.0, 101.0, 102.0, 999.0],
+                }
+            )
+        )
+        self.assertEqual(
+            prices.index.tolist(),
+            [
+                pd.Timestamp("2026-04-18"),
+                pd.Timestamp("2026-04-19"),
+                pd.Timestamp("2026-04-20"),
+            ],
+        )
+        self.assertIsNone(prices.index.tz)
+        self.assertEqual(prices["Close"].tolist(), [100.0, 101.0, 102.0])
+
+    def test_duplicate_intraday_prices_keep_final_bar_for_displayed_date(self):
+        prices, _ = _normalize_price_frame(
+            pd.DataFrame(
+                {
+                    "trade_date": [
+                        "2026-04-20 15:59:00",
+                        "2026-04-20 09:30:00",
+                        "2026-04-20 12:00:00",
+                    ],
+                    "close": [101.0, 99.0, 100.0],
+                }
+            )
+        )
+
+        self.assertEqual(prices.index.tolist(), [pd.Timestamp("2026-04-20")])
+        self.assertEqual(prices["Close"].tolist(), [101.0])
+
+    def test_mixed_timestamp_chain_drops_future_and_invalid_trade_date_poison(self):
+        base_chain = _make_chain()
+        expected = self._build_snapshot(
+            price_df=pd.DataFrame(),
+            chain_df=base_chain,
+        ).to_dict()
+        mixed_chain = base_chain.copy()
+        trade_formats = (
+            "2026-04-20 15:30:00",
+            "2026-04-20T23:30:00Z",
+            "2026-04-20T00:30:00-07:00",
+        )
+        expiry_formats = {
+            "2026-04-24": ("2026-04-24 16:00:00", "2026-04-24T23:00:00Z", "2026-04-24T00:30:00+09:00"),
+            "2026-05-15": ("2026-05-15 16:00:00", "2026-05-15T23:00:00Z", "2026-05-15T00:30:00+09:00"),
+            "2026-06-19": ("2026-06-19 16:00:00", "2026-06-19T23:00:00Z", "2026-06-19T00:30:00+09:00"),
+        }
+        for position, index in enumerate(mixed_chain.index):
+            expiry = str(mixed_chain.at[index, "expiry"])
+            mixed_chain.at[index, "trade_date"] = trade_formats[position % 3]
+            mixed_chain.at[index, "expiry"] = expiry_formats[expiry][position % 3]
+
+        poison = mixed_chain.iloc[[0]].copy()
+        poison["underlying_price"] = 999.0
+        poison["mid"] = 999.0
+        invalid_poison = pd.concat([poison] * (len(mixed_chain) + 1), ignore_index=True)
+        invalid_poison["trade_date"] = "not-a-date"
+        future_poison = poison.copy()
+        future_poison["trade_date"] = "2026-04-21T00:30:00+14:00"
+
+        actual = self._build_snapshot(
+            price_df=pd.DataFrame(),
+            chain_df=pd.concat(
+                [mixed_chain, invalid_poison, future_poison], ignore_index=True
+            ),
+        ).to_dict()
+
+        self.assertEqual(actual, expected)
 
     def test_snapshot_preserves_earnings_source_provenance(self):
         price_df, prior_events = _make_price_history()

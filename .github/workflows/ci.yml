@@ -93,7 +93,7 @@ jobs:
         # `-q` matches the local invocation in the test-plan
         # checklists across the recent PRs (PR #58 onwards). Failure
         # exits non-zero and fails the job.
-        run: pytest tests/unit -q
+        run: pytest tests/unit tests/golden -q
 
   frontend-tests:
     name: Frontend (node --test + vitest)
