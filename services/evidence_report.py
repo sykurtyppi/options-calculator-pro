@@ -10,7 +10,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
-from services.baseline_evidence_store import BaselineEvidenceStore, get_baseline_evidence_store
+from services.baseline_evidence_store import (
+    COHORT_PAIRED,
+    COHORT_UNIVERSE,
+    BaselineEvidenceStore,
+    baseline_cohort,
+    get_baseline_evidence_store,
+    is_booked_strike_exit,
+)
 from services.data_quality_diagnostics import build_data_quality_diagnostics
 from services.evidence_maturity import build_evidence_maturity
 from services.forward_performance_diagnostics import build_forward_performance_diagnostics
@@ -20,6 +27,10 @@ from services.provider_telemetry import build_provider_telemetry_diagnostics
 MIN_COMMERCIAL_EVIDENCE_DAYS = 60
 TARGET_COMMERCIAL_EVIDENCE_DAYS = 90
 MIN_RESOLVED_SAMPLE = 30
+
+# Mirrors scripts/run_forward_loop.ALLOWED_RECOMMENDATIONS (services must not
+# import from scripts).
+ACTIONABLE_RECOMMENDATIONS = frozenset({"Best Candidate", "Candidate"})
 
 
 def build_evidence_report(
@@ -42,9 +53,17 @@ def build_evidence_report(
     resolved_baselines = [row for row in baselines if str(row.get("status") or "") == "resolved"]
     open_baselines = [row for row in baselines if str(row.get("status") or "") == "open"]
     skipped_baselines = [row for row in baselines if "skipped" in str(row.get("status") or "")]
+    # Only booked-strike exits are comparable. Legacy rows repriced a contract
+    # re-discovered at exit, not the one entered, and the universe cohort
+    # answers a different question - pooling either would bias the comparison.
+    comparable_paired = [
+        row for row in resolved_baselines
+        if baseline_cohort(row) == COHORT_PAIRED and is_booked_strike_exit(row)
+    ]
+    legacy_repriced = [row for row in resolved_baselines if not is_booked_strike_exit(row)]
 
     selector_stats = _outcome_stats(selected)
-    baseline_stats = _group_by(resolved_baselines, lambda row: row.get("baseline_name") or "unknown_baseline")
+    baseline_stats = _group_by(comparable_paired, lambda row: row.get("baseline_name") or "unknown_baseline")
     baseline_stats["no_trade"] = {
         "n": len(selected),
         "wins": 0,
@@ -63,7 +82,7 @@ def build_evidence_report(
     maturity = build_evidence_maturity(
         active_evidence_days=active_days,
         resolved_selector_outcomes=selector_stats["n"],
-        resolved_baseline_outcomes=len(resolved_baselines),
+        resolved_baseline_outcomes=len(comparable_paired),
         claimable_evidence_count=int(evidence_quality.get("claim_allowed_count") or 0),
         max_bucket_sample_size=_max_bucket_sample_size(forward.get("calibration_report", {})),
     )
@@ -85,6 +104,16 @@ def build_evidence_report(
         },
         "selector_summary": selector_stats,
         "baseline_comparison": baseline_stats,
+        "universe_shadow": _universe_shadow_summary(baselines),
+        "legacy_repriced_baselines": {
+            "n": len(legacy_repriced),
+            "by_baseline": _group_by(legacy_repriced, lambda row: row.get("baseline_name") or "unknown_baseline"),
+            "note": (
+                "Excluded from every comparison: the exit re-discovered strikes instead of "
+                "repricing the contracts booked at entry, so these returns are not the "
+                "position's P&L."
+            ),
+        },
         "structure_breakdown": forward.get("by_structure", {}),
         "data_quality_breakdown": forward.get("data_quality_comparison", {}),
         "stale_source_breakdown": forward.get("stale_source_comparison", {}),
@@ -105,7 +134,7 @@ def build_evidence_report(
         "warning_flags": _warnings(
             active_days=active_days,
             selector_n=selector_stats["n"],
-            baseline_n=len(resolved_baselines),
+            baseline_n=len(comparable_paired),
             forward_warnings=forward.get("warning_flags", []),
             evidence_quality=evidence_quality,
             surface_quality=surface_quality,
@@ -114,6 +143,8 @@ def build_evidence_report(
         "notes": [
             "Selector outcomes are paper/research records, not live broker fills.",
             "Baseline structures are shadow evidence only and do not update calibration or priors.",
+            "baseline_comparison covers the paired cohort only (entered beside a selector trade); universe_shadow covers every eligible event regardless of the selector call.",
+            "Shadow exits are on the day before earnings, so short-vol baselines measure the pre-earnings IV run-up, not the post-earnings crush.",
             "Simple IV/RV filter is an observational baseline over selected paper outcomes, not a separately traded strategy.",
         ],
     }
@@ -231,6 +262,41 @@ def _group_by(rows: Iterable[Dict[str, Any]], key_fn: Any) -> Dict[str, Dict[str
     for row in rows:
         grouped[str(key_fn(row))].append(row)
     return {key: _baseline_stats(items) for key, items in sorted(grouped.items())}
+
+
+def _universe_shadow_summary(baselines: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = [row for row in baselines if baseline_cohort(row) == COHORT_UNIVERSE]
+    resolved = [
+        row for row in rows
+        if str(row.get("status") or "") == "resolved" and is_booked_strike_exit(row)
+    ]
+    by_baseline: Dict[str, Dict[str, Any]] = {}
+    for name in sorted({str(row.get("baseline_name") or "unknown_baseline") for row in resolved}):
+        members = [row for row in resolved if str(row.get("baseline_name") or "unknown_baseline") == name]
+        by_baseline[name] = {
+            "all_events": _baseline_stats(members),
+            "selector_actionable": _baseline_stats(
+                row for row in members if row.get("selector_recommendation") in ACTIONABLE_RECOMMENDATIONS
+            ),
+            "selector_not_actionable": _baseline_stats(
+                row for row in members if row.get("selector_recommendation") not in ACTIONABLE_RECOMMENDATIONS
+            ),
+        }
+    return {
+        "events_recorded": len({(row.get("symbol"), row.get("earnings_date")) for row in rows}),
+        "entries": len(rows),
+        "open": sum(1 for row in rows if str(row.get("status") or "") == "open"),
+        "resolved": len(resolved),
+        "skipped": sum(1 for row in rows if "skipped" in str(row.get("status") or "")),
+        "by_baseline": by_baseline,
+        "rule": (
+            "Every eligible earnings event is shadow-entered once, on its first day in the "
+            "DTE window, for each baseline structure, whatever the selector recommended. "
+            "If selector_not_actionable returns are no worse than selector_actionable, the "
+            "selector's skips are not adding value."
+        ),
+        "paper_research_label": "shadow paper baseline, not execution-grade live fills",
+    }
 
 
 def _simple_iv_rv_filter(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:

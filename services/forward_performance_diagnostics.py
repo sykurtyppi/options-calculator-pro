@@ -12,7 +12,13 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
-from services.baseline_evidence_store import BaselineEvidenceStore, get_baseline_evidence_store
+from services.baseline_evidence_store import (
+    COHORT_PAIRED,
+    BaselineEvidenceStore,
+    baseline_cohort,
+    get_baseline_evidence_store,
+    is_booked_strike_exit,
+)
 from services.outcome_recorder import OutcomeStore, get_outcome_store
 from services.recommendation_ledger import RecommendationLedger, get_recommendation_ledger
 
@@ -56,7 +62,15 @@ def build_forward_performance_diagnostics(
         for row in outcomes
         if _is_resolved(row)
     ]
-    resolved_baselines = [_merged_baseline(row) for row in baseline_rows if _is_baseline_resolved(row)]
+    # Benchmarks compare like with like: paired-cohort rows whose exit repriced
+    # the booked contracts. See services/evidence_report.py for the other cohorts.
+    resolved_baselines = [
+        _merged_baseline(row)
+        for row in baseline_rows
+        if _is_baseline_resolved(row)
+        and baseline_cohort(row) == COHORT_PAIRED
+        and is_booked_strike_exit(row)
+    ]
 
     no_trade_count = sum(1 for row in ledger_rows if str(row.get("recommendation") or "") == "No Trade")
     open_count = sum(1 for row in outcomes if str(row.get("status") or "") in {"open", "exited"})
@@ -379,6 +393,10 @@ def _benchmark_comparison(
         "always_otm_strangle": {
             **_group_stats(baseline_by_name.get("always_otm_strangle", [])),
             "rule": "Shadow baseline: enter OTM strangle whenever selector records a candidate baseline.",
+        },
+        "always_iron_condor": {
+            **_group_stats(baseline_by_name.get("always_iron_condor", [])),
+            "rule": "Shadow baseline: sell an iron condor whenever selector records a candidate; closed the day before earnings.",
         },
         "no_trade": no_trade,
         "simple_iv_rv_filter": {

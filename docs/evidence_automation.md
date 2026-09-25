@@ -12,9 +12,12 @@ What it does:
 
 - runs the forward screener and selector
 - records actionable paper entries
-- records shadow baseline quotes for `always_atm_straddle` and `always_otm_strangle`
+- records shadow baseline quotes for `always_atm_straddle`, `always_otm_strangle` and `always_iron_condor` in two cohorts:
+  - `paired`: beside each selector paper entry (the `baseline_comparison` in the Evidence Report)
+  - `universe`: once per eligible earnings event on its first day in the DTE window, whatever the selector recommended, so No Trade calls have a counterfactual (`universe_shadow`, split by selector decision)
 - finalizes due paper outcomes at T-1 when quotes are available
-- finalizes due shadow baselines without updating calibration or priors
+- finalizes due shadow baselines by repricing the contracts booked at entry, without updating calibration or priors. Baselines resolved before booked-strike exits existed re-discovered strikes at exit; they are reported only under `legacy_repriced_baselines` and excluded from comparisons
+- because exits are at T-1, the iron condor baseline measures shorting the pre-earnings IV run-up, not the post-earnings crush
 - writes a daily evidence snapshot to `~/.options_calculator_pro/reports/evidence/`
 
 Safe dry run:

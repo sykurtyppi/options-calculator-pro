@@ -243,7 +243,12 @@ def test_run_daily_cycle_records_entries_finalizes_exits_and_skips_missing_data(
     assert store.count_finalized() == 2
     assert cal._n() == 2
     assert ledger.count() == 4
-    assert baseline_store.count() == 6
+    # Paired: 3 selector entries x 3 baselines. Universe: all 4 analyzed events
+    # x 3 baselines, entered once - the second cycle adds nothing.
+    baseline_rows = baseline_store.list_for_diagnostics()
+    assert sum(1 for row in baseline_rows if row["cohort"] == "paired") == 9
+    assert sum(1 for row in baseline_rows if row["cohort"] == "universe") == 12
+    assert baseline_store.count() == 21
 
     aapl_trade = store.get_trade(
         make_trade_id("AAPL", today, "atm_straddle", earnings_date=today + timedelta(days=6))

@@ -116,6 +116,7 @@ export function buildSimpleIvRvFilter(payload = {}) {
 function labelBaseline(name) {
   if (name === 'always_atm_straddle') return 'Always ATM straddle'
   if (name === 'always_otm_strangle') return 'Always OTM strangle'
+  if (name === 'always_iron_condor') return 'Always iron condor'
   if (name === 'no_trade') return 'No trade'
   return String(name || 'unknown').replace(/_/g, ' ')
 }
