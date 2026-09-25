@@ -511,6 +511,34 @@ def _select_otm_wing(
 
 
 def _normalize_forward_chain_frame(frame: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Provider boundary for the forward loop's option chains.
+
+    LOAD-BEARING PROVIDER ASSUMPTION — a worthless leg must arrive as a numeric
+    ``0.0`` bid, NOT as NaN.
+
+    ``_closing_leg_mid`` distinguishes the two: a valid ``bid == 0.0`` means
+    "genuinely worthless", and an exit is still priced from the ask; a NaN bid
+    means "unknown" and the leg is refused, because treating unknown as zero
+    once converted a -95% loss into a +267% win. That split is only safe while
+    providers really do emit 0.0 for worthless legs.
+
+    Both current providers satisfy it: yfinance
+    (yfinance_market_data_client.py:207) and MarketData
+    (market_data_client.py:563) each run bid through
+    ``pd.to_numeric(..., errors="coerce")``, so a real zero stays 0.0 and only an
+    absent/unparseable quote becomes NaN. This function deliberately does NOT
+    fill or drop NaN bid/ask — it coerces ``strike`` only — so that distinction
+    survives intact down to the pricing layer.
+
+    If a provider is ever added that reports absent quotes as NaN rather than
+    0.0, the assumption inverts: condors at MAX WIN (every leg decayed to
+    nothing) would start being refused as unknown, silently deleting the modal
+    successful outcome from the learning ledger and biasing the structure's
+    measured return downward. Symptom to watch for: a run of exits skipped with
+    reason ``missing_condor_mid``. Guarded by
+    test_condor_max_win_exit_is_recorded_not_deleted and
+    test_closing_leg_mid_rejects_an_unknown_bid_but_accepts_a_real_zero.
+    """
     if frame is None or frame.empty:
         return pd.DataFrame()
     normalized = frame.copy()
@@ -619,6 +647,144 @@ def _expiry_after(options: list[str], target: date) -> Optional[str]:
 
 def _expiry_after_gap(options: list[str], start: date, gap_days: int) -> Optional[str]:
     return _expiry_after(options, start + timedelta(days=gap_days))
+
+
+# ── Iron condor geometry ─────────────────────────────────────────────────────
+# The short legs sit at the SAME OTM distance as the otm_strangle's wings (±3%
+# of spot) so the sold body of the condor is directly comparable to the strangle
+# the engine would otherwise buy. The protective long wings sit a further
+# CONDOR_WING_OFFSET_PCT beyond them — that offset is what converts an undefined-
+# risk strangle sale into a defined-risk condor, and it sets the max loss
+# (wing width - net credit).
+CONDOR_SHORT_OTM_PCT = 0.03
+CONDOR_WING_OFFSET_PCT = 0.02
+# How far outside the no-arbitrage bounds a re-priced condor value may sit before
+# it is treated as unusable data rather than quote noise. Two ticks on a
+# penny-increment chain. Repairing more than this fabricates an outcome.
+CONDOR_QUOTE_REPAIR_TOLERANCE = 0.02
+# ...and never let a repaired error exceed this fraction of the position's
+# capital at risk, so the tolerance stays proportionate on thin-risk condors
+# where a flat two ticks would be a large slice of the return.
+CONDOR_QUOTE_REPAIR_MAX_RETURN_IMPACT = 0.05
+
+
+def _row_at_strike(frame: pd.DataFrame, strike: Optional[float], *, tolerance: float = 1e-6) -> Optional[pd.Series]:
+    """Exact-strike lookup, used to RE-PRICE an already-booked leg.
+
+    Deliberately NOT _select_otm_wing: that helper filters to strikes still OTM
+    relative to the CURRENT spot, which is right when discovering a new structure
+    but wrong when re-pricing an open position. If spot has moved through a short
+    strike — precisely the case where a condor loses money — the OTM filter drops
+    the booked strike and the fallback silently prices a DIFFERENT option, so the
+    realized P&L would describe a trade that was never held.
+    """
+    if strike is None or frame is None or frame.empty:
+        return None
+    row = _nearest_row(frame, float(strike))
+    if row is None:
+        return None
+    return row if abs(float(row["strike"]) - float(strike)) <= tolerance else None
+
+
+def _reprice_selection(frame: pd.DataFrame, strike: Optional[float], *, leg: str) -> Dict[str, Any]:
+    """_select_otm_wing-shaped result that resolves an ALREADY-BOOKED strike exactly.
+
+    Re-pricing an open position must quote the strike actually held. Running OTM
+    discovery instead drops that strike the moment spot trades through it, and the
+    nearest-valid fallback then substitutes a strike that is always FURTHER out of
+    the money, and therefore cheaper, on both sides:
+
+        call: spot rises above K → filter keeps strikes >= spot > K → K' > K
+        put:  spot falls below K → filter keeps strikes <= spot < K → K' < K
+
+    so the exit is systematically under-valued and the realized return is
+    understated. Observed live on AMZN (booked 260 call, re-priced on the 265) and
+    TTD (booked 24.5, re-priced on the 25).
+    """
+    if strike is None:
+        return {"row": None, "reason": "missing_booked_strike", "quote_quality_label": "partial_or_missing_mid"}
+    row = _row_at_strike(frame, strike)
+    if row is None:
+        return {
+            "row": None,
+            "reason": "booked_strike_no_longer_listed",
+            "quote_quality_label": "partial_or_missing_mid",
+            "requested_strike": float(strike),
+        }
+    return {
+        "row": row,
+        "reason": None,
+        "quote_quality_label": "booked_strike_reprice",
+        "fallback_distance": 0.0,
+        "requested_strike": float(strike),
+    }
+
+
+def _closing_leg_mid(row: Optional[pd.Series], *, action: str) -> Optional[float]:
+    """Mark one leg of an OPEN position, aware of which side of the market closes it.
+
+    `_mid_from_row` voids any leg quoted with `bid <= 0` ("H3: zero bid not
+    executable"). That is correct for a leg you must SELL to close: no bid means
+    no exit. It is wrong for a leg you must BUY to close, where the ASK governs
+    and a `0.00 x 0.05` market is the BEST possible news, not an error.
+
+    Applying the sell-side rule to all four condor legs deleted condors at max
+    WIN — the modal successful outcome for a short-vol structure is every leg
+    decaying to nothing, and one bid-less leg out of four was enough to void the
+    whole exit. Losers, by contrast, have expensive two-sided ITM legs that always
+    quote, so the ledger kept losers and dropped winners.
+
+    Only used when re-pricing an open position. Entry keeps the strict rule for
+    every leg: refusing to OPEN on a phantom quote biases nothing, because no
+    trade is booked.
+    """
+    if row is None:
+        return None
+    _INF = float("inf")
+    # _safe_float already returns None for NaN/missing; infinity needs screening.
+    bid = _safe_float(row.get("bid"))
+    ask = _safe_float(row.get("ask"))
+    if ask is None or ask < 0 or ask == _INF:
+        return None
+    # A MISSING/NaN/negative/infinite bid means UNKNOWN, not zero. Coercing it to
+    # zero silently halves the cost of buying a leg back: a moderately ITM short
+    # quoted `NaN x 3.00` marked at 1.50 instead of ~2.95, converting a -95% loss
+    # into a +267% win that passed every downstream check because the number
+    # looked entirely plausible. Reject the leg exactly as _mid_from_row does.
+    if bid is None or bid < 0 or bid == _INF:
+        return None
+    if ask < bid:  # crossed quote — unusable either way
+        return None
+    # The ONLY relaxation over _mid_from_row: a PRESENT, VALID zero bid.
+    if bid == 0.0 and action == "sell_to_close":
+        # Genuinely unsellable: the position gets nothing for it. Mark it
+        # worthless rather than voiding the entire structure. Conservative —
+        # net_credit = shorts - longs, so a zero here RAISES the cost to close.
+        return 0.0
+    return float((bid + ask) / 2.0)
+
+
+def _select_condor_wing(
+    frame: pd.DataFrame,
+    *,
+    short_strike: float,
+    target_strike: float,
+    leg: str,
+) -> Optional[pd.Series]:
+    """Nearest protective long wing STRICTLY beyond the short strike.
+
+    Direction is filtered before snapping: a wing at or inside the short strike
+    would invert the vertical and silently turn the position into something that
+    is not a condor (and not defined-risk), so it must never be selected. Returns
+    None when the chain has no strike beyond the short leg, which the caller
+    turns into an explicit no-wing skip rather than a naked short.
+    """
+    if frame is None or frame.empty or "strike" not in frame.columns:
+        return None
+    candidates = frame[frame["strike"] > short_strike] if leg == "call" else frame[frame["strike"] < short_strike]
+    if candidates.empty:
+        return None
+    return _nearest_row(candidates, target_strike)
 
 
 def fetch_structure_quote(
@@ -764,20 +930,32 @@ def fetch_structure_quote(
         return {"mid": float(mid + put_mid), "spot": spot, "context": pricing_context, **_payload(legs=legs, surface_quality=front_surface_quality)}
 
     if structure == "otm_strangle":
-        call_target = float(pricing_context.get("call_strike") or (spot * 1.03))
-        put_target = float(pricing_context.get("put_strike") or (spot * 0.97))
-        call_selection = _select_otm_wing(
-            front_calls,
-            target_strike=call_target,
-            spot=spot,
-            leg="call",
-        )
-        put_selection = _select_otm_wing(
-            front_puts,
-            target_strike=put_target,
-            spot=spot,
-            leg="put",
-        )
+        _booked_call = _safe_float(pricing_context.get("call_strike"))
+        _booked_put = _safe_float(pricing_context.get("put_strike"))
+        if _booked_call is not None and _booked_put is not None:
+            # RE-PRICE an open position: quote the booked strikes exactly. Running
+            # OTM discovery here silently prices a different, cheaper strike once
+            # spot trades through the booked one. See _reprice_selection.
+            call_target = float(_booked_call)
+            put_target = float(_booked_put)
+            call_selection = _reprice_selection(front_calls, _booked_call, leg="call")
+            put_selection = _reprice_selection(front_puts, _booked_put, leg="put")
+        else:
+            # DISCOVERY of a new structure: pick the wings against current spot.
+            call_target = float(spot * 1.03)
+            put_target = float(spot * 0.97)
+            call_selection = _select_otm_wing(
+                front_calls,
+                target_strike=call_target,
+                spot=spot,
+                leg="call",
+            )
+            put_selection = _select_otm_wing(
+                front_puts,
+                target_strike=put_target,
+                spot=spot,
+                leg="put",
+            )
         provenance = {
             "requested_call_wing_strike": round(call_target, 4),
             "selected_call_wing_strike": _safe_float(call_selection.get("row", {}).get("strike")) if call_selection.get("row") is not None else None,
@@ -859,6 +1037,288 @@ def fetch_structure_quote(
             "spot": spot,
             "context": pricing_context,
             **_payload(legs=legs, provenance=provenance, surface_quality=front_surface_quality),
+        }
+
+    if structure == "iron_condor":
+        booked = {
+            "short_call": _safe_float(pricing_context.get("short_call_strike")),
+            "long_call": _safe_float(pricing_context.get("long_call_strike")),
+            "short_put": _safe_float(pricing_context.get("short_put_strike")),
+            "long_put": _safe_float(pricing_context.get("long_put_strike")),
+        }
+        is_reprice = all(value is not None for value in booked.values())
+        condor_provenance: Dict[str, Any] = {"reprice_of_booked_strikes": is_reprice}
+        short_call_label = short_put_label = "booked_strike_reprice"
+        short_call_fallback = short_put_fallback = 0.0
+
+        if is_reprice:
+            # RE-PRICE an open position: resolve the four booked strikes exactly.
+            # Never re-discover them — spot may have moved through a short strike
+            # (the condor's loss case), and re-discovery would price a different
+            # structure than the one actually held. See _row_at_strike.
+            short_call_row = _row_at_strike(front_calls, booked["short_call"])
+            long_call_row = _row_at_strike(front_calls, booked["long_call"])
+            short_put_row = _row_at_strike(front_puts, booked["short_put"])
+            long_put_row = _row_at_strike(front_puts, booked["long_put"])
+            missing = [
+                name for name, row in (
+                    ("short_call", short_call_row), ("long_call", long_call_row),
+                    ("short_put", short_put_row), ("long_put", long_put_row),
+                ) if row is None
+            ]
+            if missing:
+                reason = "condor_strike_no_longer_listed"
+                condor_provenance.update({"missing_booked_legs": missing, "final_reason": reason})
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+            short_call_target = float(booked["short_call"])
+            short_put_target = float(booked["short_put"])
+            wing_offset = float(pricing_context.get("wing_offset") or (spot * CONDOR_WING_OFFSET_PCT))
+        else:
+            # DISCOVERY: reuse the strangle's wing selection for the sold body so
+            # the short strikes (and their quote-quality/fallback provenance) are
+            # picked exactly the way the comparable strangle would pick them.
+            short_call_target = float(spot * (1.0 + CONDOR_SHORT_OTM_PCT))
+            short_put_target = float(spot * (1.0 - CONDOR_SHORT_OTM_PCT))
+            short_call_sel = _select_otm_wing(front_calls, target_strike=short_call_target, spot=spot, leg="call")
+            short_put_sel = _select_otm_wing(front_puts, target_strike=short_put_target, spot=spot, leg="put")
+            condor_provenance.update(
+                {
+                    "requested_short_call_strike": round(short_call_target, 4),
+                    "requested_short_put_strike": round(short_put_target, 4),
+                    "short_call_quote_quality_label": short_call_sel.get("quote_quality_label"),
+                    "short_put_quote_quality_label": short_put_sel.get("quote_quality_label"),
+                }
+            )
+            if short_call_sel.get("row") is None:
+                reason = str(short_call_sel.get("reason") or "missing_condor_short_call")
+                condor_provenance["final_reason"] = reason
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+            if short_put_sel.get("row") is None:
+                reason = str(short_put_sel.get("reason") or "missing_condor_short_put")
+                condor_provenance["final_reason"] = reason
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+            short_call_row = short_call_sel["row"]
+            short_put_row = short_put_sel["row"]
+            short_call_label = str(short_call_sel.get("quote_quality_label"))
+            short_put_label = str(short_put_sel.get("quote_quality_label"))
+            short_call_fallback = float(short_call_sel.get("fallback_distance", 0.0) or 0.0)
+            short_put_fallback = float(short_put_sel.get("fallback_distance", 0.0) or 0.0)
+
+            # Protective wings a configured offset beyond each short strike.
+            wing_offset = float(spot * CONDOR_WING_OFFSET_PCT)
+            long_call_row = _select_condor_wing(
+                front_calls, short_strike=float(short_call_row["strike"]),
+                target_strike=float(short_call_row["strike"]) + wing_offset, leg="call",
+            )
+            long_put_row = _select_condor_wing(
+                front_puts, short_strike=float(short_put_row["strike"]),
+                target_strike=float(short_put_row["strike"]) - wing_offset, leg="put",
+            )
+            if long_call_row is None:
+                reason = "no_condor_call_wing"
+                condor_provenance["final_reason"] = reason
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+            if long_put_row is None:
+                reason = "no_condor_put_wing"
+                condor_provenance["final_reason"] = reason
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+
+        short_call_strike = float(short_call_row["strike"])
+        short_put_strike = float(short_put_row["strike"])
+
+        if is_reprice:
+            # Closing the position: the short body is BOUGHT back (ask governs),
+            # the long wings are SOLD (bid governs). See _closing_leg_mid.
+            short_call_mid = _closing_leg_mid(short_call_row, action="buy_to_close")
+            short_put_mid = _closing_leg_mid(short_put_row, action="buy_to_close")
+            long_call_mid = _closing_leg_mid(long_call_row, action="sell_to_close")
+            long_put_mid = _closing_leg_mid(long_put_row, action="sell_to_close")
+        else:
+            short_call_mid = _mid_from_row(short_call_row)
+            short_put_mid = _mid_from_row(short_put_row)
+            long_call_mid = _mid_from_row(long_call_row)
+            long_put_mid = _mid_from_row(long_put_row)
+        if None in (short_call_mid, short_put_mid, long_call_mid, long_put_mid):
+            reason = "missing_condor_mid"
+            condor_provenance["final_reason"] = reason
+            _record_quote(False, reason)
+            return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+
+        long_call_strike = float(long_call_row["strike"])
+        long_put_strike = float(long_put_row["strike"])
+        # NET CREDIT: what the four-leg structure is worth. Positive = we are paid
+        # to put it on. This is the value convention `mid` carries for a condor,
+        # so entry books a credit and exit books the cost to close.
+        # Value the two short verticals SEPARATELY. Each is independently bounded
+        # by [0, its own width]; checking only the aggregate lets a broken single
+        # vertical hide behind a cheap one (a call vertical marked 2.50 against a
+        # 2.00 width passed because the total 2.515 sat under a 4.00 ceiling, and
+        # booked a loss roughly double what the position can structurally lose).
+        call_vertical = float(short_call_mid - long_call_mid)
+        put_vertical = float(short_put_mid - long_put_mid)
+        call_width = long_call_strike - short_call_strike
+        put_width = short_put_strike - long_put_strike
+        net_credit = call_vertical + put_vertical
+        # Only one side can be breached, so the binding risk is the WIDER wing.
+        wing_width = float(max(call_width, put_width))
+        # No-arbitrage bound on the STRUCTURE's value, used to repair broken
+        # quotes when re-pricing an open position.
+        #
+        # The ceiling is call_width + put_width, NOT max(...): a condor is two
+        # short verticals, each worth [0, its own width], and only at EXPIRATION
+        # can just one be in the money. This system never holds to expiration —
+        # `front_expiry` is the first expiry after earnings while
+        # `trades_due_for_exit` fires at earnings_date - 1 day — so the untested
+        # side still carries time value at every exit. Clamping at max(width)
+        # therefore truncated REAL early-close losses to a suspiciously clean
+        # -100%, hiding a genuine cost of the early-close policy.
+        #
+        # Exceeding the expiration max loss on an early close is informative, not
+        # a data error, so no floor is placed on the resulting return.
+        value_ceiling = float(call_width + put_width)
+        if is_reprice:
+            # Repair only NOISE. A large violation is unusable data, and silently
+            # clamping it fabricates an outcome — a raw -0.80 became a recorded
+            # maximum win. Size the tolerance against the position's capital at
+            # risk as well: a flat 0.02 is a couple of ticks on a 0.40 risk base
+            # but 20 percentage points of return on a thin 0.10 base.
+            _entry_risk = _safe_float(pricing_context.get("max_loss_per_unit"))
+            repair_tolerance = CONDOR_QUOTE_REPAIR_TOLERANCE
+            if _entry_risk is not None and _entry_risk > 0:
+                repair_tolerance = min(
+                    repair_tolerance,
+                    CONDOR_QUOTE_REPAIR_MAX_RETURN_IMPACT * float(_entry_risk),
+                )
+            _legs = (
+                ("call_vertical", call_vertical, call_width),
+                ("put_vertical", put_vertical, put_width),
+            )
+            # The budget is the TOTAL repair applied to the structure, not a
+            # per-leg allowance. Both verticals can violate in the same direction,
+            # so a per-leg budget silently delivered up to 2x the advertised error
+            # (two legs each repaired just under tolerance manufactured ~10pp of
+            # return on a 0.40 base, and booked a maximum win on a position whose
+            # true value was negative).
+            _violations = {
+                name: max(0.0 - value, value - width, 0.0) for name, value, width in _legs
+            }
+            total_violation = float(sum(_violations.values()))
+            if total_violation > repair_tolerance:
+                reason = "condor_quote_outside_no_arbitrage_bounds"
+                _worst = max(_violations, key=lambda k: _violations[k])
+                condor_provenance.update(
+                    {"violating_leg": _worst,
+                     "leg_violations": {k: round(v, 4) for k, v in _violations.items()},
+                     "total_violation": round(total_violation, 4),
+                     "repair_tolerance": round(repair_tolerance, 4),
+                     "final_reason": reason}
+                )
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+            _clamped: Dict[str, float] = {}
+            _bounded: Dict[str, float] = {}
+            for name, value, width in _legs:
+                bounded_leg = float(min(max(value, 0.0), width))
+                if bounded_leg != value:
+                    _clamped[name] = round(value, 4)
+                _bounded[name] = bounded_leg
+            call_vertical = _bounded["call_vertical"]
+            put_vertical = _bounded["put_vertical"]
+            if _clamped:
+                condor_provenance["reprice_value_clamped_from"] = _clamped
+            # Each vertical is now inside its own bound, so the total is inside
+            # the aggregate bound by construction.
+            net_credit = float(call_vertical + put_vertical)
+        max_loss = float(wing_width - net_credit)
+        condor_provenance.update(
+            {
+                "selected_short_call_strike": short_call_strike,
+                "selected_long_call_strike": long_call_strike,
+                "selected_short_put_strike": short_put_strike,
+                "selected_long_put_strike": long_put_strike,
+                "call_width": round(call_width, 4),
+                "put_width": round(put_width, 4),
+                "wing_width": round(wing_width, 4),
+                "net_credit": round(net_credit, 4),
+                "max_loss": round(max_loss, 4),
+            }
+        )
+        # These two sanity gates decide whether a structure is worth OPENING, so
+        # they must fire on discovery ONLY. Applying them when re-pricing an open
+        # position is destructive: as a condor approaches max loss the breached
+        # vertical's cost-to-close approaches the wing width, so ordinary deep-ITM
+        # bid/ask noise pushes it past and trips `max_loss <= 0` — precisely on the
+        # worst losers. The exit is one-shot (`trades_due_for_exit` matches only
+        # earnings_date == as_of + 1 day, and the skip path leaves status='open'),
+        # so a single dropped quote orphans that trade permanently and it is never
+        # recorded. That removes outcomes from the learning ledger in an
+        # outcome-CORRELATED way, inflating measured performance. An already-open
+        # position must be marked to market and booked at whatever it is worth,
+        # including at or through max loss.
+        if not is_reprice:
+            if net_credit <= 0:
+                # A condor that pays nothing (or costs money) has no premium to
+                # capture — never open it.
+                reason = "non_positive_condor_credit"
+                condor_provenance["final_reason"] = reason
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+            if max_loss <= 0:
+                # Credit >= wing width implies a risk-free structure, which in
+                # practice means the quotes are broken rather than a free lunch.
+                reason = "condor_credit_exceeds_wing_width"
+                condor_provenance["final_reason"] = reason
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(provenance=condor_provenance, surface_quality=front_surface_quality, final_reason=reason)}
+
+        pricing_context.update(
+            {
+                "short_call_strike": short_call_strike,
+                "long_call_strike": long_call_strike,
+                "short_put_strike": short_put_strike,
+                "long_put_strike": long_put_strike,
+                "wing_offset": wing_offset,
+                "wing_width": wing_width,
+                # Capital at risk for this structure. Persisted at ENTRY so the
+                # exit can compute return-on-risk against the entry's own credit.
+                "max_loss_per_unit": max_loss,
+                "net_credit_at_quote": net_credit,
+                "short_call_contract": str(short_call_row.get("contractSymbol")),
+                "long_call_contract": str(long_call_row.get("contractSymbol")),
+                "short_put_contract": str(short_put_row.get("contractSymbol")),
+                "long_put_contract": str(long_put_row.get("contractSymbol")),
+            }
+        )
+        # Leg names carry the short_/long_ prefix because execution_scenarios
+        # derives fill direction from them (short legs fill toward the bid).
+        legs = {
+            "short_call": _quote_fields_from_row(
+                short_call_row,
+                quote_quality_label=short_call_label,
+                requested_strike=short_call_target,
+                fallback_distance=short_call_fallback,
+            ),
+            "long_call": _quote_fields_from_row(long_call_row),
+            "short_put": _quote_fields_from_row(
+                short_put_row,
+                quote_quality_label=short_put_label,
+                requested_strike=short_put_target,
+                fallback_distance=short_put_fallback,
+            ),
+            "long_put": _quote_fields_from_row(long_put_row),
+        }
+        condor_provenance["final_reason"] = None
+        _record_quote(True)
+        return {
+            "mid": net_credit,
+            "spot": spot,
+            "context": pricing_context,
+            **_payload(legs=legs, provenance=condor_provenance, surface_quality=front_surface_quality),
         }
 
     if structure in {"call_calendar", "put_calendar"}:
@@ -1435,6 +1895,68 @@ def run_forward_screener(
     return summary
 
 
+# Structures whose `mid` is a NET CREDIT received rather than a debit paid.
+CREDIT_STRUCTURES = frozenset({"iron_condor"})
+
+
+def _realized_trade_math(
+    *,
+    structure: str,
+    entry_mid: float,
+    exit_mid: float,
+    capital_at_risk: Optional[float] = None,
+) -> tuple[float, float, float]:
+    """Return ``(gross_return_pct, realized_pnl, realized_expansion_pct)``.
+
+    One rule, applied with the correct sign and base for the structure::
+
+        gross_return_pct = (position P&L per share) / (capital at risk) * 100
+
+    For a LONG DEBIT structure the P&L is ``exit - entry`` and the capital at risk
+    IS the premium paid (``entry_mid``), so this reduces EXACTLY to the original
+    ``((exit - entry) / entry) * 100``. Long-structure numbers are unchanged.
+
+    For a CREDIT structure (iron condor) ``mid`` is the net credit: we are PAID
+    ``entry_mid`` to open and PAY ``exit_mid`` to close, so the P&L sign flips to
+    ``entry - exit``, and the capital at risk is the defined max loss
+    (wing width - credit), NOT the credit. Basing the condor on max loss keeps it
+    on the same "return on capital at risk" footing as the long structures, so
+    ``avg_return_pct`` stays comparable across structures in the prior store —
+    using the credit as the base instead would let a condor print -300% and
+    corrupt cross-structure ranking.
+
+    ``realized_expansion_pct`` keeps ONE meaning for every structure: the percent
+    change in the structure's own market value (positive = it got more expensive
+    = vol expanded). It is a volatility diagnostic, not the position return, and
+    for a credit structure it is deliberately the opposite sign to the P&L.
+    """
+    entry_mid = float(entry_mid)
+    exit_mid = float(exit_mid)
+    expansion_pct = ((exit_mid - entry_mid) / entry_mid) * 100.0
+    if structure in CREDIT_STRUCTURES:
+        pnl_per_share = entry_mid - exit_mid
+        # Falling back to the credit as the base produces a wrong-but-plausible
+        # number (the "-300%" case the docstring warns about) that is worse for a
+        # learning ledger than an obviously-missing one. Keep the fallback so the
+        # trade still closes with a correctly SIGNED P&L, but the caller is
+        # expected to treat a missing capital_at_risk as a provenance defect.
+        if capital_at_risk is not None and float(capital_at_risk) > 0:
+            base = float(capital_at_risk)
+        else:
+            base = entry_mid
+            logger.warning(
+                "credit-structure return re-based onto the entry credit because "
+                "max_loss_per_unit was missing from the persisted pricing context; "
+                "this return is NOT return-on-risk and is not comparable to the "
+                "other structures.",
+            )
+    else:
+        pnl_per_share = exit_mid - entry_mid
+        base = entry_mid
+    gross_return_pct = (pnl_per_share / base) * 100.0
+    return gross_return_pct, pnl_per_share * 100.0, expansion_pct
+
+
 def run_exit_detection(
     *,
     today: Optional[date] = None,
@@ -1517,17 +2039,27 @@ def run_exit_detection(
             )
             continue
 
-        realized_expansion_pct = ((float(exit_mid) - entry_mid) / entry_mid) * 100.0
+        # Credit structures (iron condor) invert the P&L sign and use the defined
+        # max loss recorded at ENTRY as the return base; long debit structures are
+        # unchanged. See _realized_trade_math.
+        entry_pricing_context = note_payload.get("pricing_context") or {}
+        gross_return_pct, realized_pnl, realized_expansion_pct = _realized_trade_math(
+            structure=structure,
+            entry_mid=entry_mid,
+            exit_mid=float(exit_mid),
+            capital_at_risk=_safe_float(entry_pricing_context.get("max_loss_per_unit")),
+        )
         execution_penalty = float(row.get("execution_penalty_at_entry") or 0.0)
         modeled_cost_pct = 26.0 * execution_penalty
-        realized_return_pct = realized_expansion_pct - modeled_cost_pct
-        realized_pnl = (float(exit_mid) - entry_mid) * 100.0
+        realized_return_pct = gross_return_pct - modeled_cost_pct
         entry_execution_scenarios = _loads_dict(row.get("entry_execution_scenarios_json"))
         if not entry_execution_scenarios:
             entry_execution_scenarios = note_payload.get("entry_execution_scenarios", {})
         scenario_outcomes = compare_execution_scenarios(
             entry=entry_execution_scenarios,
             exit=exit_execution_scenarios,
+            structure=structure,
+            capital_at_risk=_safe_float(entry_pricing_context.get("max_loss_per_unit")),
         )
         exit_execution_scenarios = {
             **exit_execution_scenarios,

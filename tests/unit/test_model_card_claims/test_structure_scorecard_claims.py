@@ -31,7 +31,7 @@ def _neutral_priors() -> dict:
         s: WalkForwardPrior(structure=s, history_count=0, win_rate=0.50,
                             avg_return_pct=0.0, rank_score=0.50,
                             source="neutral_test_fixture")
-        for s in ("atm_straddle", "otm_strangle", "call_calendar", "put_calendar")
+        for s in ("atm_straddle", "otm_strangle", "call_calendar", "put_calendar", "iron_condor")
     }
 
 

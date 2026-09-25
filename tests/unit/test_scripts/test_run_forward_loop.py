@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 import pandas as pd
+import pytest
 
 import scripts.run_forward_loop as forward_loop
 from services.calibration_service import IVExpansionCalibration
@@ -656,3 +657,578 @@ def test_otm_strangle_quote_provenance_is_persisted_in_paper_entry(tmp_path: Pat
     entry_scenarios = json.loads(str(trade["entry_execution_scenarios_json"]))
     assert entry_scenarios["scenario_values"]["mid"] == 2.0
     assert entry_scenarios["scenario_values"]["cross_50"] == 2.2
+
+
+# ── Iron condor booking (defined-risk credit structure) ──────────────────────
+#
+# Geometry used by these tests (spot = 100):
+#   short call 103 (mid 1.1)   long call 105 (mid 0.5)
+#   short put   97 (mid 0.9)   long put   95 (mid 0.4)
+#   net credit = (1.1 + 0.9) - (0.5 + 0.4) = 1.1
+#   wing width = 2.0  →  max loss = 2.0 - 1.1 = 0.9
+
+
+def _condor_chain():
+    calls = _option_frame([
+        {"contractSymbol": "AAPL_C_103", "strike": 103.0, "bid": 1.0, "ask": 1.2, "lastPrice": 1.1},
+        {"contractSymbol": "AAPL_C_105", "strike": 105.0, "bid": 0.4, "ask": 0.6, "lastPrice": 0.5},
+    ])
+    puts = _option_frame([
+        {"contractSymbol": "AAPL_P_97", "strike": 97.0, "bid": 0.8, "ask": 1.0, "lastPrice": 0.9},
+        {"contractSymbol": "AAPL_P_95", "strike": 95.0, "bid": 0.3, "ask": 0.5, "lastPrice": 0.4},
+    ])
+    return calls, puts
+
+
+def test_iron_condor_quote_forms_defined_risk_credit(monkeypatch) -> None:
+    calls, puts = _condor_chain()
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL",
+        structure="iron_condor",
+        earnings_date=date(2026, 4, 30),
+        as_of_date=date(2026, 4, 24),
+    )
+
+    # `mid` is the NET CREDIT received, and it is positive so the entry gate
+    # (entry_mid > 0) accepts it exactly like a debit structure's premium.
+    assert quote["mid"] == pytest.approx(1.1)
+    ctx = quote["context"]
+    assert ctx["short_call_strike"] == 103.0
+    assert ctx["long_call_strike"] == 105.0
+    assert ctx["short_put_strike"] == 97.0
+    assert ctx["long_put_strike"] == 95.0
+    assert ctx["wing_width"] == pytest.approx(2.0)
+    # Capital at risk persisted at entry, used as the exit return base.
+    assert ctx["max_loss_per_unit"] == pytest.approx(0.9)
+    # Leg names must carry the short_/long_ prefix so execution_scenarios can
+    # derive fill direction.
+    assert set(quote["bid_ask_mid"]["legs"]) == {"short_call", "long_call", "short_put", "long_put"}
+
+
+def test_iron_condor_skips_when_no_protective_call_wing(monkeypatch) -> None:
+    # Only the short call exists — there is no strike beyond it to buy, so the
+    # structure would be a naked short. It must be refused, not booked.
+    calls = _option_frame([
+        {"contractSymbol": "AAPL_C_103", "strike": 103.0, "bid": 1.0, "ask": 1.2, "lastPrice": 1.1},
+    ])
+    _, puts = _condor_chain()
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL",
+        structure="iron_condor",
+        earnings_date=date(2026, 4, 30),
+        as_of_date=date(2026, 4, 24),
+    )
+
+    assert quote["mid"] is None
+    assert quote["reason"] == "no_condor_call_wing"
+
+
+def test_iron_condor_rejects_non_positive_credit(monkeypatch) -> None:
+    # Wings priced above the body → the "condor" would cost money to put on.
+    calls = _option_frame([
+        {"contractSymbol": "AAPL_C_103", "strike": 103.0, "bid": 0.1, "ask": 0.3, "lastPrice": 0.2},
+        {"contractSymbol": "AAPL_C_105", "strike": 105.0, "bid": 1.0, "ask": 1.2, "lastPrice": 1.1},
+    ])
+    puts = _option_frame([
+        {"contractSymbol": "AAPL_P_97", "strike": 97.0, "bid": 0.1, "ask": 0.3, "lastPrice": 0.2},
+        {"contractSymbol": "AAPL_P_95", "strike": 95.0, "bid": 1.0, "ask": 1.2, "lastPrice": 1.1},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL",
+        structure="iron_condor",
+        earnings_date=date(2026, 4, 30),
+        as_of_date=date(2026, 4, 24),
+    )
+
+    assert quote["mid"] is None
+    assert quote["reason"] == "non_positive_condor_credit"
+
+
+def test_realized_trade_math_is_unchanged_for_long_debit() -> None:
+    # Regression guard: the refactor must reproduce the original
+    # ((exit - entry) / entry) formula exactly for debit structures.
+    gross, pnl, expansion = forward_loop._realized_trade_math(
+        structure="atm_straddle", entry_mid=4.0, exit_mid=5.0,
+    )
+    assert gross == pytest.approx(25.0)
+    assert pnl == pytest.approx(100.0)
+    assert expansion == pytest.approx(25.0)
+    # A max-loss hint must NOT change a debit structure's math.
+    assert forward_loop._realized_trade_math(
+        structure="atm_straddle", entry_mid=4.0, exit_mid=5.0, capital_at_risk=0.9,
+    )[0] == pytest.approx(25.0)
+
+
+def test_realized_trade_math_condor_win_flips_sign_and_uses_max_loss() -> None:
+    # Sold for 1.1, bought back for 0.4 → profit 0.7 per share on 0.9 at risk.
+    gross, pnl, expansion = forward_loop._realized_trade_math(
+        structure="iron_condor", entry_mid=1.1, exit_mid=0.4, capital_at_risk=0.9,
+    )
+    assert pnl == pytest.approx(70.0)
+    assert gross == pytest.approx((0.7 / 0.9) * 100.0)
+    # Expansion keeps its vol meaning: the structure got CHEAPER, so negative.
+    assert expansion == pytest.approx(((0.4 - 1.1) / 1.1) * 100.0)
+    assert expansion < 0 < gross
+
+
+def test_realized_trade_math_condor_loss_is_negative() -> None:
+    # Sold for 1.1, costs 1.8 to close → a loss, even though the structure's
+    # market value rose (which for a long structure would be a gain).
+    gross, pnl, expansion = forward_loop._realized_trade_math(
+        structure="iron_condor", entry_mid=1.1, exit_mid=1.8, capital_at_risk=0.9,
+    )
+    assert pnl == pytest.approx(-70.0)
+    assert gross == pytest.approx((-0.7 / 0.9) * 100.0)
+    assert expansion > 0 > gross
+
+
+def test_realized_trade_math_condor_falls_back_to_credit_base() -> None:
+    # Legacy/missing max_loss must still produce a correctly SIGNED return
+    # rather than dividing by nothing.
+    gross, pnl, _ = forward_loop._realized_trade_math(
+        structure="iron_condor", entry_mid=1.1, exit_mid=0.4, capital_at_risk=None,
+    )
+    assert pnl == pytest.approx(70.0)
+    assert gross == pytest.approx((0.7 / 1.1) * 100.0)
+
+
+def test_exit_detection_books_condor_profit_when_premium_decays(tmp_path: Path) -> None:
+    """End-to-end wiring: max_loss_per_unit recorded in the entry notes must
+    reach the exit and produce a POSITIVE return when the condor cheapens."""
+    as_of = date(2026, 4, 24)
+    store = OutcomeStore(store_path=tmp_path / "outcomes.sqlite")
+    store.insert_entry(
+        trade_id="AAPL-condor",
+        symbol="AAPL",
+        structure="iron_condor",
+        entry_date=as_of - timedelta(days=3),
+        setup_score=0.7,
+        source_type="paper",
+        earnings_date=as_of + timedelta(days=1),  # due for exit on as_of
+        entry_mid=1.1,
+        execution_penalty_at_entry=0.0,
+        notes=json.dumps({"pricing_context": {"max_loss_per_unit": 0.9, "wing_width": 2.0}}),
+    )
+
+    captured: dict = {}
+
+    def fake_finalizer(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    def fake_price_fetcher(**_kwargs):
+        return {"mid": 0.4, "context": {}, "bid_ask_mid": {}}
+
+    summary = forward_loop.run_exit_detection(
+        today=as_of,
+        store=store,
+        log_path=tmp_path / "learning_log.jsonl",
+        price_fetcher=fake_price_fetcher,
+        finalizer=fake_finalizer,
+        baseline_store=BaselineEvidenceStore(store_path=tmp_path / "baseline.sqlite"),
+    )
+
+    assert summary["exits"] == 1
+    assert captured["realized_pnl"] == pytest.approx(70.0)
+    assert captured["realized_return_pct"] == pytest.approx((0.7 / 0.9) * 100.0)
+    # The structure got cheaper — the vol diagnostic is negative while the
+    # position return is positive.
+    assert captured["realized_expansion_pct"] < 0
+
+
+def test_iron_condor_reprice_keeps_booked_strikes_after_spot_moves_through_them(monkeypatch) -> None:
+    """The condor's loss case is spot moving THROUGH a short strike. Re-pricing
+    must still quote the strikes actually held: the OTM-discovery filter would
+    have dropped the booked 103 call once spot printed 106 and silently priced a
+    different option, describing a trade that was never held."""
+    calls, puts = _condor_chain()
+    # Spot has rallied to 106 — above BOTH the short (103) and long (105) calls.
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=106.0)
+
+    booked_context = {
+        "front_expiry": "2026-05-01",
+        "short_call_strike": 103.0,
+        "long_call_strike": 105.0,
+        "short_put_strike": 97.0,
+        "long_put_strike": 95.0,
+    }
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL",
+        structure="iron_condor",
+        earnings_date=date(2026, 4, 30),
+        as_of_date=date(2026, 5, 1),
+        context=booked_context,
+    )
+
+    assert quote["bid_ask_mid"]["provenance"]["reprice_of_booked_strikes"] is True
+    ctx = quote["context"]
+    assert ctx["short_call_strike"] == 103.0
+    assert ctx["long_call_strike"] == 105.0
+    assert ctx["short_put_strike"] == 97.0
+    assert ctx["long_put_strike"] == 95.0
+    # Same four legs → same credit as the entry chain prices.
+    assert quote["mid"] == pytest.approx(1.1)
+
+
+def test_iron_condor_reprice_reports_a_delisted_booked_strike(monkeypatch) -> None:
+    # The booked long call is no longer in the chain — refuse rather than
+    # substitute a different strike.
+    calls = _option_frame([
+        {"contractSymbol": "AAPL_C_103", "strike": 103.0, "bid": 1.0, "ask": 1.2, "lastPrice": 1.1},
+    ])
+    _, puts = _condor_chain()
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL",
+        structure="iron_condor",
+        earnings_date=date(2026, 4, 30),
+        as_of_date=date(2026, 5, 1),
+        context={
+            "front_expiry": "2026-05-01",
+            "short_call_strike": 103.0, "long_call_strike": 105.0,
+            "short_put_strike": 97.0, "long_put_strike": 95.0,
+        },
+    )
+
+    assert quote["mid"] is None
+    assert quote["reason"] == "condor_strike_no_longer_listed"
+    assert "long_call" in quote["bid_ask_mid"]["provenance"]["missing_booked_legs"]
+
+
+def test_strangle_reprice_keeps_booked_strike_after_spot_moves_through_it(monkeypatch) -> None:
+    """Regression for the live AMZN/TTD mis-pricing: once spot trades through the
+    booked short strike, OTM discovery dropped it and the fallback substituted a
+    further-OTM (cheaper) strike, understating the exit and the realized return.
+    Re-pricing must quote the strike actually held."""
+    calls = _option_frame([
+        {"contractSymbol": "AMZN_C_260", "strike": 260.0, "bid": 4.3, "ask": 4.7, "lastPrice": 4.5},
+        {"contractSymbol": "AMZN_C_265", "strike": 265.0, "bid": 2.8, "ask": 3.2, "lastPrice": 3.0},
+    ])
+    puts = _option_frame([
+        {"contractSymbol": "AMZN_P_245", "strike": 245.0, "bid": 1.5, "ask": 1.9, "lastPrice": 1.7},
+    ])
+    # Spot has rallied through the booked 260 call, exactly the live case.
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=262.0)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AMZN",
+        structure="otm_strangle",
+        earnings_date=date(2026, 4, 28),
+        as_of_date=date(2026, 4, 29),
+        context={"front_expiry": "2026-05-01", "call_strike": 260.0, "put_strike": 245.0},
+    )
+
+    provenance = quote["bid_ask_mid"]["provenance"]
+    assert provenance["selected_call_wing_strike"] == 260.0, "must re-price the BOOKED strike, not the 265"
+    assert provenance["call_mid"] == pytest.approx(4.5)
+    # 4.5 + 1.7 — using the 265 call would have understated this by 1.5.
+    assert quote["mid"] == pytest.approx(6.2)
+
+
+def test_strangle_reprice_reports_a_delisted_booked_strike(monkeypatch) -> None:
+    calls = _option_frame([
+        {"contractSymbol": "AMZN_C_265", "strike": 265.0, "bid": 2.8, "ask": 3.2, "lastPrice": 3.0},
+    ])
+    puts = _option_frame([
+        {"contractSymbol": "AMZN_P_245", "strike": 245.0, "bid": 1.5, "ask": 1.9, "lastPrice": 1.7},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=262.0)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AMZN",
+        structure="otm_strangle",
+        earnings_date=date(2026, 4, 28),
+        as_of_date=date(2026, 4, 29),
+        context={"front_expiry": "2026-05-01", "call_strike": 260.0, "put_strike": 245.0},
+    )
+
+    assert quote["mid"] is None
+    assert quote["reason"] == "booked_strike_no_longer_listed"
+
+
+def test_strangle_discovery_still_uses_otm_selection(monkeypatch) -> None:
+    """With no booked strikes in context this is a NEW structure, so wing
+    discovery against current spot must be unchanged."""
+    _install_fake_option_chain(
+        monkeypatch,
+        calls=_option_frame([
+            {"contractSymbol": "AAPL_C_103", "strike": 103.0, "bid": 1.0, "ask": 1.2, "lastPrice": 1.1},
+        ]),
+        puts=_option_frame([
+            {"contractSymbol": "AAPL_P_97", "strike": 97.0, "bid": 0.8, "ask": 1.0, "lastPrice": 0.9},
+        ]),
+    )
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL",
+        structure="otm_strangle",
+        earnings_date=date(2026, 4, 30),
+        as_of_date=date(2026, 4, 24),
+    )
+
+    assert quote["mid"] == pytest.approx(2.0)
+    assert quote["bid_ask_mid"]["provenance"]["call_quote_quality_label"] == "exact_wing_mid"
+
+
+def test_condor_reprice_books_a_max_loss_exit_instead_of_dropping_it(monkeypatch) -> None:
+    """AUDIT HIGH: the net_credit/max_loss sanity gates are OPEN-time checks. They
+    also fired when re-pricing an open position, so as a condor approached max
+    loss (breached vertical worth ~the wing width) ordinary deep-ITM quote noise
+    tripped them and the exit quote was dropped. Exits are one-shot
+    (trades_due_for_exit matches only earnings_date == as_of + 1 day, and the skip
+    path leaves status='open'), so that trade was orphaned forever — deleting the
+    WORST outcomes from the learning ledger in an outcome-correlated way."""
+    # Spot gapped far above the call spread: it is fully breached.
+    # Call vertical: 9.50 - 7.52 = 1.98, inside its own 2.00 width (valid).
+    calls = _option_frame([
+        {"contractSymbol": "C_103", "strike": 103.0, "bid": 9.30, "ask": 9.70, "lastPrice": 9.5},
+        {"contractSymbol": "C_105", "strike": 105.0, "bid": 7.42, "ask": 7.62, "lastPrice": 7.52},
+    ])
+    # Put vertical: 0.13 - 0.06 = 0.07 of residual time value on the UNTESTED
+    # side. Total 2.05 therefore exceeds max(call_width, put_width) = 2.00 while
+    # both verticals are individually valid — the legitimate early-close mark.
+    puts = _option_frame([
+        {"contractSymbol": "P_97", "strike": 97.0, "bid": 0.10, "ask": 0.16, "lastPrice": 0.13},
+        {"contractSymbol": "P_95", "strike": 95.0, "bid": 0.04, "ask": 0.08, "lastPrice": 0.06},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=112.0)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor",
+        earnings_date=date(2026, 4, 30), as_of_date=date(2026, 5, 1),
+        context={"front_expiry": "2026-05-01",
+                 "short_call_strike": 103.0, "long_call_strike": 105.0,
+                 "short_put_strike": 97.0, "long_put_strike": 95.0},
+    )
+
+    # It must produce a quote, not a skip.
+    assert quote["mid"] is not None, f"max-loss exit was dropped: {quote.get('reason')}"
+    # The mark is the TRUE value, not truncated. This system always closes before
+    # expiration, so the untested side still carries time value and an early close
+    # can legitimately cost more than the expiration-defined max loss. Clamping at
+    # max(call_width, put_width) hid that as a suspiciously clean -100%; the real
+    # no-arbitrage ceiling is call_width + put_width.
+    assert quote["mid"] > 2.0, "real early-close cost must not be truncated to the expiry max loss"
+    assert quote["mid"] <= 4.0 + 1e-9, "must stay inside the no-arbitrage ceiling"
+    assert "reprice_value_clamped_from" not in quote["bid_ask_mid"]["provenance"]
+
+
+def test_condor_discovery_still_refuses_a_broken_credit(monkeypatch) -> None:
+    """The same gates must STILL protect the open decision."""
+    calls = _option_frame([
+        {"contractSymbol": "C_103", "strike": 103.0, "bid": 0.1, "ask": 0.3, "lastPrice": 0.2},
+        {"contractSymbol": "C_105", "strike": 105.0, "bid": 1.0, "ask": 1.2, "lastPrice": 1.1},
+    ])
+    puts = _option_frame([
+        {"contractSymbol": "P_97", "strike": 97.0, "bid": 0.1, "ask": 0.3, "lastPrice": 0.2},
+        {"contractSymbol": "P_95", "strike": 95.0, "bid": 1.0, "ask": 1.2, "lastPrice": 1.1},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts)
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor",
+        earnings_date=date(2026, 4, 30), as_of_date=date(2026, 4, 24),
+    )
+    assert quote["mid"] is None
+    assert quote["reason"] == "non_positive_condor_credit"
+
+
+def test_condor_realized_loss_cannot_exceed_defined_max_loss() -> None:
+    """With the exit clamped to the wing width, return-on-risk bottoms out at
+    -100% — a defined-risk structure must never book worse than its max loss."""
+    gross, pnl, _ = forward_loop._realized_trade_math(
+        structure="iron_condor", entry_mid=1.1, exit_mid=2.0, capital_at_risk=0.9,
+    )
+    assert gross == pytest.approx(-100.0)
+    assert pnl == pytest.approx(-90.0)
+
+
+def test_condor_max_win_exit_is_recorded_not_deleted(monkeypatch) -> None:
+    """RE-AUDIT HIGH: every leg decaying to nothing is the MODAL success for a
+    short-vol structure, and those legs go bid-less. _mid_from_row voids any leg
+    with bid <= 0, so one bid-less leg out of four voided the whole exit and the
+    trade was orphaned. Losers keep expensive two-sided ITM legs that always
+    quote, so the ledger kept losers and deleted winners."""
+    calls = _option_frame([
+        {"contractSymbol": "C_103", "strike": 103.0, "bid": 0.00, "ask": 0.05, "lastPrice": 0.02},
+        {"contractSymbol": "C_105", "strike": 105.0, "bid": 0.00, "ask": 0.02, "lastPrice": 0.01},
+    ])
+    puts = _option_frame([
+        {"contractSymbol": "P_97", "strike": 97.0, "bid": 0.00, "ask": 0.05, "lastPrice": 0.02},
+        {"contractSymbol": "P_95", "strike": 95.0, "bid": 0.00, "ask": 0.02, "lastPrice": 0.01},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=100.0)
+
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor",
+        earnings_date=date(2026, 4, 30), as_of_date=date(2026, 5, 1),
+        context={"front_expiry": "2026-05-01",
+                 "short_call_strike": 103.0, "long_call_strike": 105.0,
+                 "short_put_strike": 97.0, "long_put_strike": 95.0},
+    )
+    assert quote["mid"] is not None, f"max-WIN exit was deleted: {quote.get('reason')}"
+    # Shorts are bought back near the ask (~0.025 each); the unsellable long
+    # wings mark at 0. Cost to close is tiny, i.e. nearly the full credit kept.
+    assert quote["mid"] == pytest.approx(0.05)
+
+
+def test_condor_entry_still_refuses_a_bidless_leg(monkeypatch) -> None:
+    """The relaxation is exit-only. Refusing to OPEN on a phantom quote biases
+    nothing, because no trade is booked."""
+    calls, puts = _condor_chain()
+    calls.loc[calls["strike"] == 103.0, "bid"] = 0.0
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts)
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor",
+        earnings_date=date(2026, 4, 30), as_of_date=date(2026, 4, 24),
+    )
+    assert quote["mid"] is None
+
+
+def test_condor_reprice_refuses_an_arbitrage_violating_quote(monkeypatch) -> None:
+    """RE-AUDIT MEDIUM: clamping a LARGE violation fabricated an outcome — a raw
+    value of -0.80 was repaired to 0.0 and booked as the exact maximum win.
+    Noise is repaired; unusable data is refused."""
+    # Long wings quoted far above the shorts at the same widths: an arbitrage
+    # violation, i.e. the chain is broken.
+    calls = _option_frame([
+        {"contractSymbol": "C_103", "strike": 103.0, "bid": 0.10, "ask": 0.20, "lastPrice": 0.15},
+        {"contractSymbol": "C_105", "strike": 105.0, "bid": 0.90, "ask": 1.10, "lastPrice": 1.00},
+    ])
+    puts = _option_frame([
+        {"contractSymbol": "P_97", "strike": 97.0, "bid": 0.10, "ask": 0.20, "lastPrice": 0.15},
+        {"contractSymbol": "P_95", "strike": 95.0, "bid": 0.90, "ask": 1.10, "lastPrice": 1.00},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=100.0)
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor",
+        earnings_date=date(2026, 4, 30), as_of_date=date(2026, 5, 1),
+        context={"front_expiry": "2026-05-01",
+                 "short_call_strike": 103.0, "long_call_strike": 105.0,
+                 "short_put_strike": 97.0, "long_put_strike": 95.0},
+    )
+    assert quote["mid"] is None
+    assert quote["reason"] == "condor_quote_outside_no_arbitrage_bounds"
+
+
+def test_closing_leg_mid_rejects_an_unknown_bid_but_accepts_a_real_zero() -> None:
+    """RE-AUDIT CRITICAL: a missing/NaN bid means UNKNOWN, not zero. Coercing it
+    to zero halved the cost of buying a short leg back — a leg quoted `NaN x 3.00`
+    marked at 1.50 instead of ~2.95, converting a -95% loss into a +267% win that
+    passed every downstream check because the number looked plausible."""
+    import pandas as _pd
+
+    def row(bid, ask):
+        return _pd.Series({"strike": 103.0, "bid": bid, "ask": ask})
+
+    # UNKNOWN bid in any form -> reject, never mark at ask/2.
+    for bad in (float("nan"), None, -1.0, float("inf")):
+        assert forward_loop._closing_leg_mid(row(bad, 3.00), action="buy_to_close") is None, bad
+        assert forward_loop._closing_leg_mid(row(bad, 3.00), action="sell_to_close") is None, bad
+    # A leg with no bid column at all is also unknown.
+    assert forward_loop._closing_leg_mid(_pd.Series({"strike": 103.0, "ask": 3.0}), action="buy_to_close") is None
+    # A PRESENT, VALID zero bid is the one relaxation: buying back is cheap,
+    # selling gets nothing.
+    assert forward_loop._closing_leg_mid(row(0.0, 0.05), action="buy_to_close") == pytest.approx(0.025)
+    assert forward_loop._closing_leg_mid(row(0.0, 0.05), action="sell_to_close") == 0.0
+    # Normal two-sided quotes are unchanged, and crossed quotes are refused.
+    assert forward_loop._closing_leg_mid(row(2.90, 3.00), action="buy_to_close") == pytest.approx(2.95)
+    assert forward_loop._closing_leg_mid(row(3.10, 3.00), action="buy_to_close") is None
+
+
+def test_condor_reprice_refuses_a_single_broken_vertical(monkeypatch) -> None:
+    """RE-AUDIT MEDIUM-HIGH: each short vertical is independently bounded by its
+    OWN width. Checking only the aggregate let a call vertical marked 2.50
+    against a 2.00 width hide behind a cheap put vertical (total 2.515 < the 4.00
+    aggregate ceiling) and book a loss roughly double the structural maximum."""
+    calls = _option_frame([
+        {"contractSymbol": "C_103", "strike": 103.0, "bid": 9.90, "ask": 10.10, "lastPrice": 10.0},
+        {"contractSymbol": "C_105", "strike": 105.0, "bid": 7.40, "ask": 7.60, "lastPrice": 7.5},
+    ])  # call vertical = 2.50 vs width 2.00 -> impossible
+    puts = _option_frame([
+        {"contractSymbol": "P_97", "strike": 97.0, "bid": 0.01, "ask": 0.03, "lastPrice": 0.02},
+        {"contractSymbol": "P_95", "strike": 95.0, "bid": 0.005, "ask": 0.01, "lastPrice": 0.007},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=112.0)
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor",
+        earnings_date=date(2026, 4, 30), as_of_date=date(2026, 5, 1),
+        context={"front_expiry": "2026-05-01",
+                 "short_call_strike": 103.0, "long_call_strike": 105.0,
+                 "short_put_strike": 97.0, "long_put_strike": 95.0},
+    )
+    assert quote["mid"] is None
+    assert quote["reason"] == "condor_quote_outside_no_arbitrage_bounds"
+    assert quote["bid_ask_mid"]["provenance"]["violating_leg"] == "call_vertical"
+
+
+def test_condor_repair_tolerance_scales_with_capital_at_risk(monkeypatch) -> None:
+    """RE-AUDIT LOW-MEDIUM: a flat 0.02 is two ticks on a 0.40 risk base but 20
+    percentage points of return on a thin 0.10 base."""
+    calls = _option_frame([
+        {"contractSymbol": "C_103", "strike": 103.0, "bid": 9.90, "ask": 10.10, "lastPrice": 10.0},
+        {"contractSymbol": "C_105", "strike": 105.0, "bid": 8.00, "ask": 8.20, "lastPrice": 8.1},
+    ])  # call vertical = 1.90; width 2.00 -> valid
+    puts = _option_frame([
+        {"contractSymbol": "P_97", "strike": 97.0, "bid": 0.01, "ask": 0.03, "lastPrice": 0.02},
+        {"contractSymbol": "P_95", "strike": 95.0, "bid": 0.02, "ask": 0.05, "lastPrice": 0.035},
+    ])  # put vertical = 0.02 - 0.035 = -0.015 -> a small negative violation
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=112.0)
+    base_ctx = {"front_expiry": "2026-05-01",
+                "short_call_strike": 103.0, "long_call_strike": 105.0,
+                "short_put_strike": 97.0, "long_put_strike": 95.0}
+
+    # Fat risk base: 0.015 is inside the flat tolerance -> repaired and booked.
+    fat = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor", earnings_date=date(2026, 4, 30),
+        as_of_date=date(2026, 5, 1), context={**base_ctx, "max_loss_per_unit": 0.90},
+    )
+    assert fat["mid"] is not None
+
+    # Thin risk base: 5% of 0.10 = 0.005, so the same 0.015 error is now too
+    # large a slice of the return to repair silently.
+    thin = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor", earnings_date=date(2026, 4, 30),
+        as_of_date=date(2026, 5, 1), context={**base_ctx, "max_loss_per_unit": 0.10},
+    )
+    assert thin["mid"] is None
+    assert thin["reason"] == "condor_quote_outside_no_arbitrage_bounds"
+
+
+def test_condor_repair_budget_is_total_not_per_leg(monkeypatch) -> None:
+    """RE-AUDIT LOW: CONDOR_QUOTE_REPAIR_MAX_RETURN_IMPACT asserts a bound on the
+    return error introduced by repair. Applied PER LEG, two verticals violating
+    in the same direction each just under tolerance manufactured ~2x that — the
+    auditor booked a +400% maximum win on a position whose true value was
+    negative. The budget must cover the whole structure."""
+    # Each vertical sits at -0.0195: individually under the 0.02 tolerance,
+    # together 0.039 — over it.
+    calls = _option_frame([
+        {"contractSymbol": "C_103", "strike": 103.0, "bid": 0.10, "ask": 0.12, "lastPrice": 0.11},
+        {"contractSymbol": "C_105", "strike": 105.0, "bid": 0.12, "ask": 0.139, "lastPrice": 0.1295},
+    ])
+    puts = _option_frame([
+        {"contractSymbol": "P_97", "strike": 97.0, "bid": 0.10, "ask": 0.12, "lastPrice": 0.11},
+        {"contractSymbol": "P_95", "strike": 95.0, "bid": 0.12, "ask": 0.139, "lastPrice": 0.1295},
+    ])
+    _install_fake_option_chain(monkeypatch, calls=calls, puts=puts, spot=100.0)
+    quote = forward_loop.fetch_structure_quote(
+        symbol="AAPL", structure="iron_condor",
+        earnings_date=date(2026, 4, 30), as_of_date=date(2026, 5, 1),
+        context={"front_expiry": "2026-05-01",
+                 "short_call_strike": 103.0, "long_call_strike": 105.0,
+                 "short_put_strike": 97.0, "long_put_strike": 95.0,
+                 "max_loss_per_unit": 0.40},
+    )
+    assert quote["mid"] is None, "two sub-tolerance violations must not sum past the budget"
+    prov = quote["bid_ask_mid"]["provenance"]
+    assert quote["reason"] == "condor_quote_outside_no_arbitrage_bounds"
+    assert prov["total_violation"] > prov["repair_tolerance"]
+    # Each leg alone was inside tolerance — the TOTAL is what refused it.
+    assert all(v <= prov["repair_tolerance"] for v in prov["leg_violations"].values())

@@ -1,15 +1,18 @@
 import unittest
+import pytest
 from datetime import date
 from pathlib import Path
 import time
 from unittest.mock import patch
 
+import services.structure_scorecard as sc
 from services.earnings_vol_snapshot import VolSnapshot
 from services.structure_scorecard import (
     WalkForwardPrior,
     build_structure_scorecards,
     reload_walk_forward_priors,
     score_atm_straddle,
+    score_iron_condor,
     _effective_history_count,
     _blend_expected_return,
     _compute_rank_score,
@@ -119,7 +122,7 @@ def _neutral_priors() -> dict[str, WalkForwardPrior]:
             rank_score=0.50,
             source="test_neutral",
         )
-        for structure in ("atm_straddle", "otm_strangle", "call_calendar", "put_calendar")
+        for structure in ("atm_straddle", "otm_strangle", "call_calendar", "put_calendar", "iron_condor")
     }
 
 
@@ -1030,3 +1033,288 @@ class TestBuildScorecardsTemporalIntegrity(unittest.TestCase):
             with patch("services.structure_prior_store.get_structure_prior_store", return_value=iso):
                 with self.assertRaises(BacktestLeakageError):
                     build_structure_scorecards(snapshot, as_of_date=snapshot.as_of_date)
+
+
+class TestIronCondorScorecard(unittest.TestCase):
+    """Sell-side defined-risk structure. Its edge sign is inverted vs the long
+    structures: it wins when realized < implied and the crush classifier fires."""
+
+    def _condor_prior(self):
+        # Neutral no-data prior (history_count=0) so the blend leans on the live
+        # signal and the crush gate is what moves the score in these tests.
+        return WalkForwardPrior(
+            structure="iron_condor", history_count=0, win_rate=0.50,
+            avg_return_pct=0.0, rank_score=0.31, source="test_neutral_condor",
+        )
+
+    def _seller_favorable(self, **extra):
+        # Realized ran well below implied, tails contained, IV rich, smile not
+        # concave — the setup a vol-seller wants.
+        base = dict(
+            historical_vs_implied_move_ratio=0.55,
+            tail_vs_implied_move_ratio=0.45,
+            iv_rv_har=1.45,
+            iv_rv_yz=1.40,
+            smile_curvature=0.10,
+            smile_concavity_flag=False,
+        )
+        base.update(extra)
+        return _base_snapshot(**base)
+
+    def test_build_includes_iron_condor(self):
+        with patch(
+            "services.structure_scorecard._load_walk_forward_priors",
+            side_effect=lambda as_of_date=None: _neutral_priors(),
+        ):
+            cards = build_structure_scorecards(self._seller_favorable(), crush_probability=0.8)
+        structures = {c.structure for c in cards}
+        assert "iron_condor" in structures
+        assert len(cards) == 5
+
+    def test_eligible_on_a_well_formed_snapshot(self):
+        card = score_iron_condor(
+            self._seller_favorable(), prior=self._condor_prior(), crush_probability=0.8
+        )
+        assert card.eligible, card.eligibility_flags
+        assert card.structure == "iron_condor"
+
+    def test_crush_gate_is_monotonic(self):
+        # Holding the snapshot fixed, a higher crush probability must not lower
+        # the composite score — the classifier is the primary entry signal.
+        snap = self._seller_favorable()
+        prior = self._condor_prior()
+        low = score_iron_condor(snap, prior=prior, crush_probability=0.15)
+        mid = score_iron_condor(snap, prior=prior, crush_probability=0.50)
+        high = score_iron_condor(snap, prior=prior, crush_probability=0.85)
+        assert low.composite_structure_score <= mid.composite_structure_score <= high.composite_structure_score
+        assert low.expected_edge_pct <= high.expected_edge_pct
+
+    def test_high_crush_low_realized_produces_positive_edge(self):
+        card = score_iron_condor(
+            self._seller_favorable(), prior=self._condor_prior(), crush_probability=0.9
+        )
+        assert card.expected_edge_pct > 0.0
+        assert card.expected_move_fit_score > 0.5
+
+    def test_high_realized_move_is_hostile_to_the_seller(self):
+        # When realized has been outrunning implied (ratio well above 1), the
+        # low-good score collapses and the condor's edge should fall vs the
+        # favorable case, even with the same high crush probability.
+        prior = self._condor_prior()
+        favorable = score_iron_condor(self._seller_favorable(), prior=prior, crush_probability=0.85)
+        hostile = score_iron_condor(
+            self._seller_favorable(historical_vs_implied_move_ratio=1.80, tail_vs_implied_move_ratio=1.70),
+            prior=prior, crush_probability=0.85,
+        )
+        assert hostile.expected_edge_pct < favorable.expected_edge_pct
+
+    def test_fat_tails_and_concavity_penalize_the_condor(self):
+        prior = self._condor_prior()
+        contained = score_iron_condor(self._seller_favorable(), prior=prior, crush_probability=0.8)
+        breachy = score_iron_condor(
+            self._seller_favorable(
+                tail_vs_implied_move_ratio=1.80,   # upper-quartile tails
+                smile_concavity_flag=True,          # bimodal / large expected jump
+                smile_curvature=0.65,
+            ),
+            prior=prior, crush_probability=0.8,
+        )
+        assert breachy.concavity_penalty > contained.concavity_penalty
+        assert breachy.composite_structure_score < contained.composite_structure_score
+
+    def test_missing_crush_is_neutral_not_a_crash(self):
+        # crush_probability=None (model unavailable / caller did not compute it)
+        # must not raise; the crush component falls back to neutral and the
+        # ratios carry the score.
+        card = score_iron_condor(
+            self._seller_favorable(), prior=self._condor_prior(), crush_probability=None
+        )
+        assert card.structure == "iron_condor"
+        assert 0.0 <= card.composite_structure_score <= 1.0
+
+    def test_ineligible_when_wings_cannot_form(self):
+        card = score_iron_condor(
+            self._seller_favorable(near_term_atm_iv=None, smile_points=1),
+            prior=self._condor_prior(), crush_probability=0.8,
+        )
+        assert not card.eligible
+        assert card.composite_structure_score == 0.0
+
+
+class TestLivePriorShrinkage(unittest.TestCase):
+    """The live-observation store is blended into the report prior continuously.
+
+    This replaced an all-or-nothing overlay whose step at MIN_OBS_FOR_OVERRIDE
+    let a 5-trade paper sample wholly displace a 42-observation backtest
+    (observed live: otm_strangle rank_score 0.840 -> 0.000 overnight).
+    """
+
+    def _report(self, **kw):
+        base = dict(structure="otm_strangle", history_count=42, win_rate=0.69,
+                    avg_return_pct=9.05, rank_score=0.84, source="report")
+        base.update(kw)
+        return WalkForwardPrior(**base)
+
+    def _live(self, n, *, win=0.40, ret=-8.29):
+        return {"structure": "otm_strangle", "history_count": n, "win_rate": win,
+                "avg_return_pct": ret, "rank_score": 0.0, "source": "persistent_store"}
+
+    def test_no_live_evidence_leaves_the_report_prior_untouched(self):
+        rep = self._report()
+        assert sc._shrink_live_into_report_prior(rep, self._live(0)) is rep
+
+    def test_small_live_sample_cannot_capture_the_prior(self):
+        # The exact live case: 5 clustered paper trades must NOT displace a
+        # 42-observation backtest the way the old cliff allowed.
+        blended = sc._shrink_live_into_report_prior(self._report(), self._live(5))
+        assert blended.rank_score > 0.60, (
+            f"5 observations must not collapse the rank, got {blended.rank_score:.3f}"
+        )
+        # It still moves the estimate toward the live result, just not all the way.
+        assert blended.avg_return_pct < 9.05
+        assert blended.avg_return_pct > -8.29
+
+    def test_live_weight_rises_monotonically_with_sample_size(self):
+        rep = self._report()
+        returns = [
+            sc._shrink_live_into_report_prior(rep, self._live(n)).avg_return_pct
+            for n in (1, 5, 20, 60, 200)
+        ]
+        # Live result is worse than the report, so more live evidence pulls the
+        # blended return down, strictly and without any jump.
+        assert returns == sorted(returns, reverse=True), returns
+
+    def test_parity_point_matches_the_documented_strength(self):
+        # w_live = n/(n+20) → exactly 0.5 at n == LIVE_PRIOR_SHRINKAGE_STRENGTH.
+        rep = self._report()
+        n = int(sc.LIVE_PRIOR_SHRINKAGE_STRENGTH)
+        blended = sc._shrink_live_into_report_prior(rep, self._live(n))
+        assert blended.avg_return_pct == pytest.approx((9.05 + -8.29) / 2.0, abs=1e-9)
+
+    def test_blend_has_no_discontinuity_at_the_old_threshold(self):
+        # The defect being fixed: crossing observation 5 used to swap the whole
+        # prior. Neighbouring counts must now differ only marginally.
+        rep = self._report()
+        r4 = sc._shrink_live_into_report_prior(rep, self._live(4)).rank_score
+        r5 = sc._shrink_live_into_report_prior(rep, self._live(5)).rank_score
+        assert abs(r5 - r4) < 0.05, f"cliff at the old threshold: {r4:.3f} -> {r5:.3f}"
+
+    def test_simulated_report_prior_contributes_no_evidence_count(self):
+        # A simulated scoreboard must never masquerade as real observations.
+        sim = self._report(is_simulated=True, history_count=40)
+        blended = sc._shrink_live_into_report_prior(sim, self._live(3))
+        assert blended.history_count == 3
+        assert blended.is_simulated is False
+
+    def test_real_report_prior_counts_toward_total_evidence(self):
+        blended = sc._shrink_live_into_report_prior(self._report(), self._live(3))
+        assert blended.history_count == 45
+
+
+class TestAuditFixes(unittest.TestCase):
+    """Regressions for defects found by the independent audit."""
+
+    def _condor_prior(self):
+        return WalkForwardPrior(
+            structure="iron_condor", history_count=0, win_rate=0.50,
+            avg_return_pct=0.0, rank_score=0.31, source="test_neutral_condor",
+        )
+
+    def test_condor_prefers_rich_vol_over_cheap_vol(self):
+        """AUDIT HIGH: _finalize_scorecard adds +0.10 * cheapness_score for every
+        structure, and cheapness is HIGH when options are CHEAP. Passed through
+        raw, it made the premium-SELLING condor score higher on cheap vol — the
+        opposite of its thesis, and it out-weighed the richness term in move_fit."""
+        common = dict(
+            historical_vs_implied_move_ratio=0.55, tail_vs_implied_move_ratio=0.45,
+            smile_curvature=0.10, smile_concavity_flag=False,
+        )
+        rich = score_iron_condor(
+            _base_snapshot(cheapness_score=0.19, iv_rv_har=1.50, iv_rv_yz=1.45, **common),
+            prior=self._condor_prior(), crush_probability=0.80,
+        )
+        cheap = score_iron_condor(
+            _base_snapshot(cheapness_score=0.94, iv_rv_har=0.85, iv_rv_yz=0.85, **common),
+            prior=self._condor_prior(), crush_probability=0.80,
+        )
+        assert rich.expected_edge_pct > cheap.expected_edge_pct
+        assert rich.composite_structure_score > cheap.composite_structure_score, (
+            f"selling premium must score better on RICH vol: "
+            f"rich={rich.composite_structure_score:.3f} cheap={cheap.composite_structure_score:.3f}"
+        )
+
+    def test_simulated_report_prior_gains_no_weight_from_the_blend(self):
+        """AUDIT HIGH: blending a SIMULATED report prior's win/return at w_report
+        smuggled simulated statistics into rank_score, and clearing is_simulated
+        removed the flag downstream consumers use to discount them."""
+        sim = WalkForwardPrior(
+            structure="call_calendar", history_count=117, win_rate=0.21,
+            avg_return_pct=-24.17, rank_score=0.31, source="iv_expansion_study",
+            is_simulated=True,
+        )
+        live = {"structure": "call_calendar", "history_count": 10, "win_rate": 0.70,
+                "avg_return_pct": 15.0, "rank_score": 0.0, "source": "persistent_store"}
+        blended = sc._shrink_live_into_report_prior(sim, live)
+        # The simulated -24.17 contributes NOTHING: the live sample is shrunk
+        # toward the NEUTRAL baseline (0.0 return / 0.50 win) instead, so the
+        # result sits between neutral and live and never carries simulated stats.
+        assert blended.avg_return_pct == pytest.approx(15.0 * (10 / 30.0))
+        assert 0.0 < blended.avg_return_pct < 15.0
+        assert 0.50 < blended.win_rate < 0.70
+        assert blended.history_count == 10
+        assert "neutral_baseline" in blended.source
+        # A non-simulated report still blends normally.
+        real = WalkForwardPrior(
+            structure="otm_strangle", history_count=42, win_rate=0.69,
+            avg_return_pct=9.05, rank_score=0.84, source="report",
+        )
+        mixed = sc._shrink_live_into_report_prior(real, {**live, "structure": "otm_strangle"})
+        # Strictly between the two: pulled toward the live result, not replaced by it.
+        assert 9.05 < mixed.avg_return_pct < 15.0
+        assert mixed.history_count == 52
+
+    def test_nan_live_return_does_not_poison_the_blend(self):
+        """AUDIT LOW: NaN is truthy, so `x or 0.0` does not screen it."""
+        real = WalkForwardPrior(
+            structure="otm_strangle", history_count=42, win_rate=0.69,
+            avg_return_pct=9.05, rank_score=0.84, source="report",
+        )
+        blended = sc._shrink_live_into_report_prior(
+            real, {"structure": "otm_strangle", "history_count": 5,
+                   "win_rate": 0.40, "avg_return_pct": float("nan")},
+        )
+        import math
+        assert math.isfinite(blended.avg_return_pct)
+        assert math.isfinite(blended.rank_score)
+
+    def test_blend_is_continuous_for_a_simulated_report_too(self):
+        """AUDIT MEDIUM (re-verification): forcing w_report=0 for a simulated
+        report removed the contamination but reintroduced a CLIFF — at n_live=1 a
+        single observation seized the estimate with no shrinkage. The module
+        claims continuity for every structure at every count, so the live sample
+        must shrink toward the NEUTRAL baseline rather than toward nothing."""
+        sim = WalkForwardPrior(
+            structure="call_calendar", history_count=117, win_rate=0.21,
+            avg_return_pct=-24.17, rank_score=0.3086, source="sim", is_simulated=True,
+        )
+        neutral_rank = sc._compute_rank_score(
+            win_rate=sc._NEUTRAL_PRIOR_WIN_RATE,
+            avg_return_pct=sc._NEUTRAL_PRIOR_AVG_RETURN_PCT,
+            history_count=0,
+        )
+        one_win = sc._shrink_live_into_report_prior(
+            sim, {"history_count": 1, "win_rate": 0.667, "avg_return_pct": 50.0})
+        one_loss = sc._shrink_live_into_report_prior(
+            sim, {"history_count": 1, "win_rate": 0.333, "avg_return_pct": -50.0})
+        # A single observation must nudge, not seize: both stay near neutral.
+        assert abs(one_win.rank_score - neutral_rank) < 0.10, one_win.rank_score
+        assert abs(one_loss.rank_score - neutral_rank) < 0.10, one_loss.rank_score
+        assert one_loss.rank_score > 0.0, "a single loss must not zero the rank"
+        # And the sequence is monotone with no jump.
+        ranks = [
+            sc._shrink_live_into_report_prior(
+                sim, {"history_count": n, "win_rate": 0.70, "avg_return_pct": 15.0}
+            ).rank_score
+            for n in (1, 2, 5, 10, 30, 100)
+        ]
+        assert ranks == sorted(ranks), ranks

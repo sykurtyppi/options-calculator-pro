@@ -56,6 +56,11 @@ SUPPORTED_STRUCTURES: tuple[str, ...] = (
     "otm_strangle",
     "call_calendar",
     "put_calendar",
+    # Sell-side counterpart to the four long-vol structures above. Defined-risk
+    # short-volatility play (short OTM call spread + short OTM put spread) whose
+    # edge sign is INVERTED: it wins when realized move < implied (the
+    # variance-risk-premium / vol-crush edge). See score_iron_condor.
+    "iron_condor",
 )
 
 
@@ -181,13 +186,22 @@ _PRIORS_CACHE_MAX: int = 32
 def build_structure_scorecards(
     snapshot: VolSnapshot,
     as_of_date: Optional[date] = None,
+    *,
+    crush_probability: Optional[float] = None,
 ) -> List[StructureScorecard]:
     """
-    Build scorecards for all four supported structures.
+    Build scorecards for all supported structures.
 
     Parameters
     ----------
     snapshot : VolSnapshot
+    crush_probability : float, optional
+        Trained crush-classifier probability for this event (services.crush_features
+        / edge_engine._ml_crush_probability). Consumed ONLY by the sell-side
+        iron_condor scorecard, where a high crush probability is the entry signal.
+        None (the default, and the value under any caller that has not computed it)
+        makes the condor fall back to a neutral crush component and lean on the raw
+        vol-richness ratios instead. The four long-vol scorers ignore it.
     as_of_date : date, optional
         If provided, the walk-forward priors are filtered to observations
         recorded on or before this date, and the raising leakage sentinel runs.
@@ -234,6 +248,9 @@ def build_structure_scorecards(
         score_otm_strangle(snapshot, prior=priors["otm_strangle"]),
         score_call_calendar(snapshot, prior=priors["call_calendar"]),
         score_put_calendar(snapshot, prior=priors["put_calendar"]),
+        score_iron_condor(
+            snapshot, prior=priors["iron_condor"], crush_probability=crush_probability
+        ),
     ]
 
 
@@ -612,6 +629,209 @@ def _score_calendar(
     return _finalize_scorecard(structure, snapshot, prior, context, flags)
 
 
+def score_iron_condor(
+    snapshot: VolSnapshot,
+    *,
+    prior: Optional[WalkForwardPrior] = None,
+    crush_probability: Optional[float] = None,
+) -> StructureScorecard:
+    """Defined-risk SHORT-volatility structure: sell an OTM call spread + an OTM
+    put spread. This is the sell-side counterpart to the four long-vol structures,
+    and its edge sign is INVERTED.
+
+    The long structures win when realized move > implied; the condor wins when
+    realized move < implied — the variance-risk-premium / vol-crush edge (implied
+    exceeds realized ~70-75% of the time at earnings; De Silva, Smith & So 2025,
+    Review of Finance, show delta-neutral long straddle/strangle/calendar returns
+    are negative in the concave pre-earnings smile). Three inversions follow, and
+    each is called out at its term below:
+
+      1. The historical/implied and tail/implied ratios are scored LOW-good here
+         (via _score_low_good) instead of HIGH-good: a low ratio means realized
+         ran below implied, which is what the seller wants.
+      2. IV richness (iv/rv) is a POSITIVE driver ("richness_score"), not the
+         crowding PENALTY it is for the long structures — rich IV is the premium
+         the condor collects.
+      3. Theta is the seller's friend, so theta carries only a tiny timing
+         sensitivity, not the decay drag the long structures pay; and crowding is
+         not penalised at all.
+
+    The trained crush classifier (OOF AUC ~0.84) is the PRIMARY move-fit driver
+    via ``crush_probability`` — a high crush probability is precisely the entry
+    signal. When it is None (model unavailable, or a caller that did not compute
+    it) the crush component falls back to neutral 0.5 and the raw vol-richness
+    ratios carry the score, so the condor degrades gracefully rather than
+    fabricating confidence.
+
+    Two risks are penalised MORE heavily than for buyers, because a defined-risk
+    condor's worst case is a move that breaches a short strike:
+      - a concave / bimodal smile (the market pricing a large expected jump), and
+      - upper-quartile historical tails (tail_vs_implied in its p75-p95 band).
+    """
+    prior = prior or _load_walk_forward_priors()["iron_condor"]
+    flags = _base_eligibility_flags(snapshot)
+    # Both an OTM call wing and an OTM put wing must be formable. Mirror the OTM
+    # strangle's leg requirements (a condor is a strangle with long protective
+    # wings) plus explicit per-leg spread availability.
+    if snapshot.smile_points < 3 or snapshot.near_term_atm_iv is None:
+        flags.append("cannot_form_iron_condor")
+    if snapshot.atm_call_spread_pct is None or snapshot.atm_put_spread_pct is None:
+        flags.append("missing_structure_leg_spread")
+    if snapshot.near_term_spread_pct is not None and snapshot.near_term_spread_pct > ABSOLUTE_SPREAD_THRESHOLD_PCT:
+        flags.append("structure_spread_exceeds_absolute_threshold")
+
+    # (0) The SHARED composite term must be inverted too. _finalize_scorecard adds
+    # `+ 0.10 * context.cheapness_score` for every structure, and
+    # snapshot.cheapness_score is HIGH when options are CHEAP (it is
+    # 1 - clip((iv_rv - 0.80)/0.90)). That is right for the four buyers and
+    # exactly backwards for a premium seller: left raw, the condor collects a
+    # composite bonus on the cheap-vol names where selling premium makes least
+    # sense, and that 0.10 weight swamps the richness term inside move_fit
+    # (0.15 x 0.15 = 0.0225). Feed the seller's own premium-richness into that
+    # slot instead, on the same underlying metric so the term stays comparable
+    # across structures.
+    cheapness = _coalesce_unit(snapshot.cheapness_score)
+    premium_richness = _clamp01(1.0 - cheapness)
+    timing = _coalesce_unit(snapshot.timing_score)
+    execution = _coalesce_unit(snapshot.execution_score)
+    quality = _coalesce_unit(snapshot.data_quality_score)
+
+    # (1) Inverted ratio scores: LOW historical/implied and LOW tail/implied are
+    # favourable for the seller. Same corpus-calibrated bounds as the long
+    # structures (module header), just scored on the low side.
+    low_move_score = _score_low_good(snapshot.historical_vs_implied_move_ratio, MOVE_RATIO_P10, MOVE_RATIO_P90)
+    low_tail_score = _score_low_good(snapshot.tail_vs_implied_move_ratio, TAIL_RATIO_P10, TAIL_RATIO_P90)
+    # (2) IV richness as a POSITIVE driver (same iv/rv the long structures treat
+    # as crowding and penalise).
+    richness_score = _score_high_good(_first_finite(snapshot.iv_rv_har, snapshot.iv_rv_yz), 1.00, 1.60)
+    # Crush classifier is the primary signal; neutral 0.5 when unavailable.
+    crush_score = _coalesce_unit(crush_probability)
+
+    _using_daily_fallback = (
+        getattr(snapshot, "historical_move_source", "earnings_history") == "daily_fallback"
+    )
+    _event_split_unavailable = (
+        getattr(snapshot, "event_decomposition_status", "no_earnings_date")
+        in ("no_event_spanning_expiry", "event_expiry_not_quotable")
+    )
+    _move_fit_degraded = _using_daily_fallback or _event_split_unavailable
+    if _move_fit_degraded:
+        # Without a real earnings-move distribution the seller cannot judge breach
+        # risk either — degrade to the same low sentinel the long structures use
+        # rather than sell blind.
+        move_fit = 0.15
+    else:
+        move_fit = _clamp01(
+            0.40 * crush_score
+            + 0.25 * low_tail_score
+            + 0.20 * low_move_score
+            + 0.15 * richness_score
+        )
+
+    concavity_intensity = _clamp01(
+        max(
+            1.0 if snapshot.smile_concavity_flag else 0.0,
+            _score_high_good(abs(snapshot.smile_curvature) if snapshot.smile_curvature is not None else None, 0.22, 0.70),
+        )
+    )
+
+    leg_spread_pct = _average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct])
+    execution_penalty = _execution_penalty(snapshot, leg_spread_pct=leg_spread_pct, structure="iron_condor")
+    # (3) Theta works FOR the seller: only a small penalty for entering so far out
+    # that little decay is captured — NOT the decay drag a buyer pays.
+    theta_penalty = 0.02 * (1.0 - timing)
+    # Crowding (rich IV, everyone long vol) is the seller's premium, not a cost.
+    crowding_penalty = 0.0
+    # A concave / bimodal smile signals a large expected jump — real breach risk
+    # for short strikes — so it is penalised more than for buyers (0.10 vs 0.08).
+    concavity_penalty = 0.10 * concavity_intensity
+    # Upper-quartile historical tails elevate short-strike breach risk. Fold into
+    # the sample-uncertainty penalty like the calendar's tail-risk term.
+    tail_risk_penalty = 0.09 * _score_high_good(snapshot.tail_vs_implied_move_ratio, TAIL_RATIO_P75, TAIL_RATIO_P95)
+    sample_confidence, sample_penalty = _sample_confidence_and_penalty(snapshot, prior, max_penalty=0.12)
+    sample_penalty = _clamp01(sample_penalty + tail_risk_penalty)
+
+    # IV contribution = crush actually captured (no crowding subtraction — see (2)).
+    expected_iv_contribution_pct = 10.0 * _clamp01(
+        0.50 * crush_score + 0.30 * richness_score + 0.20 * low_tail_score
+    )
+    # Provisional pre-OOS return scale (between the calendar's 14 and the
+    # strangle's 22). The neutral prior means _blend_expected_return leans fully
+    # on this signal until real condor outcomes accrue and the walk-forward blend
+    # takes over; it is a score-derived diagnostic, not a calibrated forecast.
+    expected_return_signal_pct = 16.0 * (
+        0.40 * move_fit
+        + 0.20 * richness_score
+        + 0.15 * timing
+        + 0.10 * execution
+        + 0.15 * low_tail_score
+        - 0.50
+    )
+    expected_return_pct = _blend_expected_return(prior, expected_return_signal_pct + expected_iv_contribution_pct * 0.30)
+    expected_edge_pct = expected_return_pct - _penalty_pct(
+        execution_penalty=execution_penalty,
+        theta_penalty=theta_penalty,
+        crowding_penalty=crowding_penalty,
+        concavity_penalty=concavity_penalty,
+        sample_penalty=sample_penalty,
+    )
+
+    _crush_txt = (
+        f"Crush classifier probability {crush_probability:.2f} "
+        f"{'supports' if crush_probability >= 0.50 else 'does not support'} a vol-sale."
+        if crush_probability is not None and np.isfinite(crush_probability)
+        else "Crush classifier unavailable; the crush component stays neutral and the vol-richness ratios carry the score."
+    )
+    rationale = [
+        _crush_txt,
+        _ratio_rationale(
+            "historical/implied move", snapshot.historical_vs_implied_move_ratio,
+            favorable="above 1 warns realized has outrun implied — hostile to a vol sale",
+            cautious="below 1 means realized ran under implied — favorable for the seller",
+        ),
+        _ratio_rationale(
+            "tail/implied move", snapshot.tail_vs_implied_move_ratio,
+            favorable="fat tails raise short-strike breach risk",
+            cautious="contained tails keep the short strikes safer",
+        ),
+        f"IV/RV richness {'supports' if richness_score >= 0.6 else 'does not strongly support'} premium collection (score {richness_score:.2f}).",
+        _execution_rationale(snapshot, execution_penalty),
+        "Defined-risk: max loss is capped at the wing width minus the net credit; the crush-gate keeps entries to events where implied looks rich versus realized.",
+        f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
+    ]
+    if _move_fit_degraded:
+        if _event_split_unavailable:
+            rationale.append(
+                "Warning: no quotable option expiry spans the earnings reaction, so the "
+                "event-implied move could not be computed. Move-fit estimate set to "
+                "sentinel 0.15 — no event-pricing evidence exists to justify selling vol."
+            )
+        else:
+            rationale.append(
+                "Warning: historical move profile uses daily returns (no earnings history available). "
+                "Move-fit estimate set to sentinel 0.15 — unreliable for judging short-strike breach risk."
+            )
+    context = _StructureContext(
+        move_fit_score=move_fit,
+        # Seller's slot: richness, not cheapness — see (0) above.
+        cheapness_score=premium_richness,
+        timing_score=timing,
+        execution_score=execution,
+        data_quality_score=quality,
+        expected_iv_contribution_pct=expected_iv_contribution_pct,
+        expected_return_pct=expected_return_pct,
+        expected_edge_pct=expected_edge_pct,
+        theta_drag_penalty=theta_penalty,
+        execution_penalty=execution_penalty,
+        crowding_penalty=crowding_penalty,
+        concavity_penalty=concavity_penalty,
+        sample_uncertainty_penalty=sample_penalty,
+        sample_confidence=sample_confidence,
+        rationale_bullets=rationale,
+    )
+    return _finalize_scorecard("iron_condor", snapshot, prior, context, flags)
+
+
 def _finalize_scorecard(
     structure: str,
     snapshot: VolSnapshot,
@@ -716,6 +936,10 @@ def _execution_penalty(snapshot: VolSnapshot, *, leg_spread_pct: Optional[float]
         "otm_strangle": 0.14,
         "call_calendar": 0.12,
         "put_calendar": 0.12,
+        # Iron condor is a 4-leg structure (two vertical spreads); round-trip
+        # crosses four bid-ask spreads vs two for a straddle/strangle, so it
+        # carries the highest execution-drag scale in the universe.
+        "iron_condor": 0.16,
     }[structure]
     return structure_scale * _clamp01(
         0.45 * spread_penalty
@@ -1350,6 +1574,114 @@ def _walk_forward_prior_signature(
     return tuple(signature) + (as_of_key,)
 
 
+# Observations of live evidence required for the live sample to reach EQUAL
+# weight with the report-based prior:
+#
+#     w_live = n_live / (n_live + LIVE_PRIOR_SHRINKAGE_STRENGTH)
+#
+#   n_live=  3 → 13%      n_live= 20 → 50%
+#   n_live=  5 → 20%      n_live= 40 → 67%
+#   n_live= 10 → 33%      n_live=100 → 83%
+#
+# 20 is chosen against the sample-size literature: ~30 trades is the point where
+# significance can begin to be estimated at all, so parity at 20 and ~60% weight
+# by 30 lets live results matter well before they are conclusive, without a tiny
+# clustered sample ever seizing the score. Monotonic in n_live and continuous —
+# no observation count causes a discontinuous jump, which was the defect of the
+# MIN_OBS_FOR_OVERRIDE cliff this replaced.
+LIVE_PRIOR_SHRINKAGE_STRENGTH = 20.0
+
+
+def _shrink_live_into_report_prior(
+    report: WalkForwardPrior,
+    live: Dict[str, Any],
+) -> WalkForwardPrior:
+    """Blend a live-observation aggregate into the report-based prior.
+
+    Returns ``report`` unchanged when there is no live evidence, so a structure
+    that has never traded is completely unaffected.
+
+    The live sample is always shrunk by the SAME continuous weight; only the
+    ANCHOR it is shrunk toward depends on the report:
+
+      - real report      -> anchor on the report's own win/return
+      - simulated report -> anchor on the NEUTRAL no-data baseline, because a
+                            simulated scoreboard carries zero empirical weight
+                            (the F2/V3 rule that _effective_history_count
+                            enforces). Anchoring on its statistics would smuggle
+                            them into rank_score and _blend_expected_return;
+                            anchoring on NOTHING (w_report=0) would let a single
+                            observation seize the estimate, reintroducing exactly
+                            the discontinuity this function exists to remove.
+                            The neutral constants are the same ones
+                            _load_calendar_prior_from_reports already routes a
+                            simulated rank through, so the two agree.
+
+    history_count becomes the TOTAL real evidence behind the blended estimate. A
+    simulated report contributes ZERO to that count (mirroring
+    _effective_history_count), so a simulated scoreboard can never masquerade as
+    observations and inflate the history term of the rank.
+    """
+    try:
+        n_live = int(live.get("history_count") or 0)
+    except (TypeError, ValueError):
+        n_live = 0
+    if n_live <= 0:
+        return report
+
+    live_win = _coalesce_unit(live.get("win_rate"))
+    _raw_live_ret = live.get("avg_return_pct")
+    try:
+        live_ret = float(_raw_live_ret)
+    except (TypeError, ValueError):
+        live_ret = 0.0
+    if not np.isfinite(live_ret):
+        # NaN is truthy, so `x or 0.0` does NOT screen it — guard explicitly or a
+        # NaN propagates into the blend and poisons the rank.
+        live_ret = 0.0
+
+    # ONE continuous weight for every case — the cliff this function removed must
+    # not reappear for any structure at any observation count.
+    w_live = float(n_live) / (float(n_live) + LIVE_PRIOR_SHRINKAGE_STRENGTH)
+    w_anchor = 1.0 - w_live
+    if report.is_simulated:
+        anchor_win = _NEUTRAL_PRIOR_WIN_RATE
+        anchor_ret = _NEUTRAL_PRIOR_AVG_RETURN_PCT
+        anchor_label = "neutral_baseline"
+    else:
+        anchor_win = float(report.win_rate)
+        anchor_ret = float(report.avg_return_pct)
+        anchor_label = report.source
+
+    blended_win = w_anchor * anchor_win + w_live * live_win
+    blended_ret = w_anchor * anchor_ret + w_live * live_ret
+
+    # Real observations only: a simulated report prior adds no empirical count.
+    report_real_count = 0 if report.is_simulated else int(report.history_count)
+    total_count = report_real_count + n_live
+
+    return WalkForwardPrior(
+        structure=report.structure,
+        history_count=total_count,
+        win_rate=blended_win,
+        avg_return_pct=blended_ret,
+        rank_score=_compute_rank_score(
+            win_rate=blended_win,
+            avg_return_pct=blended_ret,
+            history_count=total_count,
+        ),
+        # Name the ANCHOR actually used, not the report — for a simulated report
+        # the report's statistics contribute nothing and saying otherwise would
+        # misstate the provenance.
+        source=(
+            f"shrinkage_blend(anchor={anchor_label},live_n={n_live},w_live={w_live:.2f})"
+        ),
+        # The blend now contains real observations, so it is no longer purely
+        # simulated even when the report half was.
+        is_simulated=False,
+    )
+
+
 def _load_walk_forward_priors(
     as_of_date: Optional[date] = None,
 ) -> Dict[str, WalkForwardPrior]:
@@ -1372,25 +1704,40 @@ def _load_walk_forward_priors(
         "put_calendar": _load_calendar_prior_from_reports("put_calendar"),
         "atm_straddle": _load_straddle_prior_from_reports(),
         "otm_strangle": _load_strangle_prior_from_reports(),
+        # No OOS backtest report exists for the sell-side iron condor yet, so it
+        # starts from the honest no-data baseline (history_count=0, coin-flip win
+        # rate). The persistent store overlay below will replace this once the
+        # forward loop has recorded >= MIN_OBS_FOR_OVERRIDE real condor outcomes.
+        # Until then the selector's thin-history gates keep it out of "Best
+        # Candidate" — it can be surfaced as Watch/Candidate but not over-trusted.
+        "iron_condor": _neutral_prior("iron_condor", source="neutral_no_iron_condor_report"),
     }
-    # Overlay with the durable persistent store for any structure that has
-    # accumulated >= MIN_OBS_FOR_OVERRIDE (5) real observations.
-    # Below that threshold the report-based prior continues to govern.
+    # Blend the durable live-observation store into the report-based prior.
+    #
+    # This REPLACED an all-or-nothing overlay: the live aggregate used to be
+    # discarded entirely below MIN_OBS_FOR_OVERRIDE (5) observations and to
+    # wholly replace the report prior at or above it. That step function was a
+    # cliff — the 5th recorded trade swapped a 42-observation backtest for a
+    # 5-observation paper sample in a single night. Observed live on
+    # otm_strangle: rank_score fell 0.840 → 0.000 (rank is 30% of the composite)
+    # on a sample of five clustered, same-regime trades.
+    #
+    # Sample-size work is unambiguous that five observations carry almost no
+    # information: ~30 trades is where significance can even begin to be
+    # estimated and ~100 is a practical minimum for believing an edge, and at
+    # ten trades a true 45% win rate can present anywhere from 10% to 80%.
+    # So live evidence now earns influence continuously instead of seizing it,
+    # which is also the idiom already used by _blend_expected_return.
+    #
     # The persistent store is imported lazily to avoid a circular dependency
     # (structure_prior_store does not import from structure_scorecard).
     try:
         from services.structure_prior_store import load_all_structure_priors
 
-        for structure, d in load_all_structure_priors(as_of_date=as_of_date).items():
+        live_priors = load_all_structure_priors(as_of_date=as_of_date, min_observations=1)
+        for structure, d in live_priors.items():
             if structure in base:
-                base[structure] = WalkForwardPrior(
-                    structure=d["structure"],
-                    history_count=d["history_count"],
-                    win_rate=d["win_rate"],
-                    avg_return_pct=d["avg_return_pct"],
-                    rank_score=d["rank_score"],
-                    source=d["source"],
-                )
+                base[structure] = _shrink_live_into_report_prior(base[structure], d)
     except Exception as exc:
         import logging as _logging
         _logging.getLogger(__name__).warning(

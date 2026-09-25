@@ -15,7 +15,7 @@ const scoredRow = {
   dte: 5,
   release_timing: 'AMC',
   iv_rv_ratio: 0.92,
-  atm_iv: 55.2,
+  atm_iv: 0.552,   // decimal, as the API sends it (55.2%) — NOT already-percent
   ts_ratio: 0.88,
   median_earnings_move_pct: 9.5,
   sample_size: 10,
@@ -113,5 +113,44 @@ describe('RankedSetupTable', () => {
     const green = 'rgb(46, 160, 67)' // #2ea043
     const greenCells = cells.filter((td) => td.style.color === green)
     expect(greenCells).toHaveLength(0)
+  })
+})
+
+describe('RankedSetupTable · ATM IV units', () => {
+  // Regression: atm_iv arrives as a DECIMAL from the API
+  // (screener_service.iv_front = snapshot.near_term_atm_iv -> "iv30" -> atm_iv).
+  // It was rendered with a bare '%' suffix, so a realistic 34.1% implied vol
+  // displayed as "0.3%" — an impossible value, in a financial product.
+  // The old fixture hid this by supplying an already-percent 55.2.
+  const decimalIvRow = {
+    rank: 1, symbol: 'COST', earnings_date: '2026-06-20', dte: 5,
+    release_timing: 'AMC', iv_rv_ratio: 0.92,
+    atm_iv: 0.34076871872222675,   // the exact value observed from the live API
+    ts_ratio: 0.88, median_earnings_move_pct: 9.5, sample_size: 10,
+    ranking_score: 0.74, status: 'ranked', error_note: null,
+  }
+
+  test('renders a decimal IV as a real percentage, not a fraction of one', () => {
+    const { container } = render(
+      <RankedSetupTable rows={[decimalIvRow]} selectedSymbol={null} onSelect={() => {}} />
+    )
+    expect(container.textContent).toMatch(/34\.1%/)
+    expect(container.textContent).not.toMatch(/0\.3%/)
+  })
+
+  test('already-percent columns are unaffected by the IV fix', () => {
+    const { container } = render(
+      <RankedSetupTable rows={[decimalIvRow]} selectedSymbol={null} onSelect={() => {}} />
+    )
+    // median_earnings_move_pct is ALREADY a percent (9.5 means 9.5%) and must
+    // not be multiplied — the two units keep separate formatters.
+    expect(container.textContent).toMatch(/9\.5%/)
+  })
+
+  test('a null IV still renders the placeholder, not "NaN%"', () => {
+    const { container } = render(
+      <RankedSetupTable rows={[{ ...decimalIvRow, atm_iv: null }]} selectedSymbol={null} onSelect={() => {}} />
+    )
+    expect(container.textContent).not.toMatch(/NaN/)
   })
 })
