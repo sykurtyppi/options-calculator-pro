@@ -122,7 +122,10 @@ def test_decision_ignores_priors_cached_before_store_isolation(monkeypatch, tmp_
     warmed = scorecard_module._load_walk_forward_priors(
         as_of_date=date.fromisoformat(CASE["as_of_date"]),
     )
-    assert warmed["atm_straddle"].source.startswith("persistent_store:")
+    # Assert on the observation count, not the provenance label: #142 changed
+    # the label format (persistent_store:… -> shrinkage_blend(…)). The isolated
+    # store in _decision is empty, so a count of 5 identifies the warmed store.
+    assert warmed["atm_straddle"].history_count == 5
 
     snapshot = _snapshot(CASE["option_chain"])
     _decision(snapshot, monkeypatch, tmp_path)
@@ -130,7 +133,7 @@ def test_decision_ignores_priors_cached_before_store_isolation(monkeypatch, tmp_
     restored = scorecard_module._load_walk_forward_priors(
         as_of_date=snapshot.as_of_date,
     )
-    assert restored["atm_straddle"].source.startswith("persistent_store:")
+    assert restored["atm_straddle"].history_count == 5
 
 
 def test_decision_isolation_does_not_cache_values_after_real_getter_restored(
