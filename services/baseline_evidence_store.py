@@ -3,6 +3,15 @@
 This store records hypothetical baseline trades beside selector paper trades.
 It is intentionally separate from OutcomeStore so baseline rows never update
 calibration or structure priors.
+
+Two cohorts share the table and must never be pooled:
+
+* ``paired`` - entered on the same day as a selector paper trade, so it answers
+  "did the selector's pick beat the naive structure on the SAME events?".
+* ``universe`` - entered once per eligible earnings event (first day inside the
+  DTE window) regardless of what the selector said, so it answers "what did
+  every event pay, including the ones the selector passed on?". Without it the
+  selector's No Trade calls have no counterfactual and can never be graded.
 """
 
 from __future__ import annotations
@@ -21,7 +30,19 @@ _WRITE_LOCK = threading.Lock()
 BASELINE_STRUCTURES = {
     "always_atm_straddle": "atm_straddle",
     "always_otm_strangle": "otm_strangle",
+    # Short-vol control. Exit is T-1 (the day before earnings), so this measures
+    # shorting the pre-earnings IV run-up, NOT selling the event crush.
+    "always_iron_condor": "iron_condor",
 }
+
+COHORT_PAIRED = "paired"
+COHORT_UNIVERSE = "universe"
+
+# How the exit quote was obtained. Rows resolved before booked-strike exits
+# existed re-discovered strikes at exit (a different contract than the one
+# bought), so their returns are not comparable and are reported separately.
+EXIT_REPRICING_BOOKED = "booked_strikes"
+EXIT_REPRICING_LEGACY = "rediscovered_legacy"
 
 _TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS baseline_trades (
@@ -76,6 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_baseline_recommendation_id ON baseline_trades (re
 CREATE INDEX IF NOT EXISTS idx_baseline_due ON baseline_trades (earnings_date, status);
 CREATE INDEX IF NOT EXISTS idx_baseline_name ON baseline_trades (baseline_name);
 CREATE INDEX IF NOT EXISTS idx_baseline_symbol ON baseline_trades (symbol);
+CREATE INDEX IF NOT EXISTS idx_baseline_universe_event ON baseline_trades (cohort, symbol, earnings_date);
 """
 
 _MIGRATION_COLUMNS: Dict[str, str] = {
@@ -94,11 +116,32 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "surface_extreme_spread_count": "INTEGER",
     "surface_sparse_atm_count": "INTEGER",
     "surface_iv_anomaly_count": "INTEGER",
+    "cohort": "TEXT",
+    "entry_pricing_context_json": "TEXT",
+    "capital_at_risk": "REAL",
+    "exit_repricing": "TEXT",
+    "selector_recommendation": "TEXT",
+    "days_to_earnings_at_entry": "INTEGER",
 }
 
 
 def make_baseline_id(recommendation_id: str, baseline_name: str) -> str:
     return f"{recommendation_id}|baseline|{baseline_name}"
+
+
+def make_universe_baseline_id(symbol: str, earnings_date: Any, baseline_name: str) -> str:
+    # Keyed on the EVENT, not the daily recommendation id, so an event is entered
+    # exactly once no matter how many days it sits inside the DTE window.
+    return f"universe|{str(symbol).upper()}|{_fmt_date(earnings_date)}|{baseline_name}"
+
+
+def baseline_cohort(row: Dict[str, Any]) -> str:
+    # Rows written before cohorts existed were all paired with a selector entry.
+    return str(row.get("cohort") or COHORT_PAIRED)
+
+
+def is_booked_strike_exit(row: Dict[str, Any]) -> bool:
+    return str(row.get("exit_repricing") or "") == EXIT_REPRICING_BOOKED
 
 
 class BaselineEvidenceStore:
@@ -138,8 +181,14 @@ class BaselineEvidenceStore:
         status: str = "open",
         skip_reason: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        cohort: str = COHORT_PAIRED,
+        baseline_id: Optional[str] = None,
+        entry_pricing_context: Optional[Dict[str, Any]] = None,
+        capital_at_risk: Optional[float] = None,
+        selector_recommendation: Optional[str] = None,
+        days_to_earnings_at_entry: Optional[int] = None,
     ) -> bool:
-        baseline_id = make_baseline_id(recommendation_id, baseline_name)
+        baseline_id = baseline_id or make_baseline_id(recommendation_id, baseline_name)
         sql = """
             INSERT OR IGNORE INTO baseline_trades (
                 baseline_id, recommendation_id, symbol, baseline_name, structure,
@@ -153,9 +202,12 @@ class BaselineEvidenceStore:
                 surface_crossed_quote_count, surface_zero_bid_count,
                 surface_extreme_spread_count, surface_sparse_atm_count,
                 surface_iv_anomaly_count,
-                status, skip_reason, metadata_json
+                status, skip_reason, metadata_json,
+                cohort, entry_pricing_context_json, capital_at_risk,
+                selector_recommendation, days_to_earnings_at_entry
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                ?,?,?,?,?
             )
         """
         surface_quality = surface_quality or {}
@@ -193,11 +245,32 @@ class BaselineEvidenceStore:
             status,
             skip_reason,
             _json(metadata or {}),
+            cohort,
+            _json(entry_pricing_context) if entry_pricing_context else None,
+            capital_at_risk,
+            selector_recommendation,
+            int(days_to_earnings_at_entry) if days_to_earnings_at_entry is not None else None,
         )
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
                 cur.execute(sql, params)
                 return cur.rowcount > 0
+
+    def recorded_universe_baselines(self, symbol: str, earnings_date: Any) -> set[str]:
+        """Baseline names already recorded for this event in the universe cohort.
+
+        Checked BEFORE quoting so an event that stays in the DTE window for ten
+        days costs one set of quotes, not ten.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT baseline_name
+            FROM baseline_trades
+            WHERE cohort = ? AND symbol = ? AND earnings_date = ?
+            """,
+            (COHORT_UNIVERSE, str(symbol).upper(), _fmt_date(earnings_date)),
+        ).fetchall()
+        return {str(row["baseline_name"]) for row in rows}
 
     def baselines_due_for_exit(self, as_of_date: date) -> list[Dict[str, Any]]:
         target = _fmt_date(as_of_date + timedelta(days=1))
@@ -227,10 +300,12 @@ class BaselineEvidenceStore:
         exit_execution_scenarios: Optional[Dict[str, Any]] = None,
         status: str = "resolved",
         skip_reason: Optional[str] = None,
+        exit_repricing: Optional[str] = None,
     ) -> bool:
         sql = """
             UPDATE baseline_trades
             SET exit_date = ?,
+                exit_repricing = ?,
                 exit_mid = ?,
                 realized_return_pct = ?,
                 realized_expansion_pct = ?,
@@ -246,6 +321,7 @@ class BaselineEvidenceStore:
         """
         params = (
             _fmt_date(exit_date),
+            exit_repricing,
             exit_mid,
             realized_return_pct,
             realized_expansion_pct,
@@ -329,6 +405,7 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "surface_quality_reasons_json",
         "surface_quality_json",
         "metadata_json",
+        "entry_pricing_context_json",
     ):
         if key in result:
             result[key] = _loads(result.get(key))

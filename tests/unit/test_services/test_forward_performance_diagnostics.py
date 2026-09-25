@@ -174,6 +174,7 @@ def _record_baseline(
         realized_expansion_pct=5.0,
         quote_source_at_exit="marketdata_app",
         quote_quality_at_exit="marketdata_app_paper_research_mid_not_execution_grade",
+        exit_repricing="booked_strikes",
         exit_execution_scenarios={
             "scenario_outcomes": {
                 "realized_return_pct": {

@@ -120,6 +120,7 @@ export function buildBenchmarkComparisonRows(payload = {}) {
     selector: 'Selector',
     always_atm_straddle: 'Always ATM straddle',
     always_otm_strangle: 'Always OTM strangle',
+    always_iron_condor: 'Always iron condor',
     no_trade: 'No trade',
     simple_iv_rv_filter: 'Simple IV/RV filter',
     liquidity_only_filter: 'Liquidity-only filter',

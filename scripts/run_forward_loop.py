@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -31,8 +31,13 @@ from services.move_statistics import MOVE_RATIO_UNITS_VERSION
 from services.learning_diagnostics import build_learning_diagnostics
 from services.baseline_evidence_store import (
     BASELINE_STRUCTURES,
+    COHORT_PAIRED,
+    COHORT_UNIVERSE,
+    EXIT_REPRICING_BOOKED,
+    EXIT_REPRICING_LEGACY,
     BaselineEvidenceStore,
     get_baseline_evidence_store,
+    make_universe_baseline_id,
 )
 from services.evidence_quality import evaluate_evidence_quality
 from services.execution_scenarios import (
@@ -1408,13 +1413,19 @@ def _record_baseline_entries(
     earnings_date: date,
     as_of: date,
     recommendation_id: str,
-    selector_structure: str,
+    selector_structure: Optional[str],
     snapshot: Any,
     vol_snapshot: Dict[str, Any],
     mda_client: Any,
+    cohort: str = COHORT_PAIRED,
+    selector_recommendation: Optional[str] = None,
+    baseline_names: Optional[Iterable[str]] = None,
 ) -> Dict[str, int]:
     summary = {"baseline_entries": 0, "baseline_skipped": 0}
+    wanted = set(baseline_names) if baseline_names is not None else set(BASELINE_STRUCTURES)
     for baseline_name, structure in BASELINE_STRUCTURES.items():
+        if baseline_name not in wanted:
+            continue
         card = _find_structure_scorecard(snapshot, structure) or {}
         quote = _fetch_quote_for_forward_loop(
             price_fetcher,
@@ -1426,6 +1437,10 @@ def _record_baseline_entries(
             mda_client=mda_client,
         )
         entry_mid = _safe_float(quote.get("mid"))
+        # Persist the booked contracts so the exit reprices THESE strikes and
+        # expiry. Re-discovering strikes at exit prices a different position.
+        pricing_context = quote.get("context") or {}
+        capital_at_risk = _safe_float(pricing_context.get("max_loss_per_unit"))
         execution_penalty = _safe_float(_get(card, "execution_penalty"))
         evidence_quality = evaluate_evidence_quality(
             quote_payload=quote,
@@ -1436,6 +1451,7 @@ def _record_baseline_entries(
             quote_payload=quote,
             phase="entry",
         ).to_dict()
+        entered = entry_mid is not None and entry_mid > 0
         inserted = baseline_store.insert_entry(
             recommendation_id=recommendation_id,
             symbol=symbol,
@@ -1459,18 +1475,72 @@ def _record_baseline_entries(
             execution_grade=bool(evidence_quality.get("execution_grade")),
             entry_execution_scenarios=entry_execution_scenarios,
             surface_quality=quote.get("surface_quality") or {},
-            status="open" if entry_mid is not None and entry_mid > 0 else "entry_skipped",
-            skip_reason=None if entry_mid is not None and entry_mid > 0 else str(quote.get("reason", "missing_entry_mid")),
+            status="open" if entered else "entry_skipped",
+            skip_reason=None if entered else str(quote.get("reason", "missing_entry_mid")),
             metadata={
                 "source": "forward_loop_shadow_baseline",
                 "evidence_quality": evidence_quality,
             },
+            cohort=cohort,
+            baseline_id=(
+                make_universe_baseline_id(symbol, earnings_date, baseline_name)
+                if cohort == COHORT_UNIVERSE
+                else None
+            ),
+            entry_pricing_context=pricing_context,
+            capital_at_risk=capital_at_risk,
+            selector_recommendation=selector_recommendation,
+            days_to_earnings_at_entry=(earnings_date - as_of).days,
         )
-        if inserted and entry_mid is not None and entry_mid > 0:
+        if inserted and entered:
             summary["baseline_entries"] += 1
         elif inserted:
             summary["baseline_skipped"] += 1
     return summary
+
+
+def _record_universe_shadow_entries(
+    *,
+    baseline_store: BaselineEvidenceStore,
+    price_fetcher: Callable[..., Dict[str, Any]],
+    symbol: str,
+    earnings_date: date,
+    as_of: date,
+    recommendation_id: str,
+    recommendation: Any,
+    selector_structure: Optional[str],
+    snapshot: Any,
+    vol_snapshot: Dict[str, Any],
+    mda_client: Any,
+) -> Dict[str, int]:
+    """Shadow-enter every baseline once per eligible event, whatever the selector said.
+
+    This is the counterfactual for the selector's No Trade / Watchlist calls:
+    without it only the events the selector liked are ever priced, so its
+    skips can never be shown to have avoided losses. Entry is the first day the
+    event is analyzed inside the DTE window; later days are no-ops and cost no
+    quotes. The rows live in the baseline store, which never feeds priors or
+    calibration.
+    """
+    already = baseline_store.recorded_universe_baselines(symbol, earnings_date)
+    missing = [name for name in BASELINE_STRUCTURES if name not in already]
+    if not missing:
+        return {"baseline_entries": 0, "baseline_skipped": 0}
+    return _record_baseline_entries(
+        baseline_store=baseline_store,
+        price_fetcher=price_fetcher,
+        symbol=symbol,
+        earnings_date=earnings_date,
+        as_of=as_of,
+        recommendation_id=recommendation_id,
+        selector_structure=selector_structure,
+        snapshot=snapshot,
+        vol_snapshot=vol_snapshot,
+        mda_client=mda_client,
+        cohort=COHORT_UNIVERSE,
+        selector_recommendation=str(recommendation) if recommendation is not None else None,
+        baseline_names=missing,
+    )
 
 
 def _finalize_baseline_exits(
@@ -1489,22 +1559,33 @@ def _finalize_baseline_exits(
         if entry_mid is None or entry_mid <= 0 or earnings_date is None:
             summary["baseline_skipped"] += 1
             continue
+        # Reprice the contracts that were booked at entry. Rows entered before
+        # the context was persisted can only re-discover strikes; they are
+        # flagged so the report keeps them out of the comparison.
+        entry_context = row.get("entry_pricing_context_json") or {}
+        exit_repricing = EXIT_REPRICING_BOOKED if entry_context else EXIT_REPRICING_LEGACY
+        structure = str(row.get("structure"))
         quote = _fetch_quote_for_forward_loop(
             price_fetcher,
             symbol=str(row.get("symbol")),
-            structure=str(row.get("structure")),
+            structure=structure,
             earnings_date=earnings_date,
             as_of_date=as_of,
-            context=None,
+            context=entry_context or None,
             mda_client=mda_client,
         )
         exit_execution_scenarios = build_execution_scenarios(
-            structure=str(row.get("structure")),
+            structure=structure,
             quote_payload=quote,
             phase="exit",
         ).to_dict()
         exit_mid = _safe_float(quote.get("mid"))
-        if exit_mid is None or exit_mid <= 0:
+        # A condor closed near max profit legitimately costs ~0 to buy back, so
+        # only a missing mid (or a negative one) is unusable for credit structures.
+        exit_unusable = exit_mid is None or (
+            exit_mid < 0 if structure in CREDIT_STRUCTURES else exit_mid <= 0
+        )
+        if exit_unusable:
             summary["baseline_skipped"] += 1
             if not dry_run:
                 baseline_store.update_exit(
@@ -1519,11 +1600,21 @@ def _finalize_baseline_exits(
                     exit_execution_scenarios=exit_execution_scenarios,
                     status="exit_skipped",
                     skip_reason=str(quote.get("reason", "missing_exit_mid")),
+                    exit_repricing=exit_repricing,
                 )
             continue
-        expansion_pct = ((exit_mid - entry_mid) / entry_mid) * 100.0
+        # Same return rule as selector paper trades: credit structures flip the
+        # P&L sign and use capital at risk as the base; debit structures reduce
+        # to the old (exit - entry) / entry. Modeled cost is subtracted after.
+        capital_at_risk = _safe_float(row.get("capital_at_risk"))
+        gross_return_pct, _pnl, expansion_pct = _realized_trade_math(
+            structure=structure,
+            entry_mid=entry_mid,
+            exit_mid=exit_mid,
+            capital_at_risk=capital_at_risk,
+        )
         cost_pct = _safe_float(row.get("modeled_cost_pct")) or 0.0
-        realized_return_pct = expansion_pct - cost_pct
+        realized_return_pct = gross_return_pct - cost_pct
         if not dry_run:
             baseline_store.update_exit(
                 baseline_id=str(row.get("baseline_id")),
@@ -1539,9 +1630,12 @@ def _finalize_baseline_exits(
                     "scenario_outcomes": compare_execution_scenarios(
                         entry=row.get("entry_execution_scenarios_json") or {},
                         exit=exit_execution_scenarios,
+                        structure=structure,
+                        capital_at_risk=capital_at_risk,
                     ),
                 },
                 status="resolved",
+                exit_repricing=exit_repricing,
             )
         summary["baseline_exits"] += 1
         _append_learning_log(
@@ -1551,6 +1645,8 @@ def _finalize_baseline_exits(
                 "symbol": row.get("symbol"),
                 "structure": row.get("structure"),
                 "baseline_name": row.get("baseline_name"),
+                "cohort": row.get("cohort") or COHORT_PAIRED,
+                "exit_repricing": exit_repricing,
                 "realized_return_pct": round(float(realized_return_pct), 4),
                 "source": "paper_baseline",
                 "recommendation_id": row.get("recommendation_id"),
@@ -1595,6 +1691,9 @@ def run_forward_screener(
         "ledger_failures": 0,
         "baseline_entries": 0,
         "baseline_skipped": 0,
+        "universe_shadow_entries": 0,
+        "universe_shadow_skipped": 0,
+        "universe_shadow_failures": 0,
         "discovery_source": str(screener_payload.get("source") or "unknown"),
     }
 
@@ -1655,6 +1754,30 @@ def run_forward_screener(
                     },
                     dry_run=dry_run,
                 )
+
+        # Universe shadow cohort: price every eligible event BEFORE the
+        # actionable gate so No Trade calls get a counterfactual. Best-effort -
+        # a shadow failure must never change what the selector path does.
+        if not dry_run and earnings_date is not None:
+            try:
+                universe_summary = _record_universe_shadow_entries(
+                    baseline_store=baseline_store or get_baseline_evidence_store(),
+                    price_fetcher=price_fetcher,
+                    symbol=symbol,
+                    earnings_date=earnings_date,
+                    as_of=as_of,
+                    recommendation_id=recommendation_id,
+                    recommendation=recommendation,
+                    selector_structure=structure,
+                    snapshot=snapshot,
+                    vol_snapshot=vol_snapshot,
+                    mda_client=mda_client,
+                )
+                summary["universe_shadow_entries"] += universe_summary["baseline_entries"]
+                summary["universe_shadow_skipped"] += universe_summary["baseline_skipped"]
+            except Exception as exc:
+                summary["universe_shadow_failures"] += 1
+                logger.warning("forward_loop: universe shadow entry failed for %s: %s", symbol, exc)
 
         if recommendation not in ALLOWED_RECOMMENDATIONS or not structure or earnings_date is None:
             _record_skip(summary, "recommendation_not_actionable")
