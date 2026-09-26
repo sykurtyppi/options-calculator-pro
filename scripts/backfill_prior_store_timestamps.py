@@ -23,6 +23,19 @@ Usage
   # Write to the default production stores:
   python scripts/backfill_prior_store_timestamps.py --target=production
 
+Which trades are used
+---------------------
+Only finalized outcomes that are valid evidence: status 'finalized' and not
+invalidated (the evidence_valid column or a notes.evidence_invalidated flag,
+via services.outcome_recorder._VALID_EVIDENCE_SQL). Because the learning
+stores cannot drop a single observation in place, running this script is how
+an outcome invalidated AFTER it was finalized gets removed from calibration
+and priors. Existing prior observations whose id is an excluded outcome are
+dropped even for structures with no remaining valid trades.
+
+Note: both stores are rebuilt from outcome_trades only; calibration points and
+prior observations that did not come from outcome_trades are not carried over.
+
 Safety
 ------
 - Default is --dry-run.  You must pass --target=production to touch files.
@@ -55,11 +68,16 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_DEFAULT_OUTCOME_DB = Path.home() / ".options_calculator_pro" / "outcomes" / "outcome_store.sqlite"
-_DEFAULT_PRIOR_STORE = Path.home() / ".options_calculator_pro" / "priors" / "structure_priors.json"
-_DEFAULT_CAL_STORE = Path.home() / ".options_calculator_pro" / "calibration" / "iv_expansion.json"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-SUPPORTED_STRUCTURES = ("atm_straddle", "otm_strangle", "call_calendar", "put_calendar")
+# The stores' own defaults, so OPTIONS_CALCULATOR_*_PATH overrides are honoured
+# and the script rebuilds the same files the forward loop writes.
+from services.calibration_service import _DEFAULT_STORE as _DEFAULT_CAL_STORE  # noqa: E402
+from services.outcome_recorder import _DEFAULT_STORE as _DEFAULT_OUTCOME_DB  # noqa: E402
+from services.outcome_recorder import _VALID_EVIDENCE_SQL  # noqa: E402
+from services.structure_prior_store import SUPPORTED_STRUCTURES  # noqa: E402
+from services.structure_prior_store import _DEFAULT_STORE as _DEFAULT_PRIOR_STORE  # noqa: E402
 
 
 def _parse_date(val: Any) -> Optional[date]:
@@ -78,22 +96,33 @@ def _parse_date(val: Any) -> Optional[date]:
     return None
 
 
-def _fetch_trades(db_path: Path) -> List[Dict[str, Any]]:
-    """Read finalized outcome_trades rows from the SQLite store."""
+def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"outcome_store not found at {db_path}")
-
+    # Plain connection, as before: this script only SELECTs. (mode=ro can fail
+    # on a WAL database that needs recovery, which the live store may.)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _fetch_trades(db_path: Path) -> List[Dict[str, Any]]:
+    """Read finalized, valid-evidence outcome_trades rows from the SQLite store.
+
+    Finalization is ``status = 'finalized'`` (there is no ``finalized``
+    column). Invalidated outcomes are excluded in SQL.
+    """
+    conn = _connect_read_only(db_path)
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT trade_id, structure, source_type, entry_date, exit_date,
                    realized_return_pct, realized_expansion_pct, setup_score
             FROM outcome_trades
-            WHERE finalized = 1
+            WHERE status = 'finalized'
               AND realized_return_pct IS NOT NULL
               AND realized_expansion_pct IS NOT NULL
+              AND {_VALID_EVIDENCE_SQL}
             ORDER BY exit_date, entry_date, trade_id
             """
         ).fetchall()
@@ -102,6 +131,20 @@ def _fetch_trades(db_path: Path) -> List[Dict[str, Any]]:
     finally:
         conn.close()
     return [dict(r) for r in rows]
+
+
+def _fetch_invalidated_trade_ids(db_path: Path) -> set[str]:
+    """Trade ids invalidated as evidence; their observations must not survive."""
+    conn = _connect_read_only(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT trade_id FROM outcome_trades WHERE NOT {_VALID_EVIDENCE_SQL}"
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(f"Failed to query outcome_trades: {exc}") from exc
+    finally:
+        conn.close()
+    return {str(row["trade_id"]) for row in rows}
 
 
 def _backup(path: Path, dry_run: bool) -> None:
@@ -118,7 +161,8 @@ def _rebuild_prior_store(
     trades: List[Dict[str, Any]],
     existing_path: Path,
     dry_run: bool,
-) -> None:
+    invalidated_ids: Optional[set[str]] = None,
+) -> Dict[str, Any]:
     """Rebuild the structure prior store observations list from outcome_trades."""
     logger.info("Rebuilding structure prior store …")
 
@@ -176,9 +220,25 @@ def _rebuild_prior_store(
         obs_list = obs_by_structure[s]
         existing_entry = structures.get(s, {})
 
+        if not obs_list and existing_entry:
+            # No valid outcome_trades rows for this structure: keep the existing
+            # entry, minus any observation from an invalidated outcome.
+            kept = [
+                obs for obs in existing_entry.get("observations", [])
+                if str(obs.get("observation_id")) not in (invalidated_ids or set())
+            ]
+            new_structures[s] = dict(existing_entry)
+            new_structures[s]["observations"] = kept
+            if len(kept) != len(existing_entry.get("observations", [])):
+                new_structures[s].update(_recompute_aggregates(kept))
+                logger.info(
+                    "  %-20s dropped %d invalidated observation(s)",
+                    s, len(existing_entry.get("observations", [])) - len(kept),
+                )
+            continue
+
         if not obs_list:
-            # Keep existing entry as-is if it has data; else initialize empty
-            new_structures[s] = dict(existing_entry) if existing_entry else {
+            new_structures[s] = {
                 "structure": s,
                 "schema_version": _SCHEMA_VERSION,
                 "observations": [],
@@ -211,6 +271,10 @@ def _rebuild_prior_store(
             s, agg["observation_count"], agg["win_rate"], agg["avg_return_pct"],
         )
 
+    # Never drop a structure the store knows about but this script does not.
+    for s, entry in structures.items():
+        new_structures.setdefault(s, entry)
+
     payload = {
         "schema_version": _SCHEMA_VERSION,
         "structures": new_structures,
@@ -224,13 +288,14 @@ def _rebuild_prior_store(
         existing_path.parent.mkdir(parents=True, exist_ok=True)
         existing_path.write_text(json.dumps(payload, indent=2))
         logger.info("Wrote prior store → %s", existing_path)
+    return payload
 
 
 def _rebuild_calibration_store(
     trades: List[Dict[str, Any]],
     existing_path: Path,
     dry_run: bool,
-) -> None:
+) -> Dict[str, Any]:
     """Rebuild the calibration store timestamps list from outcome_trades."""
     logger.info("Rebuilding calibration store …")
 
@@ -290,9 +355,10 @@ def _rebuild_calibration_store(
         existing_path.parent.mkdir(parents=True, exist_ok=True)
         existing_path.write_text(json.dumps(payload, indent=2))
         logger.info("Wrote calibration store → %s", existing_path)
+    return payload
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -327,7 +393,7 @@ def main() -> int:
         default=False,
         help="Show what would be written without touching any files (default).",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     dry_run = args.target != "production"
     if dry_run:
@@ -343,16 +409,20 @@ def main() -> int:
 
     try:
         trades = _fetch_trades(db_path)
+        invalidated_ids = _fetch_invalidated_trade_ids(db_path)
     except (FileNotFoundError, RuntimeError) as exc:
         logger.error("%s", exc)
         return 1
 
-    logger.info("Fetched %d finalized trades from outcome_trades", len(trades))
+    logger.info(
+        "Fetched %d finalized valid-evidence trades from outcome_trades (%d invalidated excluded)",
+        len(trades), len(invalidated_ids),
+    )
     if not trades:
         logger.warning("No finalized trades found — nothing to backfill.")
         return 0
 
-    _rebuild_prior_store(trades, prior_path, dry_run=dry_run)
+    _rebuild_prior_store(trades, prior_path, dry_run=dry_run, invalidated_ids=invalidated_ids)
     _rebuild_calibration_store(trades, cal_path, dry_run=dry_run)
 
     if dry_run:
