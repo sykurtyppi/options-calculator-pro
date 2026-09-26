@@ -21,7 +21,7 @@ from services.baseline_evidence_store import (
 from services.data_quality_diagnostics import build_data_quality_diagnostics
 from services.evidence_maturity import build_evidence_maturity
 from services.forward_performance_diagnostics import build_forward_performance_diagnostics
-from services.outcome_recorder import OutcomeStore, get_outcome_store, is_outcome_evidence_valid
+from services.outcome_recorder import OutcomeStore, get_outcome_store, outcome_invalidation_reason
 from services.provider_telemetry import build_provider_telemetry_diagnostics
 
 MIN_COMMERCIAL_EVIDENCE_DAYS = 60
@@ -48,11 +48,11 @@ def build_evidence_report(
         max_rows=max_rows,
         recent_limit=recent_limit,
     )
-    all_outcomes = outcome_obj.list_for_diagnostics(limit=max_rows)
     # Invalidated outcomes stay in the store for audit but never count as
-    # evidence: not in performance, quality, realism or maturity figures.
-    invalidated = [row for row in all_outcomes if not is_outcome_evidence_valid(row)]
-    outcomes = [row for row in all_outcomes if is_outcome_evidence_valid(row)]
+    # evidence: not in performance, quality, realism or maturity figures. The
+    # store filters BEFORE its row limit, so they cannot displace valid rows.
+    outcomes = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid")
+    invalidated = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid")
     selected = [row for row in outcomes if _is_resolved(row)]
     resolved_baselines = [row for row in baselines if str(row.get("status") or "") == "resolved"]
     open_baselines = [row for row in baselines if str(row.get("status") or "") == "open"]
@@ -110,13 +110,11 @@ def build_evidence_report(
         "invalidated_outcomes": {
             "n": len(invalidated),
             "resolved_n": sum(1 for row in invalidated if _is_resolved(row)),
-            "by_reason": _count_by(
-                invalidated,
-                lambda row: row.get("invalidation_reason") or "notes.evidence_invalidated",
-            ),
+            "by_reason": _count_by(invalidated, lambda row: outcome_invalidation_reason(row) or "unknown"),
             "note": "Excluded from every performance, calibration and maturity figure; kept for audit.",
         },
         "baseline_comparison": baseline_stats,
+        "exit_attrition": _exit_attrition(outcomes, baselines),
         "universe_shadow": _universe_shadow_summary(baselines),
         "legacy_repriced_baselines": {
             "n": len(legacy_repriced),
@@ -277,6 +275,48 @@ def _group_by(rows: Iterable[Dict[str, Any]], key_fn: Any) -> Dict[str, Dict[str
     for row in rows:
         grouped[str(key_fn(row))].append(row)
     return {key: _baseline_stats(items) for key, items in sorted(grouped.items())}
+
+
+def _exit_attrition(
+    outcomes: Iterable[Dict[str, Any]],
+    baselines: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Entered positions that never produced an outcome, beside the resolved ones.
+
+    Exits are valued only on T-1. A position that could not be priced that day
+    (missing chain, booked contract no longer listed, quote on other contracts)
+    is terminal attrition, not a result. If attrition is concentrated in one
+    structure or reason, the resolved sample is selected by quote availability;
+    check that before reading performance.
+    """
+    selector_rows = list(outcomes)
+    selector_missing = [row for row in selector_rows if str(row.get("status") or "") == "exit_missing"]
+    selector_resolved = [row for row in selector_rows if _is_resolved(row)]
+    baseline_rows = list(baselines)
+    baseline_missing = [
+        row for row in baseline_rows
+        if str(row.get("status") or "") in {"exit_skipped", "exit_missing"}
+    ]
+    baseline_resolved = [row for row in baseline_rows if str(row.get("status") or "") == "resolved"]
+
+    def _block(missing: list, resolved: list, reason_key: str) -> Dict[str, Any]:
+        entered = len(missing) + len(resolved)
+        return {
+            "resolved": len(resolved),
+            "exit_missing": len(missing),
+            "attrition_rate": (len(missing) / entered) if entered else None,
+            "by_reason": _count_by(missing, lambda row: row.get(reason_key) or "unknown"),
+            "by_structure": _count_by(missing, lambda row: row.get("structure") or "unknown"),
+        }
+
+    return {
+        "selector": _block(selector_missing, selector_resolved, "exit_missing_reason"),
+        "baselines": _block(baseline_missing, baseline_resolved, "skip_reason"),
+        "note": (
+            "Exits are valued only on T-1; an unpriceable exit is terminal attrition and is "
+            "never replaced by a later-date quote or a nearby contract."
+        ),
+    }
 
 
 def _universe_shadow_summary(baselines: Iterable[Dict[str, Any]]) -> Dict[str, Any]:

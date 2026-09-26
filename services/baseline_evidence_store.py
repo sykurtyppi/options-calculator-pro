@@ -45,9 +45,14 @@ COHORT_UNIVERSE = "universe"
 #   exit re-discovered strikes (a different contract than the one bought).
 # * booked_strikes - the #143 label, applied WITHOUT checking the exit legs;
 #   an ATM straddle exit could pair a different call and put strike.
+# * unverifiable_entry_context - see EXIT_REPRICING_UNVERIFIABLE.
 EXIT_REPRICING_BOOKED = "booked_entry_contracts"
 EXIT_REPRICING_LEGACY = "rediscovered_legacy"
 EXIT_REPRICING_UNVERIFIED = "booked_strikes"
+# Priced from a stored entry context that lacks a leg strike or the expiry
+# (e.g. straddles entered before the put strike was recorded separately), so
+# the exit cannot be proven to be the same position.
+EXIT_REPRICING_UNVERIFIABLE = "unverifiable_entry_context"
 
 _TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS baseline_trades (
@@ -312,12 +317,49 @@ class BaselineEvidenceStore:
             SELECT *
             FROM baseline_trades
             WHERE earnings_date = ?
-              AND status = 'open'
+              AND (
+                status = 'open'
+                -- A failed exit is retried if the loop runs again on the
+                -- same T-1 day; never on a later day (different horizon).
+                OR (status = 'exit_skipped' AND exit_date = ?)
+              )
             ORDER BY entry_date, symbol, baseline_name
             """,
-            (target,),
+            (target, _fmt_date(as_of_date)),
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+    def mark_missing_exits(self, as_of_date: date) -> list[Dict[str, Any]]:
+        """Move open baselines whose T-1 exit day has passed to 'exit_missing'.
+
+        Covers rows whose exit was never attempted (e.g. the loop did not run
+        on T-1). No outcome is fabricated.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                due = cur.execute(
+                    """
+                    SELECT baseline_id, symbol, baseline_name, structure, earnings_date
+                    FROM baseline_trades
+                    WHERE status = 'open'
+                      AND earnings_date IS NOT NULL
+                      AND earnings_date <= ?
+                    """,
+                    (_fmt_date(as_of_date),),
+                ).fetchall()
+                cur.execute(
+                    """
+                    UPDATE baseline_trades
+                    SET status = 'exit_missing',
+                        skip_reason = 'no_exit_attempt_recorded',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE status = 'open'
+                      AND earnings_date IS NOT NULL
+                      AND earnings_date <= ?
+                    """,
+                    (_fmt_date(as_of_date),),
+                )
+        return [dict(row) for row in due]
 
     def update_exit(
         self,

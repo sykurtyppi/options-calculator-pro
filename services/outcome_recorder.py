@@ -183,7 +183,31 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "evidence_valid": "INTEGER",
     "invalidated_at": "TEXT",
     "invalidation_reason": "TEXT",
+    # Exit attrition. An exit is valued only on T-1 (the day before earnings).
+    # A trade that could not be priced that day is moved to the terminal
+    # status 'exit_missing' once the day has passed, instead of staying
+    # 'open' forever; it is never priced on a later date or another contract.
+    "last_exit_attempt_at": "TEXT",
+    "last_exit_attempt_reason": "TEXT",
+    "exit_missing_reason": "TEXT",
 }
+
+# SQL twin of is_outcome_evidence_valid(). Mutations that write outcome or
+# learning state carry it in their WHERE clause, so an invalidation made after
+# a caller read the row still blocks the write.
+# CASE, not OR: SQLite does not promise short-circuit evaluation, and
+# json_type()/json_extract() raise on malformed JSON - one bad notes value
+# would otherwise break every guarded query.
+_VALID_EVIDENCE_SQL = """(
+    COALESCE(evidence_valid, 1) NOT IN (0, '0', 'false')
+    AND (CASE
+        WHEN notes IS NULL THEN 1
+        WHEN json_valid(notes) = 0 THEN 1
+        WHEN json_type(notes) != 'object' THEN 1
+        WHEN COALESCE(json_extract(notes, '$.evidence_invalidated'), 0) IN (0, '', '{}', '[]') THEN 1
+        ELSE 0
+    END) = 1
+)"""
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────
 
@@ -417,8 +441,9 @@ class OutcomeStore:
                 status                 = 'exited',
                 updated_at             = CURRENT_TIMESTAMP
             WHERE trade_id = ?
-              AND status IN ('open', 'exited')
-        """
+              AND status IN ('open', 'exited', 'finalizing')
+              AND {valid}
+        """.format(valid=_VALID_EVIDENCE_SQL)
         params = (
             _fmt_date(exit_date),
             exit_mid,
@@ -440,7 +465,7 @@ class OutcomeStore:
             logger.debug("outcome_store: updated exit trade_id=%s", trade_id)
         else:
             logger.warning(
-                "outcome_store: no open/exited row found for trade_id=%s", trade_id
+                "outcome_store: no open/exited valid-evidence row found for trade_id=%s", trade_id
             )
         return updated
 
@@ -450,15 +475,17 @@ class OutcomeStore:
         """
         Mark a trade as finalized (learning updates already applied externally).
 
-        Returns True if status changed, False if not found or already finalized.
+        Returns True if status changed; False if not found, already finalized,
+        terminal (exit_missing), or invalidated as evidence.
         """
         sql = """
             UPDATE outcome_trades
             SET status     = 'finalized',
                 updated_at = CURRENT_TIMESTAMP
             WHERE trade_id = ?
-              AND status != 'finalized'
-        """
+              AND status IN ('open', 'exited', 'finalizing')
+              AND {valid}
+        """.format(valid=_VALID_EVIDENCE_SQL)
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
                 cur.execute(sql, (trade_id,))
@@ -486,7 +513,8 @@ class OutcomeStore:
             SET learning_update_status = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE trade_id = ?
-        """
+              AND {valid}
+        """.format(valid=_VALID_EVIDENCE_SQL)
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
                 cur.execute(sql, (status, trade_id))
@@ -593,12 +621,107 @@ class OutcomeStore:
             SELECT *
             FROM outcome_trades
             WHERE earnings_date = ?
-              AND status IN ('open', 'exited')
+              AND status IN ('open', 'exited', 'finalizing')
+              AND {valid}
             ORDER BY entry_date, symbol
-            """,
+            """.format(valid=_VALID_EVIDENCE_SQL),
             (target_earnings_date,),
         ).fetchall()
-        return [dict(row) for row in rows if is_outcome_evidence_valid(dict(row))]
+        return [dict(row) for row in rows]
+
+    # ── Exit attrition ────────────────────────────────────────────────────────
+
+    def record_exit_attempt_failure(self, trade_id: str, *, reason: str, attempted_on: date) -> bool:
+        """Remember why a T-1 exit could not be priced; the row stays open.
+
+        Re-running the loop later the same day retries the exit. The reason is
+        what mark_missing_exits() records if no attempt succeeds.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    """
+                    UPDATE outcome_trades
+                    SET last_exit_attempt_at = ?,
+                        last_exit_attempt_reason = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE trade_id = ?
+                      AND status = 'open'
+                    """,
+                    (_fmt_date(attempted_on), str(reason), trade_id),
+                )
+                return cur.rowcount > 0
+
+    def mark_missing_exits(self, as_of_date: date) -> list[Dict[str, Any]]:
+        """Move open trades whose T-1 exit day has passed to 'exit_missing'.
+
+        T-1 is earnings_date - 1, so the window has closed once
+        earnings_date <= as_of_date. No outcome is fabricated: realized fields
+        stay NULL. Invalidated rows are left alone (reports exclude them).
+        Returns the rows that were transitioned.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                due = cur.execute(
+                    """
+                    SELECT trade_id, symbol, structure, earnings_date, last_exit_attempt_reason
+                    FROM outcome_trades
+                    WHERE status = 'open'
+                      AND earnings_date IS NOT NULL
+                      AND earnings_date <= ?
+                      AND {valid}
+                    """.format(valid=_VALID_EVIDENCE_SQL),
+                    (_fmt_date(as_of_date),),
+                ).fetchall()
+                moved = []
+                for row in due:
+                    reason = row["last_exit_attempt_reason"] or "no_exit_attempt_recorded"
+                    cur.execute(
+                        """
+                        UPDATE outcome_trades
+                        SET status = 'exit_missing',
+                            exit_missing_reason = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE trade_id = ? AND status = 'open'
+                        """,
+                        (reason, row["trade_id"]),
+                    )
+                    moved.append({**dict(row), "exit_missing_reason": reason})
+        return moved
+
+    # ── Finalization claim ────────────────────────────────────────────────────
+
+    def claim_for_finalization(self, trade_id: str) -> bool:
+        """Atomically move a valid, exited trade to 'finalizing'.
+
+        The learning updates run only after this succeeds, and invalidate()
+        refuses a 'finalizing' row, so an invalidation can no longer land
+        between the validity check and the calibration/prior writes. A row
+        already 'finalized' is reported as claimable so re-finalizing stays
+        idempotent (both learning stores dedupe on the trade id).
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    """
+                    UPDATE outcome_trades
+                    SET status = 'finalizing',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE trade_id = ?
+                      AND status IN ('open', 'exited', 'finalizing')
+                      AND {valid}
+                    """.format(valid=_VALID_EVIDENCE_SQL),
+                    (trade_id,),
+                )
+                if cur.rowcount > 0:
+                    return True
+                row = cur.execute(
+                    "SELECT 1 FROM outcome_trades WHERE trade_id = ? AND status = 'finalized' AND {valid}".format(
+                        valid=_VALID_EVIDENCE_SQL,
+                    ),
+                    (trade_id,),
+                ).fetchone()
+                return row is not None
 
     # ── Evidence invalidation ─────────────────────────────────────────────────
 
@@ -634,13 +757,22 @@ class OutcomeStore:
                         invalidation_reason = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE trade_id = ?
+                      AND status != 'finalizing'
                     """,
                     (stamp, reason, trade_id),
                 )
+                if cur.rowcount == 0:
+                    # Learning updates are mid-flight; invalidating now would
+                    # leave calibration/priors holding an "invalid" outcome
+                    # with no warning. Retry once finalization completes.
+                    raise ValueError(
+                        f"invalidate: trade_id={trade_id!r} is being finalized; retry when it is finalized"
+                    )
         return {
             "trade_id": trade_id,
             "status": row.get("status"),
             "already_invalidated": not is_outcome_evidence_valid(row),
+            "previous_invalidation_reason": outcome_invalidation_reason(row),
             "learning_already_applied": str(row.get("learning_update_status") or "") == "complete",
             "invalidated_at": stamp,
             "invalidation_reason": reason,
@@ -660,13 +792,25 @@ class OutcomeStore:
             "store_path": str(self._path),
         }
 
-    def list_for_diagnostics(self, *, limit: int = 10_000) -> list[Dict[str, Any]]:
-        """Return recent outcome rows for read-only diagnostics aggregation."""
+    def list_for_diagnostics(self, *, limit: int = 10_000, evidence: str = "all") -> list[Dict[str, Any]]:
+        """Return recent outcome rows for read-only diagnostics aggregation.
+
+        ``evidence`` is "all", "valid" or "invalid". The filter runs BEFORE the
+        LIMIT so invalidated rows can never displace valid evidence at the cap.
+        """
         capped_limit = max(1, min(int(limit or 10_000), 50_000))
+        where = {
+            "all": "",
+            "valid": f"WHERE {_VALID_EVIDENCE_SQL}",
+            "invalid": f"WHERE NOT {_VALID_EVIDENCE_SQL}",
+        }.get(evidence)
+        if where is None:
+            raise ValueError(f"list_for_diagnostics: unknown evidence filter {evidence!r}")
         rows = self._conn.execute(
-            """
+            f"""
             SELECT *
             FROM outcome_trades
+            {where}
             ORDER BY COALESCE(exit_date, updated_at, created_at) DESC, created_at DESC
             LIMIT ?
             """,
@@ -692,15 +836,43 @@ def is_outcome_evidence_valid(row: Dict[str, Any]) -> bool:
     flag = row.get("evidence_valid")
     if flag is not None and str(flag).strip().lower() in {"0", "false"}:
         return False
-    notes = row.get("notes")
-    if notes:
-        try:
-            parsed = json.loads(str(notes)) if not isinstance(notes, dict) else notes
-        except (TypeError, ValueError):
-            parsed = None
-        if isinstance(parsed, dict) and parsed.get("evidence_invalidated"):
-            return False
-    return True
+    return not _notes_invalidation(row.get("notes"))
+
+
+def _notes_invalidation(notes: Any) -> Any:
+    """The truthy ``notes.evidence_invalidated`` value, else None."""
+    if not notes:
+        return None
+    try:
+        parsed = json.loads(str(notes)) if not isinstance(notes, dict) else notes
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    flag = parsed.get("evidence_invalidated")
+    return flag if flag else None
+
+
+def outcome_invalidation_reason(row: Dict[str, Any]) -> Optional[str]:
+    """Why an outcome was invalidated, or None if it is valid evidence.
+
+    Prefers the first-class column; for rows invalidated through notes it reads
+    the nested ``{"reason_code", "reason"}`` object that manual invalidations
+    wrote, falling back to a generic label for a bare ``true`` flag.
+    """
+    if is_outcome_evidence_valid(row):
+        return None
+    if row.get("invalidation_reason"):
+        return str(row["invalidation_reason"])
+    flag = _notes_invalidation(row.get("notes"))
+    if isinstance(flag, dict):
+        code = flag.get("reason_code")
+        text = flag.get("reason")
+        if code and text:
+            return f"{code}: {text}"
+        if code or text:
+            return str(code or text)
+    return "notes.evidence_invalidated"
 
 
 def make_trade_id(
@@ -985,6 +1157,17 @@ def finalize_trade_and_update_learning(
             exit_quote_timestamp=exit_quote_timestamp,
             exit_bid_ask_mid=exit_bid_ask_mid,
             exit_execution_scenarios=exit_execution_scenarios,
+        )
+
+    # ── 2b. Claim the row before any irreversible learning write ─────────────
+    # The validity check above read a snapshot; another process may have
+    # invalidated the row since. The claim re-checks validity in the same
+    # UPDATE that moves the row to 'finalizing', and invalidate() refuses a
+    # 'finalizing' row, so nothing can slip between here and the writes below.
+    if not s.claim_for_finalization(trade_id):
+        raise ValueError(
+            f"finalize_trade_and_update_learning: trade_id={trade_id!r} could not be claimed for "
+            "finalization (invalidated or in a terminal status); refusing to update learning stores"
         )
 
     # ── 3. Update calibration ─────────────────────────────────────────────────

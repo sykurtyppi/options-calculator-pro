@@ -19,7 +19,7 @@ from services.baseline_evidence_store import (
     get_baseline_evidence_store,
     is_booked_strike_exit,
 )
-from services.outcome_recorder import OutcomeStore, get_outcome_store, is_outcome_evidence_valid
+from services.outcome_recorder import OutcomeStore, get_outcome_store
 from services.recommendation_ledger import RecommendationLedger, get_recommendation_ledger
 
 LOW_QUALITY_THRESHOLD = 0.60
@@ -49,8 +49,9 @@ def build_forward_performance_diagnostics(
     baseline_obj = baseline_store or get_baseline_evidence_store()
 
     ledger_rows = ledger_obj.list_for_diagnostics(limit=max_rows)
-    all_outcomes = outcome_obj.list_for_diagnostics(limit=max_rows)
-    outcomes = [row for row in all_outcomes if is_outcome_evidence_valid(row)]
+    # Filtered in the store, before its row limit (see OutcomeStore.list_for_diagnostics).
+    outcomes = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid")
+    invalidated_count = len(outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid"))
     baseline_rows = baseline_obj.list_for_diagnostics(limit=max_rows)
     ledger_by_id = {
         str(row.get("recommendation_id")): row
@@ -94,7 +95,7 @@ def build_forward_performance_diagnostics(
         "no_trade_count": no_trade_count,
         "open_outcome_count": open_count,
         "resolved_outcome_count": len(resolved),
-        "invalidated_outcome_count": len(all_outcomes) - len(outcomes),
+        "invalidated_outcome_count": invalidated_count,
         "performance_summary": _group_stats(resolved),
         "by_structure": _group_by(resolved, lambda item: item["structure"] or "unknown"),
         "stale_source_comparison": _group_by(
