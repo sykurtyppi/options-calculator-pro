@@ -54,4 +54,25 @@ describe('EvidenceReportPanel integrity sections', () => {
     await waitFor(() => expect(screen.getByText(/No resolved universe events yet/i)).toBeInTheDocument())
     expect(document.body.textContent).toMatch(/4 recorded, 4 open/)
   })
+
+  test('shows intervals and warns when a few trades carry the result', async () => {
+    apiFetch.mockResolvedValue(_resp({
+      uncertainty: {
+        method: '95% percentile bootstrap, 2000 resamples, fixed seed.',
+        selector: {
+          n: 25, mean: 6.4, ci_low: 1.2, ci_high: 11.9, verdict: 'above_zero',
+          outlier_dependence: { k: 5, mean_without_top_k: -0.5, mean_without_bottom_k: 8.1, top_k_share_of_profit: 0.85, fragile: true },
+        },
+        selector_minus_baseline: {},
+        universe_picked_minus_skipped: {},
+      },
+    }))
+    render(<EvidenceReportPanel apiBase="" />)
+    await waitFor(() => expect(screen.getByText(/How Sure Are We/i)).toBeInTheDocument())
+    const body = document.body.textContent
+    expect(body).toMatch(/\+1\.2% to \+11\.9%/)
+    expect(body).toMatch(/Above zero/)
+    expect(body).toMatch(/depends on a few trades/)
+    expect(body).toMatch(/percentile bootstrap/)
+  })
 })

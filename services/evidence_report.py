@@ -20,6 +20,12 @@ from services.baseline_evidence_store import (
 )
 from services.data_quality_diagnostics import build_data_quality_diagnostics
 from services.evidence_maturity import build_evidence_maturity
+from services.evidence_statistics import (
+    METHOD_NOTE,
+    paired_difference,
+    summarize_returns,
+    two_sample_difference,
+)
 from services.forward_performance_diagnostics import build_forward_performance_diagnostics
 from services.outcome_recorder import OutcomeStore, get_outcome_store, outcome_invalidation_reason
 from services.provider_telemetry import build_provider_telemetry_diagnostics
@@ -91,6 +97,14 @@ def build_evidence_report(
         max_bucket_sample_size=_max_bucket_sample_size(forward.get("calibration_report", {})),
     )
 
+    uncertainty = _uncertainty(selected, comparable_paired, baselines)
+    fragility_warnings = []
+    if (uncertainty["selector"].get("outlier_dependence") or {}).get("fragile"):
+        fragility_warnings.append(
+            "Selector average return is positive only because of its 5 best results; "
+            "without them it is zero or negative."
+        )
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "evidence_label": "paper_research_not_execution_grade",
@@ -116,6 +130,7 @@ def build_evidence_report(
         "baseline_comparison": baseline_stats,
         "exit_attrition": _exit_attrition(outcomes, baselines),
         "universe_shadow": _universe_shadow_summary(baselines),
+        "uncertainty": uncertainty,
         "legacy_repriced_baselines": {
             "n": len(legacy_repriced),
             "by_exit_repricing": _count_by(legacy_repriced, lambda row: row.get("exit_repricing") or "unlabelled"),
@@ -152,7 +167,7 @@ def build_evidence_report(
             evidence_quality=evidence_quality,
             surface_quality=surface_quality,
             maturity=maturity,
-        ),
+        ) + fragility_warnings,
         "notes": [
             "Selector outcomes are paper/research records, not live broker fills.",
             "Baseline structures are shadow evidence only and do not update calibration or priors.",
@@ -275,6 +290,63 @@ def _group_by(rows: Iterable[Dict[str, Any]], key_fn: Any) -> Dict[str, Dict[str
     for row in rows:
         grouped[str(key_fn(row))].append(row)
     return {key: _baseline_stats(items) for key, items in sorted(grouped.items())}
+
+
+def _uncertainty(
+    selected: list[Dict[str, Any]],
+    comparable_paired: list[Dict[str, Any]],
+    baselines: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Intervals and outlier checks for the three questions the report asks.
+
+    1. Is the selector's mean return distinguishable from zero (= no trade)?
+    2. Did the selector beat each baseline on the SAME events (paired)?
+    3. Did events the selector picked pay more than events it skipped?
+    """
+    selector_returns = [row.get("realized_return_pct") for row in selected]
+    selector_by_rec = {
+        str(row["recommendation_id"]): row.get("realized_return_pct")
+        for row in selected
+        if row.get("recommendation_id") and row.get("realized_return_pct") is not None
+    }
+    paired: Dict[str, Any] = {}
+    for name in sorted({str(row.get("baseline_name") or "unknown_baseline") for row in comparable_paired}):
+        baseline_by_rec = {
+            str(row["recommendation_id"]): row.get("realized_return_pct")
+            for row in comparable_paired
+            if str(row.get("baseline_name") or "unknown_baseline") == name
+            and row.get("recommendation_id") and row.get("realized_return_pct") is not None
+        }
+        paired[name] = paired_difference(selector_by_rec, baseline_by_rec)
+
+    universe_rows = [
+        row for row in baselines
+        if baseline_cohort(row) == COHORT_UNIVERSE
+        and str(row.get("status") or "") == "resolved"
+        and is_booked_strike_exit(row)
+    ]
+    picked_vs_skipped: Dict[str, Any] = {}
+    for name in sorted({str(row.get("baseline_name") or "unknown_baseline") for row in universe_rows}):
+        members = [row for row in universe_rows if str(row.get("baseline_name") or "unknown_baseline") == name]
+        picked_vs_skipped[name] = two_sample_difference(
+            [row.get("realized_return_pct") for row in members
+             if row.get("selector_recommendation") in ACTIONABLE_RECOMMENDATIONS],
+            [row.get("realized_return_pct") for row in members
+             if row.get("selector_recommendation") not in ACTIONABLE_RECOMMENDATIONS],
+        )
+
+    return {
+        "selector": summarize_returns(selector_returns),
+        "selector_minus_baseline": paired,
+        "universe_picked_minus_skipped": picked_vs_skipped,
+        "method": METHOD_NOTE,
+        "notes": [
+            "selector: the interval is also the comparison with no-trade (zero return).",
+            "selector_minus_baseline pairs each selector trade with the baseline entered on the same event.",
+            "universe_picked_minus_skipped compares independent groups, so its interval is wider.",
+            "fragile = the mean turns non-positive once the 5 best results are removed.",
+        ],
+    }
 
 
 def _exit_attrition(

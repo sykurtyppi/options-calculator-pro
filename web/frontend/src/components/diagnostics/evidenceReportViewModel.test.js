@@ -13,6 +13,8 @@ import {
   buildExitAttritionRows,
   buildUniverseShadowRows,
   buildUniverseShadowSummary,
+  buildOutlierDependence,
+  buildUncertaintyRows,
 } from './evidenceReportViewModel.js'
 
 const payload = {
@@ -233,4 +235,47 @@ test('new blocks degrade to empty values on an older report payload', () => {
   assert.equal(buildUniverseShadowSummary({}).eventsRecorded, 0)
   assert.equal(buildExitAttritionRows({})[0].rateLabel, 'n/a')
   assert.equal(buildExcludedEvidenceSummary({}).invalidatedN, 0)
+})
+
+
+const uncertaintyPayload = {
+  uncertainty: {
+    method: '95% percentile bootstrap, 2000 resamples, fixed seed.',
+    selector: {
+      n: 25, mean: 6.4, ci_low: 1.2, ci_high: 11.9, verdict: 'above_zero',
+      outlier_dependence: { k: 5, mean_without_top_k: -0.5, mean_without_bottom_k: 8.1, top_k_share_of_profit: 0.85, fragile: true },
+    },
+    selector_minus_baseline: {
+      always_atm_straddle: { pairs: 12, mean: 3, ci_low: -1.5, ci_high: 7.25, verdict: 'includes_zero' },
+    },
+    universe_picked_minus_skipped: {
+      always_otm_strangle: { n_first: 4, n_second: 20, mean: 2, ci_low: null, ci_high: null, verdict: 'insufficient_sample' },
+    },
+  },
+}
+
+test('uncertainty rows put every comparison next to its interval', () => {
+  const rows = buildUncertaintyRows(uncertaintyPayload)
+  assert.deepEqual(rows.map((row) => row.label), [
+    'Selector vs no trade',
+    'Selector − Always ATM straddle (same events)',
+    'Picked − skipped (Always OTM strangle)',
+  ])
+  assert.equal(rows[0].intervalLabel, '+1.2% to +11.9%')
+  assert.equal(rows[0].verdictLabel, 'Above zero')
+  assert.equal(rows[1].n, '12')
+  assert.equal(rows[1].verdictLabel, 'No detectable difference')
+  assert.equal(rows[2].n, '4 vs 20')
+  assert.equal(rows[2].intervalLabel, '—')
+  assert.equal(rows[2].verdictLabel, 'Too few to tell')
+})
+
+test('outlier dependence flags a result carried by a few trades', () => {
+  const outliers = buildOutlierDependence(uncertaintyPayload)
+  assert.equal(outliers.available, true)
+  assert.equal(outliers.fragile, true)
+  assert.equal(outliers.withoutTopLabel, '-0.5%')
+  assert.equal(outliers.topShareLabel, '85%')
+  assert.equal(buildOutlierDependence({}).available, false)
+  assert.deepEqual(buildUncertaintyRows({}), [])
 })

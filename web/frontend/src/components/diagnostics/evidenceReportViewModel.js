@@ -191,6 +191,56 @@ export function buildExcludedEvidenceSummary(payload = {}) {
   }
 }
 
+// Every headline comparison with its interval. "Too few to tell" is shown
+// instead of an interval below the backend's minimum sample.
+export function buildUncertaintyRows(payload = {}) {
+  const block = payload.uncertainty || {}
+  const rows = []
+  if (block.selector) {
+    rows.push(uncertaintyRow('selector', 'Selector vs no trade', block.selector, block.selector.n))
+  }
+  for (const [name, item] of Object.entries(block.selector_minus_baseline || {})) {
+    rows.push(uncertaintyRow(`paired-${name}`, `Selector − ${labelBaseline(name)} (same events)`, item, item.pairs))
+  }
+  for (const [name, item] of Object.entries(block.universe_picked_minus_skipped || {})) {
+    const n = `${Number(item.n_first || 0)} vs ${Number(item.n_second || 0)}`
+    rows.push(uncertaintyRow(`universe-${name}`, `Picked − skipped (${labelBaseline(name)})`, item, n))
+  }
+  return rows
+}
+
+export function buildOutlierDependence(payload = {}) {
+  const item = ((payload.uncertainty || {}).selector || {}).outlier_dependence || {}
+  return {
+    available: item.mean_without_top_k !== null && item.mean_without_top_k !== undefined,
+    k: Number(item.k || 5),
+    withoutTopLabel: formatReturnPct(item.mean_without_top_k),
+    withoutBottomLabel: formatReturnPct(item.mean_without_bottom_k),
+    topShareLabel: formatRate(item.top_k_share_of_profit),
+    fragile: Boolean(item.fragile),
+  }
+}
+
+function uncertaintyRow(key, label, item, n) {
+  const hasInterval = finiteOrNull(item.ci_low) !== null && finiteOrNull(item.ci_high) !== null
+  return {
+    key,
+    label,
+    n: n === undefined || n === null ? '0' : String(n),
+    meanLabel: formatReturnPct(item.mean),
+    intervalLabel: hasInterval ? `${formatReturnPct(item.ci_low)} to ${formatReturnPct(item.ci_high)}` : '—',
+    verdictLabel: labelVerdict(item.verdict),
+    verdict: item.verdict || 'insufficient_sample',
+  }
+}
+
+function labelVerdict(value) {
+  if (value === 'above_zero') return 'Above zero'
+  if (value === 'below_zero') return 'Below zero'
+  if (value === 'includes_zero') return 'No detectable difference'
+  return 'Too few to tell'
+}
+
 function countRows(counts = {}) {
   return Object.entries(counts || {})
     .map(([label, count]) => ({ label, count: Number(count || 0) }))
