@@ -68,6 +68,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from services.durable_json import atomic_write_json, exclusive_lock, read_json_strict
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_STORE = Path(
@@ -191,6 +193,16 @@ def _recompute_aggregates(observations: List[Dict]) -> Dict[str, Any]:
     }
 
 
+def _finite_number(value: Any, name: str) -> float:
+    """float(value), rejecting booleans and NaN/inf (they are not evidence)."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, not a boolean")
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
 def _migrate_v1_entry(structure: str, entry: Dict) -> Dict:
     """Upgrade a schema_version=1 entry to v2 by synthesizing a placeholder observation.
 
@@ -243,20 +255,24 @@ class StructurePriorStore:
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_structures(raw: Dict[str, Any]) -> Dict[str, Dict]:
+        structures = raw.get("structures", {})
+        # Migrate any v1 entries to v2
+        migrated = {}
+        for s, entry in structures.items():
+            if entry.get("schema_version", 1) < _SCHEMA_VERSION:
+                entry = _migrate_v1_entry(s, entry)
+            if "observations" not in entry:
+                entry["observations"] = []
+            migrated[s] = entry
+        return migrated
+
     def _load(self) -> None:
+        """Load for READS; lenient. update() re-reads strictly under the lock."""
         try:
             if self._path.exists():
-                raw = json.loads(self._path.read_text())
-                structures = raw.get("structures", {})
-                # Migrate any v1 entries to v2
-                migrated = {}
-                for s, entry in structures.items():
-                    if entry.get("schema_version", 1) < _SCHEMA_VERSION:
-                        entry = _migrate_v1_entry(s, entry)
-                    if "observations" not in entry:
-                        entry["observations"] = []
-                    migrated[s] = entry
-                self._data = migrated
+                self._data = self._parse_structures(json.loads(self._path.read_text()))
                 n = sum(
                     e.get("observation_count", 0) for e in self._data.values()
                 )
@@ -273,33 +289,22 @@ class StructurePriorStore:
             self._data = {}
 
     def save(self) -> None:
-        """Flush to disk (thread-safe, acquires write lock)."""
-        with _WRITE_LOCK:
-            self._save_locked()
+        """Make sure the store file exists without discarding anyone's evidence.
 
-    def _save_locked(self) -> None:
-        """Save — must be called with _WRITE_LOCK held."""
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "schema_version": _SCHEMA_VERSION,
-                "structures": self._data,
-            }
-            tmp_path = self._path.with_name(f".{self._path.name}.{os.getpid()}.tmp")
-            try:
-                with tmp_path.open("w", encoding="utf-8") as fh:
-                    json.dump(payload, fh, indent=2)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_path, self._path)
-            finally:
-                if tmp_path.exists():
-                    try:
-                        tmp_path.unlink()
-                    except OSError:
-                        logger.warning("structure_prior_store: failed to remove temp file %s", tmp_path)
-        except Exception as exc:
-            logger.error("structure_prior_store: save failed (%s)", exc)
+        update() persists every observation, so an existing file is
+        authoritative: under the cross-process lock it is re-read and adopted,
+        never overwritten with this instance's possibly stale memory. Only a
+        missing file is created from memory. Raises PersistenceError on failure.
+        """
+        with _WRITE_LOCK:
+            with exclusive_lock(self._path):
+                raw = read_json_strict(self._path)
+                if raw is not None:
+                    self._data = self._parse_structures(raw)
+                    return
+                atomic_write_json(
+                    self._path, {"schema_version": _SCHEMA_VERSION, "structures": self._data},
+                )
 
     # ── Update ────────────────────────────────────────────────────────────────
 
@@ -312,9 +317,14 @@ class StructurePriorStore:
         source_type: str = "paper",
         observation_date: Optional[date] = None,
         observation_id: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """
         Record one finalized outcome observation for *structure*.
+
+        Returns True when the observation was durably recorded, False when it
+        was a duplicate or the structure is unsupported. Raises
+        PersistenceError when it could not be written and ValueError for a
+        non-finite or boolean value; nothing changes in memory or on disk then.
 
         Parameters
         ----------
@@ -339,13 +349,20 @@ class StructurePriorStore:
                 "structure_prior_store: unrecognised structure %r — skipping update",
                 structure,
             )
-            return
+            return False
 
         obs_date_str = (observation_date or date.today()).isoformat()
         obs_id = str(observation_id) if observation_id is not None else str(uuid.uuid4())
+        realized_return_pct = _finite_number(realized_return_pct, "realized_return_pct")
+        realized_expansion_pct = _finite_number(realized_expansion_pct, "realized_expansion_pct")
 
-        with _WRITE_LOCK:
-            entry = self._data.get(
+        # Cross-process: reload the latest file under the lock so a stale
+        # in-memory copy never overwrites another writer's observations, and
+        # swap memory only after the write is durable.
+        with _WRITE_LOCK, exclusive_lock(self._path):
+            raw = read_json_strict(self._path)
+            data = self._parse_structures(raw) if raw is not None else {}
+            entry = data.get(
                 structure,
                 {
                     "structure": structure,
@@ -367,11 +384,12 @@ class StructurePriorStore:
             # Deduplication: skip if observation_id already recorded
             existing_ids = {o.get("observation_id") for o in entry.get("observations", [])}
             if obs_id in existing_ids:
+                self._data = data
                 logger.debug(
                     "structure_prior_store: skipped duplicate observation_id=%s for %s",
                     obs_id, structure,
                 )
-                return
+                return False
 
             # Append to per-observation list
             observation: Dict[str, Any] = {
@@ -437,8 +455,11 @@ class StructurePriorStore:
                 "source_types": src_counts,
                 "last_updated": datetime.now(timezone.utc).isoformat(),
             }
-            self._data[structure] = new_entry
-            self._save_locked()
+            data = {**data, structure: new_entry}
+            atomic_write_json(self._path, {"schema_version": _SCHEMA_VERSION, "structures": data})
+            # Atomic swap of the whole dict: readers holding the old one keep
+            # a consistent snapshot (see PR-W note above).
+            self._data = data
 
         logger.debug(
             "structure_prior_store: updated %s n=%d win_rate=%.2f avg_ret=%.2f%%",
@@ -447,6 +468,7 @@ class StructurePriorStore:
             win_rate,
             avg_return,
         )
+        return True
 
     # ── Read ──────────────────────────────────────────────────────────────────
 

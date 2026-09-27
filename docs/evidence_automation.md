@@ -20,6 +20,8 @@ What it does:
 - because exits are at T-1, the iron condor baseline measures shorting the pre-earnings IV run-up, not the post-earnings crush
 - an exit is valued only on T-1 and only on the booked contracts (every leg strike, the expiry, and the contract symbol where both sides recorded one). Running the loop again the same day retries a failed exit; once T-1 has passed, a trade or baseline that was never priced moves to the terminal status `exit_missing` (never re-priced on a later date or a nearby contract). The Evidence Report counts this under `exit_attrition` by reason and structure
 - baselines whose entry context lacks a leg strike or the expiry resolve as `unverifiable_entry_context` and are excluded from comparisons
+- the calibration and structure-prior stores serialize every update behind a cross-process file lock (sidecar `.<name>.lock` files next to each JSON store), re-read the file before adding an observation, and write atomically; a failed write raises instead of being reported as learned, and the trade is left with a retryable `learning_update_status`
+- finalizing a trade takes an exclusive, owner-token claim (15-minute lease); a second worker can neither claim, overwrite the exit of, nor finalize a trade another worker is finalizing
 - outcomes invalidated as evidence (`scripts/invalidate_outcome.py`, or a `notes.evidence_invalidated` flag) are refused by every exit/finalize/learning write and excluded from reports before the row limit; invalidating a trade while its learning updates run is refused, so retry once it is finalized
 - writes a daily evidence snapshot to `~/.options_calculator_pro/reports/evidence/`
 

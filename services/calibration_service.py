@@ -27,7 +27,11 @@ The file is loaded on first use and flushed on every ``update()`` call.
 
 Thread safety
 -------------
-``update()`` and ``save()`` are protected by a module-level ``threading.Lock``.
+``update()`` and ``save()`` hold a per-instance ``threading.Lock`` AND a
+cross-process ``fcntl`` lock (services.durable_json) around a full
+reload -> dedupe -> update -> atomic write cycle, so concurrent processes and
+store instances cannot lose each other's observations. Write failures raise
+PersistenceError; memory only changes after the write is durable.
 Concurrent ``apply()`` calls are read-only and do not acquire the lock.
 """
 
@@ -44,6 +48,19 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+
+from services.durable_json import atomic_write_json, exclusive_lock, read_json_strict  # noqa: E402
+
+
+def _finite_number(value: Any, name: str) -> float:
+    """float(value), rejecting booleans and NaN/inf (they are not evidence)."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, not a boolean")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
 
 logger = logging.getLogger(__name__)
 
@@ -203,81 +220,100 @@ class IVExpansionCalibration:
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
+    def _parse_payload(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Observations from a persisted payload (lists copied, not shared)."""
+        scores = raw.get("scores", [])
+        expansions = raw.get("expansions", [])
+        sources = raw.get("sources", [])
+        timestamps = raw.get("timestamps", [])
+        observation_ids = raw.get("observation_ids", [])
+        if len(scores) != len(expansions):
+            raise ValueError("scores/expansions length mismatch")
+        parsed_scores = [float(s) for s in scores]
+        if len(sources) == len(scores):
+            parsed_sources = [self._normalize_source_type(src) for src in sources]
+        else:
+            parsed_sources = ["paper"] * len(parsed_scores)
+        # Migration: if no timestamps stored, synthesize from file mtime
+        if len(timestamps) == len(scores):
+            parsed_timestamps = [str(t) for t in timestamps]
+        else:
+            try:
+                import datetime as _dt
+                fallback_str = _dt.datetime.fromtimestamp(
+                    pathlib.Path(self._path).stat().st_mtime
+                ).strftime("%Y-%m-%d")
+            except Exception:
+                fallback_str = "1970-01-01"
+            parsed_timestamps = [fallback_str] * len(parsed_scores)
+        return {
+            "scores": parsed_scores,
+            "expansions": [float(e) for e in expansions],
+            "sources": parsed_sources,
+            "timestamps": parsed_timestamps,
+            "observation_ids": {str(obs_id) for obs_id in observation_ids if obs_id not in (None, "")},
+        }
+
+    def _adopt(self, state: Dict[str, Any]) -> None:
+        self._scores = state["scores"]
+        self._expansions = state["expansions"]
+        self._sources = state["sources"]
+        self._timestamps = state["timestamps"]
+        self._observation_ids = state["observation_ids"]
+        self._curve_dirty = True
+
+    def _payload(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "schema_version": 2,
+            "scores": state["scores"],
+            "expansions": state["expansions"],
+            "sources": state["sources"],
+            "timestamps": state["timestamps"],
+            "observation_ids": sorted(state["observation_ids"]),
+            "n": len(state["scores"]),
+        }
+
     def _load(self) -> None:
-        """Load persisted observations from disk (silent no-op if missing)."""
+        """Load persisted observations from disk (silent no-op if missing).
+
+        Lenient at construction: a corrupt file starts the instance empty for
+        READS. ``update()`` re-reads strictly under the file lock, so it fails
+        loudly instead of overwriting that file with a partial state.
+        """
         try:
             if self._path.exists():
-                raw = json.loads(self._path.read_text())
-                scores = raw.get("scores", [])
-                expansions = raw.get("expansions", [])
-                sources = raw.get("sources", [])
-                timestamps = raw.get("timestamps", [])
-                observation_ids = raw.get("observation_ids", [])
-                if len(scores) == len(expansions):
-                    self._scores = [float(s) for s in scores]
-                    self._expansions = [float(e) for e in expansions]
-                    if len(sources) == len(scores):
-                        self._sources = [self._normalize_source_type(src) for src in sources]
-                    else:
-                        self._sources = ["paper"] * len(self._scores)
-                    # Migration: if no timestamps stored, synthesize from file mtime
-                    if len(timestamps) == len(scores):
-                        self._timestamps = [str(t) for t in timestamps]
-                    else:
-                        try:
-                            fallback_date = pathlib.Path(self._path).stat().st_mtime
-                            import datetime as _dt
-                            fallback_str = _dt.datetime.fromtimestamp(fallback_date).strftime("%Y-%m-%d")
-                        except Exception:
-                            fallback_str = "1970-01-01"
-                        self._timestamps = [fallback_str] * len(self._scores)
-                    self._observation_ids = {
-                        str(obs_id)
-                        for obs_id in observation_ids
-                        if obs_id not in (None, "")
-                    }
-                    self._curve_dirty = True
-                    logger.info(
-                        "calibration: loaded %d observations from %s",
-                        len(self._scores),
-                        self._path,
-                    )
+                self._adopt(self._parse_payload(json.loads(self._path.read_text())))
+                logger.info(
+                    "calibration: loaded %d observations from %s",
+                    len(self._scores),
+                    self._path,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("calibration: could not load store (%s) — starting fresh", exc)
 
     def save(self) -> None:
-        """Flush current observations to disk."""
-        with self._lock:
-            self._save_locked()
+        """Make sure the store file exists without discarding anyone's evidence.
 
-    def _save_locked(self) -> None:
-        """Save (must be called with self._lock held)."""
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "schema_version": 2,
-                "scores": self._scores,
-                "expansions": self._expansions,
-                "sources": self._sources,
-                "timestamps": self._timestamps,
-                "observation_ids": sorted(self._observation_ids),
-                "n": len(self._scores),
-            }
-            tmp_path = self._path.with_name(f".{self._path.name}.{os.getpid()}.tmp")
-            try:
-                with tmp_path.open("w", encoding="utf-8") as fh:
-                    json.dump(payload, fh, indent=2)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_path, self._path)
-            finally:
-                if tmp_path.exists():
-                    try:
-                        tmp_path.unlink()
-                    except OSError:
-                        logger.warning("calibration: failed to remove temp file %s", tmp_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("calibration: save failed (%s)", exc)
+        update() already persists every observation, so the file on disk is
+        authoritative: under the cross-process lock, an existing file is
+        re-read and adopted (never overwritten with this instance's possibly
+        stale memory); only a missing file is created from memory. Raises
+        PersistenceError if that write fails.
+        """
+        with self._lock:
+            with exclusive_lock(self._path):
+                raw = read_json_strict(self._path)
+                if raw is not None:
+                    self._adopt(self._parse_payload(raw))
+                    return
+                state = {
+                    "scores": list(self._scores),
+                    "expansions": list(self._expansions),
+                    "sources": list(self._sources),
+                    "timestamps": list(self._timestamps),
+                    "observation_ids": set(self._observation_ids),
+                }
+                atomic_write_json(self._path, self._payload(state))
 
     # ── Curve management ─────────────────────────────────────────────────────
 
@@ -437,24 +473,38 @@ class IVExpansionCalibration:
         observation_date : date, optional
             The date to associate with this observation for as_of_date filtering
             in walk-forward backtesting (#18).  Defaults to today.
+
+        Returns True when the observation was durably recorded, False when it
+        was already present. Raises PersistenceError when it could not be
+        written, and ValueError for a non-finite or boolean value; in both
+        cases nothing changes in memory or on disk.
         """
         normalized_source = self._normalize_source_type(source_type)
         normalized_id = str(observation_id) if observation_id not in (None, "") else None
         obs_date_str = (observation_date or date.today()).isoformat()
+        score = _finite_number(setup_score, "setup_score")
+        expansion = _finite_number(observed_expansion_pct, "observed_expansion_pct")
         with self._lock:
-            if normalized_id is not None and normalized_id in self._observation_ids:
-                logger.debug(
-                    "calibration: skipped duplicate observation_id=%s", normalized_id
-                )
-                return False
-            self._scores.append(float(setup_score))
-            self._expansions.append(float(observed_expansion_pct))
-            self._sources.append(normalized_source)
-            self._timestamps.append(obs_date_str)
-            if normalized_id is not None:
-                self._observation_ids.add(normalized_id)
-            self._curve_dirty = True
-            self._save_locked()
+            # Cross-process: reload the latest file under the lock, so a
+            # stale in-memory copy can never overwrite another writer's
+            # observations; memory changes only after the write is durable.
+            with exclusive_lock(self._path):
+                raw = read_json_strict(self._path)
+                state = self._parse_payload(raw if raw is not None else {})
+                if normalized_id is not None and normalized_id in state["observation_ids"]:
+                    self._adopt(state)
+                    logger.debug(
+                        "calibration: skipped duplicate observation_id=%s", normalized_id
+                    )
+                    return False
+                state["scores"].append(score)
+                state["expansions"].append(expansion)
+                state["sources"].append(normalized_source)
+                state["timestamps"].append(obs_date_str)
+                if normalized_id is not None:
+                    state["observation_ids"].add(normalized_id)
+                atomic_write_json(self._path, self._payload(state))
+                self._adopt(state)
         logger.debug(
             "calibration: update score=%.3f expansion=%.2f%% source=%s obs_id=%s (N=%d total)",
             setup_score,

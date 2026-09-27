@@ -38,6 +38,7 @@ import logging
 import os
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -190,7 +191,16 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "last_exit_attempt_at": "TEXT",
     "last_exit_attempt_reason": "TEXT",
     "exit_missing_reason": "TEXT",
+    # Finalization ownership: the worker holding the claim, and since when
+    # (UTC 'YYYY-MM-DD HH:MM:SS'). A claim older than the lease is presumed
+    # crashed and may be taken over.
+    "finalizing_owner": "TEXT",
+    "finalizing_since": "TEXT",
 }
+
+# How long a finalization claim is exclusive before another worker may take
+# it over (a finalize that crashed mid-way).
+FINALIZATION_LEASE_SECONDS = 900
 
 # SQL twin of is_outcome_evidence_valid(). Mutations that write outcome or
 # learning state carry it in their WHERE clause, so an invalidation made after
@@ -416,12 +426,17 @@ class OutcomeStore:
         exit_quote_timestamp: Optional[str] = None,
         exit_bid_ask_mid: Optional[Dict[str, Any]] = None,
         exit_execution_scenarios: Optional[Dict[str, Any]] = None,
+        owner: Optional[str] = None,
     ) -> bool:
         """
         Update exit fields on an open trade.
 
         Sets status = 'exited'.  Does NOT trigger learning updates —
         call finalize_trade_and_update_learning() for that.
+
+        A trade being finalized ('finalizing') can only be written by the
+        worker holding the claim (``owner``); it stays 'finalizing'. Nobody
+        else can overwrite its exit facts mid-finalization.
 
         Returns True if a row was updated, False if trade_id not found
         or already finalized.
@@ -438,10 +453,13 @@ class OutcomeStore:
                 exit_quote_timestamp    = ?,
                 exit_bid_ask_mid_json   = ?,
                 exit_execution_scenarios_json = ?,
-                status                 = 'exited',
+                status                 = CASE WHEN status = 'finalizing' THEN 'finalizing' ELSE 'exited' END,
                 updated_at             = CURRENT_TIMESTAMP
             WHERE trade_id = ?
-              AND status IN ('open', 'exited', 'finalizing')
+              AND (
+                status IN ('open', 'exited')
+                OR (status = 'finalizing' AND ? IS NOT NULL AND finalizing_owner = ?)
+              )
               AND {valid}
         """.format(valid=_VALID_EVIDENCE_SQL)
         params = (
@@ -456,6 +474,8 @@ class OutcomeStore:
             _json_payload(exit_bid_ask_mid or {}),
             _json_payload(exit_execution_scenarios or {}),
             trade_id,
+            owner,
+            owner,
         )
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
@@ -471,24 +491,30 @@ class OutcomeStore:
 
     # ── Mark finalized ────────────────────────────────────────────────────────
 
-    def mark_finalized(self, trade_id: str) -> bool:
+    def mark_finalized(self, trade_id: str, *, owner: Optional[str] = None) -> bool:
         """
         Mark a trade as finalized (learning updates already applied externally).
 
         Returns True if status changed; False if not found, already finalized,
-        terminal (exit_missing), or invalidated as evidence.
+        terminal (exit_missing), invalidated as evidence, or claimed by another
+        finalizer. A 'finalizing' row can only be finalized by its ``owner``.
         """
         sql = """
             UPDATE outcome_trades
-            SET status     = 'finalized',
-                updated_at = CURRENT_TIMESTAMP
+            SET status           = 'finalized',
+                finalizing_owner = NULL,
+                finalizing_since = NULL,
+                updated_at       = CURRENT_TIMESTAMP
             WHERE trade_id = ?
-              AND status IN ('open', 'exited', 'finalizing')
+              AND (
+                status IN ('open', 'exited')
+                OR (status = 'finalizing' AND ? IS NOT NULL AND finalizing_owner = ?)
+              )
               AND {valid}
         """.format(valid=_VALID_EVIDENCE_SQL)
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
-                cur.execute(sql, (trade_id,))
+                cur.execute(sql, (trade_id, owner, owner))
                 return cur.rowcount > 0
 
     # ── Learning-loop bookkeeping ─────────────────────────────────────────────
@@ -691,37 +717,49 @@ class OutcomeStore:
 
     # ── Finalization claim ────────────────────────────────────────────────────
 
-    def claim_for_finalization(self, trade_id: str) -> bool:
-        """Atomically move a valid, exited trade to 'finalizing'.
+    def claim_for_finalization(
+        self,
+        trade_id: str,
+        *,
+        owner: str,
+        lease_seconds: int = FINALIZATION_LEASE_SECONDS,
+    ) -> bool:
+        """Compare-and-set a valid trade to 'finalizing', owned by ``owner``.
 
-        The learning updates run only after this succeeds, and invalidate()
-        refuses a 'finalizing' row, so an invalidation can no longer land
-        between the validity check and the calibration/prior writes. A row
-        already 'finalized' is reported as claimable so re-finalizing stays
-        idempotent (both learning stores dedupe on the trade id).
+        True only when THIS owner now holds the claim. It succeeds from
+        'open'/'exited', or from a 'finalizing' claim older than the lease (a
+        crashed finalizer); a live claim held by another worker is refused.
+        The learning updates run only after this succeeds, only the owner can
+        write exits to or finalize the row, and invalidate() refuses a live
+        claim - so nothing can land between the validity check and the
+        calibration/prior writes. Callers handle an already-'finalized' row
+        themselves (re-finalizing is idempotent; see
+        finalize_trade_and_update_learning).
         """
+        if not owner:
+            raise ValueError("claim_for_finalization: an owner token is required")
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
                 cur.execute(
                     """
                     UPDATE outcome_trades
                     SET status = 'finalizing',
+                        finalizing_owner = ?,
+                        finalizing_since = datetime('now'),
                         updated_at = CURRENT_TIMESTAMP
                     WHERE trade_id = ?
-                      AND status IN ('open', 'exited', 'finalizing')
                       AND {valid}
+                      AND (
+                        status IN ('open', 'exited')
+                        OR (
+                          status = 'finalizing'
+                          AND (finalizing_since IS NULL OR finalizing_since <= datetime('now', ?))
+                        )
+                      )
                     """.format(valid=_VALID_EVIDENCE_SQL),
-                    (trade_id,),
+                    (owner, trade_id, f"-{int(lease_seconds)} seconds"),
                 )
-                if cur.rowcount > 0:
-                    return True
-                row = cur.execute(
-                    "SELECT 1 FROM outcome_trades WHERE trade_id = ? AND status = 'finalized' AND {valid}".format(
-                        valid=_VALID_EVIDENCE_SQL,
-                    ),
-                    (trade_id,),
-                ).fetchone()
-                return row is not None
+                return cur.rowcount > 0
 
     # ── Evidence invalidation ─────────────────────────────────────────────────
 
@@ -757,9 +795,13 @@ class OutcomeStore:
                         invalidation_reason = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE trade_id = ?
-                      AND status != 'finalizing'
+                      AND NOT (
+                        status = 'finalizing'
+                        AND finalizing_since IS NOT NULL
+                        AND finalizing_since > datetime('now', ?)
+                      )
                     """,
-                    (stamp, reason, trade_id),
+                    (stamp, reason, trade_id, f"-{FINALIZATION_LEASE_SECONDS} seconds"),
                 )
                 if cur.rowcount == 0:
                     # Learning updates are mid-flight; invalidating now would
@@ -1144,8 +1186,28 @@ def finalize_trade_and_update_learning(
         or exit_bid_ask_mid is not None
         or exit_execution_scenarios is not None
     )
-    if exit_fields_provided:
-        s.update_exit(
+    # ── 2a. Claim the row BEFORE writing anything ────────────────────────────
+    # Exclusive compare-and-set with an owner token: a second worker cannot
+    # also claim it, overwrite its exit facts, or finalize it, and an
+    # invalidation cannot land between here and the learning writes. An
+    # already-finalized trade is re-run idempotently (both learning stores
+    # dedupe on the trade id) - that is the failed-learning retry path.
+    owner = uuid.uuid4().hex
+    already_finalized = False
+    if not s.claim_for_finalization(trade_id, owner=owner):
+        current = s.get_trade(trade_id) or {}
+        if str(current.get("status") or "") == "finalized" and is_outcome_evidence_valid(current):
+            already_finalized = True
+        else:
+            raise ValueError(
+                f"finalize_trade_and_update_learning: trade_id={trade_id!r} could not be claimed for "
+                "finalization (invalidated, terminal, or being finalized by another worker); "
+                "refusing to update learning stores"
+            )
+
+    if exit_fields_provided and not already_finalized:
+        if not s.update_exit(
+            owner=owner,
             trade_id=trade_id,
             exit_date=resolved_exit_date,
             exit_mid=exit_mid,
@@ -1157,18 +1219,11 @@ def finalize_trade_and_update_learning(
             exit_quote_timestamp=exit_quote_timestamp,
             exit_bid_ask_mid=exit_bid_ask_mid,
             exit_execution_scenarios=exit_execution_scenarios,
-        )
-
-    # ── 2b. Claim the row before any irreversible learning write ─────────────
-    # The validity check above read a snapshot; another process may have
-    # invalidated the row since. The claim re-checks validity in the same
-    # UPDATE that moves the row to 'finalizing', and invalidate() refuses a
-    # 'finalizing' row, so nothing can slip between here and the writes below.
-    if not s.claim_for_finalization(trade_id):
-        raise ValueError(
-            f"finalize_trade_and_update_learning: trade_id={trade_id!r} could not be claimed for "
-            "finalization (invalidated or in a terminal status); refusing to update learning stores"
-        )
+        ):
+            raise ValueError(
+                f"finalize_trade_and_update_learning: trade_id={trade_id!r} lost its finalization "
+                "claim before the exit was written; refusing to update learning stores"
+            )
 
     # ── 3. Update calibration ─────────────────────────────────────────────────
     calibration_ok = False
@@ -1249,7 +1304,8 @@ def finalize_trade_and_update_learning(
     s.set_learning_update_status(trade_id, learning_status)
 
     # ── 7. Mark finalized ─────────────────────────────────────────────────────
-    s.mark_finalized(trade_id)
+    if not already_finalized and not s.mark_finalized(trade_id, owner=owner):
+        warnings.append("finalization claim was lost before the trade could be marked finalized")
 
     return {
         "trade_id": trade_id,
