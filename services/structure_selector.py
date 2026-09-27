@@ -136,6 +136,11 @@ def select_best_structure(
         or top.expected_edge_pct < MARGINAL_EDGE_THRESHOLD_PCT
         or top_penalty >= WATCH_EXECUTION_PENALTY_THRESHOLD
         or conflicting
+        # Every structure is priced off the option surface; a surface the
+        # system itself classifies as degraded demotes to Watch (recorded,
+        # never actionable). The universe shadow cohort still prices these
+        # events, so whether degraded surfaces really pay worse is measured.
+        or _surface_degraded(snapshot)
     ):
         recommendation = RECOMMENDATION_WATCH
     elif (
@@ -181,6 +186,10 @@ def select_best_structure(
         data_quality=snapshot.data_quality,
         data_quality_score=float(snapshot.data_quality_score),
     )
+
+
+def _surface_degraded(snapshot: VolSnapshot) -> bool:
+    return getattr(snapshot, "surface_quality_status", None) == "degraded_surface"
 
 
 def _confidence_pct(
@@ -314,7 +323,12 @@ def _explain_selected(
             f"Tail/implied ratio {snapshot.tail_vs_implied_move_ratio if snapshot.tail_vs_implied_move_ratio is not None else 0.0:.2f} "
             f"and event-risk score {snapshot.event_risk_score if snapshot.event_risk_score is not None else 0.5:.2f} favor wing exposure."
         )
-    if recommendation == RECOMMENDATION_WATCH:
+    if recommendation == RECOMMENDATION_WATCH and _surface_degraded(snapshot):
+        bullets.append(
+            "Held at watch because the option surface is degraded (wide spreads, sparse strikes or IV "
+            "anomalies); prices on it are not reliable enough to act on."
+        )
+    elif recommendation == RECOMMENDATION_WATCH:
         bullets.append("The engine still labels this a watch because the edge is real but not yet separated enough from the alternatives.")
     if recommendation == RECOMMENDATION_NO_TRADE:
         bullets.append("Despite ranking first, the structure does not clear the conservative decision rules.")

@@ -26,6 +26,7 @@ const payload = {
     resolved_selector_outcomes: 2,
     minimum_resolved_sample: 30,
     ready_for_paid_beta: false,
+    blocking_reasons: ['at least 60 evidence days', 'enough claimable (execution-grade) evidence'],
   },
   maturity: {
     maturity_label: 'Insufficient evidence',
@@ -83,6 +84,8 @@ const payload = {
 test('evidence report summary exposes commercialization gate without overclaiming', () => {
   const summary = buildEvidenceReportSummary(payload)
   assert.equal(summary.readyForPaidBeta, false)
+  assert.deepEqual(summary.gateBlockingReasons, ['at least 60 evidence days', 'enough claimable (execution-grade) evidence'])
+  assert.deepEqual(buildEvidenceReportSummary({}).gateBlockingReasons, [])
   assert.equal(summary.maturityLabel, 'Insufficient evidence')
   assert.equal(summary.edgeQualityLabel, 'Withheld: insufficient claimable evidence')
   assert.equal(summary.benchmarkMeaningful, false)

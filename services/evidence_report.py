@@ -6,9 +6,12 @@ against shadow baselines without presenting either as execution-grade live P&L.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
+
+import numpy as np
 
 from services.baseline_evidence_store import (
     COHORT_PAIRED,
@@ -69,6 +72,7 @@ def build_evidence_report(
     comparable_paired = [
         row for row in resolved_baselines
         if baseline_cohort(row) == COHORT_PAIRED and is_booked_strike_exit(row)
+        and not _has_non_finite_return(row)
     ]
     legacy_repriced = [row for row in resolved_baselines if not is_booked_strike_exit(row)]
 
@@ -105,27 +109,26 @@ def build_evidence_report(
             "without them it is zero or negative."
         )
 
-    return {
+    report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "evidence_label": "paper_research_not_execution_grade",
         "maturity": maturity,
-        "commercialization_gate": {
-            "active_evidence_days": active_days,
-            "minimum_days": MIN_COMMERCIAL_EVIDENCE_DAYS,
-            "target_days": TARGET_COMMERCIAL_EVIDENCE_DAYS,
-            "resolved_selector_outcomes": selector_stats["n"],
-            "minimum_resolved_sample": MIN_RESOLVED_SAMPLE,
-            "ready_for_paid_beta": bool(
-                active_days >= MIN_COMMERCIAL_EVIDENCE_DAYS
-                and selector_stats["n"] >= MIN_RESOLVED_SAMPLE
-            ),
-        },
+        "commercialization_gate": _commercialization_gate(
+            active_days=active_days,
+            selector_n=selector_stats["n"],
+            maturity=maturity,
+        ),
         "selector_summary": selector_stats,
         "invalidated_outcomes": {
             "n": len(invalidated),
             "resolved_n": sum(1 for row in invalidated if _is_resolved(row)),
             "by_reason": _count_by(invalidated, lambda row: outcome_invalidation_reason(row) or "unknown"),
             "note": "Excluded from every performance, calibration and maturity figure; kept for audit.",
+        },
+        "non_finite_outcomes": {
+            "selector_n": sum(1 for row in outcomes if _has_non_finite_return(row)),
+            "baseline_n": sum(1 for row in resolved_baselines if _has_non_finite_return(row)),
+            "note": "Legacy rows whose realized return is NaN/inf; excluded from every figure.",
         },
         "baseline_comparison": baseline_stats,
         "exit_attrition": _exit_attrition(outcomes, baselines),
@@ -176,6 +179,9 @@ def build_evidence_report(
             "Simple IV/RV filter is an observational baseline over selected paper outcomes, not a separately traded strategy.",
         ],
     }
+    # Legacy NaN/inf values can still reach nested diagnostics; the report
+    # must always serialize as strict JSON.
+    return _json_safe(report)
 
 
 def build_weekly_evidence_report(
@@ -248,7 +254,14 @@ def build_weekly_evidence_report(
 
 
 def _is_resolved(row: Dict[str, Any]) -> bool:
-    return row.get("realized_return_pct") is not None and str(row.get("status") or "") in {"exited", "finalized"}
+    # A non-finite or non-numeric return (only legacy rows can hold one; the
+    # store now refuses them) is not a resolved outcome - see non_finite_outcomes.
+    return _num(row.get("realized_return_pct")) is not None and str(row.get("status") or "") in {"exited", "finalized"}
+
+
+def _has_non_finite_return(row: Dict[str, Any]) -> bool:
+    value = row.get("realized_return_pct")
+    return value is not None and _num(value) is None
 
 
 def _outcome_stats(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
@@ -292,6 +305,51 @@ def _group_by(rows: Iterable[Dict[str, Any]], key_fn: Any) -> Dict[str, Dict[str
     return {key: _baseline_stats(items) for key, items in sorted(grouped.items())}
 
 
+def _unique_by_recommendation(rows: Iterable[Dict[str, Any]]) -> tuple[Dict[str, Any], List[str]]:
+    """Map recommendation_id -> return, EXCLUDING ids that occur more than once.
+
+    A pairing key must identify one event on each side. Silently keeping the
+    last duplicate made the paired result depend on row order; ambiguous keys
+    are dropped and reported instead.
+    """
+    grouped: Dict[str, list] = defaultdict(list)
+    for row in rows:
+        key = row.get("recommendation_id")
+        if key and row.get("realized_return_pct") is not None:
+            grouped[str(key)].append(row.get("realized_return_pct"))
+    unique = {key: values[0] for key, values in grouped.items() if len(values) == 1}
+    duplicates = sorted(key for key, values in grouped.items() if len(values) > 1)
+    return unique, duplicates
+
+
+def _commercialization_gate(*, active_days: int, selector_n: int, maturity: Dict[str, Any]) -> Dict[str, Any]:
+    """Paid-beta readiness: every condition must hold, and each unmet one is named.
+
+    Elapsed days and a raw sample are not enough - claim-blocked or degraded
+    rows could otherwise open the gate with nothing that supports a claim or
+    a baseline comparison. Invariant: never ready while headline (edge-quality)
+    claims are withheld.
+    """
+    checks = {
+        f"at least {MIN_COMMERCIAL_EVIDENCE_DAYS} evidence days": active_days >= MIN_COMMERCIAL_EVIDENCE_DAYS,
+        f"at least {MIN_RESOLVED_SAMPLE} resolved selector outcomes": selector_n >= MIN_RESOLVED_SAMPLE,
+        "enough claimable (execution-grade) evidence": bool(maturity.get("edge_quality_label_allowed")),
+        "enough matched selector and baseline outcomes to compare": bool(maturity.get("benchmark_comparison_meaningful")),
+        "calibration buckets large enough to interpret": bool(maturity.get("bucket_interpretation_allowed")),
+        "evidence maturity past early observation": maturity.get("maturity_label") in {"Developing evidence", "Mature evidence"},
+    }
+    blocking = [name for name, ok in checks.items() if not ok]
+    return {
+        "active_evidence_days": active_days,
+        "minimum_days": MIN_COMMERCIAL_EVIDENCE_DAYS,
+        "target_days": TARGET_COMMERCIAL_EVIDENCE_DAYS,
+        "resolved_selector_outcomes": selector_n,
+        "minimum_resolved_sample": MIN_RESOLVED_SAMPLE,
+        "ready_for_paid_beta": not blocking,
+        "blocking_reasons": blocking,
+    }
+
+
 def _uncertainty(
     selected: list[Dict[str, Any]],
     comparable_paired: list[Dict[str, Any]],
@@ -304,20 +362,17 @@ def _uncertainty(
     3. Did events the selector picked pay more than events it skipped?
     """
     selector_returns = [row.get("realized_return_pct") for row in selected]
-    selector_by_rec = {
-        str(row["recommendation_id"]): row.get("realized_return_pct")
-        for row in selected
-        if row.get("recommendation_id") and row.get("realized_return_pct") is not None
-    }
+    selector_by_rec, selector_duplicates = _unique_by_recommendation(selected)
     paired: Dict[str, Any] = {}
     for name in sorted({str(row.get("baseline_name") or "unknown_baseline") for row in comparable_paired}):
-        baseline_by_rec = {
-            str(row["recommendation_id"]): row.get("realized_return_pct")
-            for row in comparable_paired
+        baseline_by_rec, baseline_duplicates = _unique_by_recommendation(
+            row for row in comparable_paired
             if str(row.get("baseline_name") or "unknown_baseline") == name
-            and row.get("recommendation_id") and row.get("realized_return_pct") is not None
+        )
+        paired[name] = {
+            **paired_difference(selector_by_rec, baseline_by_rec),
+            "excluded_duplicate_keys": sorted(set(selector_duplicates) | set(baseline_duplicates)),
         }
-        paired[name] = paired_difference(selector_by_rec, baseline_by_rec)
 
     universe_rows = [
         row for row in baselines
@@ -625,11 +680,25 @@ def _avg(values: Iterable[Any]) -> Optional[float]:
 
 
 def _num(value: Any) -> Optional[float]:
+    """A finite float, else None (NaN, +/-inf, bools and non-numbers)."""
+    if isinstance(value, (bool, np.bool_)):
+        return None
     try:
         parsed = float(value)
-        return parsed if parsed == parsed else None
     except Exception:
         return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _json_safe(value: Any) -> Any:
+    """*value* with every non-finite float replaced by None (strict JSON)."""
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
+        return None
+    return value
 
 
 def _truthy(value: Any) -> bool:

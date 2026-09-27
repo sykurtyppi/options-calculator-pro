@@ -77,6 +77,9 @@ export default function EvidenceReportPanel({ apiBase }) {
           <div className={`data-quality-warning-box ${summary.readyForPaidBeta ? 'quality-positive' : ''}`}>
             <strong>{summary.readyForPaidBeta ? 'Evidence gate: beta-ready candidate' : `Evidence maturity: ${summary.maturityLabel}`}</strong>
             <span>{summary.activeDays}/{summary.targetDays} days collected · {summary.resolvedOutcomes}/{summary.minimumResolved} resolved selector outcomes · {summary.evidenceLabel}</span>
+            {!summary.readyForPaidBeta && summary.gateBlockingReasons.length > 0 && (
+              <span>Not beta-ready: {summary.gateBlockingReasons.join('; ')}</span>
+            )}
           </div>
 
           <div className="provider-telemetry-summary-grid">

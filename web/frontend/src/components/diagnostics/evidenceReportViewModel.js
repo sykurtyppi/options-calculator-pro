@@ -16,6 +16,7 @@ export function buildEvidenceReportSummary(payload = {}) {
     resolvedOutcomes: Number(gate.resolved_selector_outcomes || selector.n || 0),
     minimumResolved: Number(gate.minimum_resolved_sample || 30),
     readyForPaidBeta: Boolean(gate.ready_for_paid_beta),
+    gateBlockingReasons: Array.isArray(gate.blocking_reasons) ? gate.blocking_reasons : [],
     selectorReturnLabel: formatReturnPct(selector.avg_realized_return_pct),
     selectorWinRateLabel: formatRate(selector.win_rate),
   }

@@ -24,6 +24,8 @@ What it does:
 - finalizing a trade takes an exclusive, owner-token claim (15-minute lease); a second worker can neither claim, overwrite the exit of, nor finalize a trade another worker is finalizing
 - a finalize that fails or loses its claim after the exit was written hands the claim back; once the exit day has passed, the next loop run re-finalizes such trades from the stored exit (no re-quote) and reports them as `refinalized`
 - outcomes invalidated as evidence (`scripts/invalidate_outcome.py`, or a `notes.evidence_invalidated` flag) are refused by every exit/finalize/learning write and excluded from reports before the row limit; invalidating a trade while its learning updates run is refused, so retry once it is finalized
+- realized values that are NaN, infinite or boolean are refused when an outcome or baseline exit is written (a baseline exit that would produce one is recorded as `exit_skipped` with `non_finite_exit_value`); older rows holding one are excluded from every report figure and counted under `non_finite_outcomes`
+- an option surface classified `degraded_surface` holds the selector at Watch: the event is recorded and shadow-priced, never actionable
 - writes a daily evidence snapshot to `~/.options_calculator_pro/reports/evidence/`
 
 Safe dry run:
@@ -37,6 +39,7 @@ Recommended collection window:
 - minimum: 60 calendar days
 - target: 90 calendar days
 - do not market the tool as edge-proven until the Evidence Report has enough resolved paper outcomes and baseline comparisons
+- `commercialization_gate.ready_for_paid_beta` is true only when every condition holds (60+ evidence days, 30+ resolved selector outcomes, claimable evidence, meaningful baseline comparison, interpretable calibration buckets, maturity past early observation); `blocking_reasons` names each unmet one
 
 ## macOS launchd Scheduling
 

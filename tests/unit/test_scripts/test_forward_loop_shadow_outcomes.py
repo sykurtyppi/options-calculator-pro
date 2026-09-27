@@ -492,3 +492,49 @@ def test_unverified_143_label_is_not_comparable(tmp_path):
 
     assert "always_iron_condor" not in report["baseline_comparison"]
     assert report["legacy_repriced_baselines"]["by_exit_repricing"] == {"booked_strikes": 1}
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), True])
+def test_baseline_store_refuses_non_finite_exit_values(tmp_path, bad):
+    store = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
+    with pytest.raises(ValueError, match="realized_return_pct"):
+        _resolved(store, baseline_id="b1", recommendation_id="r1", cohort="paired",
+                  repricing=EXIT_REPRICING_BOOKED, ret=bad)
+    assert store.list_for_diagnostics()[0]["status"] == "open"
+
+
+def test_non_finite_baseline_exit_is_skipped_not_raised(tmp_path):
+    baselines = _enter_all(tmp_path)
+    # An infinite mid passes the "usable quote" check but cannot be a return.
+    summary = _exit(tmp_path, baselines, _Fetcher(exit_mids={"atm_straddle": float("inf"), "otm_strangle": 4.0,
+                                                             "iron_condor": 0.0}))
+
+    assert summary == {"baseline_exits": 2, "baseline_skipped": 1, "baseline_exit_missing": 0}
+    straddle = {row["baseline_name"]: row for row in baselines.list_for_diagnostics()}["always_atm_straddle"]
+    assert straddle["status"] == "exit_skipped"
+    assert straddle["skip_reason"] == "non_finite_exit_value"
+    assert straddle["realized_return_pct"] is None
+
+
+def test_report_excludes_and_counts_legacy_non_finite_baselines(tmp_path):
+    import json
+
+    baselines = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
+    _resolved(baselines, baseline_id="good", recommendation_id="r1", cohort="paired",
+              repricing=EXIT_REPRICING_BOOKED, ret=10.0)
+    _resolved(baselines, baseline_id="legacy", recommendation_id="r2", cohort="paired",
+              repricing=EXIT_REPRICING_BOOKED, ret=1.0)
+    # A row written before the store refused NaN/inf.
+    with baselines._conn:
+        baselines._conn.execute(
+            "UPDATE baseline_trades SET realized_return_pct = ? WHERE baseline_id = 'legacy'", (float("inf"),)
+        )
+
+    report = build_evidence_report(baseline_store=baselines, outcome_store=OutcomeStore(tmp_path / "o.sqlite"))
+
+    paired = report["baseline_comparison"]["always_iron_condor"]
+    assert paired["n"] == 1 and paired["avg_realized_return_pct"] == 10.0
+    assert report["non_finite_outcomes"]["baseline_n"] == 1
+    # Maturity must not count the legacy row as a comparable baseline outcome.
+    assert report["maturity"]["inputs"]["resolved_baseline_outcomes"] == 1
+    json.dumps(report, allow_nan=False)
