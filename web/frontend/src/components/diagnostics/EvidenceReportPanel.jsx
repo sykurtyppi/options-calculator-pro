@@ -9,9 +9,11 @@ import {
   buildExcludedEvidenceSummary,
   buildExecutionRealismSummary,
   buildExitAttritionRows,
+  buildOutlierDependence,
   buildQuoteQualityRows,
   buildSimpleIvRvFilter,
   buildSurfaceQualitySummary,
+  buildUncertaintyRows,
   buildUniverseShadowRows,
   buildUniverseShadowSummary,
 } from './evidenceReportViewModel'
@@ -53,6 +55,9 @@ export default function EvidenceReportPanel({ apiBase }) {
   const universe = useMemo(() => buildUniverseShadowSummary(payload || {}), [payload])
   const attritionRows = useMemo(() => buildExitAttritionRows(payload || {}), [payload])
   const excluded = useMemo(() => buildExcludedEvidenceSummary(payload || {}), [payload])
+  const uncertaintyRows = useMemo(() => buildUncertaintyRows(payload || {}), [payload])
+  const outliers = useMemo(() => buildOutlierDependence(payload || {}), [payload])
+  const uncertaintyMethod = (payload?.uncertainty || {}).method || ''
 
   return (
     <section className="oos-block evidence-report-block">
@@ -117,6 +122,41 @@ export default function EvidenceReportPanel({ apiBase }) {
                 </tbody>
               </table>
             </div>
+          </div>
+
+          <div className="selector-panel selector-panel-full">
+            <div className="selector-panel-header">
+              <h3>How Sure Are We?</h3>
+              <span>{uncertaintyMethod || 'Bootstrap intervals for each comparison.'}</span>
+            </div>
+            {uncertaintyRows.length ? (
+              <div className="structure-table-wrap">
+                <table className="structure-table forward-performance-table">
+                  <thead>
+                    <tr><th>Comparison</th><th>n</th><th>Mean</th><th>95% interval</th><th>Reading</th></tr>
+                  </thead>
+                  <tbody>
+                    {uncertaintyRows.map((row) => (
+                      <tr key={row.key}>
+                        <td><strong>{row.label}</strong></td>
+                        <td>{row.n}</td>
+                        <td>{row.meanLabel}</td>
+                        <td>{row.intervalLabel}</td>
+                        <td>{row.verdictLabel}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : <div className="oos-message">No resolved evidence to measure yet.</div>}
+            {outliers.available && (
+              <p className={`oos-help ${outliers.fragile ? 'error-banner' : ''}`}>
+                Without the {outliers.k} best selector results the mean is {outliers.withoutTopLabel}
+                {' '}(without the {outliers.k} worst: {outliers.withoutBottomLabel}); the {outliers.k} largest gains
+                {' '}are {outliers.topShareLabel} of all gains.
+                {outliers.fragile ? ' The positive average depends on a few trades.' : ''}
+              </p>
+            )}
           </div>
 
           <div className="selector-panel selector-panel-full">
