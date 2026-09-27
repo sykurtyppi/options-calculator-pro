@@ -35,6 +35,7 @@ from services.automation_watchdog import (
 )
 from services.baseline_evidence_store import _DEFAULT_STORE as DEFAULT_BASELINE_STORE
 from services.outcome_recorder import _DEFAULT_STORE as DEFAULT_OUTCOME_STORE
+from services.outcome_recorder import _VALID_EVIDENCE_SQL
 from services.provider_telemetry import _DEFAULT_STORE as DEFAULT_TELEMETRY_STORE
 from services.recommendation_ledger import _DEFAULT_LEDGER as DEFAULT_LEDGER_STORE
 
@@ -56,6 +57,14 @@ DEFAULT_MAX_DAILY_REPORT_AGE_HOURS = 36.0
 DEFAULT_MAX_WEEKLY_REPORT_AGE_DAYS = 8
 DEFAULT_MAX_TELEMETRY_AGE_HOURS = 48.0
 DEFAULT_MAX_RUN_LOG_AGE_HOURS = 36.0
+# Evidence-integrity thresholds. Attrition is outcome-CORRELATED risk: if
+# unpriceable exits or failed entries cluster in losing or illiquid names, the
+# resolved sample is selected by quote availability and overstates results.
+DEFAULT_MAX_EXIT_ATTRITION_RATE = 0.20
+DEFAULT_MAX_UNIVERSE_ENTRY_FAILURE_RATE = 0.25
+DEFAULT_MIN_ATTRITION_SAMPLE = 5
+DEFAULT_ATTRITION_WINDOW_DAYS = 90
+DEFAULT_MAX_FINALIZING_AGE_HOURS = 24.0
 # Ops-AE C1c (Codex P2): tightened from 36h to 26h. The resolver fires
 # daily at 12:30 local; the daily watchdog fires at 22:15 local. With
 # the previous 36h threshold, a missed today-12:30 run was only ~33.75h
@@ -121,6 +130,11 @@ class EvidenceHealthConfig:
     screener_alert_launchd_log_path: Path = DEFAULT_SCREENER_ALERT_LAUNCHD_LOG
     max_state_backup_age_hours: float = DEFAULT_MAX_STATE_BACKUP_AGE_HOURS
     max_screener_alert_age_days: int = DEFAULT_MAX_SCREENER_ALERT_AGE_DAYS
+    max_exit_attrition_rate: float = DEFAULT_MAX_EXIT_ATTRITION_RATE
+    max_universe_entry_failure_rate: float = DEFAULT_MAX_UNIVERSE_ENTRY_FAILURE_RATE
+    min_attrition_sample: int = DEFAULT_MIN_ATTRITION_SAMPLE
+    attrition_window_days: int = DEFAULT_ATTRITION_WINDOW_DAYS
+    max_finalizing_age_hours: float = DEFAULT_MAX_FINALIZING_AGE_HOURS
 
 
 def build_evidence_health_status(
@@ -155,6 +169,9 @@ def build_evidence_health_status(
     }
     for result in databases.values():
         issues.extend(result["issues"])
+
+    evidence_integrity = _check_evidence_integrity(cfg, now_utc)
+    issues.extend(evidence_integrity["issues"])
 
     watchdog = build_evidence_watchdog_status(
         config=EvidenceWatchdogConfig(
@@ -209,6 +226,7 @@ def build_evidence_health_status(
         "provider_telemetry": provider["summary"],
         "candidate_exit_resolver": candidate_resolver["summary"],
         "databases": {key: value["summary"] for key, value in databases.items()},
+        "evidence_integrity": evidence_integrity["summary"],
         "watchdog": watchdog,
         "issues": issues,
         "summary": _summary_text(status, issues),
@@ -616,6 +634,208 @@ def _check_sqlite_store(name: str, path: Path) -> dict[str, Any]:
     }
 
 
+
+
+def _connect_for_reads(path: Path) -> Optional[sqlite3.Connection]:
+    """Plain connection used ONLY for SELECTs; None if the store is absent.
+
+    Deliberately not the store classes, which run schema migrations on open;
+    and not ``mode=ro``, which can fail on a WAL database needing recovery
+    (the same store the probe in _check_sqlite_store opens normally).
+    """
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(str(path), timeout=2.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    # Errors propagate: an unreadable store must warn, not look like an old schema.
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _attrition_rate(missing: int, resolved: int) -> Optional[float]:
+    entered = missing + resolved
+    return (missing / entered) if entered else None
+
+
+def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[str, Any]:
+    """Alert when evidence quietly degrades instead of failing loudly.
+
+    Covers what the freshness checks cannot see: trades stuck mid-finalization,
+    exits left open past their T-1 valuation day (the exit sweep is not
+    running), exit attrition and universe entry failures above a tolerable
+    rate (outcome-correlated sample selection), and invalidated outcomes that
+    already reached the learning stores.
+    """
+    issues: list[dict[str, Any]] = []
+    today = now.date().isoformat()
+    window_start = (now.date() - timedelta(days=cfg.attrition_window_days)).isoformat()
+    summary: dict[str, Any] = {"window_days": cfg.attrition_window_days}
+
+    conn = _connect_for_reads(cfg.outcome_store_path)
+    if conn is not None:
+        try:
+            columns = _table_columns(conn, "outcome_trades")
+            if {"status", "earnings_date", "evidence_valid", "notes", "updated_at"} <= columns:
+                valid = _VALID_EVIDENCE_SQL
+                stale_cutoff = (now - timedelta(hours=cfg.max_finalizing_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
+                finalizing = conn.execute(
+                    "SELECT trade_id FROM outcome_trades WHERE status = 'finalizing' AND updated_at < ?",
+                    (stale_cutoff,),
+                ).fetchall()
+                orphaned = conn.execute(
+                    f"SELECT trade_id FROM outcome_trades WHERE status = 'open' AND earnings_date <= ? AND {valid}",
+                    (today,),
+                ).fetchall()
+                counts = dict(conn.execute(
+                    f"""
+                    SELECT status, COUNT(*) FROM outcome_trades
+                    WHERE earnings_date >= ? AND earnings_date <= ? AND {valid}
+                      AND status IN ('exit_missing', 'finalized', 'exited')
+                    GROUP BY status
+                    """,
+                    (window_start, today),
+                ).fetchall())
+                missing_reasons = dict(conn.execute(
+                    f"""
+                    SELECT COALESCE(exit_missing_reason, 'unknown'), COUNT(*) FROM outcome_trades
+                    WHERE status = 'exit_missing' AND earnings_date >= ? AND {valid}
+                    GROUP BY 1 ORDER BY 2 DESC
+                    """,
+                    (window_start,),
+                ).fetchall()) if "exit_missing_reason" in columns else {}
+                learned_invalid = conn.execute(
+                    f"SELECT trade_id FROM outcome_trades WHERE NOT {valid} AND learning_update_status = 'complete'"
+                ).fetchall() if "learning_update_status" in columns else []
+                missing = int(counts.get("exit_missing", 0))
+                resolved = int(counts.get("finalized", 0)) + int(counts.get("exited", 0))
+                rate = _attrition_rate(missing, resolved)
+                summary["selector"] = {
+                    "stuck_finalizing": [row["trade_id"] for row in finalizing],
+                    "open_past_exit_day": [row["trade_id"] for row in orphaned],
+                    "exit_missing": missing,
+                    "resolved": resolved,
+                    "exit_attrition_rate": rate,
+                    "exit_missing_by_reason": missing_reasons,
+                    "invalidated_after_learning": [row["trade_id"] for row in learned_invalid],
+                }
+                if finalizing:
+                    issues.append(_issue(
+                        "WARN", "evidence_integrity",
+                        f"{len(finalizing)} trade(s) stuck in 'finalizing' for over {cfg.max_finalizing_age_hours:.0f}h: "
+                        f"{', '.join(row['trade_id'] for row in finalizing[:5])}.",
+                        "A finalize crashed between claiming the trade and writing learning updates. Check the "
+                        "evidence-cycle log for that run; the trade cannot be invalidated until it is finalized.",
+                    ))
+                if orphaned:
+                    issues.append(_issue(
+                        "WARN", "evidence_integrity",
+                        f"{len(orphaned)} trade(s) still open after their T-1 exit day.",
+                        "Exit detection has not run since their exit day; it moves them to exit_missing. "
+                        "Run scripts/run_forward_loop.py and check the evidence-cycle schedule.",
+                    ))
+                if rate is not None and missing + resolved >= cfg.min_attrition_sample and rate > cfg.max_exit_attrition_rate:
+                    issues.append(_issue(
+                        "WARN", "evidence_integrity",
+                        f"Selector exit attrition is {rate:.0%} ({missing} of {missing + resolved} exits in "
+                        f"{cfg.attrition_window_days}d could not be priced; top reasons: {missing_reasons}).",
+                        "Resolved selector results may be biased toward trades that happened to get a quote. "
+                        "See exit_attrition in the evidence report before reading performance.",
+                    ))
+                if learned_invalid:
+                    issues.append(_issue(
+                        "WARN", "evidence_integrity",
+                        f"{len(learned_invalid)} invalidated outcome(s) already reached calibration/priors.",
+                        "Run scripts/backfill_prior_store_timestamps.py (dry run first) to rebuild the "
+                        "learning stores without them.",
+                    ))
+        except sqlite3.Error as exc:
+            summary["selector_error"] = f"{type(exc).__name__}: {exc}"
+            issues.append(_issue(
+                "WARN", "evidence_integrity",
+                f"Could not read the selector store for integrity checks: {type(exc).__name__}: {exc}.",
+                "Evidence attrition is unmonitored until this is fixed; see the store's own health check.",
+            ))
+        finally:
+            conn.close()
+
+    conn = _connect_for_reads(cfg.baseline_store_path)
+    if conn is not None:
+        try:
+            columns = _table_columns(conn, "baseline_trades")
+            if {"status", "earnings_date", "cohort", "skip_reason"} <= columns:
+                exit_counts = dict(conn.execute(
+                    """
+                    SELECT status, COUNT(*) FROM baseline_trades
+                    WHERE earnings_date >= ? AND earnings_date <= ?
+                      AND status IN ('resolved', 'exit_skipped', 'exit_missing')
+                    GROUP BY status
+                    """,
+                    (window_start, today),
+                ).fetchall())
+                # A universe entry that is still entry_skipped once its
+                # earnings date has passed never entered: final attrition.
+                entry_counts = dict(conn.execute(
+                    """
+                    SELECT CASE WHEN status = 'entry_skipped' THEN 'failed' ELSE 'entered' END, COUNT(*)
+                    FROM baseline_trades
+                    WHERE cohort = 'universe' AND earnings_date >= ? AND earnings_date < ?
+                    GROUP BY 1
+                    """,
+                    (window_start, today),
+                ).fetchall())
+                entry_reasons = dict(conn.execute(
+                    """
+                    SELECT COALESCE(skip_reason, 'unknown'), COUNT(*) FROM baseline_trades
+                    WHERE cohort = 'universe' AND status = 'entry_skipped'
+                      AND earnings_date >= ? AND earnings_date < ?
+                    GROUP BY 1 ORDER BY 2 DESC
+                    """,
+                    (window_start, today),
+                ).fetchall())
+                b_missing = int(exit_counts.get("exit_skipped", 0)) + int(exit_counts.get("exit_missing", 0))
+                b_resolved = int(exit_counts.get("resolved", 0))
+                b_rate = _attrition_rate(b_missing, b_resolved)
+                failed = int(entry_counts.get("failed", 0))
+                entered = int(entry_counts.get("entered", 0))
+                entry_rate = _attrition_rate(failed, entered)
+                summary["baselines"] = {
+                    "exit_missing": b_missing,
+                    "resolved": b_resolved,
+                    "exit_attrition_rate": b_rate,
+                    "universe_entries": entered,
+                    "universe_entry_failures": failed,
+                    "universe_entry_failure_rate": entry_rate,
+                    "universe_entry_failures_by_reason": entry_reasons,
+                }
+                if b_rate is not None and b_missing + b_resolved >= cfg.min_attrition_sample and b_rate > cfg.max_exit_attrition_rate:
+                    issues.append(_issue(
+                        "WARN", "evidence_integrity",
+                        f"Baseline exit attrition is {b_rate:.0%} ({b_missing} of {b_missing + b_resolved} in "
+                        f"{cfg.attrition_window_days}d).",
+                        "Baseline comparisons may be biased toward priceable exits; see exit_attrition in the report.",
+                    ))
+                if entry_rate is not None and failed + entered >= cfg.min_attrition_sample and entry_rate > cfg.max_universe_entry_failure_rate:
+                    issues.append(_issue(
+                        "WARN", "evidence_integrity",
+                        f"Universe shadow entries failed for {entry_rate:.0%} of closed events "
+                        f"({failed} of {failed + entered}; top reasons: {entry_reasons}).",
+                        "The universe cohort no longer covers every eligible event; check provider quotes and "
+                        "universe_shadow.entry_attrition in the report.",
+                    ))
+        except sqlite3.Error as exc:
+            summary["baseline_error"] = f"{type(exc).__name__}: {exc}"
+            issues.append(_issue(
+                "WARN", "evidence_integrity",
+                f"Could not read the baseline store for integrity checks: {type(exc).__name__}: {exc}.",
+                "Evidence attrition is unmonitored until this is fixed; see the store's own health check.",
+            ))
+        finally:
+            conn.close()
+
+    return {"summary": summary, "issues": issues}
 
 
 def _launchd_job_freshness(

@@ -189,6 +189,12 @@ Checks performed:
 - baseline store SQLite readability/writability
 - provider telemetry SQLite readability/writability
 - launchd watchdog status
+- evidence integrity (`evidence_integrity`, WARN), read-only against the outcome and baseline stores:
+  - trades stuck in `finalizing` for more than 24h (a finalize crashed mid-way)
+  - trades still `open` after their T-1 exit day (exit detection is not running)
+  - selector or baseline exit attrition above 20% over the last 90 days, with at least 5 exits
+  - universe shadow entries that never entered, for more than 25% of closed events
+  - invalidated outcomes that already reached calibration/priors (run `scripts/backfill_prior_store_timestamps.py`)
 
 Each issue includes a fix suggestion. The health check does not run the selector
 and does not change strategy state.

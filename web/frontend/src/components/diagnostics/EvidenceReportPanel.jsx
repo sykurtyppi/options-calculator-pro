@@ -6,10 +6,14 @@ import {
   buildEvidenceQualitySummary,
   buildEvidenceReportSummary,
   buildEvidenceWarnings,
+  buildExcludedEvidenceSummary,
   buildExecutionRealismSummary,
+  buildExitAttritionRows,
   buildQuoteQualityRows,
   buildSimpleIvRvFilter,
   buildSurfaceQualitySummary,
+  buildUniverseShadowRows,
+  buildUniverseShadowSummary,
 } from './evidenceReportViewModel'
 
 export default function EvidenceReportPanel({ apiBase }) {
@@ -45,6 +49,10 @@ export default function EvidenceReportPanel({ apiBase }) {
   const evidenceQuality = useMemo(() => buildEvidenceQualitySummary(payload || {}), [payload])
   const executionRealism = useMemo(() => buildExecutionRealismSummary(payload || {}), [payload])
   const surfaceQuality = useMemo(() => buildSurfaceQualitySummary(payload || {}), [payload])
+  const universeRows = useMemo(() => buildUniverseShadowRows(payload || {}), [payload])
+  const universe = useMemo(() => buildUniverseShadowSummary(payload || {}), [payload])
+  const attritionRows = useMemo(() => buildExitAttritionRows(payload || {}), [payload])
+  const excluded = useMemo(() => buildExcludedEvidenceSummary(payload || {}), [payload])
 
   return (
     <section className="oos-block evidence-report-block">
@@ -111,7 +119,85 @@ export default function EvidenceReportPanel({ apiBase }) {
             </div>
           </div>
 
+          <div className="selector-panel selector-panel-full">
+            <div className="selector-panel-header">
+              <h3>Did the Selector's Skips Pay?</h3>
+              <span>Every eligible event, shadow-entered whatever the selector said. If skipped events paid as well as picked ones, the selector's filtering is not adding value.</span>
+            </div>
+            {universeRows.length ? (
+              <div className="structure-table-wrap">
+                <table className="structure-table forward-performance-table">
+                  <thead>
+                    <tr><th>Baseline</th><th>All events</th><th>Selector picked</th><th>Selector skipped</th><th>Picked − skipped</th></tr>
+                  </thead>
+                  <tbody>
+                    {universeRows.map((row) => (
+                      <tr key={row.name}>
+                        <td><strong>{row.label}</strong></td>
+                        <td>{row.allReturnLabel} <em>(n={row.allN})</em></td>
+                        <td>{row.pickedReturnLabel} <em>(n={row.pickedN})</em></td>
+                        <td>{row.skippedReturnLabel} <em>(n={row.skippedN})</em></td>
+                        <td>{row.selectorEdgeLabel}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : <div className="oos-message">No resolved universe events yet ({universe.eventsRecorded} recorded, {universe.open} open).</div>}
+          </div>
+
           <div className="selector-explain-grid data-quality-grid">
+            <div className="selector-panel">
+              <div className="selector-panel-header">
+                <h3>Exit Attrition</h3>
+                <span>Entered positions that could not be valued on T-1. High or concentrated attrition biases resolved results.</span>
+              </div>
+              {attritionRows.map((row) => (
+                <div key={row.key}>
+                  <div className="quality-source-row">
+                    <span>{row.label}</span>
+                    <strong>{row.missing} missing / {row.resolved} resolved · {row.rateLabel}</strong>
+                  </div>
+                  {row.reasons.map((reason) => (
+                    <div className="quality-source-row" key={`${row.key}-${reason.label}`}>
+                      <span>↳ {reason.label}</span><strong>{reason.count}</strong>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+            <div className="selector-panel">
+              <div className="selector-panel-header">
+                <h3>Universe Coverage</h3>
+                <span>Failed entries are retried daily while the event is in the DTE window.</span>
+              </div>
+              <div className="quality-source-row"><span>Events recorded</span><strong>{universe.eventsRecorded}</strong></div>
+              <div className="quality-source-row"><span>Entered after a retry</span><strong>{universe.enteredAfterRetry}</strong></div>
+              <div className="quality-source-row"><span>Never entered</span><strong>{universe.notEntered}</strong></div>
+              {universe.notEnteredReasons.map((reason) => (
+                <div className="quality-source-row" key={`entry-${reason.label}`}>
+                  <span>↳ {reason.label}</span><strong>{reason.count}</strong>
+                </div>
+              ))}
+            </div>
+            <div className="selector-panel">
+              <div className="selector-panel-header">
+                <h3>Excluded Evidence</h3>
+                <span>Kept for audit, left out of every comparison above.</span>
+              </div>
+              <div className="quality-source-row"><span>Invalidated selector outcomes</span><strong>{excluded.invalidatedN}</strong></div>
+              {excluded.invalidatedReasons.map((reason) => (
+                <div className="quality-source-row" key={`inv-${reason.label}`}>
+                  <span>↳ {reason.label}</span><strong>{reason.count}</strong>
+                </div>
+              ))}
+              <div className="quality-source-row"><span>Unverified baseline exits</span><strong>{excluded.legacyBaselinesN}</strong></div>
+              {excluded.legacyReasons.map((reason) => (
+                <div className="quality-source-row" key={`legacy-${reason.label}`}>
+                  <span>↳ {reason.label}</span><strong>{reason.count}</strong>
+                </div>
+              ))}
+            </div>
             <div className="selector-panel">
               <div className="selector-panel-header">
                 <h3>Simple IV/RV Filter</h3>
