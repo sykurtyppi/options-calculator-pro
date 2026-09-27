@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from collections import defaultdict
 from datetime import date, datetime, timezone
@@ -245,6 +246,20 @@ def seed_from_trades(
         realized_expansion_pct = gross_return_pct * 100.0
         realized_return_pct = net_return_pct * 100.0
         realized_pnl = row.get("pnl_per_contract")
+        try:
+            realized_pnl = float(realized_pnl) if realized_pnl is not None else None
+        except (TypeError, ValueError):
+            realized_pnl = float("nan")
+        # The outcome store refuses NaN/inf; checking only at the exit write
+        # would stop the run after the entry was inserted, leaving an open row
+        # that no later run repairs.
+        if not all(
+            math.isfinite(value)
+            for value in (setup_score, realized_expansion_pct, realized_return_pct)
+            + ((realized_pnl,) if realized_pnl is not None else ())
+        ):
+            skipped_bad_data += 1
+            continue
 
         raw_symbol = row.get("symbol")
         if raw_symbol is None:

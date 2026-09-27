@@ -73,6 +73,9 @@ from web.api.screener_engine import build_edge_screener
 
 logger = logging.getLogger(__name__)
 
+# Skip / exit_missing reason for an exit whose value is NaN or infinite.
+NON_FINITE_EXIT_REASON = "non_finite_exit_value"
+
 DEFAULT_LOG_PATH = (
     Path.home() / ".options_calculator_pro" / "logs" / "learning_log.jsonl"
 )
@@ -1779,7 +1782,7 @@ def _finalize_baseline_exits(
                     exit_bid_ask_mid=quote.get("bid_ask_mid", {}),
                     exit_execution_scenarios=exit_execution_scenarios,
                     status="exit_skipped",
-                    skip_reason="non_finite_exit_value",
+                    skip_reason=NON_FINITE_EXIT_REASON,
                     exit_repricing=exit_repricing,
                 )
             continue
@@ -2286,6 +2289,20 @@ def run_exit_detection(
         # facts; no quote is re-fetched and the exit day is not moved.
         for pending in trade_store.trades_pending_finalization(as_of):
             pending_id = str(pending["trade_id"])
+            stored = (_safe_float(pending.get("realized_return_pct")), _safe_float(pending.get("realized_expansion_pct")))
+            if not all(value is not None and math.isfinite(value) for value in stored):
+                # A legacy non-finite exit can never be finalized; make it
+                # terminal attrition instead of retrying it every run.
+                if trade_store.mark_recorded_exit_unusable(pending_id, reason=NON_FINITE_EXIT_REASON):
+                    summary["exit_missing"] += 1
+                    _append_learning_log(
+                        log_path,
+                        {"event_type": "exit_missing", "symbol": pending.get("symbol"),
+                         "structure": pending.get("structure"), "source": pending.get("source_type") or "paper",
+                         "trade_id": pending_id, "reason": NON_FINITE_EXIT_REASON},
+                        dry_run=dry_run,
+                    )
+                continue
             try:
                 result = finalizer(
                     trade_id=pending_id,
@@ -2410,6 +2427,23 @@ def run_exit_detection(
         execution_penalty = float(row.get("execution_penalty_at_entry") or 0.0)
         modeled_cost_pct = 26.0 * execution_penalty
         realized_return_pct = gross_return_pct - modeled_cost_pct
+        if not all(
+            value is not None and math.isfinite(value)
+            for value in (float(exit_mid), realized_return_pct, realized_expansion_pct)
+        ) or (realized_pnl is not None and not math.isfinite(realized_pnl)):
+            # The store refuses NaN/inf outcomes. Record the specific reason
+            # (a same-day retry may still price it; otherwise mark_missing_exits
+            # makes it terminal attrition under this reason).
+            summary["skipped"] += 1
+            _record_failed_exit(trade_id, NON_FINITE_EXIT_REASON)
+            _append_learning_log(
+                log_path,
+                {"event_type": "skip", "symbol": symbol, "structure": structure, "source": "paper",
+                 "reason": NON_FINITE_EXIT_REASON, "trade_id": trade_id,
+                 "recommendation_id": row.get("recommendation_id")},
+                dry_run=dry_run,
+            )
+            continue
         entry_execution_scenarios = _loads_dict(row.get("entry_execution_scenarios_json"))
         if not entry_execution_scenarios:
             entry_execution_scenarios = note_payload.get("entry_execution_scenarios", {})

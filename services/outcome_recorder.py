@@ -702,6 +702,37 @@ class OutcomeStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_recorded_exit_unusable(self, trade_id: str, *, reason: str) -> bool:
+        """Move a recorded but unusable exit (e.g. a legacy inf return) to 'exit_missing'.
+
+        Such a row can never be finalized (the finalizer refuses non-finite
+        values), so without a terminal state the pending-finalization sweep
+        would retry it forever. The stored values are kept for audit. Only
+        'exited' rows and expired claims are moved; a live claim is its owner's.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    """
+                    UPDATE outcome_trades
+                    SET status = 'exit_missing',
+                        exit_missing_reason = ?,
+                        finalizing_owner = NULL,
+                        finalizing_since = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE trade_id = ?
+                      AND (
+                        status = 'exited'
+                        OR (
+                          status = 'finalizing'
+                          AND (finalizing_since IS NULL OR finalizing_since <= datetime('now', ?))
+                        )
+                      )
+                    """,
+                    (str(reason), trade_id, f"-{FINALIZATION_LEASE_SECONDS} seconds"),
+                )
+                return cur.rowcount > 0
+
     # ── Exit attrition ────────────────────────────────────────────────────────
 
     def record_exit_attempt_failure(self, trade_id: str, *, reason: str, attempted_on: date) -> bool:

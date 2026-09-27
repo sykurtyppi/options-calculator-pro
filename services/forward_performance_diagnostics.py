@@ -8,6 +8,8 @@ execution-grade live performance.
 
 from __future__ import annotations
 
+import math
+
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
@@ -124,13 +126,15 @@ def build_forward_performance_diagnostics(
 
 
 def _is_resolved(row: Dict[str, Any]) -> bool:
-    if row.get("realized_return_pct") is None:
+    # A non-finite return (legacy rows only; the stores now refuse them) is
+    # not a resolved outcome: it would count in n and poison every average.
+    if _num(row.get("realized_return_pct")) is None:
         return False
     return str(row.get("status") or "") in {"exited", "finalized"}
 
 
 def _is_baseline_resolved(row: Dict[str, Any]) -> bool:
-    if row.get("realized_return_pct") is None:
+    if _num(row.get("realized_return_pct")) is None:
         return False
     return str(row.get("status") or "") in {"resolved", "exited", "finalized"}
 
@@ -549,11 +553,14 @@ def _median(values: Iterable[Optional[float]]) -> Optional[float]:
 
 
 def _num(value: Any) -> Optional[float]:
+    """A finite float, else None (NaN, +/-inf, bools and non-numbers)."""
+    if isinstance(value, bool):
+        return None
     try:
         parsed = float(value)
-        return parsed if parsed == parsed else None
     except Exception:
         return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
