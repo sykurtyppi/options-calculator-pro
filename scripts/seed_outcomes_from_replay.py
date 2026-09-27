@@ -163,6 +163,22 @@ def _parse_date(val: Any) -> Optional[date]:
 # ── Seeding logic ─────────────────────────────────────────────────────────────
 
 
+def _needs_replay_relearn(existing: Dict[str, Any]) -> bool:
+    """A seeded replay row that finalized but never finished its learning."""
+    from services.outcome_recorder import is_outcome_evidence_valid
+
+    return (
+        existing.get("source_type") == "replay"
+        and existing.get("status") == "finalized"
+        and existing.get("learning_update_status") != "complete"
+        and is_outcome_evidence_valid(existing)
+        and all(
+            existing.get(key) is not None
+            for key in ("setup_score", "realized_return_pct", "realized_expansion_pct")
+        )
+    )
+
+
 def seed_from_trades(
     trades: List[Dict[str, Any]],
     *,
@@ -267,18 +283,28 @@ def seed_from_trades(
         )
 
         if not was_new:
+            existing = store.get_trade(trade_id) or {}
             skipped_duplicate += 1
-            continue
-
-        # Mark as finalized immediately — replay trades have no "open" phase.
-        store.update_exit(
-            trade_id=trade_id,
-            exit_date=earnings_date or entry_date,
-            realized_return_pct=realized_return_pct,
-            realized_pnl=float(realized_pnl) if realized_pnl is not None else None,
-            realized_expansion_pct=realized_expansion_pct,
-        )
-        store.mark_finalized(trade_id)
+            # Re-apply learning only to a row THIS script seeded and finalized
+            # whose learning never completed (e.g. a failed store write). A
+            # paper trade can share the id format; learning replay numbers
+            # under its id would make its real outcome a duplicate later.
+            if not _needs_replay_relearn(existing):
+                continue
+            # Learn what the row records, not this run's replay numbers.
+            setup_score = float(existing["setup_score"])
+            realized_return_pct = float(existing["realized_return_pct"])
+            realized_expansion_pct = float(existing["realized_expansion_pct"])
+        else:
+            # Mark as finalized immediately — replay trades have no "open" phase.
+            store.update_exit(
+                trade_id=trade_id,
+                exit_date=earnings_date or entry_date,
+                realized_return_pct=realized_return_pct,
+                realized_pnl=float(realized_pnl) if realized_pnl is not None else None,
+                realized_expansion_pct=realized_expansion_pct,
+            )
+            store.mark_finalized(trade_id)
 
         # ── Update calibration ────────────────────────────────────────────
         obs_date = earnings_date or entry_date
@@ -290,24 +316,46 @@ def seed_from_trades(
                 trade_id,
             )
             continue
-        if cal.update(
-            setup_score,
-            realized_expansion_pct,
-            observation_id=trade_id,
-            source_type="replay",
-            observation_date=obs_date,
-        ):
-            cal_updates += 1
+        # Learning writes can raise (PersistenceError, ValueError); record the
+        # outcome per trade so a failure is retryable instead of the trade
+        # being finalized with no learning and no way to find it again.
+        calibration_ok = prior_ok = False
+        try:
+            if cal.update(
+                setup_score,
+                realized_expansion_pct,
+                observation_id=trade_id,
+                source_type="replay",
+                observation_date=obs_date,
+            ):
+                cal_updates += 1
+            calibration_ok = True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("seed: calibration update failed for %s (%s)", trade_id, exc)
 
         # ── Update structure prior ────────────────────────────────────────
-        ps.update(
-            structure=row_structure,
-            realized_return_pct=realized_return_pct,
-            realized_expansion_pct=realized_expansion_pct,
-            source_type="replay",
-            observation_date=obs_date,
-            observation_id=trade_id,
+        try:
+            ps.update(
+                structure=row_structure,
+                realized_return_pct=realized_return_pct,
+                realized_expansion_pct=realized_expansion_pct,
+                source_type="replay",
+                observation_date=obs_date,
+                observation_id=trade_id,
+            )
+            prior_ok = True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("seed: structure prior update failed for %s (%s)", trade_id, exc)
+
+        store.set_learning_update_status(
+            trade_id,
+            "complete" if calibration_ok and prior_ok
+            else "both_failed" if not (calibration_ok or prior_ok)
+            else "calibration_failed" if not calibration_ok
+            else "prior_failed",
         )
+        if not was_new:
+            continue
 
         inserted += 1
         by_year[entry_date.year] += 1

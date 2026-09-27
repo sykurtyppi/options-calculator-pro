@@ -2237,7 +2237,7 @@ def run_exit_detection(
 ) -> Dict[str, int]:
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
-    summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "baseline_exits": 0, "baseline_skipped": 0}
+    summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "refinalized": 0, "baseline_exits": 0, "baseline_skipped": 0}
 
     # Trades whose T-1 exit day has passed without a price become terminal
     # 'exit_missing' attrition instead of staying open forever.
@@ -2256,6 +2256,31 @@ def run_exit_detection(
                 },
                 dry_run=dry_run,
             )
+
+        # Exits that were recorded but never finalized (a finalize raised or
+        # lost its claim after the exit write) are completed from the stored
+        # facts; no quote is re-fetched and the exit day is not moved.
+        for pending in trade_store.trades_pending_finalization(as_of):
+            pending_id = str(pending["trade_id"])
+            try:
+                result = finalizer(
+                    trade_id=pending_id,
+                    realized_return_pct=float(pending["realized_return_pct"]),
+                    realized_expansion_pct=float(pending["realized_expansion_pct"]),
+                    store=trade_store,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("forward_loop: re-finalize failed for %s: %s", pending_id, exc)
+                continue
+            if isinstance(result, dict) and result.get("status") == "finalized":
+                summary["refinalized"] += 1
+                _append_learning_log(
+                    log_path,
+                    {"event_type": "refinalize", "symbol": pending.get("symbol"),
+                     "structure": pending.get("structure"), "source": pending.get("source_type") or "paper",
+                     "trade_id": pending_id, "learning_update_status": result.get("learning_update_status")},
+                    dry_run=dry_run,
+                )
 
     def _record_failed_exit(trade_id: str, reason: str) -> None:
         if not dry_run:
@@ -2377,21 +2402,40 @@ def run_exit_detection(
         }
 
         if not dry_run:
-            finalizer(
-                trade_id=trade_id,
-                exit_date=as_of,
-                exit_mid=float(exit_mid),
-                realized_return_pct=float(realized_return_pct),
-                realized_pnl=float(realized_pnl),
-                realized_expansion_pct=float(realized_expansion_pct),
-                exit_quote_source=quote.get("quote_source"),
-                exit_quote_quality=quote.get("quote_quality"),
-                exit_quote_timestamp=quote.get("quote_timestamp"),
-                exit_bid_ask_mid=quote.get("bid_ask_mid", {}),
-                exit_execution_scenarios=exit_execution_scenarios,
-                store=trade_store,
-                source_type="paper",
-            )
+            try:
+                finalize_result = finalizer(
+                    trade_id=trade_id,
+                    exit_date=as_of,
+                    exit_mid=float(exit_mid),
+                    realized_return_pct=float(realized_return_pct),
+                    realized_pnl=float(realized_pnl),
+                    realized_expansion_pct=float(realized_expansion_pct),
+                    exit_quote_source=quote.get("quote_source"),
+                    exit_quote_quality=quote.get("quote_quality"),
+                    exit_quote_timestamp=quote.get("quote_timestamp"),
+                    exit_bid_ask_mid=quote.get("bid_ask_mid", {}),
+                    exit_execution_scenarios=exit_execution_scenarios,
+                    store=trade_store,
+                    source_type="paper",
+                )
+            except Exception as exc:
+                # One trade's finalize failing (claimed by another worker,
+                # invalidated, a locked database) must not stop the loop: every
+                # later trade would miss its only exit day.
+                summary["skipped"] += 1
+                reason = f"finalize_failed: {type(exc).__name__}"
+                _record_failed_exit(trade_id, reason)
+                logger.warning("forward_loop: finalize failed for %s: %s", trade_id, exc)
+                _append_learning_log(
+                    log_path,
+                    {"event_type": "skip", "symbol": symbol, "structure": structure, "source": "paper",
+                     "reason": reason, "trade_id": trade_id, "error": str(exc)},
+                    dry_run=dry_run,
+                )
+                continue
+            if isinstance(finalize_result, dict) and finalize_result.get("status") == "claim_lost":
+                summary["skipped"] += 1
+                continue
         summary["exits"] += 1
         _append_learning_log(
             log_path,

@@ -55,8 +55,10 @@ The outcome_trades table must have these columns (added in earlier schema):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
+import math
 import shutil
 import sqlite3
 import sys
@@ -75,6 +77,7 @@ if str(_REPO_ROOT) not in sys.path:
 # and the script rebuilds the same files the forward loop writes.
 from services.calibration_service import _DEFAULT_STORE as _DEFAULT_CAL_STORE  # noqa: E402
 from services.outcome_recorder import _DEFAULT_STORE as _DEFAULT_OUTCOME_DB  # noqa: E402
+from services.durable_json import PersistenceError, atomic_write_json, exclusive_lock  # noqa: E402
 from services.outcome_recorder import _VALID_EVIDENCE_SQL  # noqa: E402
 from services.structure_prior_store import SUPPORTED_STRUCTURES  # noqa: E402
 from services.structure_prior_store import _DEFAULT_STORE as _DEFAULT_PRIOR_STORE  # noqa: E402
@@ -96,6 +99,16 @@ def _parse_date(val: Any) -> Optional[date]:
     return None
 
 
+def _finite(value: Any) -> bool:
+    """A real, finite number (not None, bool, NaN or inf) - anything else is skipped."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"outcome_store not found at {db_path}")
@@ -107,7 +120,7 @@ def _connect_read_only(db_path: Path) -> sqlite3.Connection:
 
 
 def _fetch_trades(db_path: Path) -> List[Dict[str, Any]]:
-    """Read finalized, valid-evidence outcome_trades rows from the SQLite store.
+    """Read finalized (or finalizing), valid-evidence outcome_trades rows.
 
     Finalization is ``status = 'finalized'`` (there is no ``finalized``
     column). Invalidated outcomes are excluded in SQL.
@@ -117,9 +130,11 @@ def _fetch_trades(db_path: Path) -> List[Dict[str, Any]]:
         rows = conn.execute(
             f"""
             SELECT trade_id, structure, source_type, entry_date, exit_date,
-                   realized_return_pct, realized_expansion_pct, setup_score
+                   realized_return_pct, realized_expansion_pct, setup_score, status
             FROM outcome_trades
-            WHERE status = 'finalized'
+            -- 'finalizing' too, but only where a store already holds the
+            -- observation (see _keep_in_flight_only_if_learned).
+            WHERE status IN ('finalized', 'finalizing')
               AND realized_return_pct IS NOT NULL
               AND realized_expansion_pct IS NOT NULL
               AND {_VALID_EVIDENCE_SQL}
@@ -131,6 +146,40 @@ def _fetch_trades(db_path: Path) -> List[Dict[str, Any]]:
     finally:
         conn.close()
     return [dict(r) for r in rows]
+
+
+def _existing_observation_ids(prior_path: Path, cal_path: Path) -> tuple[set[str], set[str]]:
+    """Observation ids already in the prior and calibration stores (lenient)."""
+    prior_ids: set[str] = set()
+    cal_ids: set[str] = set()
+    try:
+        prior = json.loads(prior_path.read_text()) if prior_path.exists() else {}
+        for entry in (prior.get("structures") or {}).values():
+            for obs in entry.get("observations") or []:
+                prior_ids.add(str(obs.get("observation_id")))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read prior store ids: %s", exc)
+    try:
+        cal = json.loads(cal_path.read_text()) if cal_path.exists() else {}
+        cal_ids = {str(value) for value in cal.get("observation_ids") or []}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read calibration store ids: %s", exc)
+    return prior_ids, cal_ids
+
+
+def _keep_in_flight_only_if_learned(trades: List[Dict[str, Any]], learned_ids: set[str]) -> List[Dict[str, Any]]:
+    """Drop 'finalizing' rows whose observation is not already in the store.
+
+    A finalize in flight may have written learning (dropping it would erase
+    that observation), but its exit may also be a crashed attempt's that the
+    retry is about to replace: adding it from the database would make the
+    retry's write a duplicate and keep the stale numbers. So an in-flight row
+    only preserves what the store already has; it never adds.
+    """
+    return [
+        row for row in trades
+        if str(row.get("status") or "finalized") != "finalizing" or str(row.get("trade_id")) in learned_ids
+    ]
 
 
 def _fetch_invalidated_trade_ids(db_path: Path) -> set[str]:
@@ -195,7 +244,7 @@ def _rebuild_prior_store(
 
         realized_return = row.get("realized_return_pct")
         realized_expansion = row.get("realized_expansion_pct")
-        if realized_return is None or realized_expansion is None:
+        if not _finite(realized_return) or not _finite(realized_expansion):
             skipped += 1
             continue
 
@@ -226,6 +275,10 @@ def _rebuild_prior_store(
             kept = [
                 obs for obs in existing_entry.get("observations", [])
                 if str(obs.get("observation_id")) not in (invalidated_ids or set())
+                # Legacy NaN/inf observations would make the rebuilt file
+                # unwritable; this rebuild is their repair path.
+                and _finite(obs.get("realized_return_pct"))
+                and _finite(obs.get("realized_expansion_pct"))
             ]
             new_structures[s] = dict(existing_entry)
             new_structures[s]["observations"] = kept
@@ -271,9 +324,22 @@ def _rebuild_prior_store(
             s, agg["observation_count"], agg["win_rate"], agg["avg_return_pct"],
         )
 
-    # Never drop a structure the store knows about but this script does not.
+    # Never drop a structure the store knows about but this script does not,
+    # but do drop its invalidated and non-finite observations.
     for s, entry in structures.items():
-        new_structures.setdefault(s, entry)
+        if s in new_structures:
+            continue
+        observations = entry.get("observations") or []
+        kept = [
+            obs for obs in observations
+            if str(obs.get("observation_id")) not in (invalidated_ids or set())
+            and _finite(obs.get("realized_return_pct"))
+            and _finite(obs.get("realized_expansion_pct"))
+        ]
+        new_structures[s] = dict(entry)
+        if len(kept) != len(observations):
+            new_structures[s]["observations"] = kept
+            new_structures[s].update(_recompute_aggregates(kept))
 
     payload = {
         "schema_version": _SCHEMA_VERSION,
@@ -286,7 +352,7 @@ def _rebuild_prior_store(
     else:
         _backup(existing_path, dry_run=False)
         existing_path.parent.mkdir(parents=True, exist_ok=True)
-        existing_path.write_text(json.dumps(payload, indent=2))
+        atomic_write_json(existing_path, payload)
         logger.info("Wrote prior store → %s", existing_path)
     return payload
 
@@ -316,7 +382,7 @@ def _rebuild_calibration_store(
     for row in trades:
         setup_score = row.get("setup_score")
         realized_expansion = row.get("realized_expansion_pct")
-        if setup_score is None or realized_expansion is None:
+        if not _finite(setup_score) or not _finite(realized_expansion):
             skipped += 1
             continue
 
@@ -353,9 +419,39 @@ def _rebuild_calibration_store(
     else:
         _backup(existing_path, dry_run=False)
         existing_path.parent.mkdir(parents=True, exist_ok=True)
-        existing_path.write_text(json.dumps(payload, indent=2))
+        atomic_write_json(existing_path, payload)
         logger.info("Wrote calibration store → %s", existing_path)
     return payload
+
+
+def _clean_calibration_store(existing_path: Path, dry_run: bool) -> None:
+    """Drop calibration entries whose score or expansion is NaN/inf."""
+    if not existing_path.exists():
+        return
+    try:
+        existing = json.loads(existing_path.read_text())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read existing calibration store: %s", exc)
+        return
+    scores = list(existing.get("scores") or [])
+    expansions = list(existing.get("expansions") or [])
+    parallel = {key: list(existing.get(key) or []) for key in ("sources", "timestamps")}
+    keep = [i for i in range(min(len(scores), len(expansions))) if _finite(scores[i]) and _finite(expansions[i])]
+    if len(keep) == len(scores) == len(expansions):
+        return
+    payload = dict(existing)
+    payload["scores"] = [float(scores[i]) for i in keep]
+    payload["expansions"] = [float(expansions[i]) for i in keep]
+    for key, values in parallel.items():
+        if len(values) == len(scores):
+            payload[key] = [values[i] for i in keep]
+    payload["n"] = len(keep)
+    logger.info("Calibration: dropped %d non-finite entries", len(scores) - len(keep))
+    if dry_run:
+        print(f"\n[DRY RUN] Would drop {len(scores) - len(keep)} non-finite calibration entries")
+        return
+    _backup(existing_path, dry_run=False)
+    atomic_write_json(existing_path, payload)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -407,23 +503,52 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("Prior store : %s", prior_path)
     logger.info("Cal store   : %s", cal_path)
 
+    # Hold BOTH learning-store locks across fetch -> rebuild -> write, so a
+    # finalize running at the same time cannot write an observation that this
+    # rebuild then discards. (Lock order prior -> calibration; nothing else
+    # holds both, so this cannot deadlock.)
+    if not db_path.exists():
+        logger.error("outcome_store not found at %s", db_path)
+        return 1
     try:
-        trades = _fetch_trades(db_path)
-        invalidated_ids = _fetch_invalidated_trade_ids(db_path)
-    except (FileNotFoundError, RuntimeError) as exc:
+        return _backfill_locked(db_path, prior_path, cal_path, dry_run=dry_run)
+    except PersistenceError as exc:
         logger.error("%s", exc)
         return 1
 
-    logger.info(
-        "Fetched %d finalized valid-evidence trades from outcome_trades (%d invalidated excluded)",
-        len(trades), len(invalidated_ids),
-    )
-    if not trades:
-        logger.warning("No finalized trades found — nothing to backfill.")
-        return 0
 
-    _rebuild_prior_store(trades, prior_path, dry_run=dry_run, invalidated_ids=invalidated_ids)
-    _rebuild_calibration_store(trades, cal_path, dry_run=dry_run)
+def _backfill_locked(db_path: Path, prior_path: Path, cal_path: Path, *, dry_run: bool) -> int:
+    # A dry run touches no files: no lock files, no directories. It reads a
+    # possibly moving snapshot, which is fine for a preview.
+    locks = contextlib.ExitStack()
+    if not dry_run:
+        locks.enter_context(exclusive_lock(prior_path))
+        locks.enter_context(exclusive_lock(cal_path))
+    with locks:
+        try:
+            trades = _fetch_trades(db_path)
+            invalidated_ids = _fetch_invalidated_trade_ids(db_path)
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.error("%s", exc)
+            return 1
+
+        logger.info(
+            "Fetched %d finalized valid-evidence trades from outcome_trades (%d invalidated excluded)",
+            len(trades), len(invalidated_ids),
+        )
+        prior_ids, cal_ids = _existing_observation_ids(prior_path, cal_path)
+        _rebuild_prior_store(
+            _keep_in_flight_only_if_learned(trades, prior_ids), prior_path,
+            dry_run=dry_run, invalidated_ids=invalidated_ids,
+        )
+        cal_trades = _keep_in_flight_only_if_learned(trades, cal_ids)
+        if cal_trades:
+            _rebuild_calibration_store(cal_trades, cal_path, dry_run=dry_run)
+        else:
+            # Nothing to rebuild from: never replace calibration with an empty
+            # store, but still repair legacy non-finite entries.
+            logger.warning("No finalized trades found — calibration kept, non-finite entries dropped.")
+            _clean_calibration_store(cal_path, dry_run=dry_run)
 
     if dry_run:
         print("\nDRY RUN complete.  Re-run with --target=production to apply.")
