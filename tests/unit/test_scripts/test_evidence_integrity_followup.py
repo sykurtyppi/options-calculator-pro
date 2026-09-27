@@ -124,11 +124,13 @@ def _finalize_baselines(tmp_path, store, fetcher, as_of=T_MINUS_1):
 
 def test_legacy_straddle_baseline_resolves_as_unverifiable_and_is_not_compared(tmp_path):
     store = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
-    legacy = {"strike": 100.0, "call_contract": "C100", "put_contract": "P105", "front_expiry": EXPIRY}
+    # Only the call strike recorded, no contract symbols: cannot be verified,
+    # and nothing proves it wrong either.
+    legacy = {"strike": 100.0, "front_expiry": EXPIRY}
     _baseline(store, "always_atm_straddle", "atm_straddle", legacy)
 
     def fetcher(*, symbol, structure, earnings_date, as_of_date, context=None):
-        return {"mid": 6.0, "context": {**STRADDLE, "call_contract": "C100", "put_contract": "P100"}}
+        return {"mid": 6.0, "context": dict(STRADDLE)}
 
     _finalize_baselines(tmp_path, store, fetcher)
 
@@ -138,6 +140,23 @@ def test_legacy_straddle_baseline_resolves_as_unverifiable_and_is_not_compared(t
     report = build_evidence_report(baseline_store=store, outcome_store=OutcomeStore(tmp_path / "o.sqlite"))
     assert "always_atm_straddle" not in report["baseline_comparison"]
     assert report["legacy_repriced_baselines"]["by_exit_repricing"] == {EXIT_REPRICING_UNVERIFIABLE: 1}
+
+
+def test_legacy_straddle_with_conflicting_contract_symbol_fails_closed(tmp_path):
+    # Reviewer's case: C100/P105 booked, exit quote on P100. The strikes cannot
+    # be verified, but the recorded symbols prove a different put.
+    store = BaselineEvidenceStore(tmp_path / "baselines.sqlite")
+    legacy = {"strike": 100.0, "call_contract": "C100", "put_contract": "P105", "front_expiry": EXPIRY}
+    _baseline(store, "always_atm_straddle", "atm_straddle", legacy)
+
+    def fetcher(*, symbol, structure, earnings_date, as_of_date, context=None):
+        return {"mid": 6.0, "context": {**STRADDLE, "call_contract": "C100", "put_contract": "P100"}}
+
+    _finalize_baselines(tmp_path, store, fetcher)
+
+    row = store.list_for_diagnostics()[0]
+    assert (row["status"], row["skip_reason"]) == ("exit_skipped", "booked_contract_mismatch")
+    assert row["realized_return_pct"] is None
 
 
 def test_selector_exit_on_other_contracts_fails_closed_and_records_reason(tmp_path):

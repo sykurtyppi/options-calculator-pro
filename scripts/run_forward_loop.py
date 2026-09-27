@@ -1385,16 +1385,31 @@ def fetch_structure_quote(
                     expiration=str(pricing_context.get("back_expiry") or ""),
                 )
         calendar_surface_quality = _merge_surface_quality(front_surface_quality, back_surface_quality)
-        strike = float(pricing_context.get("strike") or spot)
-        front_row = _nearest_row(front_frame, strike)
-        if front_row is None:
-            _record_quote(False, "missing_front_leg")
-            return {"mid": None, "reason": "missing_front_leg", **_payload(surface_quality=calendar_surface_quality)}
+        booked_strike = _safe_float(pricing_context.get("strike"))
+        if booked_strike is not None:
+            # RE-PRICE an open calendar: both legs must be the booked strike.
+            # Nearest-row per leg let a thin chain price a different front
+            # option and a back option at yet another strike - a position
+            # that was never held.
+            front_row = _row_at_strike(front_frame, booked_strike)
+            booked_back = _safe_float(pricing_context.get("calendar_back_strike"))
+            back_row = _row_at_strike(back_frame, booked_back if booked_back is not None else booked_strike)
+            if front_row is None or back_row is None:
+                reason = "booked_contract_unavailable"
+                _record_quote(False, reason)
+                return {"mid": None, "reason": reason, **_payload(surface_quality=calendar_surface_quality, final_reason=reason)}
+        else:
+            front_row = _nearest_row(front_frame, float(spot))
+            if front_row is None:
+                _record_quote(False, "missing_front_leg")
+                return {"mid": None, "reason": "missing_front_leg", **_payload(surface_quality=calendar_surface_quality)}
+            # Discovery: the back leg must be the SAME strike, or the position
+            # is a diagonal whose P&L the calendar model does not describe.
+            back_row = _row_at_strike(back_frame, float(front_row["strike"]))
+            if back_row is None:
+                _record_quote(False, "missing_back_leg")
+                return {"mid": None, "reason": "missing_back_leg", **_payload(surface_quality=calendar_surface_quality)}
         chosen_strike = float(front_row["strike"])
-        back_row = _nearest_row(back_frame, chosen_strike)
-        if back_row is None:
-            _record_quote(False, "missing_back_leg")
-            return {"mid": None, "reason": "missing_back_leg", **_payload(surface_quality=calendar_surface_quality)}
         front_mid = _mid_from_row(front_row)
         back_mid = _mid_from_row(back_row)
         if front_mid is None or back_mid is None:
@@ -1403,6 +1418,7 @@ def fetch_structure_quote(
         pricing_context.update(
             {
                 "strike": chosen_strike,
+                "calendar_back_strike": float(back_row["strike"]),
                 "front_contract": str(front_row.get("contractSymbol")),
                 "back_contract": str(back_row.get("contractSymbol")),
             }
@@ -1568,11 +1584,20 @@ _BOOKED_LEG_KEYS: Dict[str, tuple[str, ...]] = {
     "atm_straddle": ("strike", "straddle_put_strike"),
     "otm_strangle": ("call_strike", "put_strike"),
     "iron_condor": ("short_call_strike", "long_call_strike", "short_put_strike", "long_put_strike"),
+    "call_calendar": ("strike", "calendar_back_strike"),
+    "put_calendar": ("strike", "calendar_back_strike"),
+}
+# Expiries that identify the position; a calendar has two.
+_BOOKED_EXPIRY_KEYS: Dict[str, tuple[str, ...]] = {
+    "call_calendar": ("front_expiry", "back_expiry"),
+    "put_calendar": ("front_expiry", "back_expiry"),
 }
 _BOOKED_CONTRACT_KEYS: Dict[str, tuple[str, ...]] = {
     "atm_straddle": ("call_contract", "put_contract"),
     "otm_strangle": ("call_contract", "put_contract"),
     "iron_condor": ("short_call_contract", "long_call_contract", "short_put_contract", "long_put_contract"),
+    "call_calendar": ("front_contract", "back_contract"),
+    "put_calendar": ("front_contract", "back_contract"),
 }
 
 
@@ -1582,16 +1607,39 @@ def _contract_symbol(value: Any) -> Optional[str]:
 
 
 def _entry_context_verifiable(structure: str, entry_context: Dict[str, Any]) -> bool:
-    """True when the entry recorded every leg strike and the expiry.
+    """True when the entry recorded every leg strike and every expiry.
 
     Anything less cannot be verified: e.g. straddles entered before
-    ``straddle_put_strike`` existed recorded only the call's strike, while the
-    put actually bought may have been a different strike.
+    ``straddle_put_strike`` existed recorded only the call's strike, and
+    calendars entered before ``calendar_back_strike`` existed recorded only
+    the front strike, while the other leg actually bought may have been a
+    different strike.
     """
     keys = _BOOKED_LEG_KEYS.get(structure)
-    if not keys or not entry_context.get("front_expiry"):
+    if not keys:
+        return False
+    if not all(entry_context.get(key) for key in _BOOKED_EXPIRY_KEYS.get(structure, ("front_expiry",))):
         return False
     return all(_safe_float(entry_context.get(key)) is not None for key in keys)
+
+
+def _contract_symbols_conflict(
+    structure: str,
+    entry_context: Dict[str, Any],
+    exit_context: Dict[str, Any],
+) -> bool:
+    """True when both sides recorded a leg's contract symbol and they differ.
+
+    Usable even when the entry context is too incomplete to verify by strike
+    (legacy rows): a recorded symbol mismatch still proves the exit priced a
+    different contract.
+    """
+    for key in _BOOKED_CONTRACT_KEYS.get(structure, ()):
+        booked_symbol = _contract_symbol(entry_context.get(key))
+        quoted_symbol = _contract_symbol(exit_context.get(key))
+        if booked_symbol and quoted_symbol and booked_symbol != quoted_symbol:
+            return True
+    return False
 
 
 def _booked_contracts_match(
@@ -1610,19 +1658,15 @@ def _booked_contracts_match(
     """
     if not _entry_context_verifiable(structure, entry_context):
         return False
-    if str(exit_context.get("front_expiry") or "") != str(entry_context.get("front_expiry")):
-        return False
+    for key in _BOOKED_EXPIRY_KEYS.get(structure, ("front_expiry",)):
+        if str(exit_context.get(key) or "") != str(entry_context.get(key)):
+            return False
     for key in _BOOKED_LEG_KEYS[structure]:
         booked = float(_safe_float(entry_context.get(key)))
         quoted = _safe_float(exit_context.get(key))
         if quoted is None or abs(quoted - booked) > tolerance:
             return False
-    for key in _BOOKED_CONTRACT_KEYS.get(structure, ()):
-        booked_symbol = _contract_symbol(entry_context.get(key))
-        quoted_symbol = _contract_symbol(exit_context.get(key))
-        if booked_symbol and quoted_symbol and booked_symbol != quoted_symbol:
-            return False
-    return True
+    return not _contract_symbols_conflict(structure, entry_context, exit_context)
 
 
 def _finalize_baseline_exits(
@@ -1676,8 +1720,10 @@ def _finalize_baseline_exits(
         exit_unusable = exit_mid is None or (
             exit_mid < 0 if structure in CREDIT_STRUCTURES else exit_mid <= 0
         )
-        if not exit_unusable and exit_repricing == EXIT_REPRICING_BOOKED and not _booked_contracts_match(
-            structure, entry_context, quote.get("context") or {},
+        exit_context = quote.get("context") or {}
+        if not exit_unusable and (
+            (exit_repricing == EXIT_REPRICING_BOOKED and not _booked_contracts_match(structure, entry_context, exit_context))
+            or (exit_repricing == EXIT_REPRICING_UNVERIFIABLE and _contract_symbols_conflict(structure, entry_context, exit_context))
         ):
             # Fail closed: a quote on any contract other than the one entered
             # is not this position's exit, however plausible its price.
@@ -2272,10 +2318,12 @@ def run_exit_detection(
             )
         else:
             contract_verification = "not_checked_for_structure"
-        if (
-            exit_mid is not None
-            and contract_verification == "verified"
-            and not _booked_contracts_match(structure, entry_pricing_context, quote.get("context") or {})
+        exit_context = quote.get("context") or {}
+        if exit_mid is not None and (
+            (contract_verification == "verified"
+             and not _booked_contracts_match(structure, entry_pricing_context, exit_context))
+            or (contract_verification == "unverifiable_entry_context"
+                and _contract_symbols_conflict(structure, entry_pricing_context, exit_context))
         ):
             # Fail closed: a price for other contracts is not this trade's exit.
             exit_mid = None
