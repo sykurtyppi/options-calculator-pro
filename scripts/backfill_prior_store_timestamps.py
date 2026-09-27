@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import shutil
 import sqlite3
 import sys
@@ -75,6 +76,7 @@ if str(_REPO_ROOT) not in sys.path:
 # and the script rebuilds the same files the forward loop writes.
 from services.calibration_service import _DEFAULT_STORE as _DEFAULT_CAL_STORE  # noqa: E402
 from services.outcome_recorder import _DEFAULT_STORE as _DEFAULT_OUTCOME_DB  # noqa: E402
+from services.durable_json import PersistenceError, atomic_write_json, exclusive_lock  # noqa: E402
 from services.outcome_recorder import _VALID_EVIDENCE_SQL  # noqa: E402
 from services.structure_prior_store import SUPPORTED_STRUCTURES  # noqa: E402
 from services.structure_prior_store import _DEFAULT_STORE as _DEFAULT_PRIOR_STORE  # noqa: E402
@@ -96,6 +98,16 @@ def _parse_date(val: Any) -> Optional[date]:
     return None
 
 
+def _finite(value: Any) -> bool:
+    """A real, finite number (not None, bool, NaN or inf) - anything else is skipped."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"outcome_store not found at {db_path}")
@@ -107,7 +119,7 @@ def _connect_read_only(db_path: Path) -> sqlite3.Connection:
 
 
 def _fetch_trades(db_path: Path) -> List[Dict[str, Any]]:
-    """Read finalized, valid-evidence outcome_trades rows from the SQLite store.
+    """Read finalized (or finalizing), valid-evidence outcome_trades rows.
 
     Finalization is ``status = 'finalized'`` (there is no ``finalized``
     column). Invalidated outcomes are excluded in SQL.
@@ -119,7 +131,10 @@ def _fetch_trades(db_path: Path) -> List[Dict[str, Any]]:
             SELECT trade_id, structure, source_type, entry_date, exit_date,
                    realized_return_pct, realized_expansion_pct, setup_score
             FROM outcome_trades
-            WHERE status = 'finalized'
+            -- 'finalizing' too: a finalize in flight has written its exit
+            -- and may already have written learning; dropping it here would
+            -- erase that observation (its own write dedupes afterwards).
+            WHERE status IN ('finalized', 'finalizing')
               AND realized_return_pct IS NOT NULL
               AND realized_expansion_pct IS NOT NULL
               AND {_VALID_EVIDENCE_SQL}
@@ -195,7 +210,7 @@ def _rebuild_prior_store(
 
         realized_return = row.get("realized_return_pct")
         realized_expansion = row.get("realized_expansion_pct")
-        if realized_return is None or realized_expansion is None:
+        if not _finite(realized_return) or not _finite(realized_expansion):
             skipped += 1
             continue
 
@@ -226,6 +241,10 @@ def _rebuild_prior_store(
             kept = [
                 obs for obs in existing_entry.get("observations", [])
                 if str(obs.get("observation_id")) not in (invalidated_ids or set())
+                # Legacy NaN/inf observations would make the rebuilt file
+                # unwritable; this rebuild is their repair path.
+                and _finite(obs.get("realized_return_pct"))
+                and _finite(obs.get("realized_expansion_pct"))
             ]
             new_structures[s] = dict(existing_entry)
             new_structures[s]["observations"] = kept
@@ -286,7 +305,7 @@ def _rebuild_prior_store(
     else:
         _backup(existing_path, dry_run=False)
         existing_path.parent.mkdir(parents=True, exist_ok=True)
-        existing_path.write_text(json.dumps(payload, indent=2))
+        atomic_write_json(existing_path, payload)
         logger.info("Wrote prior store → %s", existing_path)
     return payload
 
@@ -316,7 +335,7 @@ def _rebuild_calibration_store(
     for row in trades:
         setup_score = row.get("setup_score")
         realized_expansion = row.get("realized_expansion_pct")
-        if setup_score is None or realized_expansion is None:
+        if not _finite(setup_score) or not _finite(realized_expansion):
             skipped += 1
             continue
 
@@ -353,7 +372,7 @@ def _rebuild_calibration_store(
     else:
         _backup(existing_path, dry_run=False)
         existing_path.parent.mkdir(parents=True, exist_ok=True)
-        existing_path.write_text(json.dumps(payload, indent=2))
+        atomic_write_json(existing_path, payload)
         logger.info("Wrote calibration store → %s", existing_path)
     return payload
 
@@ -407,23 +426,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info("Prior store : %s", prior_path)
     logger.info("Cal store   : %s", cal_path)
 
+    # Hold BOTH learning-store locks across fetch -> rebuild -> write, so a
+    # finalize running at the same time cannot write an observation that this
+    # rebuild then discards. (Lock order prior -> calibration; nothing else
+    # holds both, so this cannot deadlock.)
+    if not db_path.exists():
+        logger.error("outcome_store not found at %s", db_path)
+        return 1
     try:
-        trades = _fetch_trades(db_path)
-        invalidated_ids = _fetch_invalidated_trade_ids(db_path)
-    except (FileNotFoundError, RuntimeError) as exc:
+        return _backfill_locked(db_path, prior_path, cal_path, dry_run=dry_run)
+    except PersistenceError as exc:
         logger.error("%s", exc)
         return 1
 
-    logger.info(
-        "Fetched %d finalized valid-evidence trades from outcome_trades (%d invalidated excluded)",
-        len(trades), len(invalidated_ids),
-    )
-    if not trades:
-        logger.warning("No finalized trades found — nothing to backfill.")
-        return 0
 
-    _rebuild_prior_store(trades, prior_path, dry_run=dry_run, invalidated_ids=invalidated_ids)
-    _rebuild_calibration_store(trades, cal_path, dry_run=dry_run)
+def _backfill_locked(db_path: Path, prior_path: Path, cal_path: Path, *, dry_run: bool) -> int:
+    with exclusive_lock(prior_path), exclusive_lock(cal_path):
+        try:
+            trades = _fetch_trades(db_path)
+            invalidated_ids = _fetch_invalidated_trade_ids(db_path)
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.error("%s", exc)
+            return 1
+
+        logger.info(
+            "Fetched %d finalized valid-evidence trades from outcome_trades (%d invalidated excluded)",
+            len(trades), len(invalidated_ids),
+        )
+        if not trades:
+            logger.warning("No finalized trades found — nothing to backfill.")
+            return 0
+
+        _rebuild_prior_store(trades, prior_path, dry_run=dry_run, invalidated_ids=invalidated_ids)
+        _rebuild_calibration_store(trades, cal_path, dry_run=dry_run)
 
     if dry_run:
         print("\nDRY RUN complete.  Re-run with --target=production to apply.")

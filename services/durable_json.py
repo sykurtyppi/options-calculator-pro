@@ -25,11 +25,15 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class PersistenceError(RuntimeError):
@@ -67,12 +71,28 @@ def read_json_strict(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_constant)
+    except _NonFiniteValue as exc:
+        # Older writers allowed NaN/Infinity. Refusing here keeps every later
+        # write from failing on it; the file is left for repair, e.g. a
+        # rebuild with scripts/backfill_prior_store_timestamps.py.
+        raise PersistenceError(
+            f"{path} contains a non-finite value ({exc}); it cannot be updated until repaired "
+            "(rebuild it with scripts/backfill_prior_store_timestamps.py)"
+        ) from exc
     except (OSError, ValueError) as exc:
         raise PersistenceError(f"cannot read {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise PersistenceError(f"{path} does not contain a JSON object")
     return raw
+
+
+class _NonFiniteValue(ValueError):
+    pass
+
+
+def _reject_constant(name: str) -> Any:
+    raise _NonFiniteValue(name)
 
 
 def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -88,11 +108,6 @@ def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
     except (OSError, ValueError, TypeError) as exc:
         raise PersistenceError(f"cannot write {path}: {exc}") from exc
     finally:
@@ -101,3 +116,14 @@ def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
                 tmp_path.unlink()
             except OSError:
                 pass
+    # The new file is in place from here on: reporting failure now would make
+    # the caller believe nothing changed (and a retry could double-count). A
+    # failed directory fsync only weakens crash durability of the rename.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        logger.warning("durable_json: directory fsync failed after writing %s (%s)", path, exc)

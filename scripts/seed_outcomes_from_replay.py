@@ -267,18 +267,23 @@ def seed_from_trades(
         )
 
         if not was_new:
+            existing = store.get_trade(trade_id) or {}
+            if existing.get("learning_update_status") == "complete":
+                skipped_duplicate += 1
+                continue
+            # Seeded before, but its learning never completed (e.g. a failed
+            # store write): re-apply below. Both stores dedupe on trade_id.
             skipped_duplicate += 1
-            continue
-
-        # Mark as finalized immediately — replay trades have no "open" phase.
-        store.update_exit(
-            trade_id=trade_id,
-            exit_date=earnings_date or entry_date,
-            realized_return_pct=realized_return_pct,
-            realized_pnl=float(realized_pnl) if realized_pnl is not None else None,
-            realized_expansion_pct=realized_expansion_pct,
-        )
-        store.mark_finalized(trade_id)
+        else:
+            # Mark as finalized immediately — replay trades have no "open" phase.
+            store.update_exit(
+                trade_id=trade_id,
+                exit_date=earnings_date or entry_date,
+                realized_return_pct=realized_return_pct,
+                realized_pnl=float(realized_pnl) if realized_pnl is not None else None,
+                realized_expansion_pct=realized_expansion_pct,
+            )
+            store.mark_finalized(trade_id)
 
         # ── Update calibration ────────────────────────────────────────────
         obs_date = earnings_date or entry_date
@@ -290,24 +295,46 @@ def seed_from_trades(
                 trade_id,
             )
             continue
-        if cal.update(
-            setup_score,
-            realized_expansion_pct,
-            observation_id=trade_id,
-            source_type="replay",
-            observation_date=obs_date,
-        ):
-            cal_updates += 1
+        # Learning writes can raise (PersistenceError, ValueError); record the
+        # outcome per trade so a failure is retryable instead of the trade
+        # being finalized with no learning and no way to find it again.
+        calibration_ok = prior_ok = False
+        try:
+            if cal.update(
+                setup_score,
+                realized_expansion_pct,
+                observation_id=trade_id,
+                source_type="replay",
+                observation_date=obs_date,
+            ):
+                cal_updates += 1
+            calibration_ok = True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("seed: calibration update failed for %s (%s)", trade_id, exc)
 
         # ── Update structure prior ────────────────────────────────────────
-        ps.update(
-            structure=row_structure,
-            realized_return_pct=realized_return_pct,
-            realized_expansion_pct=realized_expansion_pct,
-            source_type="replay",
-            observation_date=obs_date,
-            observation_id=trade_id,
+        try:
+            ps.update(
+                structure=row_structure,
+                realized_return_pct=realized_return_pct,
+                realized_expansion_pct=realized_expansion_pct,
+                source_type="replay",
+                observation_date=obs_date,
+                observation_id=trade_id,
+            )
+            prior_ok = True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("seed: structure prior update failed for %s (%s)", trade_id, exc)
+
+        store.set_learning_update_status(
+            trade_id,
+            "complete" if calibration_ok and prior_ok
+            else "both_failed" if not (calibration_ok or prior_ok)
+            else "calibration_failed" if not calibration_ok
+            else "prior_failed",
         )
+        if not was_new:
+            continue
 
         inserted += 1
         by_year[entry_date.year] += 1

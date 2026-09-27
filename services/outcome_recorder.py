@@ -201,6 +201,10 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
 # How long a finalization claim is exclusive before another worker may take
 # it over (a finalize that crashed mid-way).
 FINALIZATION_LEASE_SECONDS = 900
+# learning_update_status when a worker's claim lapsed while it was writing
+# learning (e.g. blocked on a store lock past the lease): the stores may hold
+# an observation for a row another worker now owns or that was invalidated.
+LEARNING_WRITTEN_AFTER_CLAIM_LOST = "complete_after_claim_lost"
 
 # SQL twin of is_outcome_evidence_valid(). Mutations that write outcome or
 # learning state carry it in their WHERE clause, so an invalidation made after
@@ -647,11 +651,19 @@ class OutcomeStore:
             SELECT *
             FROM outcome_trades
             WHERE earnings_date = ?
-              AND status IN ('open', 'exited', 'finalizing')
+              AND (
+                status IN ('open', 'exited')
+                -- A live claim belongs to another worker; only an expired
+                -- (crashed) claim is picked up again.
+                OR (
+                  status = 'finalizing'
+                  AND (finalizing_since IS NULL OR finalizing_since <= datetime('now', ?))
+                )
+              )
               AND {valid}
             ORDER BY entry_date, symbol
             """.format(valid=_VALID_EVIDENCE_SQL),
-            (target_earnings_date,),
+            (target_earnings_date, f"-{FINALIZATION_LEASE_SECONDS} seconds"),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -692,12 +704,20 @@ class OutcomeStore:
                     """
                     SELECT trade_id, symbol, structure, earnings_date, last_exit_attempt_reason
                     FROM outcome_trades
-                    WHERE status = 'open'
-                      AND earnings_date IS NOT NULL
+                    WHERE earnings_date IS NOT NULL
                       AND earnings_date <= ?
                       AND {valid}
+                      AND (
+                        status = 'open'
+                        -- A crashed finalize that never wrote the exit.
+                        OR (
+                          status = 'finalizing'
+                          AND exit_date IS NULL
+                          AND (finalizing_since IS NULL OR finalizing_since <= datetime('now', ?))
+                        )
+                      )
                     """.format(valid=_VALID_EVIDENCE_SQL),
-                    (_fmt_date(as_of_date),),
+                    (_fmt_date(as_of_date), f"-{FINALIZATION_LEASE_SECONDS} seconds"),
                 ).fetchall()
                 moved = []
                 for row in due:
@@ -707,8 +727,10 @@ class OutcomeStore:
                         UPDATE outcome_trades
                         SET status = 'exit_missing',
                             exit_missing_reason = ?,
+                            finalizing_owner = NULL,
+                            finalizing_since = NULL,
                             updated_at = CURRENT_TIMESTAMP
-                        WHERE trade_id = ? AND status = 'open'
+                        WHERE trade_id = ? AND status IN ('open', 'finalizing') AND exit_date IS NULL
                         """,
                         (reason, row["trade_id"]),
                     )
@@ -758,6 +780,77 @@ class OutcomeStore:
                       )
                     """.format(valid=_VALID_EVIDENCE_SQL),
                     (owner, trade_id, f"-{int(lease_seconds)} seconds"),
+                )
+                return cur.rowcount > 0
+
+    def renew_finalization_claim(
+        self,
+        trade_id: str,
+        *,
+        owner: str,
+        lease_seconds: int = FINALIZATION_LEASE_SECONDS,
+    ) -> bool:
+        """Re-confirm a claim immediately before an irreversible write.
+
+        True only if ``owner`` still holds a LIVE claim on a valid row; the
+        lease is then restarted. False if the lease expired (another worker may
+        have taken over, or the row was invalidated after expiry) - the caller
+        must not write learning then.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    """
+                    UPDATE outcome_trades
+                    SET finalizing_since = datetime('now'),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE trade_id = ?
+                      AND status = 'finalizing'
+                      AND finalizing_owner = ?
+                      AND finalizing_since > datetime('now', ?)
+                      AND {valid}
+                    """.format(valid=_VALID_EVIDENCE_SQL),
+                    (trade_id, owner, f"-{int(lease_seconds)} seconds"),
+                )
+                return cur.rowcount > 0
+
+    def flag_learning_written_without_claim(self, trade_id: str) -> None:
+        """Record that learning was written by a worker whose claim had lapsed.
+
+        Deliberately NOT guarded by validity: this is exactly the case where
+        the row may have been invalidated meanwhile, and the health check must
+        still see that the learning stores contain it (repair: rebuild them
+        with scripts/backfill_prior_store_timestamps.py).
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    "UPDATE outcome_trades SET learning_update_status = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE trade_id = ?",
+                    (LEARNING_WRITTEN_AFTER_CLAIM_LOST, trade_id),
+                )
+
+    def release_finalization_claim(self, trade_id: str, *, owner: str) -> bool:
+        """Undo a claim that failed before any learning write.
+
+        The row returns to 'exited' if it already has exit facts, else 'open',
+        so the normal exit / exit_missing handling can reach it again instead
+        of it sitting in 'finalizing' forever.
+        """
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    """
+                    UPDATE outcome_trades
+                    SET status = CASE WHEN exit_date IS NOT NULL THEN 'exited' ELSE 'open' END,
+                        finalizing_owner = NULL,
+                        finalizing_since = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE trade_id = ?
+                      AND status = 'finalizing'
+                      AND finalizing_owner = ?
+                    """,
+                    (trade_id, owner),
                 )
                 return cur.rowcount > 0
 
@@ -1198,6 +1291,26 @@ def finalize_trade_and_update_learning(
         current = s.get_trade(trade_id) or {}
         if str(current.get("status") or "") == "finalized" and is_outcome_evidence_valid(current):
             already_finalized = True
+            # Learning must describe the FINALIZED facts, not whatever this
+            # caller passed (a retry or a racing worker may carry different
+            # numbers); the stores dedupe on trade_id, so the first write wins.
+            stored_return = current.get("realized_return_pct")
+            stored_expansion = current.get("realized_expansion_pct")
+            if stored_return is None or stored_expansion is None:
+                raise ValueError(
+                    f"finalize_trade_and_update_learning: trade_id={trade_id!r} is finalized "
+                    "without realized values; refusing to update learning stores"
+                )
+            if (float(stored_return), float(stored_expansion)) != (float(realized_return_pct), float(realized_expansion_pct)):
+                warnings.append(
+                    "trade was already finalized; learning uses the stored realized values, "
+                    "not the ones passed to this call"
+                )
+            realized_return_pct = float(stored_return)
+            realized_expansion_pct = float(stored_expansion)
+            setup_score = float(current.get("setup_score") or setup_score)
+            if current.get("exit_date"):
+                resolved_exit_date = date.fromisoformat(str(current["exit_date"])[:10])
         else:
             raise ValueError(
                 f"finalize_trade_and_update_learning: trade_id={trade_id!r} could not be claimed for "
@@ -1205,27 +1318,55 @@ def finalize_trade_and_update_learning(
                 "refusing to update learning stores"
             )
 
+    def _still_owned() -> bool:
+        # Re-confirm immediately before each irreversible learning write: a
+        # worker that outlived its lease (e.g. blocked on a store lock) must
+        # not write, because the row may have been taken over or invalidated.
+        if already_finalized:
+            latest = s.get_trade(trade_id) or {}
+            return str(latest.get("status") or "") == "finalized" and is_outcome_evidence_valid(latest)
+        return s.renew_finalization_claim(trade_id, owner=owner)
+
+    def _claim_lost_result() -> Dict[str, Any]:
+        warnings.append("finalization claim was lost before the learning writes; another worker owns the trade")
+        return {
+            "trade_id": trade_id,
+            "structure": structure,
+            "status": "claim_lost",
+            "learning_update_status": None,
+            "warnings": warnings,
+        }
+
     if exit_fields_provided and not already_finalized:
-        if not s.update_exit(
-            owner=owner,
-            trade_id=trade_id,
-            exit_date=resolved_exit_date,
-            exit_mid=exit_mid,
-            realized_return_pct=realized_return_pct,
-            realized_pnl=realized_pnl,
-            realized_expansion_pct=realized_expansion_pct,
-            exit_quote_source=exit_quote_source,
-            exit_quote_quality=exit_quote_quality,
-            exit_quote_timestamp=exit_quote_timestamp,
-            exit_bid_ask_mid=exit_bid_ask_mid,
-            exit_execution_scenarios=exit_execution_scenarios,
-        ):
+        try:
+            exit_written = s.update_exit(
+                owner=owner,
+                trade_id=trade_id,
+                exit_date=resolved_exit_date,
+                exit_mid=exit_mid,
+                realized_return_pct=realized_return_pct,
+                realized_pnl=realized_pnl,
+                realized_expansion_pct=realized_expansion_pct,
+                exit_quote_source=exit_quote_source,
+                exit_quote_quality=exit_quote_quality,
+                exit_quote_timestamp=exit_quote_timestamp,
+                exit_bid_ask_mid=exit_bid_ask_mid,
+                exit_execution_scenarios=exit_execution_scenarios,
+            )
+        except Exception:
+            # Nothing irreversible has happened yet: hand the row back so the
+            # normal exit / exit_missing handling can reach it again.
+            s.release_finalization_claim(trade_id, owner=owner)
+            raise
+        if not exit_written:
             raise ValueError(
                 f"finalize_trade_and_update_learning: trade_id={trade_id!r} lost its finalization "
                 "claim before the exit was written; refusing to update learning stores"
             )
 
     # ── 3. Update calibration ─────────────────────────────────────────────────
+    if not _still_owned():
+        return _claim_lost_result()
     calibration_ok = False
     try:
         from services.calibration_service import get_calibration
@@ -1241,6 +1382,10 @@ def finalize_trade_and_update_learning(
         )
         n_after = cal._n()
         cal_phase = cal._phase()
+        if calibration_recorded and not _still_owned():
+            # The write may have waited on the store lock past the lease.
+            s.flag_learning_written_without_claim(trade_id)
+            return _claim_lost_result()
         if not calibration_recorded:
             warnings.append(
                 f"calibration observation already present for trade_id={trade_id}"
@@ -1255,6 +1400,8 @@ def finalize_trade_and_update_learning(
         cal_phase = "unknown"
 
     # ── 4. Update structure prior ─────────────────────────────────────────────
+    if not _still_owned():
+        return _claim_lost_result()
     prior_obs_count = 0
     prior_win_rate: Optional[float] = None
     prior_ok = False
@@ -1262,7 +1409,7 @@ def finalize_trade_and_update_learning(
         from services.structure_prior_store import get_structure_prior_store
 
         ps = get_structure_prior_store()
-        ps.update(
+        prior_recorded = ps.update(
             structure=structure,
             realized_return_pct=realized_return_pct,
             realized_expansion_pct=realized_expansion_pct,
@@ -1270,6 +1417,9 @@ def finalize_trade_and_update_learning(
             observation_date=resolved_exit_date,
             observation_id=trade_id,
         )
+        if prior_recorded and not _still_owned():
+            s.flag_learning_written_without_claim(trade_id)
+            return _claim_lost_result()
         diag = ps.diagnostics()
         struct_entry = diag["structures"].get(structure, {})
         prior_obs_count = struct_entry.get("observation_count", 0)
@@ -1301,11 +1451,18 @@ def finalize_trade_and_update_learning(
         learning_status = "calibration_failed"
     else:
         learning_status = "prior_failed"
-    s.set_learning_update_status(trade_id, learning_status)
 
-    # ── 7. Mark finalized ─────────────────────────────────────────────────────
-    if not already_finalized and not s.mark_finalized(trade_id, owner=owner):
-        warnings.append("finalization claim was lost before the trade could be marked finalized")
+    # ── 7. Record status and mark finalized ───────────────────────────────────
+    # Only the claim holder records the outcome: a worker that lost its claim
+    # must not overwrite the status the new owner records.
+    if already_finalized:
+        s.set_learning_update_status(trade_id, learning_status)
+    elif not s.renew_finalization_claim(trade_id, owner=owner):
+        return _claim_lost_result()
+    else:
+        s.set_learning_update_status(trade_id, learning_status)
+        if not s.mark_finalized(trade_id, owner=owner):
+            return _claim_lost_result()
 
     return {
         "trade_id": trade_id,

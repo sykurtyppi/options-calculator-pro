@@ -707,7 +707,8 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                     (window_start,),
                 ).fetchall()) if "exit_missing_reason" in columns else {}
                 learned_invalid = conn.execute(
-                    f"SELECT trade_id FROM outcome_trades WHERE NOT {valid} AND learning_update_status = 'complete'"
+                    f"SELECT trade_id FROM outcome_trades WHERE NOT {valid} "
+                    "AND learning_update_status IN ('complete', 'complete_after_claim_lost')"
                 ).fetchall() if "learning_update_status" in columns else []
                 missing = int(counts.get("exit_missing", 0))
                 resolved = int(counts.get("finalized", 0)) + int(counts.get("exited", 0))
