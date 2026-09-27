@@ -70,7 +70,7 @@ def test_gate_is_never_ready_while_claims_are_withheld(flags):
     assert len(gate["blocking_reasons"]) == flags.count(False)
 
 
-@pytest.mark.parametrize("label", ["Early observation", "Insufficient evidence", None])
+@pytest.mark.parametrize("label", ["Early observational", "Insufficient evidence", None])
 def test_gate_blocks_immature_label(label):
     gate = _commercialization_gate(active_days=365, selector_n=1000, maturity={**MATURE, "maturity_label": label})
     assert gate["ready_for_paid_beta"] is False

@@ -97,7 +97,10 @@ def build_evidence_report(
         active_evidence_days=active_days,
         resolved_selector_outcomes=selector_stats["n"],
         resolved_baseline_outcomes=len(comparable_paired),
-        claimable_evidence_count=int(evidence_quality.get("claim_allowed_count") or 0),
+        # Headline claims are about the selector's RESOLVED outcomes: rows
+        # marked claimable at entry (open trades, shadow baselines, legacy
+        # non-finite rows) must not make the claimable sample look ready.
+        claimable_evidence_count=_claimable_resolved_count(selected),
         max_bucket_sample_size=_max_bucket_sample_size(forward.get("calibration_report", {})),
     )
 
@@ -215,7 +218,8 @@ def build_weekly_evidence_report(
     )
     data_quality = data_quality_diagnostics or build_data_quality_diagnostics(max_rows=max_rows, recent_limit=recent_limit)
     provider = provider_telemetry_diagnostics or build_provider_telemetry_diagnostics(limit=recent_limit)
-    return {
+    # Exported as JSON like the daily report, so it must be strict JSON too.
+    return _json_safe({
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "report_type": "weekly_evidence_report",
         "evidence_label": "paper_research_not_execution_grade",
@@ -250,7 +254,7 @@ def build_weekly_evidence_report(
             "Paper/research rows are not execution-grade broker fills.",
             "Maturity guardrails block interpretation when sample sizes or date spans are weak.",
         ],
-    }
+    })
 
 
 def _is_resolved(row: Dict[str, Any]) -> bool:
@@ -333,7 +337,8 @@ def _commercialization_gate(*, active_days: int, selector_n: int, maturity: Dict
     checks = {
         f"at least {MIN_COMMERCIAL_EVIDENCE_DAYS} evidence days": active_days >= MIN_COMMERCIAL_EVIDENCE_DAYS,
         f"at least {MIN_RESOLVED_SAMPLE} resolved selector outcomes": selector_n >= MIN_RESOLVED_SAMPLE,
-        "enough claimable (execution-grade) evidence": bool(maturity.get("edge_quality_label_allowed")),
+        # Counted over resolved selector outcomes only (see _claimable_resolved_count).
+        "enough claimable resolved selector outcomes": bool(maturity.get("edge_quality_label_allowed")),
         "enough matched selector and baseline outcomes to compare": bool(maturity.get("benchmark_comparison_meaningful")),
         "calibration buckets large enough to interpret": bool(maturity.get("bucket_interpretation_allowed")),
         "evidence maturity past early observation": maturity.get("maturity_label") in {"Developing evidence", "Mature evidence"},
@@ -424,7 +429,10 @@ def _exit_attrition(
         row for row in baseline_rows
         if str(row.get("status") or "") in {"exit_skipped", "exit_missing"}
     ]
-    baseline_resolved = [row for row in baseline_rows if str(row.get("status") or "") == "resolved"]
+    baseline_resolved = [
+        row for row in baseline_rows
+        if str(row.get("status") or "") == "resolved" and not _has_non_finite_return(row)
+    ]
 
     def _block(missing: list, resolved: list, reason_key: str) -> Dict[str, Any]:
         entered = len(missing) + len(resolved)
@@ -451,6 +459,7 @@ def _universe_shadow_summary(baselines: Iterable[Dict[str, Any]]) -> Dict[str, A
     resolved = [
         row for row in rows
         if str(row.get("status") or "") == "resolved" and is_booked_strike_exit(row)
+        and not _has_non_finite_return(row)
     ]
     by_baseline: Dict[str, Dict[str, Any]] = {}
     for name in sorted({str(row.get("baseline_name") or "unknown_baseline") for row in resolved}):
@@ -515,6 +524,11 @@ def _simple_iv_rv_filter(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     stats["skipped_by_filter"] = len(skipped)
     stats["rule"] = "Keep selected paper outcomes only when iv_rv_har <= 1.05; otherwise no-trade."
     return stats
+
+
+def _claimable_resolved_count(selected: Iterable[Dict[str, Any]]) -> int:
+    """Resolved, finite, valid selector outcomes that are claim-allowed."""
+    return sum(1 for row in selected if _truthy(row.get("claim_allowed")))
 
 
 def _evidence_quality_summary(
