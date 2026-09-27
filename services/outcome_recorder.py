@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import threading
@@ -43,6 +44,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -468,10 +471,10 @@ class OutcomeStore:
         """.format(valid=_VALID_EVIDENCE_SQL)
         params = (
             _fmt_date(exit_date),
-            exit_mid,
-            realized_return_pct,
-            realized_pnl,
-            realized_expansion_pct,
+            _finite_or_none("exit_mid", exit_mid),
+            _finite_or_none("realized_return_pct", realized_return_pct),
+            _finite_or_none("realized_pnl", realized_pnl),
+            _finite_or_none("realized_expansion_pct", realized_expansion_pct),
             exit_quote_source,
             exit_quote_quality,
             exit_quote_timestamp,
@@ -1116,6 +1119,26 @@ def _bool_int(value: Optional[bool]) -> Optional[int]:
     return 1 if bool(value) else 0
 
 
+def _finite_or_none(name: str, value: Any) -> Optional[float]:
+    """*value* as a finite float (None passes through), else ValueError.
+
+    Realized outcome fields feed every report statistic and the learning
+    stores; a NaN/inf (or a bool that SQLite would store as 0/1) must be
+    refused at the write, not averaged in later.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a number, got bool {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number, got {value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return number
+
+
 # ── High-level workflow functions ──────────────────────────────────────────────
 
 
@@ -1263,6 +1286,13 @@ def finalize_trade_and_update_learning(
             f"evidence ({row.get('invalidation_reason') or 'notes.evidence_invalidated'}); "
             "refusing to update learning stores"
         )
+
+    # Refuse non-finite / bool outcomes before claiming: they would poison the
+    # report statistics and the learning stores.
+    realized_return_pct = _finite_or_none("realized_return_pct", realized_return_pct)
+    realized_expansion_pct = _finite_or_none("realized_expansion_pct", realized_expansion_pct)
+    realized_pnl = _finite_or_none("realized_pnl", realized_pnl)
+    exit_mid = _finite_or_none("exit_mid", exit_mid)
 
     structure = row["structure"]
     setup_score = float(row["setup_score"])

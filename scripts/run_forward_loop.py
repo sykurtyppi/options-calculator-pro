@@ -5,6 +5,7 @@ import argparse
 import inspect
 import json
 import logging
+import math
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -1759,6 +1760,29 @@ def _finalize_baseline_exits(
         )
         cost_pct = _safe_float(row.get("modeled_cost_pct")) or 0.0
         realized_return_pct = gross_return_pct - cost_pct
+        if not all(
+            value is not None and math.isfinite(value)
+            for value in (exit_mid, realized_return_pct, expansion_pct)
+        ):
+            # The store refuses NaN/inf outcomes; record why this exit could
+            # not be valued instead of aborting the remaining exits.
+            summary["baseline_skipped"] += 1
+            if not dry_run:
+                baseline_store.update_exit(
+                    baseline_id=str(row.get("baseline_id")),
+                    exit_date=as_of,
+                    exit_mid=None,
+                    realized_return_pct=None,
+                    realized_expansion_pct=None,
+                    quote_source_at_exit=quote.get("quote_source"),
+                    quote_quality_at_exit=quote.get("quote_quality"),
+                    exit_bid_ask_mid=quote.get("bid_ask_mid", {}),
+                    exit_execution_scenarios=exit_execution_scenarios,
+                    status="exit_skipped",
+                    skip_reason="non_finite_exit_value",
+                    exit_repricing=exit_repricing,
+                )
+            continue
         if not dry_run:
             baseline_store.update_exit(
                 baseline_id=str(row.get("baseline_id")),

@@ -24,6 +24,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
 
+from services.outcome_recorder import _finite_or_none
+
 _DEFAULT_STORE = Path.home() / ".options_calculator_pro" / "evidence" / "baseline_evidence.sqlite"
 _WRITE_LOCK = threading.Lock()
 
@@ -397,9 +399,9 @@ class BaselineEvidenceStore:
         params = (
             _fmt_date(exit_date),
             exit_repricing,
-            exit_mid,
-            realized_return_pct,
-            realized_expansion_pct,
+            _finite_or_none("exit_mid", exit_mid),
+            _finite_or_none("realized_return_pct", realized_return_pct),
+            _finite_or_none("realized_expansion_pct", realized_expansion_pct),
             quote_source_at_exit,
             quote_quality_at_exit,
             _json(exit_bid_ask_mid or {}),

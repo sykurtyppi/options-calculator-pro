@@ -29,15 +29,23 @@ METHOD_NOTE = (
 
 
 def _clean(values: Iterable[Any]) -> np.ndarray:
+    """Finite numbers only, in canonical (sorted) order.
+
+    Booleans are rejected: True would otherwise count as a +1 return. Sorting
+    makes the seeded bootstrap depend only on the multiset of values, not on
+    incidental row order, so the same evidence always gets the same verdict.
+    """
     out: List[float] = []
     for value in values:
+        if isinstance(value, (bool, np.bool_)):
+            continue
         try:
             number = float(value)
         except (TypeError, ValueError):
             continue
         if np.isfinite(number):
             out.append(number)
-    return np.asarray(out, dtype=float)
+    return np.sort(np.asarray(out, dtype=float))
 
 
 def _bootstrap_means(values: np.ndarray, rng: np.random.Generator) -> np.ndarray:
