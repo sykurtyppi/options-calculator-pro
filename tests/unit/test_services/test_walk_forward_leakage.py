@@ -16,6 +16,8 @@ from unittest.mock import patch
 
 import pytest
 
+from services.durable_json import PersistenceError
+
 from services.calibration_service import IVExpansionCalibration
 from services.structure_prior_store import (
     BacktestLeakageError,
@@ -477,15 +479,18 @@ def test_structure_prior_store_atomic_write_preserves_original_on_fsync_failure(
     def boom(_fd):
         raise OSError("simulated crash during fsync")
 
-    monkeypatch.setattr("services.structure_prior_store.os.fsync", boom)
-    store.update(
-        structure="atm_straddle",
-        realized_return_pct=-3.0,
-        realized_expansion_pct=2.0,
-        source_type="paper",
-        observation_date=date(2024, 6, 2),
-        observation_id="should_not_persist",
-    )
+    monkeypatch.setattr("services.durable_json.os.fsync", boom)
+    # The failed write now raises instead of being swallowed after memory
+    # had already changed.
+    with pytest.raises(PersistenceError):
+        store.update(
+            structure="atm_straddle",
+            realized_return_pct=-3.0,
+            realized_expansion_pct=2.0,
+            source_type="paper",
+            observation_date=date(2024, 6, 2),
+            observation_id="should_not_persist",
+        )
 
     assert store_path.read_bytes() == original_bytes, (
         "atomic-write contract broken — original priors file modified despite fsync failure"

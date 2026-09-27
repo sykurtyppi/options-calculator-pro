@@ -84,11 +84,11 @@ def test_unreadable_store_warns_instead_of_going_silent(tmp_path):
 def test_stuck_finalizing_trade_warns(tmp_path):
     store = OutcomeStore(tmp_path / "outcomes.sqlite")
     _trade(store, "STUCK", earnings=TODAY - timedelta(days=3), status="exited")
-    assert store.claim_for_finalization("STUCK")
+    assert store.claim_for_finalization("STUCK", owner="w1")
     store._conn.execute("UPDATE outcome_trades SET updated_at = '2026-09-20 00:00:00' WHERE trade_id = 'STUCK'")
     store._conn.commit()
     _trade(store, "FRESH", earnings=TODAY - timedelta(days=2), status="exited")
-    assert store.claim_for_finalization("FRESH")  # just claimed: not stuck
+    assert store.claim_for_finalization("FRESH", owner="w2")  # just claimed: not stuck
 
     result = _check_evidence_integrity(_cfg(tmp_path), NOW)
 

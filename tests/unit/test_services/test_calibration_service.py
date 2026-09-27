@@ -6,6 +6,8 @@ import tempfile
 
 import pytest
 
+from services.durable_json import PersistenceError
+
 from services.calibration_service import (
     IVExpansionCalibration,
     _MIN_OBS_FOR_OBSERVATIONAL,
@@ -275,12 +277,16 @@ class TestCalibrationPersistence:
         def boom(_fd):
             raise OSError("simulated crash during fsync")
 
-        monkeypatch.setattr("services.calibration_service.os.fsync", boom)
-        c.update(0.9, 9.0)  # save fails internally, swallowed by outer except
+        monkeypatch.setattr("services.durable_json.os.fsync", boom)
+        # Durability failures are no longer swallowed: the update is refused,
+        # and neither the file nor this instance's memory changes.
+        with pytest.raises(PersistenceError):
+            c.update(0.9, 9.0)
 
         assert store_path.read_bytes() == original_bytes, (
             "atomic-write contract broken — original file modified despite fsync failure"
         )
+        assert c._n() == 1, "memory recorded an observation that never reached disk"
         c_reloaded = IVExpansionCalibration(store_path=store_path)
         assert c_reloaded._n() == 1, "store survived but observation count diverged"
 

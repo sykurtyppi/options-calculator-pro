@@ -345,7 +345,7 @@ def test_every_outcome_mutation_refuses_an_invalidated_row(tmp_path):
                              realized_return_pct=100.0, realized_expansion_pct=100.0, store=store) is False
     assert store.mark_finalized("TTD") is False
     assert store.set_learning_update_status("TTD", "complete") is False
-    assert store.claim_for_finalization("TTD") is False
+    assert store.claim_for_finalization("TTD", owner="w1") is False
     row = store.get_trade("TTD")
     assert (row["status"], row["realized_return_pct"], row["learning_update_status"]) == ("open", None, None)
 
@@ -360,14 +360,14 @@ def test_invalidation_racing_finalization_cannot_reach_learning_stores(tmp_path,
     monkeypatch.setattr(structure_prior_store, "get_structure_prior_store", lambda: pytest.fail("prior"))
 
     # The finalizer has already read the row as valid when another process
-    # invalidates it, before the exit write.
-    real_update_exit = store.update_exit
+    # invalidates it, just before the claim.
+    real_claim = store.claim_for_finalization
 
-    def update_exit_after_invalidation(**kwargs):
+    def claim_after_invalidation(trade_id, **kwargs):
         store.invalidate("AMZN", reason="strike never booked")
-        return real_update_exit(**kwargs)
+        return real_claim(trade_id, **kwargs)
 
-    monkeypatch.setattr(store, "update_exit", update_exit_after_invalidation)
+    monkeypatch.setattr(store, "claim_for_finalization", claim_after_invalidation)
 
     with pytest.raises(ValueError, match="could not be claimed"):
         finalize_trade_and_update_learning(
@@ -385,18 +385,21 @@ def test_invalidate_is_refused_while_learning_updates_run(tmp_path):
     store.update_exit(trade_id="AMZN", exit_date=T_MINUS_1, exit_mid=3.0,
                       realized_return_pct=10.0, realized_expansion_pct=10.0)
 
-    assert store.claim_for_finalization("AMZN") is True
+    assert store.claim_for_finalization("AMZN", owner="w1") is True
     with pytest.raises(ValueError, match="being finalized"):
         store.invalidate("AMZN", reason="late")
     assert is_outcome_evidence_valid(store.get_trade("AMZN"))
-    assert store.mark_finalized("AMZN") is True
+    assert store.mark_finalized("AMZN", owner="w1") is True
     assert store.invalidate("AMZN", reason="late")["learning_already_applied"] is False
 
 
-def test_refinalizing_a_finalized_trade_stays_idempotent(tmp_path):
+def test_a_finalized_trade_cannot_be_claimed_again(tmp_path):
+    # Re-finalizing (the failed-learning retry path) is handled by
+    # finalize_trade_and_update_learning without a claim; the row itself is
+    # never moved back out of 'finalized'.
     store = OutcomeStore(tmp_path / "o.sqlite")
     _resolved(store, "MU", 9.0)
-    assert store.claim_for_finalization("MU") is True
+    assert store.claim_for_finalization("MU", owner="w1") is False
     assert store.get_trade("MU")["status"] == "finalized"
 
 
