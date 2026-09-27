@@ -163,6 +163,22 @@ def _parse_date(val: Any) -> Optional[date]:
 # ── Seeding logic ─────────────────────────────────────────────────────────────
 
 
+def _needs_replay_relearn(existing: Dict[str, Any]) -> bool:
+    """A seeded replay row that finalized but never finished its learning."""
+    from services.outcome_recorder import is_outcome_evidence_valid
+
+    return (
+        existing.get("source_type") == "replay"
+        and existing.get("status") == "finalized"
+        and existing.get("learning_update_status") != "complete"
+        and is_outcome_evidence_valid(existing)
+        and all(
+            existing.get(key) is not None
+            for key in ("setup_score", "realized_return_pct", "realized_expansion_pct")
+        )
+    )
+
+
 def seed_from_trades(
     trades: List[Dict[str, Any]],
     *,
@@ -268,12 +284,17 @@ def seed_from_trades(
 
         if not was_new:
             existing = store.get_trade(trade_id) or {}
-            if existing.get("learning_update_status") == "complete":
-                skipped_duplicate += 1
-                continue
-            # Seeded before, but its learning never completed (e.g. a failed
-            # store write): re-apply below. Both stores dedupe on trade_id.
             skipped_duplicate += 1
+            # Re-apply learning only to a row THIS script seeded and finalized
+            # whose learning never completed (e.g. a failed store write). A
+            # paper trade can share the id format; learning replay numbers
+            # under its id would make its real outcome a duplicate later.
+            if not _needs_replay_relearn(existing):
+                continue
+            # Learn what the row records, not this run's replay numbers.
+            setup_score = float(existing["setup_score"])
+            realized_return_pct = float(existing["realized_return_pct"])
+            realized_expansion_pct = float(existing["realized_expansion_pct"])
         else:
             # Mark as finalized immediately — replay trades have no "open" phase.
             store.update_exit(

@@ -26,6 +26,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import math
 import os
 import uuid
 from contextlib import contextmanager
@@ -71,7 +72,11 @@ def read_json_strict(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_constant)
+        raw = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_constant,
+            parse_float=_finite_float,
+        )
     except _NonFiniteValue as exc:
         # Older writers allowed NaN/Infinity. Refusing here keeps every later
         # write from failing on it; the file is left for repair, e.g. a
@@ -93,6 +98,15 @@ class _NonFiniteValue(ValueError):
 
 def _reject_constant(name: str) -> Any:
     raise _NonFiniteValue(name)
+
+
+def _finite_float(text: str) -> float:
+    # An overflowing literal such as 1e999 parses to inf without ever
+    # reaching parse_constant.
+    value = float(text)
+    if not math.isfinite(value):
+        raise _NonFiniteValue(text)
+    return value
 
 
 def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:

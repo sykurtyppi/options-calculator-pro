@@ -667,6 +667,38 @@ class OutcomeStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def trades_pending_finalization(self, as_of_date: date) -> list[Dict[str, Any]]:
+        """Trades whose exit is recorded but whose finalization never completed.
+
+        A finalize that raised or lost its claim after writing the exit leaves
+        the row 'exited' (claim released) or 'finalizing' (claim expired).
+        Neither the T-1 due list nor mark_missing_exits (exit_date IS NULL)
+        reaches it again, so once the exit day has passed it is re-finalized
+        from its stored facts. Live claims are left to their owner.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM outcome_trades
+            WHERE earnings_date IS NOT NULL
+              AND earnings_date <= ?
+              AND exit_date IS NOT NULL
+              AND realized_return_pct IS NOT NULL
+              AND realized_expansion_pct IS NOT NULL
+              AND {valid}
+              AND (
+                status = 'exited'
+                OR (
+                  status = 'finalizing'
+                  AND (finalizing_since IS NULL OR finalizing_since <= datetime('now', ?))
+                )
+              )
+            ORDER BY entry_date, symbol
+            """.format(valid=_VALID_EVIDENCE_SQL),
+            (_fmt_date(as_of_date), f"-{FINALIZATION_LEASE_SECONDS} seconds"),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     # ── Exit attrition ────────────────────────────────────────────────────────
 
     def record_exit_attempt_failure(self, trade_id: str, *, reason: str, attempted_on: date) -> bool:
@@ -831,11 +863,13 @@ class OutcomeStore:
                 )
 
     def release_finalization_claim(self, trade_id: str, *, owner: str) -> bool:
-        """Undo a claim that failed before any learning write.
+        """Hand back a claim whose finalization did not complete.
 
-        The row returns to 'exited' if it already has exit facts, else 'open',
-        so the normal exit / exit_missing handling can reach it again instead
-        of it sitting in 'finalizing' forever.
+        The row returns to 'open' (no exit yet: the T-1 retry / exit_missing
+        handling reaches it) or 'exited' (exit recorded: trades_pending_
+        finalization re-finalizes it from the stored facts once the exit day
+        has passed). Only the owner can release; a claim another worker took
+        over is left alone.
         """
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
@@ -908,7 +942,8 @@ class OutcomeStore:
             "status": row.get("status"),
             "already_invalidated": not is_outcome_evidence_valid(row),
             "previous_invalidation_reason": outcome_invalidation_reason(row),
-            "learning_already_applied": str(row.get("learning_update_status") or "") == "complete",
+            "learning_already_applied": str(row.get("learning_update_status") or "")
+            in ("complete", LEARNING_WRITTEN_AFTER_CLAIM_LOST),
             "invalidated_at": stamp,
             "invalidation_reason": reason,
         }
@@ -1327,8 +1362,21 @@ def finalize_trade_and_update_learning(
             return str(latest.get("status") or "") == "finalized" and is_outcome_evidence_valid(latest)
         return s.renew_finalization_claim(trade_id, owner=owner)
 
+    def _release_claim() -> None:
+        # Owner-guarded, so a claim another worker took over is untouched.
+        # Never let a failed release mask the error that caused it.
+        if already_finalized:
+            return
+        try:
+            s.release_finalization_claim(trade_id, owner=owner)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("finalize: could not release claim on %s (%s)", trade_id, exc)
+
     def _claim_lost_result() -> Dict[str, Any]:
         warnings.append("finalization claim was lost before the learning writes; another worker owns the trade")
+        # If the lease merely expired and nobody took over, the claim is still
+        # ours: hand it back so the row is not stuck 'finalizing'.
+        _release_claim()
         return {
             "trade_id": trade_id,
             "structure": structure,
@@ -1337,8 +1385,9 @@ def finalize_trade_and_update_learning(
             "warnings": warnings,
         }
 
-    if exit_fields_provided and not already_finalized:
-        try:
+    try:
+        exit_written = True
+        if exit_fields_provided and not already_finalized:
             exit_written = s.update_exit(
                 owner=owner,
                 trade_id=trade_id,
@@ -1353,19 +1402,21 @@ def finalize_trade_and_update_learning(
                 exit_bid_ask_mid=exit_bid_ask_mid,
                 exit_execution_scenarios=exit_execution_scenarios,
             )
-        except Exception:
-            # Nothing irreversible has happened yet: hand the row back so the
-            # normal exit / exit_missing handling can reach it again.
-            s.release_finalization_claim(trade_id, owner=owner)
-            raise
-        if not exit_written:
-            raise ValueError(
-                f"finalize_trade_and_update_learning: trade_id={trade_id!r} lost its finalization "
-                "claim before the exit was written; refusing to update learning stores"
-            )
+        owned_for_learning = exit_written and _still_owned()
+    except Exception:
+        # Nothing irreversible has happened yet (e.g. the exit write or the
+        # claim renewal hit a locked database): hand the row back so the exit
+        # retry or the pending-finalization sweep can reach it again.
+        _release_claim()
+        raise
+    if not exit_written:
+        raise ValueError(
+            f"finalize_trade_and_update_learning: trade_id={trade_id!r} lost its finalization "
+            "claim before the exit was written; refusing to update learning stores"
+        )
 
     # ── 3. Update calibration ─────────────────────────────────────────────────
-    if not _still_owned():
+    if not owned_for_learning:
         return _claim_lost_result()
     calibration_ok = False
     try:

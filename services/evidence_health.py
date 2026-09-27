@@ -689,6 +689,12 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                     f"SELECT trade_id FROM outcome_trades WHERE status = 'open' AND earnings_date <= ? AND {valid}",
                     (today,),
                 ).fetchall()
+                # Exit recorded but never finalized; the forward loop's
+                # pending-finalization sweep completes these after the exit day.
+                unfinalized = conn.execute(
+                    f"SELECT trade_id FROM outcome_trades WHERE status = 'exited' AND earnings_date < ? AND {valid}",
+                    (today,),
+                ).fetchall()
                 counts = dict(conn.execute(
                     f"""
                     SELECT status, COUNT(*) FROM outcome_trades
@@ -716,6 +722,7 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                 summary["selector"] = {
                     "stuck_finalizing": [row["trade_id"] for row in finalizing],
                     "open_past_exit_day": [row["trade_id"] for row in orphaned],
+                    "exited_not_finalized": [row["trade_id"] for row in unfinalized],
                     "exit_missing": missing,
                     "resolved": resolved,
                     "exit_attrition_rate": rate,
@@ -727,8 +734,17 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                         "WARN", "evidence_integrity",
                         f"{len(finalizing)} trade(s) stuck in 'finalizing' for over {cfg.max_finalizing_age_hours:.0f}h: "
                         f"{', '.join(row['trade_id'] for row in finalizing[:5])}.",
-                        "A finalize crashed between claiming the trade and writing learning updates. Check the "
-                        "evidence-cycle log for that run; the trade cannot be invalidated until it is finalized.",
+                        "A finalize crashed between claiming the trade and writing learning updates. Once the "
+                        "claim has expired, the next forward-loop run re-finalizes trades whose exit was recorded "
+                        "and moves the rest to exit_missing; if it persists, check the evidence-cycle log.",
+                    ))
+                if unfinalized:
+                    issues.append(_issue(
+                        "WARN", "evidence_integrity",
+                        f"{len(unfinalized)} trade(s) have an exit recorded but were never finalized: "
+                        f"{', '.join(row['trade_id'] for row in unfinalized[:5])}.",
+                        "Their learning updates have not run. The forward loop re-finalizes them from the stored "
+                        "exit; run scripts/run_forward_loop.py and check the evidence-cycle schedule.",
                     ))
                 if orphaned:
                     issues.append(_issue(

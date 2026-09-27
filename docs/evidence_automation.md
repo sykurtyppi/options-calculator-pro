@@ -22,6 +22,7 @@ What it does:
 - baselines whose entry context lacks a leg strike or the expiry resolve as `unverifiable_entry_context` and are excluded from comparisons
 - the calibration and structure-prior stores serialize every update behind a cross-process file lock (sidecar `.<name>.lock` files next to each JSON store), re-read the file before adding an observation, and write atomically; a failed write raises instead of being reported as learned, and the trade is left with a retryable `learning_update_status`
 - finalizing a trade takes an exclusive, owner-token claim (15-minute lease); a second worker can neither claim, overwrite the exit of, nor finalize a trade another worker is finalizing
+- a finalize that fails or loses its claim after the exit was written hands the claim back; once the exit day has passed, the next loop run re-finalizes such trades from the stored exit (no re-quote) and reports them as `refinalized`
 - outcomes invalidated as evidence (`scripts/invalidate_outcome.py`, or a `notes.evidence_invalidated` flag) are refused by every exit/finalize/learning write and excluded from reports before the row limit; invalidating a trade while its learning updates run is refused, so retry once it is finalized
 - writes a daily evidence snapshot to `~/.options_calculator_pro/reports/evidence/`
 
@@ -194,6 +195,7 @@ Checks performed:
 - evidence integrity (`evidence_integrity`, WARN), read-only against the outcome and baseline stores:
   - trades stuck in `finalizing` for more than 24h (a finalize crashed mid-way)
   - trades still `open` after their T-1 exit day (exit detection is not running)
+  - trades with an exit recorded but never finalized (`exited_not_finalized`; the loop re-finalizes them)
   - selector or baseline exit attrition above 20% over the last 90 days, with at least 5 exits
   - universe shadow entries that never entered, for more than 25% of closed events
   - invalidated outcomes that already reached calibration/priors (run `scripts/backfill_prior_store_timestamps.py`)

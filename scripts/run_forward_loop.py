@@ -2237,7 +2237,7 @@ def run_exit_detection(
 ) -> Dict[str, int]:
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
-    summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "baseline_exits": 0, "baseline_skipped": 0}
+    summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "refinalized": 0, "baseline_exits": 0, "baseline_skipped": 0}
 
     # Trades whose T-1 exit day has passed without a price become terminal
     # 'exit_missing' attrition instead of staying open forever.
@@ -2256,6 +2256,31 @@ def run_exit_detection(
                 },
                 dry_run=dry_run,
             )
+
+        # Exits that were recorded but never finalized (a finalize raised or
+        # lost its claim after the exit write) are completed from the stored
+        # facts; no quote is re-fetched and the exit day is not moved.
+        for pending in trade_store.trades_pending_finalization(as_of):
+            pending_id = str(pending["trade_id"])
+            try:
+                result = finalizer(
+                    trade_id=pending_id,
+                    realized_return_pct=float(pending["realized_return_pct"]),
+                    realized_expansion_pct=float(pending["realized_expansion_pct"]),
+                    store=trade_store,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("forward_loop: re-finalize failed for %s: %s", pending_id, exc)
+                continue
+            if isinstance(result, dict) and result.get("status") == "finalized":
+                summary["refinalized"] += 1
+                _append_learning_log(
+                    log_path,
+                    {"event_type": "refinalize", "symbol": pending.get("symbol"),
+                     "structure": pending.get("structure"), "source": pending.get("source_type") or "paper",
+                     "trade_id": pending_id, "learning_update_status": result.get("learning_update_status")},
+                    dry_run=dry_run,
+                )
 
     def _record_failed_exit(trade_id: str, reason: str) -> None:
         if not dry_run:
