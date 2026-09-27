@@ -9,6 +9,10 @@ import {
   buildQuoteQualityRows,
   buildSimpleIvRvFilter,
   buildSurfaceQualitySummary,
+  buildExcludedEvidenceSummary,
+  buildExitAttritionRows,
+  buildUniverseShadowRows,
+  buildUniverseShadowSummary,
 } from './evidenceReportViewModel.js'
 
 const payload = {
@@ -134,4 +138,99 @@ test('surface quality summary stays diagnostic and non-performance-oriented', ()
   assert.equal(surface.sparseAtm, 4)
   assert.equal(surface.ivAnomalies, 5)
   assert.match(surface.label, /evidence gate/)
+})
+
+
+const integrityPayload = {
+  universe_shadow: {
+    events_recorded: 12,
+    open: 3,
+    resolved: 9,
+    rule: 'Every eligible event is shadow-entered once per baseline.',
+    entry_attrition: {
+      entered: 30,
+      entered_after_retry: 2,
+      not_entered: 3,
+      not_entered_by_reason: { no_option_expiries: 2, missing_back_leg: 1 },
+    },
+    by_baseline: {
+      always_otm_strangle: {
+        all_events: { n: 9, avg_realized_return_pct: -2.0 },
+        selector_actionable: { n: 3, avg_realized_return_pct: 4.0 },
+        selector_not_actionable: { n: 6, avg_realized_return_pct: -5.0 },
+      },
+      always_atm_straddle: {
+        all_events: { n: 9, avg_realized_return_pct: 1.0 },
+        selector_actionable: { n: 0, avg_realized_return_pct: null },
+        selector_not_actionable: { n: 9, avg_realized_return_pct: 1.0 },
+      },
+    },
+  },
+  exit_attrition: {
+    selector: { resolved: 8, exit_missing: 2, attrition_rate: 0.2, by_reason: { booked_contract_unavailable: 2 }, by_structure: { otm_strangle: 2 } },
+    baselines: { resolved: 20, exit_missing: 0, attrition_rate: 0, by_reason: {}, by_structure: {} },
+  },
+  invalidated_outcomes: {
+    n: 2,
+    resolved_n: 2,
+    by_reason: { 'exit_repriced_unheld_strike: exit priced the 265 call': 1, 'notes.evidence_invalidated': 1 },
+    note: 'Excluded from every performance figure.',
+  },
+  legacy_repriced_baselines: {
+    n: 4,
+    by_exit_repricing: { rediscovered_legacy: 3, unverifiable_entry_context: 1 },
+    note: 'Excluded from every comparison.',
+  },
+}
+
+test('universe rows compare picked vs skipped events per baseline', () => {
+  const rows = buildUniverseShadowRows(integrityPayload)
+  assert.deepEqual(rows.map((row) => row.label), ['Always ATM straddle', 'Always OTM strangle'])
+  const strangle = rows.find((row) => row.name === 'always_otm_strangle')
+  assert.equal(strangle.pickedN, 3)
+  assert.equal(strangle.skippedN, 6)
+  assert.equal(strangle.pickedReturnLabel, '+4.0%')
+  assert.equal(strangle.skippedReturnLabel, '-5.0%')
+  assert.equal(strangle.selectorEdgeLabel, '+9.0%')
+  // No picked events yet: the difference is unknown, not zero.
+  assert.equal(rows.find((row) => row.name === 'always_atm_straddle').selectorEdgeLabel, 'n/a')
+})
+
+test('universe summary reports coverage and entry attrition', () => {
+  const summary = buildUniverseShadowSummary(integrityPayload)
+  assert.equal(summary.eventsRecorded, 12)
+  assert.equal(summary.enteredAfterRetry, 2)
+  assert.equal(summary.notEntered, 3)
+  assert.deepEqual(summary.notEnteredReasons, [
+    { label: 'no_option_expiries', count: 2 },
+    { label: 'missing_back_leg', count: 1 },
+  ])
+})
+
+test('exit attrition rows expose missing exits and reasons for both cohorts', () => {
+  const [selector, baselines] = buildExitAttritionRows(integrityPayload)
+  assert.equal(selector.label, 'Selector trades')
+  assert.equal(selector.missing, 2)
+  assert.equal(selector.rateLabel, '20%')
+  assert.deepEqual(selector.reasons, [{ label: 'booked_contract_unavailable', count: 2 }])
+  assert.equal(baselines.rateLabel, '0%')
+  assert.deepEqual(baselines.reasons, [])
+})
+
+test('excluded evidence explains what is left out and why', () => {
+  const excluded = buildExcludedEvidenceSummary(integrityPayload)
+  assert.equal(excluded.invalidatedN, 2)
+  assert.equal(excluded.invalidatedReasons.length, 2)
+  assert.equal(excluded.legacyBaselinesN, 4)
+  assert.deepEqual(excluded.legacyReasons, [
+    { label: 'Exit re-discovered strikes (pre-fix)', count: 3 },
+    { label: 'Entry recorded too little to verify', count: 1 },
+  ])
+})
+
+test('new blocks degrade to empty values on an older report payload', () => {
+  assert.deepEqual(buildUniverseShadowRows({}), [])
+  assert.equal(buildUniverseShadowSummary({}).eventsRecorded, 0)
+  assert.equal(buildExitAttritionRows({})[0].rateLabel, 'n/a')
+  assert.equal(buildExcludedEvidenceSummary({}).invalidatedN, 0)
 })

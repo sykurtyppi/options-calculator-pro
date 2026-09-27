@@ -113,6 +113,103 @@ export function buildSimpleIvRvFilter(payload = {}) {
   }
 }
 
+// Universe shadow cohort: every eligible event, whatever the selector said.
+// The key question is whether events the selector SKIPPED paid worse than the
+// ones it picked; if not, its skips are not adding value.
+export function buildUniverseShadowRows(payload = {}) {
+  const universe = payload.universe_shadow || {}
+  return Object.entries(universe.by_baseline || {}).map(([name, groups]) => {
+    const all = groups.all_events || {}
+    const picked = groups.selector_actionable || {}
+    const skipped = groups.selector_not_actionable || {}
+    const pickedReturn = finiteOrNull(picked.avg_realized_return_pct)
+    const skippedReturn = finiteOrNull(skipped.avg_realized_return_pct)
+    const edge = pickedReturn !== null && skippedReturn !== null ? pickedReturn - skippedReturn : null
+    return {
+      name,
+      label: labelBaseline(name),
+      allN: Number(all.n || 0),
+      allReturnLabel: formatReturnPct(all.avg_realized_return_pct),
+      pickedN: Number(picked.n || 0),
+      pickedReturnLabel: formatReturnPct(picked.avg_realized_return_pct),
+      skippedN: Number(skipped.n || 0),
+      skippedReturnLabel: formatReturnPct(skipped.avg_realized_return_pct),
+      // Picked minus skipped: positive means the selector's picks paid more.
+      selectorEdgeLabel: formatReturnPct(edge),
+    }
+  }).sort((a, b) => a.label.localeCompare(b.label))
+}
+
+export function buildUniverseShadowSummary(payload = {}) {
+  const universe = payload.universe_shadow || {}
+  const attrition = universe.entry_attrition || {}
+  return {
+    eventsRecorded: Number(universe.events_recorded || 0),
+    open: Number(universe.open || 0),
+    resolved: Number(universe.resolved || 0),
+    entered: Number(attrition.entered || 0),
+    enteredAfterRetry: Number(attrition.entered_after_retry || 0),
+    notEntered: Number(attrition.not_entered || 0),
+    notEnteredReasons: countRows(attrition.not_entered_by_reason),
+    rule: universe.rule || 'Universe shadow cohort not recorded yet.',
+  }
+}
+
+// Positions entered but never valued at T-1. High or concentrated attrition
+// means resolved results are selected by quote availability.
+export function buildExitAttritionRows(payload = {}) {
+  const attrition = payload.exit_attrition || {}
+  return [
+    ['selector', 'Selector trades'],
+    ['baselines', 'Shadow baselines'],
+  ].map(([key, label]) => {
+    const block = attrition[key] || {}
+    return {
+      key,
+      label,
+      resolved: Number(block.resolved || 0),
+      missing: Number(block.exit_missing || 0),
+      rateLabel: formatRate(block.attrition_rate),
+      reasons: countRows(block.by_reason),
+      structures: countRows(block.by_structure),
+    }
+  })
+}
+
+// What is being kept OUT of every comparison, and why.
+export function buildExcludedEvidenceSummary(payload = {}) {
+  const invalidated = payload.invalidated_outcomes || {}
+  const legacy = payload.legacy_repriced_baselines || {}
+  return {
+    invalidatedN: Number(invalidated.n || 0),
+    invalidatedResolvedN: Number(invalidated.resolved_n || 0),
+    invalidatedReasons: countRows(invalidated.by_reason),
+    invalidatedNote: invalidated.note || '',
+    legacyBaselinesN: Number(legacy.n || 0),
+    legacyReasons: countRows(legacy.by_exit_repricing).map((row) => ({ ...row, label: labelExitRepricing(row.label) })),
+    legacyNote: legacy.note || '',
+  }
+}
+
+function countRows(counts = {}) {
+  return Object.entries(counts || {})
+    .map(([label, count]) => ({ label, count: Number(count || 0) }))
+    .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))
+}
+
+function finiteOrNull(value) {
+  if (value === null || value === undefined || value === '') return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+function labelExitRepricing(value) {
+  if (value === 'rediscovered_legacy') return 'Exit re-discovered strikes (pre-fix)'
+  if (value === 'booked_strikes') return 'Labelled booked without leg check (#143)'
+  if (value === 'unverifiable_entry_context') return 'Entry recorded too little to verify'
+  return String(value || 'unknown').replace(/_/g, ' ')
+}
+
 function labelBaseline(name) {
   if (name === 'always_atm_straddle') return 'Always ATM straddle'
   if (name === 'always_otm_strangle') return 'Always OTM strangle'
