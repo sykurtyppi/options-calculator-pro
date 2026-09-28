@@ -5,13 +5,17 @@
 #   * Pushes to main — catch the rare case where a force-push or
 #     out-of-band commit lands without going through a PR.
 #
-# Two independent jobs run in parallel so frontend feedback doesn't
+# Independent jobs run in parallel so frontend feedback doesn't
 # wait on the backend matrix:
 #
 #   backend-tests   pytest -q on the full unit suite (Python 3.11 +
 #                   pip install -r requirements.txt with the web
 #                   constraints layered in, matching the parity setup
 #                   documented in README.md).
+#
+#   python-dependency-audit  pip-audit over the installed backend
+#                   environment and requirements.lock; fails on any
+#                   known vulnerability.
 #
 #   frontend-tests  npm test on the React trust-layer suite (Node 22
 #                   + Vite 6 build smoke). Node 22 specifically — see
@@ -94,6 +98,44 @@ jobs:
         # checklists across the recent PRs (PR #58 onwards). Failure
         # exits non-zero and fails the job.
         run: pytest tests/unit tests/golden -q
+
+  python-dependency-audit:
+    name: Python dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            web/api/requirements-web.txt
+
+      - name: Install backend dependencies (same as backend-tests)
+        # Audit exactly what CI tests: the web constraints are layered on
+        # top of requirements.txt and can pin different versions than the
+        # lockfile. pip/setuptools are upgraded first so the runner's
+        # bundled build tooling is not reported as an app dependency.
+        run: |
+          python -m pip install --upgrade pip setuptools
+          pip install -r requirements.txt
+          pip install -r web/api/requirements-web.txt -c web/api/constraints-web.txt
+          pip install pip-audit==2.10.1
+
+      - name: Audit the installed environment
+        # Fails on any known vulnerability (PyPI advisory database).
+        run: pip-audit --progress-spinner off --skip-editable
+
+      - name: Audit requirements.lock
+        # The authoritative pin set for tests (AGENTS.md). Fully pinned, so
+        # no resolution is needed (--no-deps --disable-pip).
+        run: pip-audit -r requirements.lock --no-deps --disable-pip --progress-spinner off
 
   frontend-tests:
     name: Frontend (node --test + vitest)
