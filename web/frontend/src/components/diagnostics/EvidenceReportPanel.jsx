@@ -240,6 +240,8 @@ export default function EvidenceReportPanel({ apiBase }) {
                   <span>↳ {reason.label}</span><strong>{reason.count}</strong>
                 </div>
               ))}
+              <div className="quality-source-row"><span>Non-finite results (selector / baseline)</span><strong>{excluded.nonFiniteSelectorN} / {excluded.nonFiniteBaselineN}</strong></div>
+              <div className="quality-source-row"><span>Replay/backtest rows (not forward evidence)</span><strong>{excluded.replayN}</strong></div>
             </div>
             <div className="selector-panel">
               <div className="selector-panel-header">

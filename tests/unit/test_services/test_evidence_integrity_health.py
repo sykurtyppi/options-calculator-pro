@@ -22,6 +22,8 @@ def _cfg(tmp_path, **overrides):
         expected_date=TODAY,
         outcome_store_path=tmp_path / "outcomes.sqlite",
         baseline_store_path=tmp_path / "baselines.sqlite",
+        calibration_store_path=tmp_path / "cal.json",
+        prior_store_path=tmp_path / "priors.json",
         **overrides,
     )
 
@@ -145,6 +147,8 @@ def test_invalidated_outcome_that_reached_learning_stores_warns(tmp_path):
         (json.dumps({"evidence_invalidated": {"reason_code": "x"}}),),
     )
     store._conn.commit()
+    # What counts is the store contents, not the status column.
+    (tmp_path / "cal.json").write_text(json.dumps({"observation_ids": ["TTD"], "scores": [0.6], "expansions": [1.0]}))
 
     result = _check_evidence_integrity(_cfg(tmp_path), NOW)
 

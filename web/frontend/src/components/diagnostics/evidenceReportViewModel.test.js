@@ -147,6 +147,8 @@ test('surface quality summary stays diagnostic and non-performance-oriented', ()
 
 
 const integrityPayload = {
+  non_finite_outcomes: { selector_n: 3, baseline_n: 1 },
+  excluded_replay_outcomes: { n: 40, resolved_n: 38 },
   universe_shadow: {
     events_recorded: 12,
     open: 3,
@@ -227,6 +229,12 @@ test('excluded evidence explains what is left out and why', () => {
   assert.equal(excluded.invalidatedN, 2)
   assert.equal(excluded.invalidatedReasons.length, 2)
   assert.equal(excluded.legacyBaselinesN, 4)
+  assert.equal(excluded.nonFiniteSelectorN, 3)
+  assert.equal(excluded.nonFiniteBaselineN, 1)
+  assert.equal(excluded.replayN, 40)
+  assert.equal(excluded.replayResolvedN, 38)
+  const empty = buildExcludedEvidenceSummary({})
+  assert.equal(empty.nonFiniteSelectorN + empty.nonFiniteBaselineN + empty.replayN, 0)
   assert.deepEqual(excluded.legacyReasons, [
     { label: 'Exit re-discovered strikes (pre-fix)', count: 3 },
     { label: 'Entry recorded too little to verify', count: 1 },

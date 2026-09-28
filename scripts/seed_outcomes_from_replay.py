@@ -164,6 +164,18 @@ def _parse_date(val: Any) -> Optional[date]:
 # ── Seeding logic ─────────────────────────────────────────────────────────────
 
 
+def _is_unfinished_replay_row(existing: Dict[str, Any]) -> bool:
+    """A replay row this script inserted but never gave an exit (interrupted run)."""
+    from services.outcome_recorder import is_outcome_evidence_valid
+
+    return (
+        existing.get("source_type") == "replay"
+        and existing.get("status") == "open"
+        and not existing.get("exit_date")
+        and is_outcome_evidence_valid(existing)
+    )
+
+
 def _needs_replay_relearn(existing: Dict[str, Any]) -> bool:
     """A seeded replay row that finalized but never finished its learning."""
     from services.outcome_recorder import is_outcome_evidence_valid
@@ -215,6 +227,7 @@ def seed_from_trades(
     inserted = 0
     skipped_duplicate = 0
     skipped_bad_data = 0
+    skipped_conflict = 0
     by_year: Dict[int, int] = defaultdict(int)
     by_structure: Dict[str, int] = defaultdict(int)
     cal_updates = 0
@@ -297,8 +310,12 @@ def seed_from_trades(
             assumed_cost_model=assumed_cost_model,
         )
 
+        existing = {} if was_new else (store.get_trade(trade_id) or {})
+        if not was_new and _is_unfinished_replay_row(existing):
+            # An earlier run was interrupted between the insert and the exit:
+            # complete it now, like a fresh insert.
+            was_new = True
         if not was_new:
-            existing = store.get_trade(trade_id) or {}
             skipped_duplicate += 1
             # Re-apply learning only to a row THIS script seeded and finalized
             # whose learning never completed (e.g. a failed store write). A
@@ -312,14 +329,19 @@ def seed_from_trades(
             realized_expansion_pct = float(existing["realized_expansion_pct"])
         else:
             # Mark as finalized immediately — replay trades have no "open" phase.
-            store.update_exit(
+            # Learn only if both writes landed: a row something else changed
+            # meanwhile (e.g. invalidated) must not reach the learning stores.
+            exit_written = store.update_exit(
                 trade_id=trade_id,
                 exit_date=earnings_date or entry_date,
                 realized_return_pct=realized_return_pct,
                 realized_pnl=float(realized_pnl) if realized_pnl is not None else None,
                 realized_expansion_pct=realized_expansion_pct,
             )
-            store.mark_finalized(trade_id)
+            if not (exit_written and store.mark_finalized(trade_id)):
+                logger.warning("seed: trade_id=%s could not be finalized; learning skipped", trade_id)
+                skipped_conflict += 1
+                continue
 
         # ── Update calibration ────────────────────────────────────────────
         obs_date = earnings_date or entry_date
@@ -389,6 +411,7 @@ def seed_from_trades(
         "inserted": inserted,
         "skipped_duplicate": skipped_duplicate,
         "skipped_bad_data": skipped_bad_data,
+        "skipped_conflict": skipped_conflict,
         "cal_updates": cal_updates,
         "cal_phase_after": cal_phase,
         "cal_n_after": cal_n,
@@ -576,6 +599,7 @@ def main() -> int:
     print(f"{prefix}Inserted (new)     : {result['inserted']}")
     print(f"{prefix}Skipped (duplicate): {result['skipped_duplicate']}")
     print(f"{prefix}Skipped (bad data) : {result['skipped_bad_data']}")
+    print(f"{prefix}Skipped (conflict) : {result['skipped_conflict']}")
 
     if result["by_year"]:
         print()

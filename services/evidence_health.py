@@ -35,7 +35,9 @@ from services.automation_watchdog import (
 )
 from services.baseline_evidence_store import _DEFAULT_STORE as DEFAULT_BASELINE_STORE
 from services.outcome_recorder import _DEFAULT_STORE as DEFAULT_OUTCOME_STORE
-from services.outcome_recorder import _VALID_EVIDENCE_SQL
+from services.calibration_service import _DEFAULT_STORE as DEFAULT_CALIBRATION_STORE
+from services.outcome_recorder import FORWARD_SOURCE_SQL, _VALID_EVIDENCE_SQL
+from services.structure_prior_store import _DEFAULT_STORE as DEFAULT_PRIOR_STORE
 from services.provider_telemetry import _DEFAULT_STORE as DEFAULT_TELEMETRY_STORE
 from services.recommendation_ledger import _DEFAULT_LEDGER as DEFAULT_LEDGER_STORE
 
@@ -134,6 +136,8 @@ class EvidenceHealthConfig:
     max_universe_entry_failure_rate: float = DEFAULT_MAX_UNIVERSE_ENTRY_FAILURE_RATE
     min_attrition_sample: int = DEFAULT_MIN_ATTRITION_SAMPLE
     attrition_window_days: int = DEFAULT_ATTRITION_WINDOW_DAYS
+    calibration_store_path: Path = DEFAULT_CALIBRATION_STORE
+    prior_store_path: Path = DEFAULT_PRIOR_STORE
     max_finalizing_age_hours: float = DEFAULT_MAX_FINALIZING_AGE_HOURS
 
 
@@ -660,6 +664,29 @@ def _attrition_rate(missing: int, resolved: int) -> Optional[float]:
     return (missing / entered) if entered else None
 
 
+def _learning_store_observation_ids(cfg: EvidenceHealthConfig) -> Optional[set[str]]:
+    """Observation ids in the calibration and prior stores, or None if unreadable.
+
+    Read-only and lenient (a legacy NaN still parses). A missing file holds
+    no observations.
+    """
+    ids: set[str] = set()
+    try:
+        cal_path = Path(cfg.calibration_store_path)
+        if cal_path.exists():
+            cal = json.loads(cal_path.read_text(encoding="utf-8"))
+            ids.update(str(value) for value in cal.get("observation_ids") or [])
+        prior_path = Path(cfg.prior_store_path)
+        if prior_path.exists():
+            prior = json.loads(prior_path.read_text(encoding="utf-8"))
+            for entry in (prior.get("structures") or {}).values():
+                for obs in entry.get("observations") or []:
+                    ids.add(str(obs.get("observation_id")))
+    except (OSError, ValueError, AttributeError):
+        return None
+    return ids
+
+
 def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[str, Any]:
     """Alert when evidence quietly degrades instead of failing loudly.
 
@@ -670,8 +697,11 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
     already reached the learning stores.
     """
     issues: list[dict[str, Any]] = []
-    today = now.date().isoformat()
-    window_start = (now.date() - timedelta(days=cfg.attrition_window_days)).isoformat()
+    # Earnings and exit days are LOCAL dates (the loop runs on date.today());
+    # a UTC date flags a normal evening run as a missed day.
+    local_today = now.astimezone().date()
+    today = local_today.isoformat()
+    window_start = (local_today - timedelta(days=cfg.attrition_window_days)).isoformat()
     summary: dict[str, Any] = {"window_days": cfg.attrition_window_days}
 
     conn = _connect_for_reads(cfg.outcome_store_path)
@@ -680,25 +710,33 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
             columns = _table_columns(conn, "outcome_trades")
             if {"status", "earnings_date", "evidence_valid", "notes", "updated_at"} <= columns:
                 valid = _VALID_EVIDENCE_SQL
+                # Attrition and exit-day checks concern forward trades only;
+                # seeded replay rows never pass through the loop.
+                forward = FORWARD_SOURCE_SQL if "source_type" in columns else "1"
                 stale_cutoff = (now - timedelta(hours=cfg.max_finalizing_age_hours)).strftime("%Y-%m-%d %H:%M:%S")
                 finalizing = conn.execute(
                     "SELECT trade_id FROM outcome_trades WHERE status = 'finalizing' AND updated_at < ?",
                     (stale_cutoff,),
                 ).fetchall()
+                # Past the day AFTER the exit day: the loop's run on earnings
+                # day moves an unpriced trade to exit_missing, so only a row
+                # still open after that means exit detection is not running.
                 orphaned = conn.execute(
-                    f"SELECT trade_id FROM outcome_trades WHERE status = 'open' AND earnings_date <= ? AND {valid}",
+                    f"SELECT trade_id FROM outcome_trades WHERE status = 'open' AND earnings_date < ? "
+                    f"AND {valid} AND {forward}",
                     (today,),
                 ).fetchall()
                 # Exit recorded but never finalized; the forward loop's
                 # pending-finalization sweep completes these after the exit day.
                 unfinalized = conn.execute(
-                    f"SELECT trade_id FROM outcome_trades WHERE status = 'exited' AND earnings_date < ? AND {valid}",
+                    f"SELECT trade_id FROM outcome_trades WHERE status = 'exited' AND earnings_date < ? "
+                    f"AND {valid} AND {forward}",
                     (today,),
                 ).fetchall()
                 counts = dict(conn.execute(
                     f"""
                     SELECT status, COUNT(*) FROM outcome_trades
-                    WHERE earnings_date >= ? AND earnings_date <= ? AND {valid}
+                    WHERE earnings_date >= ? AND earnings_date <= ? AND {valid} AND {forward}
                       AND status IN ('exit_missing', 'finalized', 'exited')
                     GROUP BY status
                     """,
@@ -707,14 +745,36 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                 missing_reasons = dict(conn.execute(
                     f"""
                     SELECT COALESCE(exit_missing_reason, 'unknown'), COUNT(*) FROM outcome_trades
-                    WHERE status = 'exit_missing' AND earnings_date >= ? AND {valid}
+                    WHERE status = 'exit_missing' AND earnings_date >= ? AND {valid} AND {forward}
                     GROUP BY 1 ORDER BY 2 DESC
                     """,
                     (window_start,),
                 ).fetchall()) if "exit_missing_reason" in columns else {}
-                learned_invalid = conn.execute(
-                    f"SELECT trade_id FROM outcome_trades WHERE NOT {valid} "
-                    "AND learning_update_status IN ('complete', 'complete_after_claim_lost')"
+                invalid_ids = {
+                    str(row["trade_id"])
+                    for row in conn.execute(f"SELECT trade_id FROM outcome_trades WHERE NOT {valid}").fetchall()
+                }
+                # Ground truth is what the learning stores CONTAIN: a status
+                # column misses partial writes (calibration only, or a finalize
+                # killed mid-way) and cannot see a completed repair.
+                learned_ids = _learning_store_observation_ids(cfg)
+                if learned_ids is None:
+                    learned_invalid = sorted(
+                        str(row["trade_id"]) for row in conn.execute(
+                            f"SELECT trade_id FROM outcome_trades WHERE NOT {valid} "
+                            "AND learning_update_status IS NOT NULL AND learning_update_status != 'both_failed'"
+                        ).fetchall()
+                    ) if "learning_update_status" in columns else []
+                else:
+                    learned_invalid = sorted(invalid_ids & learned_ids)
+                failed_learning = conn.execute(
+                    f"""
+                    SELECT trade_id FROM outcome_trades
+                    WHERE status = 'finalized' AND {valid}
+                      AND learning_update_status IN ('calibration_failed', 'prior_failed', 'both_failed')
+                      AND updated_at < ?
+                    """,
+                    (stale_cutoff,),
                 ).fetchall() if "learning_update_status" in columns else []
                 missing = int(counts.get("exit_missing", 0))
                 resolved = int(counts.get("finalized", 0)) + int(counts.get("exited", 0))
@@ -727,7 +787,8 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                     "resolved": resolved,
                     "exit_attrition_rate": rate,
                     "exit_missing_by_reason": missing_reasons,
-                    "invalidated_after_learning": [row["trade_id"] for row in learned_invalid],
+                    "invalidated_after_learning": learned_invalid,
+                    "learning_failed": [row["trade_id"] for row in failed_learning],
                 }
                 if finalizing:
                     issues.append(_issue(
@@ -764,9 +825,19 @@ def _check_evidence_integrity(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                 if learned_invalid:
                     issues.append(_issue(
                         "WARN", "evidence_integrity",
-                        f"{len(learned_invalid)} invalidated outcome(s) already reached calibration/priors.",
+                        f"{len(learned_invalid)} invalidated outcome(s) already reached calibration/priors: "
+                        f"{', '.join(learned_invalid[:5])}.",
                         "Run scripts/backfill_prior_store_timestamps.py (dry run first) to rebuild the "
                         "learning stores without them.",
+                    ))
+                if failed_learning:
+                    issues.append(_issue(
+                        "WARN", "evidence_integrity",
+                        f"{len(failed_learning)} finalized trade(s) still have a failed calibration/prior update "
+                        f"after {cfg.max_finalizing_age_hours:.0f}h: "
+                        f"{', '.join(row['trade_id'] for row in failed_learning[:5])}.",
+                        "The forward loop retries these every run; a persistent failure usually means a learning "
+                        "store file cannot be written (disk, permissions, or a corrupt file) - check the loop log.",
                     ))
         except sqlite3.Error as exc:
             summary["selector_error"] = f"{type(exc).__name__}: {exc}"

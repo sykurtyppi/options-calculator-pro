@@ -52,8 +52,9 @@ def build_forward_performance_diagnostics(
 
     ledger_rows = ledger_obj.list_for_diagnostics(limit=max_rows)
     # Filtered in the store, before its row limit (see OutcomeStore.list_for_diagnostics).
-    outcomes = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid")
-    invalidated_count = len(outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid"))
+    # Forward paper evidence only; seeded replay rows are backtest data.
+    outcomes = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward")
+    invalidated_count = len(outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid", source="forward"))
     baseline_rows = baseline_obj.list_for_diagnostics(limit=max_rows)
     ledger_by_id = {
         str(row.get("recommendation_id")): row
@@ -77,7 +78,12 @@ def build_forward_performance_diagnostics(
     ]
 
     no_trade_count = sum(1 for row in ledger_rows if str(row.get("recommendation") or "") == "No Trade")
-    open_count = sum(1 for row in outcomes if str(row.get("status") or "") in {"open", "exited"})
+    # Still awaiting an outcome. An 'exited' row with a finite result is
+    # already counted as resolved, so it must not also count as open.
+    open_count = sum(
+        1 for row in outcomes
+        if str(row.get("status") or "") in {"open", "exited", "finalizing"} and not _is_resolved(row)
+    )
     warning_flags = _warning_flags(resolved, no_trade_count=no_trade_count)
 
     return {

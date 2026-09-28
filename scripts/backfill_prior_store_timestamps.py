@@ -545,10 +545,24 @@ def _backfill_locked(db_path: Path, prior_path: Path, cal_path: Path, *, dry_run
         if cal_trades:
             _rebuild_calibration_store(cal_trades, cal_path, dry_run=dry_run)
         else:
-            # Nothing to rebuild from: never replace calibration with an empty
-            # store, but still repair legacy non-finite entries.
-            logger.warning("No finalized trades found — calibration kept, non-finite entries dropped.")
-            _clean_calibration_store(cal_path, dry_run=dry_run)
+            # Nothing to rebuild from. Calibration's arrays carry no per-entry
+            # ids, so an invalidated observation can only be removed by
+            # emptying the store - done only when EVERY observation it holds
+            # is invalidated; otherwise refuse rather than keep it silently.
+            stale = sorted(cal_ids & invalidated_ids)
+            if stale and cal_ids - invalidated_ids:
+                logger.error(
+                    "Calibration holds invalidated observation(s) %s alongside observations with no "
+                    "finalized trade to rebuild from; refusing to guess. Restore a backup or rebuild "
+                    "it manually.", stale[:5],
+                )
+                return 1
+            if stale:
+                logger.warning("Calibration holds only invalidated observations %s; emptying it.", stale[:5])
+                _rebuild_calibration_store([], cal_path, dry_run=dry_run)
+            else:
+                logger.warning("No finalized trades found — calibration kept, non-finite entries dropped.")
+                _clean_calibration_store(cal_path, dry_run=dry_run)
 
     if dry_run:
         print("\nDRY RUN complete.  Re-run with --target=production to apply.")
