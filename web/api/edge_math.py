@@ -522,7 +522,8 @@ def post_event_valuation_days(
     Before-open / intraday reports: the reaction prints on the earnings day
     itself. After-close or unknown timing (conservative): the next weekday
     after the earnings day, so a Thursday-close report is valued on Friday
-    and a Friday-close report on Monday. Exchange holidays are not modelled.
+    and a Friday-close report on Monday. A date that falls on a weekend
+    rolls to Monday either way. Exchange holidays are not modelled.
     Returns None when the earnings date is unknown or already past.
     """
     if days_to_earnings is None or not np.isfinite(days_to_earnings) or days_to_earnings < 0:
@@ -533,24 +534,34 @@ def post_event_valuation_days(
         reaction_day = earnings_day
     else:
         reaction_day = earnings_day + timedelta(days=1)
-        while reaction_day.weekday() >= 5:  # Saturday / Sunday
-            reaction_day += timedelta(days=1)
+    while reaction_day.weekday() >= 5:  # Saturday / Sunday: next session is Monday
+        reaction_day += timedelta(days=1)
     return (reaction_day - as_of).days
+
+
+# Options expiring ON the reaction session trade through the reaction until
+# that session's close. Valued at the session's open, they have one regular
+# session (6.5 of 24 hours) left.
+SAME_SESSION_REMAINING_DAYS = 6.5 / 24.0
 
 
 def _post_event_horizon(T_near_days: float, valuation_days: Optional[float]) -> Optional[Tuple[float, float]]:
     """(days from entry to valuation, days the options still have to live then).
 
-    None when the options expire at or before the valuation session: they do
-    not span the earnings reaction, so a post-event value would be fiction.
-    ``valuation_days=None`` (no event date known) values one day after entry.
+    Valuation is at the open of the first session that prices the reaction.
+    Options expiring that same session keep SAME_SESSION_REMAINING_DAYS;
+    None only when they expire BEFORE it (they never see the reaction, so a
+    post-event value would be fiction). ``valuation_days=None`` (no event
+    date known) values one day after entry.
     """
     horizon = 1.0 if valuation_days is None else float(valuation_days)
     if not np.isfinite(horizon) or horizon < 0:
         return None
     remaining = float(T_near_days) - horizon
-    if remaining <= 0:
+    if remaining < 0:
         return None
+    if remaining == 0:
+        remaining = SAME_SESSION_REMAINING_DAYS
     return horizon, remaining
 
 
@@ -677,7 +688,7 @@ def _straddle_payoff(
             "scenario_source":           _scenario_source,
             "note": (
                 f"Long ATM straddle (K={K:.2f}). P&L valued {horizon_days:.0f}d after entry "
-                f"({_valuation_basis_label(valuation_days)}) with {remaining_days:.0f}d left to expiry, "
+                f"({_valuation_basis_label(valuation_days)}) with {_remaining_label(remaining_days)}, "
                 "under IV scenarios. Theoretical BSM at one IV for both legs; breakevens on IV-flat scenario."
             ),
         }
@@ -811,13 +822,19 @@ def _strangle_payoff(
                 f"Long OTM strangle (call K={K_c:.2f} / put K={K_p:.2f}, "
                 f"±{wing_pct:.1f}% wings at implied move). "
                 f"P&L valued {horizon_days:.0f}d after entry ({_valuation_basis_label(valuation_days)}) "
-                f"with {remaining_days:.0f}d left to expiry, under IV scenarios. Theoretical BSM at one "
+                f"with {_remaining_label(remaining_days)}, under IV scenarios. Theoretical BSM at one "
                 "IV for both wings (no skew)."
             ),
         }
     except Exception as exc:
         logger.debug("Strangle payoff computation failed: %s", exc)
         return None
+
+
+def _remaining_label(remaining_days: float) -> str:
+    if remaining_days < 1:
+        return "expiry at that session's close"
+    return f"{remaining_days:.0f}d left to expiry"
 
 
 def _valuation_basis(valuation_days: Optional[float]) -> str:

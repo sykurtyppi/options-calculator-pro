@@ -49,6 +49,7 @@ class _ReplayCounter(logging.Handler):
         self.replay   = 0
         self.synthetic = 0
         self.skipped   = 0
+        self.unpriceable = 0
 
     def emit(self, record: logging.LogRecord) -> None:
         msg = record.getMessage()
@@ -58,6 +59,8 @@ class _ReplayCounter(logging.Handler):
             self.synthetic += 1
         elif "⏭  SKIP" in msg:
             self.skipped += 1
+        elif "⛔ UNPRICEABLE" in msg:
+            self.unpriceable += 1
 
 
 def main() -> int:
@@ -148,7 +151,7 @@ def main() -> int:
     session_id = db.run_calendar_spread_backtest(strategy_params)
 
     # ── Results ───────────────────────────────────────────────────────────────
-    total_trades = counter.replay + counter.synthetic + counter.skipped
+    total_trades = counter.replay + counter.synthetic + counter.skipped + counter.unpriceable
 
     print()
     print("=" * 60)
@@ -160,6 +163,7 @@ def main() -> int:
     print(f"    📸 REPLAY    : {counter.replay:>5}  (real option economics)")
     print(f"    🔮 SYNTHETIC : {counter.synthetic:>5}  (proxy fallback)")
     print(f"    ⏭  SKIPPED   : {counter.skipped:>5}  (no pair, mode=snapshot_replay)")
+    print(f"    ⛔ UNPRICEABLE: {counter.unpriceable:>4}  (pair lacks stored point-in-time inputs; re-collect snapshots)")
     if total_trades > 0:
         replay_pct = counter.replay / total_trades * 100
         print()

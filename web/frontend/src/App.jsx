@@ -22,7 +22,7 @@ import VolTermPanel from './components/charts/VolTermPanel'
 import EarningsMoveHistoryPanel from './components/charts/EarningsMoveHistoryPanel'
 import OosSplitChart from './components/charts/OosSplitChart'
 import StructurePayoffChart from './components/charts/StructurePayoffChart'
-import { payoffHorizonLabel, payoffUnavailableMessage, pricingInputWarnings } from './components/charts/payoffDisclosure.js'
+import { payoffHorizonLabel, payoffUnavailableMessage, pricingInputWarnings, scenarioSourceLabel } from './components/charts/payoffDisclosure.js'
 import CalendarSpreadChart from './components/charts/CalendarSpreadChart'
 import HowItWorksPanel from './components/common/HowItWorksPanel'
 import ValuePillars from './components/common/ValuePillars'
@@ -686,7 +686,7 @@ export default function App() {
                         {isStrangle && sp.wing_pct != null && (
                           <span style={{ marginRight: 10 }}>Wings ±{Number(sp.wing_pct).toFixed(1)}% (at implied move) ·&nbsp;</span>
                         )}
-                        <span style={{ color: 'var(--muted-dim)' }}>IV scenarios: stock-move proxy, not historical IV</span>
+                        <span style={{ color: 'var(--muted-dim)' }}>IV scenarios: {scenarioSourceLabel(sp)}</span>
                       </span>
                     </div>
 

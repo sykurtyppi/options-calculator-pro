@@ -109,6 +109,7 @@ def _print_pairing_report(progress: dict) -> None:
     pre_only   = int(progress.get("pending_pre_only_events", 0))
     post_only  = int(progress.get("pending_post_only_events", 0))
     unqualified = int(progress.get("unqualified_events", 0))
+    priceable = int(progress.get("priceable_events", 0))
 
     print()
     print("=" * 60)
@@ -116,8 +117,8 @@ def _print_pairing_report(progress: dict) -> None:
     print("=" * 60)
     print(f"  Total snapshots stored : {total:>6}")
     print(f"  Distinct events        : {events:>6}")
-    print(f"  Fully paired (replay-  : {pairable:>6}  ({pct:.1f}%)")
-    print(f"    ready)               ")
+    print(f"  Fully paired           : {pairable:>6}  ({pct:.1f}%)")
+    print(f"  Priceable by replay    : {priceable:>6}  (paired with stored point-in-time inputs)")
     print(f"  Pre-only (missing post): {pre_only:>6}")
     print(f"  Post-only (missing pre): {post_only:>6}")
     print(f"  Unqualified (no IV)    : {unqualified:>6}")
@@ -130,12 +131,15 @@ def _print_pairing_report(progress: dict) -> None:
         print("     a wider --years window or check MARKETDATA_TOKEN.")
     elif pct < 50.0:
         print()
-        print(f"  ⚠  Only {pct:.0f}% of events are replay-ready. Consider")
+        print(f"  ⚠  Only {pct:.0f}% of events are paired. Consider")
         print("     extending --years or adding more symbols.")
     else:
         print()
-        print(f"  ✓  {pct:.0f}% of events are replay-ready. The walk-forward")
-        print("     backtest will use real option economics for those trades.")
+        print(f"  ✓  {pct:.0f}% of events are paired; {priceable} carry stored point-in-time")
+        print("     inputs and will be replayed with real option economics.")
+    if pairable > priceable:
+        print(f"  ⚠  {pairable - priceable} paired event(s) lack stored point-in-time inputs")
+        print("     and will be refused by replay until their snapshots are re-collected.")
     print()
 
 
@@ -287,6 +291,9 @@ def main() -> int:
     print(f"    Captured : {captured}")
     print(f"    Skipped  : {skipped}")
     print(f"    Errors   : {errors}")
+    skipped_no_inputs = int((result.get("diagnostics") or {}).get("no_point_in_time_inputs", 0))
+    if skipped_no_inputs:
+        print(f"    Skipped (no point-in-time rate/dividend): {skipped_no_inputs}")
     if reason:
         print(f"    Reason   : {reason}")
 

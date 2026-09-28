@@ -533,10 +533,11 @@ class InstitutionalDataCollector:
         if diagnostics:
             self.logger.info(
                 "📚 Historical MDApp diagnostics: no-chain=%d, no-expiry-pair=%d, "
-                "no-underlying=%d, no-iv=%d",
+                "no-underlying=%d, no-point-in-time-inputs=%d, no-iv=%d",
                 int(diagnostics.get("no_chain_rows", 0)),
                 int(diagnostics.get("no_expiry_pairs", 0)),
                 int(diagnostics.get("no_underlying", 0)),
+                int(diagnostics.get("no_point_in_time_inputs", 0)),
                 int(diagnostics.get("no_iv_values", 0)),
             )
         return result

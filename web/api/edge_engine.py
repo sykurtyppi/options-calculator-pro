@@ -3165,9 +3165,10 @@ def analyze_single_ticker(
         structure_payoff_unavailable_reason = "no_upcoming_earnings_date"
     elif (
         _best_structure in ("atm_straddle", "otm_strangle") and _sp_near_dte
-        and _sp_valuation_days >= _sp_near_dte
+        and _sp_valuation_days > _sp_near_dte
     ):
-        # The near options expire before the earnings reaction prints.
+        # The near options expire before the earnings reaction prints (an
+        # expiry ON the reaction session still trades through it).
         structure_payoff = None
         structure_payoff_unavailable_reason = "near_expiry_before_earnings_reaction"
     elif _best_structure == "atm_straddle" and _sp_near_iv_ok and _sp_near_dte:
