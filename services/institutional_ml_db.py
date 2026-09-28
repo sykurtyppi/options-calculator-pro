@@ -272,6 +272,34 @@ class SnapshotReplayPair:
     post_back_iv: float
     pre_underlying_price: float
     post_underlying_price: float
+    # Point-in-time pricing inputs stored with each snapshot. None on legacy
+    # snapshots captured before they were recorded: such a pair is not
+    # priceable (replay must never borrow today's rate or dividend).
+    pre_risk_free_rate: Optional[float] = None
+    pre_dividend_yield: Optional[float] = None
+    post_risk_free_rate: Optional[float] = None
+    post_dividend_yield: Optional[float] = None
+
+
+UNPRICEABLE_MISSING_HISTORICAL_INPUTS = "unpriceable_missing_historical_inputs"
+
+
+def _stored_input(value: Any) -> Optional[float]:
+    """A stored pricing input as a finite float, or None (legacy / missing)."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+# Point-in-time pricing columns on earnings_option_snapshots.
+_SNAPSHOT_PRICING_COLUMNS = {
+    "pricing_risk_free_rate": "REAL",
+    "pricing_risk_free_rate_source": "TEXT",
+    "pricing_dividend_yield": "REAL",
+    "pricing_dividend_yield_source": "TEXT",
+    # The date the inputs were observed; equals capture_date when point in time.
+    "pricing_inputs_observed_on": "TEXT",
+}
 
 class InstitutionalMLDatabase:
     """
@@ -290,6 +318,9 @@ class InstitutionalMLDatabase:
                      snapshots. Falls back to yfinance when None or unavailable.
         """
         self.logger = logger
+        # Snapshot pairs refused by replay, by reason (e.g. missing stored
+        # point-in-time pricing inputs). Reported after each walk-forward.
+        self.replay_unpriceable: Dict[str, int] = {}
 
         # MarketData.app client for enhanced data quality
         self.mda_client: Optional[Any] = mda_client
@@ -592,6 +623,13 @@ class InstitutionalMLDatabase:
                         UNIQUE(symbol, event_date, capture_date, short_expiry, long_expiry)
                     )
                 """)
+                cursor.execute("PRAGMA table_info(earnings_option_snapshots)")
+                _snapshot_columns = {row[1] for row in cursor.fetchall()}
+                for _column, _sql_type in _SNAPSHOT_PRICING_COLUMNS.items():
+                    if _column not in _snapshot_columns:
+                        cursor.execute(
+                            f"ALTER TABLE earnings_option_snapshots ADD COLUMN {_column} {_sql_type}"
+                        )
 
                 # Calibrated post-earnings IV-decay labels from real snapshots
                 cursor.execute("""
@@ -1296,6 +1334,13 @@ class InstitutionalMLDatabase:
         walk_forward_log(
             f"📈 Walk-forward generated {len(trades)} trades over {dataset['date'].nunique()} trading days"
         )
+        if self.replay_unpriceable:
+            self.logger.warning(
+                "Replay skipped snapshot pairs it could not price at a point in time: %s. "
+                "Re-collect those snapshots (scripts that capture historical snapshots now "
+                "store the rate and dividend known on each capture date).",
+                dict(self.replay_unpriceable),
+            )
         return trades
 
     def _load_walk_forward_dataset(self, universe: List[str], start_date: datetime,
@@ -1888,13 +1933,22 @@ class InstitutionalMLDatabase:
                                 continue
 
                             term_ratio = float(front_iv / max(back_iv, 1e-6))
+                            # Captured live today, so today's rate and dividend
+                            # ARE the point-in-time inputs for this snapshot.
+                            from services.pricing_rates import get_pricing_risk_free_rate
+                            from services.dividend_yields import get_dividend_yield
+                            _live_rfr, _live_rfr_source = get_pricing_risk_free_rate()
+                            _live_q, _live_q_source = get_dividend_yield(symbol)
                             cursor.execute(
                                 """
                                 INSERT OR REPLACE INTO earnings_option_snapshots
                                 (symbol, event_date, capture_date, relative_day, release_timing, snapshot_phase,
                                  short_expiry, long_expiry, atm_strike, front_iv, back_iv, term_ratio,
-                                 underlying_price, source)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 underlying_price, source,
+                                 pricing_risk_free_rate, pricing_risk_free_rate_source,
+                                 pricing_dividend_yield, pricing_dividend_yield_source,
+                                 pricing_inputs_observed_on)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     symbol,
@@ -1911,6 +1965,11 @@ class InstitutionalMLDatabase:
                                     term_ratio,
                                     float(last_close),
                                     'yfinance_live',
+                                    float(_live_rfr),
+                                    str(_live_rfr_source),
+                                    float(_live_q),
+                                    str(_live_q_source),
+                                    today.strftime('%Y-%m-%d'),
                                 )
                             )
                             captured += 1
@@ -2006,6 +2065,7 @@ class InstitutionalMLDatabase:
         no_chain_rows = 0
         no_expiry_pairs = 0
         no_underlying = 0
+        no_point_in_time_inputs = 0
         no_iv_values = 0
 
         with self._open_conn() as conn:
@@ -2249,6 +2309,19 @@ class InstitutionalMLDatabase:
                                     no_underlying += 1
                                     continue
 
+                                # Point-in-time inputs for THIS snapshot date: the rate
+                                # and dividends known then, never today's. Without
+                                # them the snapshot is not recorded (fail closed).
+                                from services.pricing_rates import get_historical_risk_free_rate
+                                from services.dividend_yields import get_historical_dividend_yield
+                                _replay_rfr, _replay_rfr_source = get_historical_risk_free_rate(snap_date)
+                                _replay_q, _replay_q_source = get_historical_dividend_yield(
+                                    symbol, snap_date, snapshot_underlying
+                                )
+                                if _replay_rfr is None or _replay_q is None:
+                                    no_point_in_time_inputs += 1
+                                    continue
+
                                 def _atm_iv_from_df(df: "pd.DataFrame", exp: str) -> Tuple[float, float]:
                                     grp = df[df["expiration_date"] == exp].copy()
                                     grp["strike"] = pd.to_numeric(grp.get("strike"), errors="coerce")
@@ -2258,15 +2331,8 @@ class InstitutionalMLDatabase:
                                         return float("nan"), float("nan")
 
                                     # MDApp historical chain data may omit IV/Greeks depending on plan.
-                                    # Fallback: derive implied volatility from option price + BSM inversion.
-                                    # Fetch the risk-free rate and per-symbol dividend yield
-                                    # once per replay batch via the shared services.* sources
-                                    # of truth. Imported lazily to keep institutional_ml_db
-                                    # importable in environments without yfinance.
-                                    from services.pricing_rates import get_pricing_risk_free_rate
-                                    from services.dividend_yields import get_dividend_yield
-                                    _replay_rfr, _ = get_pricing_risk_free_rate()
-                                    _replay_q, _ = get_dividend_yield(symbol)
+                                    # Fallback: derive implied volatility from option price + BSM
+                                    # inversion, with the point-in-time inputs resolved above.
                                     grp["derived_iv"] = grp.apply(
                                         lambda row: self._resolve_row_implied_volatility(
                                             row=row,
@@ -2312,8 +2378,11 @@ class InstitutionalMLDatabase:
                                      release_timing, snapshot_phase,
                                      short_expiry, long_expiry, atm_strike,
                                      front_iv, back_iv, term_ratio,
-                                     underlying_price, source)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     underlying_price, source,
+                                     pricing_risk_free_rate, pricing_risk_free_rate_source,
+                                     pricing_dividend_yield, pricing_dividend_yield_source,
+                                     pricing_inputs_observed_on)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
                                     (
                                         symbol,
@@ -2330,6 +2399,11 @@ class InstitutionalMLDatabase:
                                         term_ratio,
                                         float(snapshot_underlying),
                                         "marketdata_app_historical",
+                                        float(_replay_rfr),
+                                        str(_replay_rfr_source),
+                                        float(_replay_q),
+                                        str(_replay_q_source),
+                                        snap_date_str,
                                     ),
                                 )
                                 captured += 1
@@ -2353,8 +2427,9 @@ class InstitutionalMLDatabase:
             captured, attempts, events_considered, skipped, errors, len(symbols),
         )
         self.logger.info(
-            "MDApp historical snapshot diagnostics: no-chain=%d, no-expiry-pair=%d, no-underlying=%d, no-iv=%d",
-            no_chain_rows, no_expiry_pairs, no_underlying, no_iv_values,
+            "MDApp historical snapshot diagnostics: no-chain=%d, no-expiry-pair=%d, no-underlying=%d, "
+            "no-point-in-time-inputs=%d, no-iv=%d",
+            no_chain_rows, no_expiry_pairs, no_underlying, no_point_in_time_inputs, no_iv_values,
         )
         if attempts > 0 and captured == 0 and no_chain_rows == attempts:
             self.logger.warning(
@@ -2372,6 +2447,7 @@ class InstitutionalMLDatabase:
                 "no_chain_rows": no_chain_rows,
                 "no_expiry_pairs": no_expiry_pairs,
                 "no_underlying": no_underlying,
+                "no_point_in_time_inputs": no_point_in_time_inputs,
                 "no_iv_values": no_iv_values,
             },
         }
@@ -2636,7 +2712,8 @@ class InstitutionalMLDatabase:
         event_date_str = pd.Timestamp(event_date).strftime("%Y-%m-%d")
         query = """
             SELECT symbol, event_date, capture_date, relative_day, release_timing, snapshot_phase,
-                   short_expiry, long_expiry, atm_strike, front_iv, back_iv, underlying_price
+                   short_expiry, long_expiry, atm_strike, front_iv, back_iv, underlying_price,
+                   pricing_risk_free_rate, pricing_dividend_yield
             FROM earnings_option_snapshots
             WHERE symbol = ? AND event_date = ?
             ORDER BY capture_date
@@ -2654,7 +2731,8 @@ class InstitutionalMLDatabase:
         df["capture_date"] = pd.to_datetime(df["capture_date"], errors="coerce")
         df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
         df["relative_day"] = pd.to_numeric(df["relative_day"], errors="coerce")
-        for col in ("atm_strike", "front_iv", "back_iv", "underlying_price"):
+        for col in ("atm_strike", "front_iv", "back_iv", "underlying_price",
+                    "pricing_risk_free_rate", "pricing_dividend_yield"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["capture_date", "event_date", "relative_day", "front_iv", "back_iv", "underlying_price"])
         if df.empty:
@@ -2703,6 +2781,10 @@ class InstitutionalMLDatabase:
             post_back_iv=float(post_row["back_iv"]),
             pre_underlying_price=float(pre_row["underlying_price"]),
             post_underlying_price=float(post_row["underlying_price"]),
+            pre_risk_free_rate=_stored_input(pre_row["pricing_risk_free_rate"]),
+            pre_dividend_yield=_stored_input(pre_row["pricing_dividend_yield"]),
+            post_risk_free_rate=_stored_input(post_row["pricing_risk_free_rate"]),
+            post_dividend_yield=_stored_input(post_row["pricing_dividend_yield"]),
         )
 
     def _calendar_spread_market_value_from_snapshot(
@@ -2777,15 +2859,30 @@ class InstitutionalMLDatabase:
         daily_share_volume: Optional[float] = None,
         volume_ratio: Optional[float] = None,
     ) -> Optional[BacktestTrade]:
-        """Replay a calendar trade from stored pre/post earnings snapshots."""
-        # Single rate + dividend read for both pre and post pricing — keeps
-        # entry/exit priced under the same regime even if the cache TTL flips
-        # between the two calls. Dividend yield is per-symbol; risk-free rate
-        # is market-wide.
-        from services.pricing_rates import get_pricing_risk_free_rate
-        from services.dividend_yields import get_dividend_yield
-        _trade_rfr, _ = get_pricing_risk_free_rate()
-        _trade_q, _ = get_dividend_yield(snapshot_pair.symbol)
+        """Replay a calendar trade from stored pre/post earnings snapshots.
+
+        Entry and exit are each priced with the rate and dividend yield stored
+        with their own snapshot (known on that capture date), so the same
+        stored pair always replays to the same result. A legacy pair without
+        stored inputs is not priceable: it is counted under
+        UNPRICEABLE_MISSING_HISTORICAL_INPUTS and returns None, never priced
+        with today's rate or dividend.
+        """
+        inputs = (
+            snapshot_pair.pre_risk_free_rate, snapshot_pair.pre_dividend_yield,
+            snapshot_pair.post_risk_free_rate, snapshot_pair.post_dividend_yield,
+        )
+        if any(value is None for value in inputs):
+            self.replay_unpriceable[UNPRICEABLE_MISSING_HISTORICAL_INPUTS] = (
+                self.replay_unpriceable.get(UNPRICEABLE_MISSING_HISTORICAL_INPUTS, 0) + 1
+            )
+            self.logger.info(
+                "⛔ UNPRICEABLE %s @ %s — %s (snapshot predates stored pricing inputs)",
+                snapshot_pair.symbol,
+                pd.Timestamp(snapshot_pair.event_date).strftime('%Y-%m-%d'),
+                UNPRICEABLE_MISSING_HISTORICAL_INPUTS,
+            )
+            return None
         entry_value = self._calendar_spread_market_value_from_snapshot(
             underlying_price=snapshot_pair.pre_underlying_price,
             strike=snapshot_pair.atm_strike,
@@ -2794,8 +2891,8 @@ class InstitutionalMLDatabase:
             long_expiry=snapshot_pair.long_expiry,
             front_iv=snapshot_pair.pre_front_iv,
             back_iv=snapshot_pair.pre_back_iv,
-            risk_free_rate=_trade_rfr,
-            dividend_yield=_trade_q,
+            risk_free_rate=float(snapshot_pair.pre_risk_free_rate),
+            dividend_yield=float(snapshot_pair.pre_dividend_yield),
         )
         exit_value = self._calendar_spread_market_value_from_snapshot(
             underlying_price=snapshot_pair.post_underlying_price,
@@ -2805,8 +2902,8 @@ class InstitutionalMLDatabase:
             long_expiry=snapshot_pair.long_expiry,
             front_iv=snapshot_pair.post_front_iv,
             back_iv=snapshot_pair.post_back_iv,
-            risk_free_rate=_trade_rfr,
-            dividend_yield=_trade_q,
+            risk_free_rate=float(snapshot_pair.post_risk_free_rate),
+            dividend_yield=float(snapshot_pair.post_dividend_yield),
         )
         if not np.isfinite(entry_value) or not np.isfinite(exit_value) or entry_value <= 0:
             return None

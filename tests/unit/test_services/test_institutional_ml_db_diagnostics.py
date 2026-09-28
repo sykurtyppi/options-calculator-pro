@@ -572,6 +572,10 @@ class TestInstitutionalDiagnostics(unittest.TestCase):
                 post_back_iv=0.50,
                 pre_underlying_price=205.0,
                 post_underlying_price=202.0,
+                pre_risk_free_rate=0.045,
+                pre_dividend_yield=0.005,
+                post_risk_free_rate=0.045,
+                post_dividend_yield=0.005,
             )
 
             trade = db._simulate_snapshot_replay_trade(

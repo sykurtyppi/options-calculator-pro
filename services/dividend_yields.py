@@ -40,7 +40,8 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, Tuple
+from datetime import date, timedelta
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -172,6 +173,57 @@ def reset_cache() -> None:
     """Drop all cached yields. Primarily for tests."""
     with _dividend_lock:
         _dividend_cache.clear()
+        _dividend_history_cache.clear()
+
+
+SOURCE_TRAILING_HISTORICAL = "yfinance_trailing_12m_dividends_historical"
+_dividend_history_cache: Dict[str, Any] = {}
+
+
+def get_historical_dividend_yield(
+    symbol: str,
+    as_of: date,
+    underlying_price: float,
+) -> Tuple[Optional[float], str]:
+    """Continuous dividend yield as knowable ON ``as_of`` (point in time).
+
+    Trailing-12-month cash dividends with an ex-date on or before ``as_of``,
+    divided by the underlying price then. Only dividends already paid by
+    ``as_of`` count, so a past valuation cannot see a later dividend regime.
+    A name with no dividend in that window resolves to 0.0 (a known fact at
+    ``as_of``). Returns ``(None, "unavailable")`` if the dividend history
+    cannot be fetched; callers must then refuse to price.
+
+    Still a continuous-yield approximation: discrete dividends and upcoming
+    ex-dates are not modelled.
+    """
+    sym = symbol.strip().upper()
+    if not sym or not np.isfinite(underlying_price) or underlying_price <= 0:
+        return None, "unavailable"
+    with _dividend_lock:
+        series = _dividend_history_cache.get(sym)
+    if series is None:
+        try:
+            import yfinance as yf  # lazy import — keep module usable without yfinance
+            series = yf.Ticker(sym).dividends
+        except Exception as exc:
+            logger.debug("Dividend history fetch for %s failed: %s", sym, exc)
+            return None, "unavailable"
+        if series is None:
+            return None, "unavailable"
+        with _dividend_lock:
+            _dividend_history_cache[sym] = series
+    window_start = as_of - timedelta(days=365)
+    paid = 0.0
+    for when, amount in getattr(series, "items", lambda: [])():
+        day = when.date() if hasattr(when, "date") else when
+        value = _safe_float(amount)
+        if window_start < day <= as_of and np.isfinite(value) and value > 0:
+            paid += value
+    q = paid / float(underlying_price)
+    if not (MIN_VALID_YIELD <= q < MAX_VALID_YIELD):
+        return None, "unavailable"
+    return float(q), SOURCE_TRAILING_HISTORICAL
 
 
 __all__ = [
@@ -184,6 +236,8 @@ __all__ = [
     "SOURCE_YFINANCE",
     "_dividend_cache",
     "_dividend_lock",
+    "SOURCE_TRAILING_HISTORICAL",
     "get_dividend_yield",
+    "get_historical_dividend_yield",
     "reset_cache",
 ]

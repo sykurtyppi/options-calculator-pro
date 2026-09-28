@@ -32,6 +32,7 @@ import logging
 import os
 import threading
 import time
+from datetime import date, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -125,6 +126,46 @@ def reset_cache() -> None:
     """Drop any cached rate. Primarily for tests."""
     with _rf_rate_lock:
         _rf_rate_cache.update({"ts": 0.0, "rate": None, "source": None})
+        _historical_rate_cache.clear()
+
+
+SOURCE_HISTORICAL_IRX = "yfinance_^IRX_historical_close"
+_historical_rate_cache: Dict[str, Tuple[Optional[float], str]] = {}
+
+
+def get_historical_risk_free_rate(as_of: date) -> Tuple[Optional[float], str]:
+    """The 13-week T-bill yield as known ON ``as_of`` (point in time).
+
+    Uses the last ^IRX close on or before ``as_of`` (within 10 days), never a
+    later observation, so valuing a past date cannot see today's rate
+    regime. Returns ``(None, "unavailable")`` when no such close can be
+    fetched; callers must then refuse to price rather than substitute today's
+    rate. Like the live rate, this is the 13-week bill yield used as a flat
+    continuous rate for every maturity.
+    """
+    key = as_of.isoformat()
+    with _rf_rate_lock:
+        if key in _historical_rate_cache:
+            return _historical_rate_cache[key]
+    result: Tuple[Optional[float], str] = (None, "unavailable")
+    try:
+        hist = yf.Ticker("^IRX").history(
+            start=(as_of - timedelta(days=10)).isoformat(),
+            end=(as_of + timedelta(days=1)).isoformat(),
+            auto_adjust=False,
+        )
+        closes = pd.to_numeric(hist.get("Close"), errors="coerce").dropna()
+        closes = closes[[pd.Timestamp(idx).date() <= as_of for idx in closes.index]]
+        if not closes.empty:
+            rate = float(closes.iloc[-1]) / 100.0
+            if np.isfinite(rate) and MIN_VALID_RATE < rate < MAX_VALID_RATE:
+                result = (rate, SOURCE_HISTORICAL_IRX)
+    except Exception as exc:
+        logger.debug("Historical ^IRX fetch for %s failed: %s", as_of, exc)
+    if result[0] is not None:
+        with _rf_rate_lock:
+            _historical_rate_cache[key] = result
+    return result
 
 
 __all__ = [
@@ -134,6 +175,7 @@ __all__ = [
     "MAX_VALID_RATE",
     "_rf_rate_cache",
     "_rf_rate_lock",
+    "get_historical_risk_free_rate",
     "get_pricing_risk_free_rate",
     "reset_cache",
 ]
