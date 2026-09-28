@@ -77,10 +77,22 @@ def test_remaining_life_changes_the_value():
     assert values == sorted(values) and len(set(values)) == 4
 
 
-@pytest.mark.parametrize("valuation", [14, 15, 30])
-def test_options_expiring_at_or_before_the_event_are_not_valued(valuation):
+@pytest.mark.parametrize("valuation", [15, 30])
+def test_options_expiring_before_the_reaction_are_not_valued(valuation):
     assert _straddle_payoff(100.0, 0.5, 14.0, valuation_days=valuation) is None
     assert _strangle_payoff(100.0, 0.5, 14.0, 6.0, valuation_days=valuation) is None
+
+
+def test_options_expiring_on_the_reaction_session_trade_through_it():
+    # Valued at that session's open with one regular session (6.5h) left,
+    # not withheld: they expire at its close, after the reaction.
+    for payoff in (
+        _straddle_payoff(100.0, 0.5, 14.0, valuation_days=14),
+        _strangle_payoff(100.0, 0.5, 14.0, 6.0, valuation_days=14),
+    ):
+        assert payoff is not None
+        assert payoff["T_remain_days"] == round(6.5 / 24, 2)
+        assert "expiry at that session's close" in payoff["note"]
 
 
 def test_positional_arguments_are_unchanged():
@@ -100,6 +112,9 @@ def test_positional_arguments_are_unchanged():
         (date(2026, 4, 20), 4, "after market close", 7),    # Fri AMC -> Monday
         (date(2026, 4, 20), 4, None, 7),                    # unknown timing treated as AMC
         (date(2026, 4, 20), 0, "after market close", 1),
+        (date(2026, 4, 20), 5, "before market open", 7),    # Sat BMO -> Monday
+        (date(2026, 4, 20), 6, "during market hours", 7),   # Sun intraday -> Monday
+        (date(2026, 4, 20), 5, "after market close", 7),    # Sat AMC -> Monday
     ],
 )
 def test_post_event_session(as_of, days_to_earnings, timing, expected):
@@ -165,10 +180,21 @@ def test_engine_values_the_straddle_at_the_post_event_session():
     assert payoff["valuation_basis"] == "first_post_event_session"
 
 
+def test_engine_values_a_straddle_expiring_on_the_reaction_session():
+    from tests.unit.test_web.test_analyze_single_ticker_golden import _run_watch_scenario
+
+    # Earnings Tue after the close -> reaction Wed (9 days); a Wed expiry
+    # trades through the reaction until that close.
+    metrics = _run_watch_scenario(near_term_dte=9).metrics
+    payoff = metrics["structure_payoff"]
+    assert metrics["structure_payoff_unavailable_reason"] is None
+    assert (payoff["valuation_days_after_entry"], payoff["T_remain_days"]) == (9, round(6.5 / 24, 2))
+    assert metrics["calendar_payoff"]["assumptions"]["synthetic_contracts"] is True
+
+
 def test_engine_withholds_a_straddle_that_expires_before_the_reaction():
     from tests.unit.test_web.test_analyze_single_ticker_golden import _run_watch_scenario
 
-    metrics = _run_watch_scenario(near_term_dte=9).metrics  # expires the day of the reaction
+    metrics = _run_watch_scenario(near_term_dte=8).metrics  # expires Tue, reaction prints Wed
     assert metrics["structure_payoff"] is None
     assert metrics["structure_payoff_unavailable_reason"] == "near_expiry_before_earnings_reaction"
-    assert metrics["calendar_payoff"]["assumptions"]["synthetic_contracts"] is True

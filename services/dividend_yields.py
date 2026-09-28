@@ -132,7 +132,9 @@ def get_dividend_yield(
             if (now - ts) < cache_ttl_seconds:
                 rate = _safe_float(cached.get("rate"))
                 if np.isfinite(rate) and MIN_VALID_YIELD <= rate < MAX_VALID_YIELD:
-                    return float(rate), SOURCE_CACHE
+                    # Report where the cached value came from (like the rate
+                    # service): a cached fallback must still read as a fallback.
+                    return float(rate), str(cached.get("source") or SOURCE_CACHE)
 
     env_rate = _resolve_symbol_env_override(sym)
     if np.isfinite(env_rate) and MIN_VALID_YIELD <= env_rate < MAX_VALID_YIELD:
@@ -187,43 +189,86 @@ def get_historical_dividend_yield(
 ) -> Tuple[Optional[float], str]:
     """Continuous dividend yield as knowable ON ``as_of`` (point in time).
 
-    Trailing-12-month cash dividends with an ex-date on or before ``as_of``,
-    divided by the underlying price then. Only dividends already paid by
-    ``as_of`` count, so a past valuation cannot see a later dividend regime.
-    A name with no dividend in that window resolves to 0.0 (a known fact at
-    ``as_of``). Returns ``(None, "unavailable")`` if the dividend history
-    cannot be fetched; callers must then refuse to price.
+    Annualised cash dividends with ex-dates on or before ``as_of``, divided by
+    the as-traded underlying price then:
 
-    Still a continuous-yield approximation: discrete dividends and upcoming
-    ex-dates are not modelled.
+    * Only dividends already paid by ``as_of`` count, so a past valuation
+      cannot see a later dividend regime.
+    * yfinance reports dividends split-adjusted to today; they are converted
+      back to as-traded amounts with the splits AFTER ``as_of``, so a later
+      split cannot shrink (or a reverse split inflate) the yield.
+    * The payout frequency comes from the gaps between recent ex-dates and
+      the latest year's worth of payments is summed, so ex-date drift cannot
+      pull a fifth quarterly dividend into a 365-day window.
+    * No dividend yet, or a dividend overdue by more than a cycle
+      (suspended), is 0.0: a known fact at ``as_of``.
+
+    Returns ``(None, "unavailable")`` if the history cannot be fetched;
+    callers must then refuse to price. Still a continuous-yield
+    approximation: discrete dividends and upcoming ex-dates are not modelled.
     """
     sym = symbol.strip().upper()
     if not sym or not np.isfinite(underlying_price) or underlying_price <= 0:
         return None, "unavailable"
     with _dividend_lock:
-        series = _dividend_history_cache.get(sym)
-    if series is None:
+        history = _dividend_history_cache.get(sym)
+    if history is None:
         try:
             import yfinance as yf  # lazy import — keep module usable without yfinance
-            series = yf.Ticker(sym).dividends
+            ticker = yf.Ticker(sym)
+            dividends = ticker.dividends
+            splits = ticker.splits
         except Exception as exc:
-            logger.debug("Dividend history fetch for %s failed: %s", sym, exc)
+            logger.debug("Dividend/split history fetch for %s failed: %s", sym, exc)
             return None, "unavailable"
-        if series is None:
+        if dividends is None or splits is None:
             return None, "unavailable"
+        history = (_dated_values(dividends), _dated_values(splits))
         with _dividend_lock:
-            _dividend_history_cache[sym] = series
-    window_start = as_of - timedelta(days=365)
-    paid = 0.0
-    for when, amount in getattr(series, "items", lambda: [])():
-        day = when.date() if hasattr(when, "date") else when
-        value = _safe_float(amount)
-        if window_start < day <= as_of and np.isfinite(value) and value > 0:
-            paid += value
-    q = paid / float(underlying_price)
+            _dividend_history_cache[sym] = history
+    dividends, splits = history
+
+    def _as_traded(day: date, amount: float) -> float:
+        factor = 1.0
+        for split_day, ratio in splits:
+            if split_day > day and ratio > 0:
+                factor *= ratio
+        return amount * factor
+
+    paid = sorted(
+        (day, _as_traded(day, amount)) for day, amount in dividends
+        if day <= as_of and amount > 0 and (as_of - day).days <= 800
+    )
+    q = 0.0
+    if paid:
+        per_year = _payments_per_year([day for day, _ in paid])
+        last_day = paid[-1][0]
+        if (as_of - last_day).days <= 365.0 / per_year + 45:
+            q = sum(amount for _, amount in paid[-per_year:]) / float(underlying_price)
     if not (MIN_VALID_YIELD <= q < MAX_VALID_YIELD):
         return None, "unavailable"
     return float(q), SOURCE_TRAILING_HISTORICAL
+
+
+def _dated_values(series: Any) -> list:
+    """(date, value) pairs from a yfinance date-indexed Series."""
+    pairs = []
+    for when, value in getattr(series, "items", lambda: [])():
+        day = when.date() if hasattr(when, "date") else when
+        parsed = _safe_float(value)
+        if isinstance(day, date) and np.isfinite(parsed):
+            pairs.append((day, float(parsed)))
+    return pairs
+
+
+def _payments_per_year(ex_dates: list) -> int:
+    """Payout frequency (1, 2, 4 or 12) from the median gap between ex-dates."""
+    recent = ex_dates[-9:]
+    gaps = [(b - a).days for a, b in zip(recent, recent[1:]) if (b - a).days > 0]
+    if not gaps:
+        return 1
+    per_year = 365.0 / float(np.median(gaps))
+    return min((1, 2, 4, 12), key=lambda candidate: abs(candidate - per_year))
 
 
 __all__ = [

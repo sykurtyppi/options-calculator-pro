@@ -6,6 +6,7 @@ import {
   payoffHorizonLabel,
   payoffUnavailableMessage,
   pricingInputWarnings,
+  scenarioSourceLabel,
 } from './payoffDisclosure.js'
 
 test('horizon label states the post-event session and the real remaining life', () => {
@@ -56,4 +57,24 @@ test('fallback pricing inputs are flagged', () => {
   })
   assert.equal(warnings.length, 2)
   assert.deepEqual(pricingInputWarnings({ pricing_risk_free_rate_source: 'yfinance_^IRX', pricing_dividend_yield_source: 'yfinance' }), [])
+})
+
+test('same-session expiry is described as expiring that session, not 0d', () => {
+  assert.equal(
+    payoffHorizonLabel({ valuation_days_after_entry: 4, T_remain_days: 0.27, valuation_basis: 'first_post_event_session' }),
+    "Valued at first post-event session (4d after entry), expiring at that session's close",
+  )
+})
+
+test('scenario source label follows the payload', () => {
+  assert.equal(scenarioSourceLabel({ scenario_source: 'heuristic_fallback' }), 'fixed heuristic multipliers (no usable history)')
+  assert.match(scenarioSourceLabel({ calendar_scenario_source: 'historical_move_proxy' }), /stock-move proxy/)
+  assert.match(scenarioSourceLabel({ scenario_source: 'small_sample_estimate' }), /small-sample/)
+  assert.equal(scenarioSourceLabel({}), 'source not reported')
+})
+
+test('legacy calendar payloads without assumptions get calendar wording', () => {
+  const items = payoffAssumptions({ structure: 'call_calendar', calendar_is_theoretical: true })
+  assert.ok(items.some((item) => item.includes('separate front and back IVs')))
+  assert.ok(!items.some((item) => item.includes('One IV for every leg')))
 })

@@ -123,8 +123,17 @@ class TestCaching(unittest.TestCase):
             second_rate, second_source = get_dividend_yield("MSFT")
         self.assertAlmostEqual(first_rate, second_rate, places=6)
         self.assertEqual(first_source, SOURCE_YFINANCE)
-        self.assertEqual(second_source, "cache")
+        # Served from cache, reporting its original source.
+        self.assertEqual(second_source, SOURCE_YFINANCE)
         ticker_patch.assert_called_once()  # second lookup served from cache
+
+    def test_cached_fallback_still_reads_as_fallback(self):
+        with patch("yfinance.Ticker", side_effect=RuntimeError("network down")) as ticker_patch:
+            first = get_dividend_yield("KO")
+            second = get_dividend_yield("KO")
+        self.assertEqual(first, (0.0, SOURCE_FALLBACK_ZERO))
+        self.assertEqual(second, (0.0, SOURCE_FALLBACK_ZERO))
+        ticker_patch.assert_called_once()
 
 
 class TestEdgeCases(unittest.TestCase):

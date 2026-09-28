@@ -284,6 +284,14 @@ class SnapshotReplayPair:
 UNPRICEABLE_MISSING_HISTORICAL_INPUTS = "unpriceable_missing_historical_inputs"
 
 
+def _prefer_priced(candidates: "pd.DataFrame") -> "pd.DataFrame":
+    """Candidates with both stored pricing inputs, or all of them if none have."""
+    priced = candidates[
+        candidates["pricing_risk_free_rate"].notna() & candidates["pricing_dividend_yield"].notna()
+    ]
+    return priced if not priced.empty else candidates
+
+
 def _stored_input(value: Any) -> Optional[float]:
     """A stored pricing input as a finite float, or None (legacy / missing)."""
     try:
@@ -627,9 +635,14 @@ class InstitutionalMLDatabase:
                 _snapshot_columns = {row[1] for row in cursor.fetchall()}
                 for _column, _sql_type in _SNAPSHOT_PRICING_COLUMNS.items():
                     if _column not in _snapshot_columns:
-                        cursor.execute(
-                            f"ALTER TABLE earnings_option_snapshots ADD COLUMN {_column} {_sql_type}"
-                        )
+                        try:
+                            cursor.execute(
+                                f"ALTER TABLE earnings_option_snapshots ADD COLUMN {_column} {_sql_type}"
+                            )
+                        except sqlite3.OperationalError as exc:
+                            # Another process migrated the same database first.
+                            if "duplicate column" not in str(exc).lower():
+                                raise
 
                 # Calibrated post-earnings IV-decay labels from real snapshots
                 cursor.execute("""
@@ -1115,6 +1128,9 @@ class InstitutionalMLDatabase:
                                  strategy_params: Dict[str, Any]) -> List[BacktestTrade]:
         """Generate deterministic trade outcomes from historical feature snapshots."""
         pricing_mode = str(strategy_params.get('pricing_mode', 'hybrid')).strip().lower() or 'hybrid'
+        # Per-run count of snapshot pairs replay refused (never accumulated
+        # across runs or parameter sweeps sharing this instance).
+        self.replay_unpriceable = {}
         earnings_event_mode = bool(strategy_params.get('earnings_event_mode', True))
         entry_days_before_earnings = max(1, int(strategy_params.get('entry_days_before_earnings', 7)))
         exit_days_after_earnings = max(0, int(strategy_params.get('exit_days_after_earnings', 1)))
@@ -1269,14 +1285,6 @@ class InstitutionalMLDatabase:
                     snapshot_pair = snapshot_pair_cache.get(replay_key)
 
                 if snapshot_pair is not None:
-                    self.logger.info(
-                        "📸 REPLAY  %s @ %s — using real option snapshot pair "
-                        "(pre_iv=%.3f post_iv=%.3f)",
-                        symbol,
-                        pd.Timestamp(event_date).strftime('%Y-%m-%d'),
-                        snapshot_pair.pre_front_iv,
-                        snapshot_pair.post_front_iv,
-                    )
                     trade = self._simulate_snapshot_replay_trade(
                         session_id=session.session_id,
                         setup_score=setup_score,
@@ -1288,6 +1296,18 @@ class InstitutionalMLDatabase:
                         daily_share_volume=getattr(row, 'volume', np.nan),
                         volume_ratio=getattr(row, 'volume_ratio_10d', 1.0),
                     )
+                    if trade is not None:
+                        # Logged only once priced: a refused pair (e.g. no
+                        # stored inputs) is logged as UNPRICEABLE instead, so
+                        # replay coverage counts real option economics only.
+                        self.logger.info(
+                            "📸 REPLAY  %s @ %s — using real option snapshot pair "
+                            "(pre_iv=%.3f post_iv=%.3f)",
+                            symbol,
+                            pd.Timestamp(event_date).strftime('%Y-%m-%d'),
+                            snapshot_pair.pre_front_iv,
+                            snapshot_pair.post_front_iv,
+                        )
                 elif pricing_mode == 'snapshot_replay':
                     self.logger.debug(
                         "⏭  SKIP    %s @ %s — snapshot_replay mode, no pair found",
@@ -1933,12 +1953,17 @@ class InstitutionalMLDatabase:
                                 continue
 
                             term_ratio = float(front_iv / max(back_iv, 1e-6))
-                            # Captured live today, so today's rate and dividend
-                            # ARE the point-in-time inputs for this snapshot.
-                            from services.pricing_rates import get_pricing_risk_free_rate
-                            from services.dividend_yields import get_dividend_yield
-                            _live_rfr, _live_rfr_source = get_pricing_risk_free_rate()
-                            _live_q, _live_q_source = get_dividend_yield(symbol)
+                            # Point-in-time inputs as of today, from the same
+                            # lookups the historical backfill uses. The current-
+                            # value services fall back to fixed defaults (4.5%,
+                            # 0%) on a feed failure; stored as observed inputs,
+                            # replay would trust them. If a lookup fails the
+                            # inputs are stored as NULL: the snapshot's IVs are
+                            # kept, and replay refuses to price it.
+                            from services.pricing_rates import get_historical_risk_free_rate
+                            from services.dividend_yields import get_historical_dividend_yield
+                            _live_rfr, _live_rfr_source = get_historical_risk_free_rate(today)
+                            _live_q, _live_q_source = get_historical_dividend_yield(symbol, today, last_close)
                             cursor.execute(
                                 """
                                 INSERT OR REPLACE INTO earnings_option_snapshots
@@ -1965,9 +1990,9 @@ class InstitutionalMLDatabase:
                                     term_ratio,
                                     float(last_close),
                                     'yfinance_live',
-                                    float(_live_rfr),
+                                    None if _live_rfr is None else float(_live_rfr),
                                     str(_live_rfr_source),
-                                    float(_live_q),
+                                    None if _live_q is None else float(_live_q),
                                     str(_live_q_source),
                                     today.strftime('%Y-%m-%d'),
                                 )
@@ -2755,6 +2780,13 @@ class InstitutionalMLDatabase:
         if pre_candidates.empty or post_candidates.empty:
             return None
 
+        # Prefer snapshots that carry stored point-in-time pricing inputs: an
+        # older legacy row must not hide a priceable backfilled one for the
+        # same event. Legacy rows are used only when no row has inputs (the
+        # pair is then refused as unpriceable by the replay itself).
+        pre_candidates = _prefer_priced(pre_candidates)
+        post_candidates = _prefer_priced(post_candidates)
+
         pre_row = pre_candidates.iloc[-1]
         aligned_post = post_candidates[
             (post_candidates["short_expiry"] == pre_row["short_expiry"])
@@ -3153,7 +3185,8 @@ class InstitutionalMLDatabase:
         max_post_days = max(min_post_days, int(max_post_days))
 
         query = """
-            SELECT symbol, event_date, capture_date, relative_day, snapshot_phase, front_iv, back_iv
+            SELECT symbol, event_date, capture_date, relative_day, snapshot_phase, front_iv, back_iv,
+                   pricing_risk_free_rate, pricing_dividend_yield
             FROM earnings_option_snapshots
             ORDER BY symbol, event_date, capture_date
         """
@@ -3172,6 +3205,7 @@ class InstitutionalMLDatabase:
                 'pending_post_only_events': 0,
                 'unqualified_events': 0,
                 'pairable_event_pct': 0.0,
+                'priceable_events': 0,
                 'capture_days': 0,
                 'min_relative_day': None,
                 'max_relative_day': None,
@@ -3188,6 +3222,7 @@ class InstitutionalMLDatabase:
                 'pending_post_only_events': 0,
                 'unqualified_events': 0,
                 'pairable_event_pct': 0.0,
+                'priceable_events': 0,
                 'capture_days': 0,
                 'min_relative_day': None,
                 'max_relative_day': None,
@@ -3212,15 +3247,24 @@ class InstitutionalMLDatabase:
             & ((snapshots['snapshot_phase'] == 'post') | (snapshots['relative_day'] > 0))
         )
 
+        # Replay prices only snapshots with stored point-in-time inputs.
+        has_inputs = (
+            pd.to_numeric(snapshots['pricing_risk_free_rate'], errors='coerce').notna()
+            & pd.to_numeric(snapshots['pricing_dividend_yield'], errors='coerce').notna()
+        )
         grouped = (
             snapshots.assign(
                 pre_hit=pre_mask.astype(int),
                 post_hit=post_mask.astype(int),
+                priced_pre_hit=(pre_mask & has_inputs).astype(int),
+                priced_post_hit=(post_mask & has_inputs).astype(int),
             )
             .groupby(['symbol', 'event_date'], dropna=False, as_index=False)
             .agg(
                 pre_count=('pre_hit', 'sum'),
                 post_count=('post_hit', 'sum'),
+                priced_pre_count=('priced_pre_hit', 'sum'),
+                priced_post_count=('priced_post_hit', 'sum'),
                 observations=('relative_day', 'size'),
             )
         )
@@ -3229,6 +3273,7 @@ class InstitutionalMLDatabase:
         events_with_pre = int((grouped['pre_count'] > 0).sum())
         events_with_post = int((grouped['post_count'] > 0).sum())
         pairable_events = int(((grouped['pre_count'] > 0) & (grouped['post_count'] > 0)).sum())
+        priceable_events = int(((grouped['priced_pre_count'] > 0) & (grouped['priced_post_count'] > 0)).sum())
         pending_pre_only = int(((grouped['pre_count'] > 0) & (grouped['post_count'] == 0)).sum())
         pending_post_only = int(((grouped['pre_count'] == 0) & (grouped['post_count'] > 0)).sum())
         unqualified_events = int(((grouped['pre_count'] == 0) & (grouped['post_count'] == 0)).sum())
@@ -3256,6 +3301,9 @@ class InstitutionalMLDatabase:
             'pending_post_only_events': pending_post_only,
             'unqualified_events': unqualified_events,
             'pairable_event_pct': pairable_event_pct,
+            # Paired AND carrying stored point-in-time inputs on both sides:
+            # the events replay can actually price.
+            'priceable_events': priceable_events,
             'capture_days': int(snapshots['capture_date'].dropna().dt.date.nunique()),
             'min_relative_day': min_relative_day,
             'max_relative_day': max_relative_day,

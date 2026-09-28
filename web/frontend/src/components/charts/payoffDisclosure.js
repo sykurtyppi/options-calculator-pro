@@ -23,7 +23,8 @@ export function payoffHorizonLabel(payoff = {}) {
   const when = payoff.valuation_basis === 'first_post_event_session'
     ? `first post-event session (${Math.round(valuation)}d after entry)`
     : `${Math.round(valuation)}d after entry (no earnings date)`
-  return `Valued at ${when}, ${Math.round(remaining)}d left to expiry`
+  const life = remaining < 1 ? "expiring at that session's close" : `${Math.round(remaining)}d left to expiry`
+  return `Valued at ${when}, ${life}`
 }
 
 const BACK_IV_SOURCE = {
@@ -31,10 +32,32 @@ const BACK_IV_SOURCE = {
   'iv30_x_0.88_fallback': 'back-leg IV = IV30 × 0.88 (fixed fallback, IV45 unavailable)',
 }
 
+// What the IV scenarios are built from, read from the payload itself.
+const SCENARIO_SOURCE_LABELS = {
+  historical_move_proxy: 'stock-move proxy (symbol history), not historical IV',
+  historical_symbol_calibrated: 'stock-move proxy (symbol history), not historical IV',
+  small_sample_move_proxy: 'small-sample stock-move proxy, not historical IV',
+  small_sample_estimate: 'small-sample stock-move proxy, not historical IV',
+  heuristic_fallback: 'fixed heuristic multipliers (no usable history)',
+}
+
+export function scenarioSourceLabel(payoff = {}) {
+  const source = payoff.scenario_source || payoff.calendar_scenario_source
+  if (!source) return 'source not reported'
+  return SCENARIO_SOURCE_LABELS[source] || source
+}
+
+function isCalendarPayoff(payoff) {
+  return String(payoff.structure || '').endsWith('_calendar') || payoff.calendar_is_theoretical === true
+}
+
 export function payoffAssumptions(payoff = {}) {
   const items = []
   const assumptions = payoff.assumptions || {}
-  if (assumptions.synthetic_contracts) {
+  if (!assumptions.synthetic_contracts && isCalendarPayoff(payoff)) {
+    // Older calendar payloads carry no assumptions block.
+    items.push('Illustrative synthetic calendar: separate front and back IVs; strike and back expiry may not be listed.')
+  } else if (assumptions.synthetic_contracts) {
     items.push('Illustrative synthetic contracts: strike = spot (may not be a listed strike), back expiry = front + 28d (may not be listed).')
     const backIv = BACK_IV_SOURCE[assumptions.back_iv_source]
     if (backIv) items.push(`Entry ${backIv}.`)

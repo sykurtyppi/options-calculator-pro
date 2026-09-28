@@ -158,7 +158,9 @@ def get_historical_risk_free_rate(as_of: date) -> Tuple[Optional[float], str]:
         closes = closes[[pd.Timestamp(idx).date() <= as_of for idx in closes.index]]
         if not closes.empty:
             rate = float(closes.iloc[-1]) / 100.0
-            if np.isfinite(rate) and MIN_VALID_RATE < rate < MAX_VALID_RATE:
+            # 0.00% is a real observation (2020-21 zero-rate era), not a
+            # missing value: accept it for historical dates.
+            if np.isfinite(rate) and 0.0 <= rate < MAX_VALID_RATE:
                 result = (rate, SOURCE_HISTORICAL_IRX)
     except Exception as exc:
         logger.debug("Historical ^IRX fetch for %s failed: %s", as_of, exc)
