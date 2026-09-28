@@ -1461,6 +1461,7 @@ from web.api.edge_math import (  # noqa: E402,F401
     _calendar_spread_payoff,
     _straddle_payoff,
     _strangle_payoff,
+    post_event_valuation_days,
     _rv_percentile_and_regime,
     _excess_kurtosis,
     _kurtosis_confidence_mult,
@@ -3063,6 +3064,18 @@ def analyze_single_ticker(
         float(iv45) if (np.isfinite(iv45) and iv45 > 0)
         else (float(iv30) * 0.88 if (np.isfinite(iv30) and iv30 > 0) else np.nan)
     )
+    # The calendar diagram prices SYNTHETIC contracts; say exactly which
+    # assumptions it used so the UI never presents them as listed contracts.
+    _cal_assumptions = {
+        "synthetic_contracts": True,
+        "strike_basis": "spot_as_atm_strike",
+        "back_expiry_basis": "front_expiry_plus_28d",
+        "back_iv_source": (
+            "iv45" if (np.isfinite(iv45) and iv45 > 0)
+            else ("iv30_x_0.88_fallback" if (np.isfinite(iv30) and iv30 > 0) else None)
+        ),
+        "back_iv_held_fixed": True,
+    }
     _cal_T_near = float(near_term_dte) if (near_term_dte is not None and near_term_dte > 0) else np.nan
     _cal_T_back = _cal_T_near + 28.0 if np.isfinite(_cal_T_near) else np.nan
     calendar_payoff: Optional[Dict[str, Any]] = (
@@ -3083,6 +3096,8 @@ def analyze_single_ticker(
             and np.isfinite(_cal_iv_back) and _cal_iv_back > 0)
         else None
     )
+    if calendar_payoff is not None:
+        calendar_payoff = {**calendar_payoff, "assumptions": _cal_assumptions}
 
     # Fix 4: Calendar spread viability based on near/back IV ratio + implied-move vs breakevens
     _nb_ratio = _safe_float(near_back_iv_ratio, np.nan)
@@ -3118,6 +3133,20 @@ def analyze_single_ticker(
     _sp_move_ok  = np.isfinite(implied_move_total_pct) and implied_move_total_pct > 0
     _sp_raw      = _raw_moves if _raw_moves else None
     _sp_impl     = float(implied_move_total_pct) if _sp_move_ok else None
+    # Value straddles/strangles at the first session that prices the earnings
+    # reaction, from the snapshot's own as_of / earnings date / timing (point
+    # in time), with the time the options actually have left then.
+    _sp_as_of = getattr(vol_snapshot, "as_of_date", None)
+    _sp_earnings = getattr(vol_snapshot, "earnings_date", None)
+    _sp_valuation_days = (
+        post_event_valuation_days(
+            _sp_as_of, float((_sp_earnings - _sp_as_of).days),
+            getattr(vol_snapshot, "release_timing", None) or earnings_release_time,
+        )
+        if isinstance(_sp_as_of, date) and isinstance(_sp_earnings, date)
+        else None
+    )
+    structure_payoff_unavailable_reason: Optional[str] = None
 
     if _best_structure == "call_calendar":
         structure_payoff: Optional[Dict[str, Any]] = calendar_payoff
@@ -3129,11 +3158,24 @@ def analyze_single_ticker(
             raw_moves_pct=_sp_raw,
             implied_move_pct=_sp_impl, side="put",
         )
+        if structure_payoff is not None:
+            structure_payoff = {**structure_payoff, "assumptions": _cal_assumptions}
+    elif _best_structure in ("atm_straddle", "otm_strangle") and _sp_valuation_days is None:
+        structure_payoff = None
+        structure_payoff_unavailable_reason = "no_upcoming_earnings_date"
+    elif (
+        _best_structure in ("atm_straddle", "otm_strangle") and _sp_near_dte
+        and _sp_valuation_days >= _sp_near_dte
+    ):
+        # The near options expire before the earnings reaction prints.
+        structure_payoff = None
+        structure_payoff_unavailable_reason = "near_expiry_before_earnings_reaction"
     elif _best_structure == "atm_straddle" and _sp_near_iv_ok and _sp_near_dte:
         structure_payoff = _straddle_payoff(
             S=current_price, iv=float(near_leg_iv), T_near_days=_sp_near_dte,
             r=pricing_risk_free_rate, q=pricing_dividend_yield,  # PR #68
             raw_moves_pct=_sp_raw, implied_move_pct=_sp_impl,
+            valuation_days=_sp_valuation_days,
         )
     elif _best_structure == "otm_strangle" and _sp_near_iv_ok and _sp_near_dte and _sp_move_ok:
         structure_payoff = _strangle_payoff(
@@ -3141,9 +3183,16 @@ def analyze_single_ticker(
             wing_pct=float(implied_move_total_pct),
             r=pricing_risk_free_rate, q=pricing_dividend_yield,  # PR #68
             raw_moves_pct=_sp_raw, implied_move_pct=_sp_impl,
+            valuation_days=_sp_valuation_days,
         )
     else:
         structure_payoff = None
+    if structure_payoff is None and structure_payoff_unavailable_reason is None and _best_structure:
+        structure_payoff_unavailable_reason = (
+            "missing_pricing_inputs"
+            if _best_structure in ("call_calendar", "put_calendar", "atm_straddle", "otm_strangle")
+            else "no_diagram_for_structure"
+        )
 
     # ── Experimental: candidate calendar contract selection ──────────────────
     # PR-AC commit 3 — strict shadow surface. Only call_calendar gets live
@@ -3643,6 +3692,7 @@ def analyze_single_ticker(
         ),
         # ── Structure-specific payoff (matches the recommended structure) ────
         "structure_payoff": structure_payoff,
+        "structure_payoff_unavailable_reason": structure_payoff_unavailable_reason,
         # ── Experimental candidate contract selection (PR-AC commit 3) ──────
         # Shadow surface. None for non-calendar structures. For call_calendar,
         # carries the dual-picker output for the live chain. For put_calendar,

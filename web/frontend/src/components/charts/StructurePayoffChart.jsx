@@ -13,6 +13,7 @@ import {
 import { CHART, axisTick, tooltipContentStyle } from './chartTheme'
 import { usePayoffZoom } from './usePayoffZoom'
 import ChartZoomHint from './ChartZoomHint'
+import { payoffAssumptions, payoffHorizonLabel } from './payoffDisclosure.js'
 
 const SERIES_KEYS = ['expand', 'flat', 'crush25', 'crush45']
 
@@ -22,6 +23,7 @@ const SERIES_KEYS = ['expand', 'flat', 'crush25', 'crush45']
  * Plots P&L per contract across four IV scenarios: +20%, flat, -25%, -45%.
  * Returns null if no payoff_scenarios are present.
  */
+
 export default function StructurePayoffChart({ payoff }) {
   if (!payoff?.payoff_scenarios?.length) return null
 
@@ -46,8 +48,8 @@ export default function StructurePayoffChart({ payoff }) {
   const zoom = usePayoffZoom(data, SERIES_KEYS)
 
   const titleMap = {
-    atm_straddle: 'Long ATM Straddle · P&L at 1-Day Post-Event',
-    otm_strangle: 'Long OTM Strangle · P&L at 1-Day Post-Event',
+    atm_straddle: 'Long ATM Straddle · P&L at First Post-Event Session',
+    otm_strangle: 'Long OTM Strangle · P&L at First Post-Event Session',
     call_calendar: 'Call Calendar Spread · P&L at Near-Leg Expiry',
     put_calendar: 'Put Calendar Spread · P&L at Near-Leg Expiry',
   }
@@ -55,7 +57,7 @@ export default function StructurePayoffChart({ payoff }) {
 
   const xAxisLabel = isCalendar
     ? 'Underlying Move at Near-Leg Expiry'
-    : 'Underlying Move 1-Day Post-Earnings'
+    : 'Underlying Move at First Post-Event Session'
 
   const debitStr = payoff.entry_debit_per_contract != null
     ? `$${Number(payoff.entry_debit_per_contract).toFixed(2)}/contract`
@@ -110,7 +112,7 @@ export default function StructurePayoffChart({ payoff }) {
           />
           <Tooltip
             formatter={(v, name) => {
-              const labels = { expand: 'IV +20%', flat: 'IV Flat', crush25: 'IV −25%', crush45: 'IV −45%' }
+              const labels = { expand: 'IV expansion', flat: 'IV flat', crush25: 'Mild crush', crush45: 'Severe crush' }
               return [`$${Number(v).toFixed(2)}`, labels[name] || name]
             }}
             labelFormatter={(l) => `Move: ${Number(l) > 0 ? '+' : ''}${Number(l)}%`}
@@ -138,21 +140,22 @@ export default function StructurePayoffChart({ payoff }) {
         </LineChart>
       </ResponsiveContainer>
       <div style={{ display: 'flex', gap: 14, marginTop: 4, fontSize: 11, color: CHART.axis, flexWrap: 'wrap' }}>
-        <span style={{ color: CHART.series.pos }}>━ IV +20%</span>
-        <span style={{ color: CHART.series.accent }}>━ IV Flat</span>
-        <span style={{ color: CHART.series.warn }}>━ IV −25%</span>
-        <span style={{ color: CHART.series.neg }}>━ IV −45%</span>
+        <span style={{ color: CHART.series.pos }}>━ IV expansion</span>
+        <span style={{ color: CHART.series.accent }}>━ IV flat</span>
+        <span style={{ color: CHART.series.warn }}>━ Mild crush</span>
+        <span style={{ color: CHART.series.neg }}>━ Severe crush</span>
         <span style={{ color: 'rgba(240,160,32,0.6)' }}>╌ BE</span>
         {(isStraddle || isStrangle) && (
-          <span style={{ color: CHART.axis, marginLeft: 4 }}>· MTM 1-day post-event</span>
+          <span style={{ color: CHART.axis, marginLeft: 4 }}>· {payoffHorizonLabel(payoff)}</span>
         )}
       </div>
       <ChartZoomHint zoomed={zoom.zoomed} onReset={zoom.reset} />
-      {(payoff.is_theoretical || payoff.calendar_is_theoretical) && (
+      {(payoff.is_theoretical || payoff.calendar_is_theoretical || isCalendar) && (
         <div style={{ marginTop: 6, fontSize: 10, color: CHART.axisDim }}>
-          {isCalendar
-            ? '⚠ Theoretical — priced from interpolated IV30/IV45. Verify debit with live chain.'
-            : '⚠ Theoretical — BSM-priced at ATM IV. IV scenarios are symbol-calibrated estimates.'}
+          <div>⚠ Illustrative model scenarios, not executable P&L. Verify the debit with the live chain.</div>
+          <ul style={{ margin: '2px 0 0 14px', padding: 0 }}>
+            {payoffAssumptions(payoff).map((item) => <li key={item}>{item}</li>)}
+          </ul>
         </div>
       )}
     </div>

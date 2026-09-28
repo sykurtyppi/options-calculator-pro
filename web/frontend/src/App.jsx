@@ -22,6 +22,7 @@ import VolTermPanel from './components/charts/VolTermPanel'
 import EarningsMoveHistoryPanel from './components/charts/EarningsMoveHistoryPanel'
 import OosSplitChart from './components/charts/OosSplitChart'
 import StructurePayoffChart from './components/charts/StructurePayoffChart'
+import { payoffHorizonLabel, payoffUnavailableMessage, pricingInputWarnings } from './components/charts/payoffDisclosure.js'
 import CalendarSpreadChart from './components/charts/CalendarSpreadChart'
 import HowItWorksPanel from './components/common/HowItWorksPanel'
 import ValuePillars from './components/common/ValuePillars'
@@ -653,6 +654,11 @@ export default function App() {
                 unknownTimingCount={m.earnings_move_unknown_timing_count}
               />
 
+              {!m.structure_payoff && payoffUnavailableMessage(m.structure_payoff_unavailable_reason) && (
+                <div className="selector-panel selector-panel-structure-payoff">
+                  <p className="oos-help">Payoff diagram: {payoffUnavailableMessage(m.structure_payoff_unavailable_reason)}</p>
+                </div>
+              )}
               {m.structure_payoff && (() => {
                 const sp = m.structure_payoff
                 const isCalendar = sp.structure === 'call_calendar' || sp.structure === 'put_calendar'
@@ -680,7 +686,7 @@ export default function App() {
                         {isStrangle && sp.wing_pct != null && (
                           <span style={{ marginRight: 10 }}>Wings ±{Number(sp.wing_pct).toFixed(1)}% (at implied move) ·&nbsp;</span>
                         )}
-                        <span style={{ color: 'var(--muted-dim)' }}>IV scenarios: symbol-calibrated where available</span>
+                        <span style={{ color: 'var(--muted-dim)' }}>IV scenarios: stock-move proxy, not historical IV</span>
                       </span>
                     </div>
 
@@ -714,7 +720,7 @@ export default function App() {
                       <div style={{ display: 'flex', gap: 18, marginTop: 6, fontSize: 11, color: 'var(--muted)', flexWrap: 'wrap' }}>
                         <span>Entry IV: {(sp.iv_entry * 100).toFixed(1)}%</span>
                         <span>DTE: {sp.T_near_days}d</span>
-                        <span>P&L eval: 1-day post-event</span>
+                        <span>{payoffHorizonLabel(sp)}</span>
                       </div>
                     )}
                   </div>
@@ -1031,7 +1037,15 @@ export default function App() {
                     value={fmtVol(m.pricing_risk_free_rate, 2)}
                     sub={m.pricing_risk_free_rate_source ? `pricing input · ${m.pricing_risk_free_rate_source}` : 'pricing input'}
                   />
+                  <Metric
+                    label="Dividend Yield"
+                    value={fmtVol(m.pricing_dividend_yield, 2)}
+                    sub={m.pricing_dividend_yield_source ? `pricing input · ${m.pricing_dividend_yield_source}` : 'pricing input'}
+                  />
                 </div>
+                {pricingInputWarnings(m).map((warning) => (
+                  <p className="oos-help" key={warning}>⚠ {warning}</p>
+                ))}
               </div>
 
               <div className="metrics-group">
@@ -1099,27 +1113,33 @@ export default function App() {
                   {/* Scenario source provenance — never pretend a fallback is calibrated history */}
                   {m.calendar_payoff.calendar_scenario_source && (() => {
                     const src = m.calendar_payoff.calendar_scenario_source
+                    // Stock-move proxy, not an IV-crush calibration (no historical IV
+                    // observations). Legacy source keys map to the same wording.
+                    const proxy = {
+                      label: 'Stock-move proxy (symbol history)',
+                      color: 'var(--warn-bright)',
+                      bg: 'color-mix(in srgb, var(--warn) 10%, transparent)',
+                      border: 'color-mix(in srgb, var(--warn) 28%, transparent)',
+                      tip: 'IV scenarios scaled from ≥8 past earnings STOCK moves vs the implied move. Not measured from historical implied volatility — an assumption, not a calibration.',
+                    }
+                    const smallProxy = {
+                      label: 'Small-sample stock-move proxy',
+                      color: 'var(--warn-bright)',
+                      bg: 'color-mix(in srgb, var(--warn) 10%, transparent)',
+                      border: 'color-mix(in srgb, var(--warn) 28%, transparent)',
+                      tip: 'Fewer than 8 earnings events; IV scenarios scaled from past stock moves, not historical implied volatility. Elevated uncertainty.',
+                    }
                     const srcMeta = {
-                      historical_symbol_calibrated: {
-                        label: 'Calibrated (symbol history)',
-                        color: 'var(--pos-bright)',
-                        bg: 'color-mix(in srgb, var(--pos) 10%, transparent)',
-                        border: 'color-mix(in srgb, var(--pos) 28%, transparent)',
-                        tip: 'Scenarios derived from ≥8 earnings events for this ticker — full statistical power.',
-                      },
-                      small_sample_estimate: {
-                        label: 'Small-sample estimate',
-                        color: 'var(--warn-bright)',
-                        bg: 'color-mix(in srgb, var(--warn) 10%, transparent)',
-                        border: 'color-mix(in srgb, var(--warn) 28%, transparent)',
-                        tip: 'Fewer than 8 earnings events available. Scenarios are estimates with elevated uncertainty.',
-                      },
+                      historical_move_proxy: proxy,
+                      historical_symbol_calibrated: proxy,
+                      small_sample_move_proxy: smallProxy,
+                      small_sample_estimate: smallProxy,
                       heuristic_fallback: {
                         label: 'Heuristic fallback',
                         color: 'var(--neg-bright)',
                         bg: 'color-mix(in srgb, var(--neg) 10%, transparent)',
                         border: 'color-mix(in srgb, var(--neg) 28%, transparent)',
-                        tip: 'No usable earnings history. Scenarios built from sector/macro heuristics — treat as illustrative only.',
+                        tip: 'No usable earnings history. Fixed heuristic IV scenarios — treat as illustrative only.',
                       },
                     }
                     const m2 = srcMeta[src] || { label: src, color: 'var(--muted)', bg: 'color-mix(in srgb, var(--muted) 8%, transparent)', border: 'color-mix(in srgb, var(--muted) 22%, transparent)', tip: '' }
