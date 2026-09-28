@@ -83,8 +83,12 @@ def _first_diff(a, b, path=""):
     return None
 
 
-def _run_watch_scenario():
-    """Fully-mocked analyze_single_ticker call — deterministic, no network/provider."""
+def _run_watch_scenario(near_term_dte=4):
+    """Fully-mocked analyze_single_ticker call — deterministic, no network/provider.
+
+    ``near_term_dte`` defaults to the golden case (4: the near expiry lapses
+    before the day-8 earnings reaction).
+    """
     hist_dates = pd.bdate_range("2024-01-02", periods=140)
     hist_df = pd.DataFrame({
         "Open": np.linspace(100.0, 102.0, len(hist_dates)),
@@ -105,7 +109,7 @@ def _run_watch_scenario():
         option_source="provided", underlying_source="provided", price_staleness_minutes=0,
         chain_staleness_minutes=0, data_quality="high", data_quality_score=0.91,
         rv30_yang_zhang=0.21, rv30_estimator="yang_zhang", rv_har_forecast=0.19, rv_percentile_rank=48.0,
-        vol_regime_label="Normal", iv30=0.27, iv45=0.30, near_term_dte=4, near_term_atm_iv=0.26,
+        vol_regime_label="Normal", iv30=0.27, iv45=0.30, near_term_dte=near_term_dte, near_term_atm_iv=0.26,
         back_term_dte=25, back_term_atm_iv=0.30, near_back_iv_ratio=0.8667, term_structure_slope=0.0015,
         near_term_implied_move_pct=5.7, near_term_implied_sigma_pct=5.7 * 1.2533141373155001,
         non_event_move_pct_har=1.0, event_implied_move_pct=5.61, event_move_share_of_total=0.98,
@@ -168,7 +172,7 @@ class TestAnalyzeSingleTickerGolden(unittest.TestCase):
     def test_golden_pins_full_metrics_surface(self):
         """Guard against the golden silently shrinking — pins the key count."""
         golden = json.loads(_FIXTURE.read_text())
-        self.assertEqual(len(golden["metrics"]), 157,
+        self.assertEqual(len(golden["metrics"]), 158,
                          "golden metrics key count changed; confirm intentional")
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -274,21 +275,26 @@ def _derive_iv_scenarios(
     implied_move_pct: Optional[float],
 ) -> Dict[str, float]:
     """
-    Fix 5: Derive symbol-specific post-earnings IV scenarios from historical
-    move distribution instead of hardcoded ±20%/−25%/−45% multipliers.
+    Post-earnings IV scenarios scaled from the symbol's historical STOCK moves.
+
+    This is an underlying-move proxy, not an IV-crush calibration: no
+    historical pre/post-event implied-volatility observations are used. It
+    assumes IV collapses more when the stock settles further inside the move
+    the market priced.
 
     Logic:
-      - If we have ≥4 historical moves AND a valid implied_move_pct, compute
-        the distribution of how moves compared to the implied move.
+      - If we have ≥4 historical moves AND a valid implied_move_pct:
         • 'crush fraction' per event = max(0, 1 − |move| / implied_move)
-          i.e. how far inside the implied move the stock settled.
-        • median and 25th-pctile crush fraction drive mild/severe crush
-          scenario multipliers respectively.
+          i.e. how far inside the implied move the stock settled
+          (larger = the priced move was more overstated = more crush).
+        • median crush fraction drives the mild scenario, the 75th
+          percentile (a LARGER crush) the severe one.
         • Expansion multiplier uses the 75th-pctile move vs implied_move.
       - Otherwise fall back to the hardcoded heuristic values documented in
         _HEURISTIC_THRESHOLDS.
 
-    All multipliers are applied to iv_back (the surviving back leg at expiry).
+    Invariant (enforced): severe ≤ mild ≤ flat ≤ expand.
+    All multipliers are applied to the given IV.
     """
     # ── Fallback (hardcoded heuristics) ──────────────────────────────────────
     fallback = {
@@ -312,18 +318,18 @@ def _derive_iv_scenarios(
     if len(moves) < 4:
         return {**fallback, "_source": "heuristic_fallback"}
 
-    # Source tier: ≥8 events = full calibration; 4-7 = small-sample estimate.
+    # Source tier: ≥8 events = full proxy; 4-7 = small-sample proxy.
     # Threshold mirrors MIN_EARNINGS_EVENTS_FOR_FULL_SIGNAL (8 events).
     _n_events = len(moves)
     if _n_events >= MIN_EARNINGS_EVENTS_FOR_FULL_SIGNAL:
-        _scenario_source = "historical_symbol_calibrated"
+        _scenario_source = "historical_move_proxy"
     else:
-        _scenario_source = "small_sample_estimate"  # 4-7 events: usable but thin
+        _scenario_source = "small_sample_move_proxy"  # 4-7 events: usable but thin
 
     # Crush fraction per event: how far inside the implied move did the stock land?
     crush_fracs = [max(0.0, 1.0 - m / impl) for m in moves]
     crush_median = float(np.percentile(crush_fracs, 50))
-    crush_p25    = float(np.percentile(crush_fracs, 25))  # more severe crush
+    crush_p75    = float(np.percentile(crush_fracs, 75))  # larger crush fraction = more severe
 
     # Expansion: how much did the stock overshoot the implied move in the worst cases?
     overshoot_p75 = float(np.percentile(moves, 75))
@@ -331,11 +337,13 @@ def _derive_iv_scenarios(
 
     # IV scenarios are multiplicative on iv_back.
     # Mild crush ≈ median historical resolution inside implied move.
-    # Severe crush ≈ 25th-pctile resolution (better-than-median crush).
+    # Severe crush ≈ 75th-pctile resolution (a larger-than-median crush).
     # Expansion ≈ stock blew through implied, IV may spike on residual uncertainty.
     mild_crush_mult   = float(np.clip(1.0 - crush_median * 0.50, 0.45, 0.95))
-    severe_crush_mult = float(np.clip(1.0 - crush_p25   * 0.70, 0.30, 0.85))
+    severe_crush_mult = float(np.clip(1.0 - crush_p75    * 0.70, 0.30, 0.85))
     expand_mult       = float(np.clip(expand_ratio * 0.80 + 0.20, 1.05, 1.40))
+    # A "severe" scenario must never keep more IV than the "mild" one.
+    severe_crush_mult = min(severe_crush_mult, mild_crush_mult)
 
     return {
         "iv_expand":       iv_back * expand_mult,
@@ -345,7 +353,7 @@ def _derive_iv_scenarios(
         "_source":            _scenario_source,
         "_n_events":          _n_events,
         "_crush_median_pct":  round(crush_median * 100, 1),
-        "_crush_p25_pct":     round(crush_p25 * 100, 1),
+        "_crush_p75_pct":     round(crush_p75 * 100, 1),
         "_expand_ratio":      round(expand_ratio, 3),
     }
 
@@ -501,6 +509,51 @@ def _calendar_spread_payoff(
         return None
 
 
+_BEFORE_OR_DURING_SESSION = {"before market open", "during market hours"}
+
+
+def post_event_valuation_days(
+    as_of: date,
+    days_to_earnings: Optional[float],
+    release_timing: Optional[str],
+) -> Optional[int]:
+    """Calendar days from entry (``as_of``) to the first session that prices the earnings reaction.
+
+    Before-open / intraday reports: the reaction prints on the earnings day
+    itself. After-close or unknown timing (conservative): the next weekday
+    after the earnings day, so a Thursday-close report is valued on Friday
+    and a Friday-close report on Monday. Exchange holidays are not modelled.
+    Returns None when the earnings date is unknown or already past.
+    """
+    if days_to_earnings is None or not np.isfinite(days_to_earnings) or days_to_earnings < 0:
+        return None
+    earnings_day = as_of + timedelta(days=int(days_to_earnings))
+    timing = str(release_timing or "").strip().lower()
+    if timing in _BEFORE_OR_DURING_SESSION:
+        reaction_day = earnings_day
+    else:
+        reaction_day = earnings_day + timedelta(days=1)
+        while reaction_day.weekday() >= 5:  # Saturday / Sunday
+            reaction_day += timedelta(days=1)
+    return (reaction_day - as_of).days
+
+
+def _post_event_horizon(T_near_days: float, valuation_days: Optional[float]) -> Optional[Tuple[float, float]]:
+    """(days from entry to valuation, days the options still have to live then).
+
+    None when the options expire at or before the valuation session: they do
+    not span the earnings reaction, so a post-event value would be fiction.
+    ``valuation_days=None`` (no event date known) values one day after entry.
+    """
+    horizon = 1.0 if valuation_days is None else float(valuation_days)
+    if not np.isfinite(horizon) or horizon < 0:
+        return None
+    remaining = float(T_near_days) - horizon
+    if remaining <= 0:
+        return None
+    return horizon, remaining
+
+
 def _straddle_payoff(
     S: float,
     iv: float,
@@ -510,30 +563,40 @@ def _straddle_payoff(
     raw_moves_pct: Optional[List[float]] = None,
     implied_move_pct: Optional[float] = None,
     q: float = 0.0,
+    *,
+    valuation_days: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Long ATM straddle payoff for an earnings play.
 
     Entry: buy ATM call + buy ATM put (K = S, T = T_near_days, σ = iv).
-    P&L evaluated 1 day post-event: stock has moved, IV has shifted per scenario.
+    P&L evaluated at the first post-event session (``valuation_days`` after
+    entry, see post_event_valuation_days): the stock has moved, IV has shifted
+    per scenario, and the options keep the time they actually have left
+    (T_near_days − valuation_days). Returns None if they expire at or before
+    that session.
 
     PR #68 added the ``q`` parameter (continuous dividend yield). Default
     ``q=0.0`` preserves the legacy no-dividend behavior byte-for-byte. With
     q > 0, both call and put prices follow Merton-extension BSM and the
     put-call parity used internally is ``P = C − S·exp(−qT) + K·exp(−rT)``.
 
-    The 1-day residual convention (rather than full expiry) captures the
+    Valuing right after the event (rather than at expiry) captures the
     dominant risk for earnings straddles — IV crush kills the position even
     when the stock moves correctly. IV scenarios come from the same
-    _derive_iv_scenarios() calibration used by the calendar diagram.
+    _derive_iv_scenarios() used by the calendar diagram.
     """
     try:
         if not (np.isfinite(S) and S > 0 and np.isfinite(iv) and iv > 0
                 and np.isfinite(T_near_days) and T_near_days >= 1):
             return None
 
+        horizon = _post_event_horizon(T_near_days, valuation_days)
+        if horizon is None:
+            return None
+        horizon_days, remaining_days = horizon
         T_entry = T_near_days / 365.0
-        T_rem   = 1.0 / 365.0   # 1-day post-event residual
+        T_rem   = remaining_days / 365.0   # time the options still have after the event
         K       = S              # ATM
 
         def _ncdf(x: float) -> float:
@@ -604,15 +667,18 @@ def _straddle_payoff(
             "strike":                    round(K, 2),
             "iv_entry":                  round(iv, 4),
             "T_near_days":               T_near_days,
-            "T_remain_days":             1,
+            "T_remain_days":             round(remaining_days, 2),
+            "valuation_days_after_entry": round(horizon_days, 2),
+            "valuation_basis":           _valuation_basis(valuation_days),
             "breakeven_moves_pct":       breakevens,
             "payoff_scenarios":          payoff_rows,
             "payoff_scenarios_per_contract": payoff_rows_per_contract,
             "is_theoretical":            True,
             "scenario_source":           _scenario_source,
             "note": (
-                f"Long ATM straddle (K={K:.2f}). P&L shown 1-day post-event "
-                "with IV scenarios. BSM entry at market IV; breakevens on IV-flat scenario."
+                f"Long ATM straddle (K={K:.2f}). P&L valued {horizon_days:.0f}d after entry "
+                f"({_valuation_basis_label(valuation_days)}) with {remaining_days:.0f}d left to expiry, "
+                "under IV scenarios. Theoretical BSM at one IV for both legs; breakevens on IV-flat scenario."
             ),
         }
     except Exception as exc:
@@ -630,6 +696,8 @@ def _strangle_payoff(
     raw_moves_pct: Optional[List[float]] = None,
     implied_move_pct: Optional[float] = None,
     q: float = 0.0,
+    *,
+    valuation_days: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Long OTM strangle payoff for an earnings play.
@@ -639,7 +707,8 @@ def _strangle_payoff(
     a pure earnings-surprise bet).
 
     Entry: buy OTM call at K_c = S*(1+wing/100) and OTM put at K_p = S*(1-wing/100).
-    P&L evaluated 1 day post-event with IV scenarios (same as straddle).
+    P&L evaluated at the first post-event session with IV scenarios and the
+    options' real remaining life (same horizon rules as the straddle).
 
     PR #68 added the ``q`` parameter (continuous dividend yield). Default
     ``q=0.0`` preserves legacy behavior; q > 0 routes through Merton-extension
@@ -651,8 +720,12 @@ def _strangle_payoff(
                 and np.isfinite(wing_pct) and wing_pct > 0):
             return None
 
+        horizon = _post_event_horizon(T_near_days, valuation_days)
+        if horizon is None:
+            return None
+        horizon_days, remaining_days = horizon
         T_entry = T_near_days / 365.0
-        T_rem   = 1.0 / 365.0
+        T_rem   = remaining_days / 365.0   # time the options still have after the event
         K_c     = S * (1.0 + wing_pct / 100.0)   # OTM call strike
         K_p     = S * (1.0 - wing_pct / 100.0)   # OTM put strike
 
@@ -726,7 +799,9 @@ def _strangle_payoff(
             "wing_pct":                  round(wing_pct, 2),
             "iv_entry":                  round(iv, 4),
             "T_near_days":               T_near_days,
-            "T_remain_days":             1,
+            "T_remain_days":             round(remaining_days, 2),
+            "valuation_days_after_entry": round(horizon_days, 2),
+            "valuation_basis":           _valuation_basis(valuation_days),
             "breakeven_moves_pct":       breakevens,
             "payoff_scenarios":          payoff_rows,
             "payoff_scenarios_per_contract": payoff_rows_per_contract,
@@ -735,12 +810,22 @@ def _strangle_payoff(
             "note": (
                 f"Long OTM strangle (call K={K_c:.2f} / put K={K_p:.2f}, "
                 f"±{wing_pct:.1f}% wings at implied move). "
-                "P&L shown 1-day post-event with IV scenarios."
+                f"P&L valued {horizon_days:.0f}d after entry ({_valuation_basis_label(valuation_days)}) "
+                f"with {remaining_days:.0f}d left to expiry, under IV scenarios. Theoretical BSM at one "
+                "IV for both wings (no skew)."
             ),
         }
     except Exception as exc:
         logger.debug("Strangle payoff computation failed: %s", exc)
         return None
+
+
+def _valuation_basis(valuation_days: Optional[float]) -> str:
+    return "first_post_event_session" if valuation_days is not None else "one_day_after_entry_no_event_date"
+
+
+def _valuation_basis_label(valuation_days: Optional[float]) -> str:
+    return "first post-event session" if valuation_days is not None else "no earnings date: one day after entry"
 
 
 def _rv_percentile_and_regime(

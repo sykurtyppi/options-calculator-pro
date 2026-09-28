@@ -13,6 +13,7 @@ import {
 import { CHART, axisTick, tooltipContentStyle } from './chartTheme'
 import { usePayoffZoom } from './usePayoffZoom'
 import ChartZoomHint from './ChartZoomHint'
+import { payoffAssumptions } from './payoffDisclosure.js'
 
 const SERIES_KEYS = ['expand', 'flat', 'crush25', 'crush45']
 
@@ -87,7 +88,7 @@ export default function CalendarSpreadChart({ calPayoff }) {
           />
           <Tooltip
             formatter={(v, name) => {
-              const labels = { expand: 'IV +20%', flat: 'IV Flat', crush25: 'IV −25%', crush45: 'IV −45%' }
+              const labels = { expand: 'IV expansion', flat: 'IV flat', crush25: 'Mild crush', crush45: 'Severe crush' }
               return [`$${Number(v).toFixed(3)}`, labels[name] || name]
             }}
             labelFormatter={(l) => `Move: ${Number(l) > 0 ? '+' : ''}${Number(l)}%`}
@@ -115,13 +116,19 @@ export default function CalendarSpreadChart({ calPayoff }) {
         </LineChart>
       </ResponsiveContainer>
       <div style={{ display: 'flex', gap: 14, marginTop: 4, fontSize: 11, color: CHART.axis, flexWrap: 'wrap' }}>
-        <span style={{ color: CHART.series.pos }}>━ IV +20%</span>
-        <span style={{ color: CHART.series.accent }}>━ IV Flat</span>
-        <span style={{ color: CHART.series.warn }}>━ IV −25%</span>
-        <span style={{ color: CHART.series.neg }}>━ IV −45%</span>
+        <span style={{ color: CHART.series.pos }}>━ IV expansion</span>
+        <span style={{ color: CHART.series.accent }}>━ IV flat</span>
+        <span style={{ color: CHART.series.warn }}>━ Mild crush</span>
+        <span style={{ color: CHART.series.neg }}>━ Severe crush</span>
         <span style={{ color: 'rgba(240,160,32,0.6)' }}>╌ BE</span>
       </div>
       <ChartZoomHint zoomed={zoom.zoomed} onReset={zoom.reset} />
+      <div style={{ marginTop: 6, fontSize: 10, color: CHART.axisDim }}>
+        <div>⚠ Illustrative model scenarios, not executable P&L.</div>
+        <ul style={{ margin: '2px 0 0 14px', padding: 0 }}>
+          {payoffAssumptions(calPayoff).map((item) => <li key={item}>{item}</li>)}
+        </ul>
+      </div>
     </div>
   )
 }
