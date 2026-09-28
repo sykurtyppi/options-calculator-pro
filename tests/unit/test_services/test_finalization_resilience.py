@@ -282,7 +282,9 @@ def test_learning_written_after_the_claim_lapsed_is_flagged_for_repair(tmp_path,
     assert not (tmp_path / "priors.json").exists()  # the prior write was not attempted
     health = _check_evidence_integrity(
         EvidenceHealthConfig(expected_date=EARNINGS, outcome_store_path=tmp_path / "o.sqlite",
-                             baseline_store_path=tmp_path / "b.sqlite"),
+                             baseline_store_path=tmp_path / "b.sqlite",
+                             calibration_store_path=tmp_path / "cal.json",
+                             prior_store_path=tmp_path / "priors.json"),
         datetime(2026, 4, 29, tzinfo=timezone.utc),
     )
     assert health["summary"]["selector"]["invalidated_after_learning"] == ["AAA"]
