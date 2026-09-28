@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -609,6 +609,12 @@ def test_otm_strangle_no_valid_strike_within_cap_fails(monkeypatch) -> None:
 
 def test_otm_strangle_quote_provenance_is_persisted_in_paper_entry(tmp_path: Path, monkeypatch) -> None:
     today = date(2026, 4, 24)
+    # The live fetcher only prices the present (point-in-time guard): run it
+    # as if today were the run date.
+    monkeypatch.setattr(forward_loop, "_today", lambda: today)
+    monkeypatch.setattr(
+        forward_loop, "_quote_clock", lambda: datetime(2026, 4, 24, 20, 0).astimezone(timezone.utc)
+    )
     store = OutcomeStore(store_path=tmp_path / "outcomes.sqlite")
     ledger = RecommendationLedger(ledger_path=tmp_path / "recommendations.sqlite")
     _install_fake_option_chain(

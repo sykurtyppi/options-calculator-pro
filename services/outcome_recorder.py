@@ -215,6 +215,11 @@ LEARNING_WRITTEN_AFTER_CLAIM_LOST = "complete_after_claim_lost"
 # CASE, not OR: SQLite does not promise short-circuit evaluation, and
 # json_type()/json_extract() raise on malformed JSON - one bad notes value
 # would otherwise break every guarded query.
+# Forward evidence = trades the forward loop entered. Seeded replay/backtest
+# rows share the table but are never forward evidence (AGENTS.md: backtest
+# evidence is not live evidence), so reports and gates must exclude them.
+FORWARD_SOURCE_SQL = "COALESCE(source_type, 'paper') != 'replay'"
+
 _VALID_EVIDENCE_SQL = """(
     COALESCE(evidence_valid, 1) NOT IN (0, '0', 'false')
     AND (CASE
@@ -654,6 +659,12 @@ class OutcomeStore:
             SELECT *
             FROM outcome_trades
             WHERE earnings_date = ?
+              -- A recorded exit is final: re-quoting it (e.g. a same-day retry
+              -- after a failed finalize) would give the row, calibration and
+              -- priors different answers. trades_pending_finalization
+              -- completes such rows from the stored facts instead.
+              AND exit_date IS NULL
+              AND {forward}
               AND (
                 status IN ('open', 'exited')
                 -- A live claim belongs to another worker; only an expired
@@ -665,7 +676,7 @@ class OutcomeStore:
               )
               AND {valid}
             ORDER BY entry_date, symbol
-            """.format(valid=_VALID_EVIDENCE_SQL),
+            """.format(valid=_VALID_EVIDENCE_SQL, forward=FORWARD_SOURCE_SQL),
             (target_earnings_date, f"-{FINALIZATION_LEASE_SECONDS} seconds"),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -676,8 +687,8 @@ class OutcomeStore:
         A finalize that raised or lost its claim after writing the exit leaves
         the row 'exited' (claim released) or 'finalizing' (claim expired).
         Neither the T-1 due list nor mark_missing_exits (exit_date IS NULL)
-        reaches it again, so once the exit day has passed it is re-finalized
-        from its stored facts. Live claims are left to their owner.
+        reaches it again, so from its exit day on it is re-finalized from its
+        stored facts. Live claims are left to their owner.
         """
         rows = self._conn.execute(
             """
@@ -698,7 +709,51 @@ class OutcomeStore:
               )
             ORDER BY entry_date, symbol
             """.format(valid=_VALID_EVIDENCE_SQL),
-            (_fmt_date(as_of_date), f"-{FINALIZATION_LEASE_SECONDS} seconds"),
+            (_fmt_date(as_of_date + timedelta(days=1)), f"-{FINALIZATION_LEASE_SECONDS} seconds"),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def exits_without_value(self, as_of_date: date) -> list[Dict[str, Any]]:
+        """'exited' rows past their exit day whose realized values are missing.
+
+        SQLite stores NaN as NULL, so a legacy NaN exit reads back as "no
+        value", as does an exit recorded without its realized figures that
+        nobody finalized. Neither can ever be finalized; the loop moves them
+        to terminal attrition instead of reporting them unfinalized forever.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM outcome_trades
+            WHERE status = 'exited'
+              AND earnings_date IS NOT NULL
+              AND earnings_date <= ?
+              AND exit_date IS NOT NULL
+              AND (realized_return_pct IS NULL OR realized_expansion_pct IS NULL)
+              AND {valid}
+            ORDER BY entry_date, symbol
+            """.format(valid=_VALID_EVIDENCE_SQL),
+            (_fmt_date(as_of_date),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def trades_needing_learning_retry(self) -> list[Dict[str, Any]]:
+        """Finalized, valid trades whose calibration or prior update failed.
+
+        Re-running finalize on them is idempotent (both stores dedupe on the
+        trade id) and learns the stored facts.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM outcome_trades
+            WHERE status = 'finalized'
+              AND learning_update_status IN ('calibration_failed', 'prior_failed', 'both_failed')
+              AND realized_return_pct IS NOT NULL
+              AND realized_expansion_pct IS NOT NULL
+              AND {valid}
+            ORDER BY entry_date, symbol
+            """.format(valid=_VALID_EVIDENCE_SQL),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -773,6 +828,9 @@ class OutcomeStore:
                     WHERE earnings_date IS NOT NULL
                       AND earnings_date <= ?
                       AND {valid}
+                      -- Replay rows never pass through the forward loop; an
+                      -- unfinished one is the seed script's to complete.
+                      AND {forward}
                       AND (
                         status = 'open'
                         -- A crashed finalize that never wrote the exit.
@@ -782,7 +840,7 @@ class OutcomeStore:
                           AND (finalizing_since IS NULL OR finalizing_since <= datetime('now', ?))
                         )
                       )
-                    """.format(valid=_VALID_EVIDENCE_SQL),
+                    """.format(valid=_VALID_EVIDENCE_SQL, forward=FORWARD_SOURCE_SQL),
                     (_fmt_date(as_of_date), f"-{FINALIZATION_LEASE_SECONDS} seconds"),
                 ).fetchall()
                 moved = []
@@ -976,8 +1034,13 @@ class OutcomeStore:
             "status": row.get("status"),
             "already_invalidated": not is_outcome_evidence_valid(row),
             "previous_invalidation_reason": outcome_invalidation_reason(row),
-            "learning_already_applied": str(row.get("learning_update_status") or "")
-            in ("complete", LEARNING_WRITTEN_AFTER_CLAIM_LOST),
+            # Any learning that may have landed: a partial write (only one
+            # store failed) or a finalize that died mid-way ('finalizing').
+            "learning_already_applied": (
+                str(row.get("learning_update_status") or "")
+                in ("complete", LEARNING_WRITTEN_AFTER_CLAIM_LOST, "calibration_failed", "prior_failed")
+                or str(row.get("status") or "") == "finalizing"
+            ),
             "invalidated_at": stamp,
             "invalidation_reason": reason,
         }
@@ -996,11 +1059,19 @@ class OutcomeStore:
             "store_path": str(self._path),
         }
 
-    def list_for_diagnostics(self, *, limit: int = 10_000, evidence: str = "all") -> list[Dict[str, Any]]:
+    def list_for_diagnostics(
+        self,
+        *,
+        limit: int = 10_000,
+        evidence: str = "all",
+        source: str = "all",
+    ) -> list[Dict[str, Any]]:
         """Return recent outcome rows for read-only diagnostics aggregation.
 
-        ``evidence`` is "all", "valid" or "invalid". The filter runs BEFORE the
-        LIMIT so invalidated rows can never displace valid evidence at the cap.
+        ``evidence`` is "all", "valid" or "invalid". ``source`` is "all",
+        "forward" (paper trades from the forward loop) or "replay" (seeded
+        backtest rows, which are never forward evidence). Both filters run
+        BEFORE the LIMIT so excluded rows can never displace evidence at the cap.
         """
         capped_limit = max(1, min(int(limit or 10_000), 50_000))
         where = {
@@ -1010,6 +1081,11 @@ class OutcomeStore:
         }.get(evidence)
         if where is None:
             raise ValueError(f"list_for_diagnostics: unknown evidence filter {evidence!r}")
+        source_clause = {"all": "", "forward": FORWARD_SOURCE_SQL, "replay": f"NOT {FORWARD_SOURCE_SQL}"}.get(source)
+        if source_clause is None:
+            raise ValueError(f"list_for_diagnostics: unknown source filter {source!r}")
+        if source_clause:
+            where = f"{where} AND {source_clause}" if where else f"WHERE {source_clause}"
         rows = self._conn.execute(
             f"""
             SELECT *
@@ -1148,6 +1224,36 @@ def _bool_int(value: Optional[bool]) -> Optional[int]:
     if value is None:
         return None
     return 1 if bool(value) else 0
+
+
+def _has_recorded_exit(row: Dict[str, Any]) -> bool:
+    return bool(row.get("exit_date")) and all(
+        _is_finite_number(row.get(key)) for key in ("realized_return_pct", "realized_expansion_pct")
+    )
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return _finite_or_none("value", value) is not None
+    except ValueError:
+        return False
+
+
+def _or_stored(value: Any, row: Dict[str, Any], column: str) -> Any:
+    return value if value is not None else row.get(column)
+
+
+def _or_stored_json(value: Optional[Dict[str, Any]], row: Dict[str, Any], column: str) -> Optional[Dict[str, Any]]:
+    if value is not None:
+        return value
+    raw = row.get(column)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _finite_or_none(name: str, value: Any) -> Optional[float]:
@@ -1448,20 +1554,39 @@ def finalize_trade_and_update_learning(
 
     try:
         exit_written = True
-        if exit_fields_provided and not already_finalized:
+        claimed = {} if already_finalized else (s.get_trade(trade_id) or {})
+        if _has_recorded_exit(claimed):
+            # The exit is already recorded (an earlier attempt wrote it and
+            # then failed or lost its claim). It is final: learn exactly those
+            # facts and leave the row untouched, so the row, calibration and
+            # priors can never disagree and no exit detail is wiped.
+            stored = (float(claimed["realized_return_pct"]), float(claimed["realized_expansion_pct"]))
+            if stored != (float(realized_return_pct), float(realized_expansion_pct)):
+                warnings.append(
+                    "exit was already recorded; learning uses the stored realized values, "
+                    "not the ones passed to this call"
+                )
+            realized_return_pct, realized_expansion_pct = stored
+            resolved_exit_date = date.fromisoformat(str(claimed["exit_date"])[:10])
+        elif exit_fields_provided and not already_finalized:
+            # Fill every field the caller did not pass from the row, so a
+            # partial call (e.g. realized values only, after record_trade_exit)
+            # never blanks the exit price, quote provenance or scenarios.
             exit_written = s.update_exit(
                 owner=owner,
                 trade_id=trade_id,
                 exit_date=resolved_exit_date,
-                exit_mid=exit_mid,
+                exit_mid=_or_stored(exit_mid, claimed, "exit_mid"),
                 realized_return_pct=realized_return_pct,
-                realized_pnl=realized_pnl,
+                realized_pnl=_or_stored(realized_pnl, claimed, "realized_pnl"),
                 realized_expansion_pct=realized_expansion_pct,
-                exit_quote_source=exit_quote_source,
-                exit_quote_quality=exit_quote_quality,
-                exit_quote_timestamp=exit_quote_timestamp,
-                exit_bid_ask_mid=exit_bid_ask_mid,
-                exit_execution_scenarios=exit_execution_scenarios,
+                exit_quote_source=_or_stored(exit_quote_source, claimed, "exit_quote_source"),
+                exit_quote_quality=_or_stored(exit_quote_quality, claimed, "exit_quote_quality"),
+                exit_quote_timestamp=_or_stored(exit_quote_timestamp, claimed, "exit_quote_timestamp"),
+                exit_bid_ask_mid=_or_stored_json(exit_bid_ask_mid, claimed, "exit_bid_ask_mid_json"),
+                exit_execution_scenarios=_or_stored_json(
+                    exit_execution_scenarios, claimed, "exit_execution_scenarios_json"
+                ),
             )
         owned_for_learning = exit_written and _still_owned()
     except Exception:
@@ -1569,12 +1694,19 @@ def finalize_trade_and_update_learning(
     # must not overwrite the status the new owner records.
     if already_finalized:
         s.set_learning_update_status(trade_id, learning_status)
-    elif not s.renew_finalization_claim(trade_id, owner=owner):
-        return _claim_lost_result()
     else:
-        s.set_learning_update_status(trade_id, learning_status)
-        if not s.mark_finalized(trade_id, owner=owner):
-            return _claim_lost_result()
+        try:
+            if not s.renew_finalization_claim(trade_id, owner=owner):
+                return _claim_lost_result()
+            s.set_learning_update_status(trade_id, learning_status)
+            if not s.mark_finalized(trade_id, owner=owner):
+                return _claim_lost_result()
+        except Exception:
+            # Learning is written but the row could not be finalized: hand the
+            # claim back so the pending-finalization sweep completes it (the
+            # stores dedupe) instead of it waiting out the lease.
+            _release_claim()
+            raise
 
     return {
         "trade_id": trade_id,

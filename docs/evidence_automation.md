@@ -22,7 +22,10 @@ What it does:
 - baselines whose entry context lacks a leg strike or the expiry resolve as `unverifiable_entry_context` and are excluded from comparisons
 - the calibration and structure-prior stores serialize every update behind a cross-process file lock (sidecar `.<name>.lock` files next to each JSON store), re-read the file before adding an observation, and write atomically; a failed write raises instead of being reported as learned, and the trade is left with a retryable `learning_update_status`
 - finalizing a trade takes an exclusive, owner-token claim (15-minute lease); a second worker can neither claim, overwrite the exit of, nor finalize a trade another worker is finalizing
-- a finalize that fails or loses its claim after the exit was written hands the claim back; once the exit day has passed, the next loop run re-finalizes such trades from the stored exit (no re-quote) and reports them as `refinalized`
+- a recorded exit is final: it is never re-quoted, not even by a same-day retry. A finalize that fails or loses its claim after the exit was written hands the claim back, and the next loop run (from the exit day on) re-finalizes the trade from the stored exit, keeping every exit field, and reports it as `refinalized`. An exit recorded without realized values (including a legacy NaN, which SQLite stores as NULL) becomes `exit_missing` with `exit_recorded_without_value` once the exit day has passed
+- a finalized trade whose calibration or prior write failed is retried by every loop run (`learning_retried`); the health check warns if it still fails after 24h
+- exits and entries are valued only at a point in time: the live quote fetcher is refused for a run date other than today (`live_quote_refused_for_past_as_of`), and a quote whose timestamp falls on another local day is not used (`quote_not_from_as_of_date`). A missed T-1 exit therefore becomes `exit_missing`, never a later price
+- seeded replay/backtest rows (`scripts/seed_outcomes_from_replay.py`) are never forward evidence: the report, maturity, gate, attrition and health figures count forward paper trades only, and replay rows are counted separately under `excluded_replay_outcomes`. The loop never exits or expires a replay row; a seed run completes rows an interrupted run left open
 - outcomes invalidated as evidence (`scripts/invalidate_outcome.py`, or a `notes.evidence_invalidated` flag) are refused by every exit/finalize/learning write and excluded from reports before the row limit; invalidating a trade while its learning updates run is refused, so retry once it is finalized
 - realized values that are NaN, infinite or boolean are refused when an outcome or baseline exit is written. An exit that would produce one is skipped with reason `non_finite_exit_value` (selector trades retry that day, then become `exit_missing`; baselines become `exit_skipped`), and replay rows with one are counted as bad data by the seed script. Older rows holding one are excluded from every report figure (including maturity, attrition, universe and forward diagnostics), counted under `non_finite_outcomes`, and moved to `exit_missing` if they were never finalized
 - an option surface classified `degraded_surface` holds the selector at Watch: the event is recorded and shadow-priced, never actionable
@@ -201,7 +204,9 @@ Checks performed:
   - trades with an exit recorded but never finalized (`exited_not_finalized`; the loop re-finalizes them)
   - selector or baseline exit attrition above 20% over the last 90 days, with at least 5 exits
   - universe shadow entries that never entered, for more than 25% of closed events
-  - invalidated outcomes that already reached calibration/priors (run `scripts/backfill_prior_store_timestamps.py`)
+  - invalidated outcomes whose observation is in the calibration or prior store (read from the store files, so it clears once the backfill repair has run; run `scripts/backfill_prior_store_timestamps.py`)
+  - finalized trades whose learning update has kept failing for over 24h
+  - dates are local: a trade is overdue only once the day after its earnings date has begun
 
 Each issue includes a fix suggestion. The health check does not run the selector
 and does not change strategy state.

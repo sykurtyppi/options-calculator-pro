@@ -60,8 +60,12 @@ def build_evidence_report(
     # Invalidated outcomes stay in the store for audit but never count as
     # evidence: not in performance, quality, realism or maturity figures. The
     # store filters BEFORE its row limit, so they cannot displace valid rows.
-    outcomes = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid")
-    invalidated = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid")
+    # Forward evidence only: seeded replay/backtest rows share the store but
+    # are never forward evidence (they would otherwise fill the gate's day
+    # span, resolved count and calibration buckets). Counted separately below.
+    outcomes = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward")
+    invalidated = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid", source="forward")
+    replay_rows = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="replay")
     selected = [row for row in outcomes if _is_resolved(row)]
     resolved_baselines = [row for row in baselines if str(row.get("status") or "") == "resolved"]
     open_baselines = [row for row in baselines if str(row.get("status") or "") == "open"]
@@ -127,6 +131,11 @@ def build_evidence_report(
             "resolved_n": sum(1 for row in invalidated if _is_resolved(row)),
             "by_reason": _count_by(invalidated, lambda row: outcome_invalidation_reason(row) or "unknown"),
             "note": "Excluded from every performance, calibration and maturity figure; kept for audit.",
+        },
+        "excluded_replay_outcomes": {
+            "n": len(replay_rows),
+            "resolved_n": sum(1 for row in replay_rows if _is_resolved(row)),
+            "note": "Seeded replay/backtest rows; not forward evidence, excluded from every figure and the gate.",
         },
         "non_finite_outcomes": {
             "selector_n": sum(1 for row in outcomes if _has_non_finite_return(row)),

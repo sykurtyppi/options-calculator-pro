@@ -75,6 +75,13 @@ logger = logging.getLogger(__name__)
 
 # Skip / exit_missing reason for an exit whose value is NaN or infinite.
 NON_FINITE_EXIT_REASON = "non_finite_exit_value"
+# exit_missing reason for an exit recorded without realized values (includes a
+# legacy NaN, which SQLite stores as NULL).
+EXIT_WITHOUT_VALUE_REASON = "exit_recorded_without_value"
+# A live quote requested for a date other than today (not point-in-time).
+PAST_AS_OF_REASON = "live_quote_refused_for_past_as_of"
+# A quote whose timestamp falls on another day than as_of.
+QUOTE_DATE_MISMATCH_REASON = "quote_not_from_as_of_date"
 
 DEFAULT_LOG_PATH = (
     Path.home() / ".options_calculator_pro" / "logs" / "learning_log.jsonl"
@@ -173,7 +180,41 @@ def _fetch_quote_for_forward_loop(
         params = {}
     if "mda_client" in params:
         kwargs["mda_client"] = mda_client
-    return price_fetcher(**kwargs)
+    # Point-in-time: the live fetcher can only price the present. Valuing a
+    # past as_of with it (e.g. re-running a missed T-1 the next morning) would
+    # book a later, possibly post-earnings, quote as that day's price.
+    if price_fetcher is fetch_structure_quote and as_of_date != _today():
+        return {"mid": None, "reason": PAST_AS_OF_REASON, "context": {}}
+    quote = price_fetcher(**kwargs)
+    quote_day = _quote_local_date(quote.get("quote_timestamp"))
+    if quote_day is not None and quote_day != as_of_date:
+        return {**quote, "mid": None, "reason": QUOTE_DATE_MISMATCH_REASON}
+    return quote
+
+
+def _today() -> date:
+    """The local date live quotes are taken on (a seam for tests)."""
+    return date.today()
+
+
+def _quote_clock() -> datetime:
+    """The time stamped on live quotes (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _quote_local_date(timestamp: Any) -> Optional[date]:
+    """The local calendar date of a quote timestamp, or None if absent/unparseable.
+
+    as_of is a local date, so an aware (UTC) timestamp is converted first:
+    a 21:30 New York quote is 01:30 UTC the next day.
+    """
+    if not timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (parsed.astimezone() if parsed.tzinfo else parsed).date()
 
 
 def _get_marketdata_client(candidate: Any = None) -> Optional[Any]:
@@ -396,7 +437,7 @@ def _quote_payload(
     )
     return {
         "quote_source": source,
-        "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+        "quote_timestamp": _quote_clock().isoformat(),
         "quote_quality": quality,
         "surface_quality": surface_quality or {},
         "bid_ask_mid": {
@@ -2264,7 +2305,8 @@ def run_exit_detection(
 ) -> Dict[str, int]:
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
-    summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "refinalized": 0, "baseline_exits": 0, "baseline_skipped": 0}
+    summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "refinalized": 0, "learning_retried": 0,
+               "baseline_exits": 0, "baseline_skipped": 0}
 
     # Trades whose T-1 exit day has passed without a price become terminal
     # 'exit_missing' attrition instead of staying open forever.
@@ -2320,6 +2362,43 @@ def run_exit_detection(
                     {"event_type": "refinalize", "symbol": pending.get("symbol"),
                      "structure": pending.get("structure"), "source": pending.get("source_type") or "paper",
                      "trade_id": pending_id, "learning_update_status": result.get("learning_update_status")},
+                    dry_run=dry_run,
+                )
+
+        # An exit recorded without realized values can never be finalized.
+        for orphan in trade_store.exits_without_value(as_of):
+            orphan_id = str(orphan["trade_id"])
+            if trade_store.mark_recorded_exit_unusable(orphan_id, reason=EXIT_WITHOUT_VALUE_REASON):
+                summary["exit_missing"] += 1
+                _append_learning_log(
+                    log_path,
+                    {"event_type": "exit_missing", "symbol": orphan.get("symbol"),
+                     "structure": orphan.get("structure"), "source": orphan.get("source_type") or "paper",
+                     "trade_id": orphan_id, "reason": EXIT_WITHOUT_VALUE_REASON},
+                    dry_run=dry_run,
+                )
+
+        # Finalized trades whose calibration or prior write failed: retry the
+        # learning (idempotent; the stores dedupe and learn the stored facts).
+        for failed in trade_store.trades_needing_learning_retry():
+            failed_id = str(failed["trade_id"])
+            try:
+                result = finalizer(
+                    trade_id=failed_id,
+                    realized_return_pct=float(failed["realized_return_pct"]),
+                    realized_expansion_pct=float(failed["realized_expansion_pct"]),
+                    store=trade_store,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("forward_loop: learning retry failed for %s: %s", failed_id, exc)
+                continue
+            if isinstance(result, dict) and result.get("learning_update_status") == "complete":
+                summary["learning_retried"] += 1
+                _append_learning_log(
+                    log_path,
+                    {"event_type": "learning_retry", "symbol": failed.get("symbol"),
+                     "structure": failed.get("structure"), "source": failed.get("source_type") or "paper",
+                     "trade_id": failed_id, "learning_update_status": "complete"},
                     dry_run=dry_run,
                 )
 

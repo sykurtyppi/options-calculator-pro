@@ -258,25 +258,27 @@ def _backfill(tmp_path, *extra):
                           "--cal-store", str(tmp_path / "cal.json"), *extra])
 
 
-def test_backfill_does_not_learn_a_stale_in_flight_exit(tmp_path, stores):
+def test_backfill_and_retry_agree_on_a_crashed_attempts_exit(tmp_path, stores):
     store = OutcomeStore(tmp_path / "o.sqlite")
     _open(store, "AAA")
     assert store.claim_for_finalization("AAA", owner="crashed")
     store.update_exit(trade_id="AAA", exit_date=T_MINUS_1, exit_mid=3.8, realized_return_pct=90.0,
                       realized_expansion_pct=90.0, owner="crashed")
     _expire(store, "AAA")
-    real_update_exit = store.update_exit
 
-    def update_exit_after_backfill(**kwargs):
-        assert _backfill(tmp_path, "--target", "production") == 0
-        return real_update_exit(**kwargs)
+    # A backfill while the row is in flight and unlearned adds nothing ...
+    assert _backfill(tmp_path, "--target", "production") == 0
+    assert _ids(tmp_path / "cal.json") == [] and _ids(tmp_path / "priors.json") == []
 
-    store.update_exit = update_exit_after_backfill
+    # ... and a retry carrying other numbers learns the RECORDED exit, so the
+    # row, calibration and priors all agree.
     result = finalize_trade_and_update_learning(trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=-30.0,
                                                 realized_expansion_pct=-30.0, store=store)
     assert result["learning_update_status"] == "complete"
-    assert _prior_returns(tmp_path / "priors.json", "AAA") == [-30.0]
-    assert json.loads((tmp_path / "cal.json").read_text())["expansions"] == [-30.0]
+    row = store.get_trade("AAA")
+    assert row["realized_return_pct"] == 90.0 and row["exit_mid"] == 3.8
+    assert _prior_returns(tmp_path / "priors.json", "AAA") == [90.0]
+    assert json.loads((tmp_path / "cal.json").read_text())["expansions"] == [90.0]
 
 
 def test_backfill_keeps_an_in_flight_rows_learned_observation(tmp_path, stores):

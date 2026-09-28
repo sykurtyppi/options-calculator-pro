@@ -181,6 +181,8 @@ export function buildExitAttritionRows(payload = {}) {
 export function buildExcludedEvidenceSummary(payload = {}) {
   const invalidated = payload.invalidated_outcomes || {}
   const legacy = payload.legacy_repriced_baselines || {}
+  const nonFinite = payload.non_finite_outcomes || {}
+  const replay = payload.excluded_replay_outcomes || {}
   return {
     invalidatedN: Number(invalidated.n || 0),
     invalidatedResolvedN: Number(invalidated.resolved_n || 0),
@@ -189,6 +191,10 @@ export function buildExcludedEvidenceSummary(payload = {}) {
     legacyBaselinesN: Number(legacy.n || 0),
     legacyReasons: countRows(legacy.by_exit_repricing).map((row) => ({ ...row, label: labelExitRepricing(row.label) })),
     legacyNote: legacy.note || '',
+    nonFiniteSelectorN: Number(nonFinite.selector_n || 0),
+    nonFiniteBaselineN: Number(nonFinite.baseline_n || 0),
+    replayN: Number(replay.n || 0),
+    replayResolvedN: Number(replay.resolved_n || 0),
   }
 }
 
