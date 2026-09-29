@@ -92,7 +92,7 @@ def _run_day(tmp_path, store, day):
 
 
 def _replay_row(symbol):
-    return {"trade_date": "2026-04-21", "event_date": "2026-04-28", "setup_score": 0.6, "gross_return_pct": 0.90,
+    return {"pricing_source": "snapshot_replay", "trade_date": "2026-04-21", "event_date": "2026-04-28", "setup_score": 0.6, "gross_return_pct": 0.90,
             "net_return_pct": 0.80, "symbol": symbol, "structure": "otm_strangle"}
 
 

@@ -194,12 +194,19 @@ def get_historical_dividend_yield(
 
     * Only dividends already paid by ``as_of`` count, so a past valuation
       cannot see a later dividend regime.
-    * yfinance reports dividends split-adjusted to today; they are converted
-      back to as-traded amounts with the splits AFTER ``as_of``, so a later
-      split cannot shrink (or a reverse split inflate) the yield.
+    * yfinance reports dividends split-adjusted to today's share basis; they
+      are restated in the share basis of ``as_of`` (the basis of the price
+      passed in) by undoing only the splits AFTER ``as_of``. A later split
+      cannot shrink (or a reverse split inflate) the yield, and a split
+      between an ex-date and ``as_of`` is already in both the dividend and
+      the price.
     * The payout frequency comes from the gaps between recent ex-dates and
       the latest year's worth of payments is summed, so ex-date drift cannot
       pull a fifth quarterly dividend into a 365-day window.
+    * One-off special dividends (more than twice the median payment) are
+      not a recurring yield and are excluded.
+    * ``underlying_price`` must be the as-traded price on ``as_of``, not a
+      split- or dividend-adjusted close.
     * No dividend yet, or a dividend overdue by more than a cycle
       (suspended), is 0.0: a known fact at ``as_of``.
 
@@ -210,8 +217,12 @@ def get_historical_dividend_yield(
     sym = symbol.strip().upper()
     if not sym or not np.isfinite(underlying_price) or underlying_price <= 0:
         return None, "unavailable"
+    now = time.time()
     with _dividend_lock:
-        history = _dividend_history_cache.get(sym)
+        cached = _dividend_history_cache.get(sym)
+    history = None
+    if cached is not None and (now - cached[0]) < DEFAULT_CACHE_TTL_SECONDS:
+        history = cached[1]
     if history is None:
         try:
             import yfinance as yf  # lazy import — keep module usable without yfinance
@@ -225,20 +236,24 @@ def get_historical_dividend_yield(
             return None, "unavailable"
         history = (_dated_values(dividends), _dated_values(splits))
         with _dividend_lock:
-            _dividend_history_cache[sym] = history
+            # Refreshed daily: a long-running process capturing "today" must
+            # see new ex-dates and splits.
+            _dividend_history_cache[sym] = (now, history)
     dividends, splits = history
 
-    def _as_traded(day: date, amount: float) -> float:
-        factor = 1.0
-        for split_day, ratio in splits:
-            if split_day > day and ratio > 0:
-                factor *= ratio
-        return amount * factor
+    # Today's basis -> as_of's basis: undo the splits after as_of only.
+    basis_factor = 1.0
+    for split_day, ratio in splits:
+        if split_day > as_of and ratio > 0:
+            basis_factor *= ratio
 
     paid = sorted(
-        (day, _as_traded(day, amount)) for day, amount in dividends
+        (day, amount * basis_factor) for day, amount in dividends
         if day <= as_of and amount > 0 and (as_of - day).days <= 800
     )
+    if paid:
+        typical = float(np.median([amount for _, amount in paid]))
+        paid = [(day, amount) for day, amount in paid if amount <= 2.0 * typical]
     q = 0.0
     if paid:
         per_year = _payments_per_year([day for day, _ in paid])

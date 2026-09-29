@@ -105,7 +105,7 @@ def _print_pairing_report(progress: dict) -> None:
     total      = int(progress.get("total_snapshots", 0))
     events     = int(progress.get("total_events", 0))
     pairable   = int(progress.get("pairable_events", 0))
-    pct        = float(progress.get("pairable_event_pct", 0.0))
+    pct        = float(progress.get("pairable_event_pct", 0.0)) * 100.0  # stored as a fraction
     pre_only   = int(progress.get("pending_pre_only_events", 0))
     post_only  = int(progress.get("pending_post_only_events", 0))
     unqualified = int(progress.get("unqualified_events", 0))
@@ -118,7 +118,7 @@ def _print_pairing_report(progress: dict) -> None:
     print(f"  Total snapshots stored : {total:>6}")
     print(f"  Distinct events        : {events:>6}")
     print(f"  Fully paired           : {pairable:>6}  ({pct:.1f}%)")
-    print(f"  Priceable by replay    : {priceable:>6}  (paired with stored point-in-time inputs)")
+    print(f"  Priceable by replay    : {priceable:>6}  (same contracts, entry strike, stored point-in-time inputs)")
     print(f"  Pre-only (missing post): {pre_only:>6}")
     print(f"  Post-only (missing pre): {post_only:>6}")
     print(f"  Unqualified (no IV)    : {unqualified:>6}")
@@ -135,11 +135,12 @@ def _print_pairing_report(progress: dict) -> None:
         print("     extending --years or adding more symbols.")
     else:
         print()
-        print(f"  ✓  {pct:.0f}% of events are paired; {priceable} carry stored point-in-time")
-        print("     inputs and will be replayed with real option economics.")
+        print(f"  ✓  {pct:.0f}% of events are paired; {priceable} can be replayed with real")
+        print("     option economics.")
     if pairable > priceable:
-        print(f"  ⚠  {pairable - priceable} paired event(s) lack stored point-in-time inputs")
-        print("     and will be refused by replay until their snapshots are re-collected.")
+        print(f"  ⚠  {pairable - priceable} paired event(s) will be refused by replay: their pre and post")
+        print("     snapshots hold different expiries, lack an entry strike, or lack stored")
+        print("     point-in-time inputs (re-collect those snapshots).")
     print()
 
 
