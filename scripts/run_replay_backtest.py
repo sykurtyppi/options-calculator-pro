@@ -6,7 +6,8 @@ Run a walk-forward backtest in hybrid pricing mode so replay-ready events
 use real option economics and the rest fall back to synthetic.
 
 After the run, prints:
-  - How many trades used REPLAY vs SYNTHETIC (from logs)
+  - How the backtest routed its trades (recorded replay vs synthetic, plus
+    skipped, refused and debit-gated candidates), as counted by the backtest
   - Session ID for looking up full results in the DB
   - Top-level P&L summary
 
@@ -25,7 +26,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import logging
 import os
 import sys
 from pathlib import Path
@@ -40,27 +40,16 @@ except ImportError:
     pass
 
 
-# ── Intercept REPLAY vs SYNTHETIC log lines ───────────────────────────────────
-
-class _ReplayCounter(logging.Handler):
-    """Counts how many trades went through replay vs synthetic paths."""
-    def __init__(self):
-        super().__init__()
-        self.replay   = 0
-        self.synthetic = 0
-        self.skipped   = 0
-        self.unpriceable = 0
-
-    def emit(self, record: logging.LogRecord) -> None:
-        msg = record.getMessage()
-        if "📸 REPLAY" in msg:
-            self.replay += 1
-        elif "🔮 SYNTHETIC" in msg:
-            self.synthetic += 1
-        elif "⏭  SKIP" in msg:
-            self.skipped += 1
-        elif "⛔ UNPRICEABLE" in msg:
-            self.unpriceable += 1
+def routing_summary(db) -> dict:
+    """Routing counts the backtest itself recorded for its last walk-forward."""
+    routing = getattr(db, "replay_routing", {}) or {}
+    return {
+        "replay": int(routing.get("snapshot_replay", 0)),
+        "synthetic": int(routing.get("synthetic_proxy", 0)),
+        "skipped": int(routing.get("skipped_no_pair", 0)),
+        "unpriceable": int(sum((getattr(db, "replay_unpriceable", {}) or {}).values())),
+        "debit_gated": int(routing.get("debit_gated", 0)),
+    }
 
 
 def main() -> int:
@@ -102,11 +91,6 @@ def main() -> int:
         print(f"  ✗  Import error: {exc}")
         print("     Use .venv_arm64/bin/python3 and run from project root.")
         return 1
-
-    # ── Wire up the replay counter before DB init (so it catches all logs) ───
-    counter = _ReplayCounter()
-    counter.setLevel(logging.DEBUG)
-    logging.getLogger("services.institutional_ml_db").addHandler(counter)
 
     # ── Initialise DB ─────────────────────────────────────────────────────────
     print()
@@ -151,7 +135,8 @@ def main() -> int:
     session_id = db.run_calendar_spread_backtest(strategy_params)
 
     # ── Results ───────────────────────────────────────────────────────────────
-    total_trades = counter.replay + counter.synthetic + counter.skipped + counter.unpriceable
+    routing = routing_summary(db)
+    total_candidates = sum(routing.values())
 
     print()
     print("=" * 60)
@@ -160,12 +145,13 @@ def main() -> int:
     print(f"  Session ID   : {session_id}")
     print()
     print("  Trade routing breakdown:")
-    print(f"    📸 REPLAY    : {counter.replay:>5}  (real option economics)")
-    print(f"    🔮 SYNTHETIC : {counter.synthetic:>5}  (proxy fallback)")
-    print(f"    ⏭  SKIPPED   : {counter.skipped:>5}  (no pair, mode=snapshot_replay)")
-    print(f"    ⛔ UNPRICEABLE: {counter.unpriceable:>4}  (pair lacks stored point-in-time inputs; re-collect snapshots)")
-    if total_trades > 0:
-        replay_pct = counter.replay / total_trades * 100
+    print(f"    📸 REPLAY    : {routing['replay']:>5}  (recorded; real option economics)")
+    print(f"    🔮 SYNTHETIC : {routing['synthetic']:>5}  (recorded; proxy fallback)")
+    print(f"    ⏭  SKIPPED   : {routing['skipped']:>5}  (no pair, mode=snapshot_replay)")
+    print(f"    ⛔ UNPRICEABLE: {routing['unpriceable']:>4}  (refused: {', '.join(sorted(db.replay_unpriceable)) or 'none'})")
+    print(f"    🚫 DEBIT-GATED: {routing['debit_gated']:>4}  (over --max-debit)")
+    if total_candidates > 0:
+        replay_pct = routing['replay'] / total_candidates * 100
         print()
         print(f"  Replay coverage this run: {replay_pct:.1f}%")
         if replay_pct < 15:

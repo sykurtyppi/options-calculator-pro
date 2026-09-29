@@ -32,10 +32,11 @@ option percentage return before execution costs, which maps to IV expansion
 but is not identical to it.  For a calendar spread, it is the best proxy
 available from the backtest output.
 
-If replay coverage in the DB is low (most trades used synthetic pricing),
-the observations are from a proxy model, not real option economics.  The
-seeding script prints replay vs synthetic coverage so you can decide whether
-the seeded observations are empirically meaningful.
+Only trades priced from stored option snapshots (pricing_source =
+"snapshot_replay") are seeded.  Synthetic-proxy trades, and legacy rows
+recorded before pricing_source existed, are skipped and counted: proxy P&L
+is a model estimate, not option-market evidence, and must never reach the
+outcome, calibration or prior stores as "replay".
 
 Usage
 -----
@@ -86,6 +87,10 @@ logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(mes
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+
+# backtest_trades.pricing_source for trades priced from stored option
+# snapshots (services.institutional_ml_db.PRICING_SOURCE_SNAPSHOT_REPLAY).
+SNAPSHOT_REPLAY_PRICING = "snapshot_replay"
 
 _DEFAULT_DB = Path.home() / ".options_calculator_pro" / "institutional_ml.db"
 
@@ -228,11 +233,15 @@ def seed_from_trades(
     skipped_duplicate = 0
     skipped_bad_data = 0
     skipped_conflict = 0
+    skipped_not_snapshot_priced = 0
     by_year: Dict[int, int] = defaultdict(int)
     by_structure: Dict[str, int] = defaultdict(int)
     cal_updates = 0
 
     for row in trades:
+        if row.get("pricing_source") != SNAPSHOT_REPLAY_PRICING:
+            skipped_not_snapshot_priced += 1
+            continue
         entry_date = _parse_date(row.get("trade_date"))
         if entry_date is None:
             skipped_bad_data += 1
@@ -412,6 +421,7 @@ def seed_from_trades(
         "skipped_duplicate": skipped_duplicate,
         "skipped_bad_data": skipped_bad_data,
         "skipped_conflict": skipped_conflict,
+        "skipped_not_snapshot_priced": skipped_not_snapshot_priced,
         "cal_updates": cal_updates,
         "cal_phase_after": cal_phase,
         "cal_n_after": cal_n,
@@ -574,10 +584,8 @@ def main() -> int:
 
     print()
     print(
-        "  ⚠  IMPORTANT: If most trades above used synthetic pricing\n"
-        "  (not replay), the seeded observations are proxy-model estimates,\n"
-        "  not empirical option economics.  Run run_replay_backtest.py with\n"
-        "  --mode snapshot_replay to check your replay coverage.\n"
+        "  Only snapshot-replay-priced trades are seeded; synthetic-proxy and\n"
+        "  legacy (unlabelled) rows are skipped.\n"
     )
 
     # ── Seed ──────────────────────────────────────────────────────────────────
@@ -600,6 +608,7 @@ def main() -> int:
     print(f"{prefix}Skipped (duplicate): {result['skipped_duplicate']}")
     print(f"{prefix}Skipped (bad data) : {result['skipped_bad_data']}")
     print(f"{prefix}Skipped (conflict) : {result['skipped_conflict']}")
+    print(f"{prefix}Skipped (not snapshot-priced: proxy or legacy): {result['skipped_not_snapshot_priced']}")
 
     if result["by_year"]:
         print()

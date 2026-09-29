@@ -31,6 +31,7 @@ from utils.logger import setup_logger as get_logger
 from utils.quotes import safe_mid
 from services import crush_features as _CF
 from services.execution_cost_model import ExecutionCostModel
+from services.market_calendar import add_sessions, is_trading_day, next_session_on_or_after
 
 # Optional MarketData.app client — imported lazily so the module loads even
 # when market_data_client is not yet on the path.
@@ -253,6 +254,14 @@ class BacktestTrade:
     crush_profile_sample_size: float
     execution_profile: str
     structure: str = "call_calendar"
+    # PRICING_SOURCE_SNAPSHOT_REPLAY (real stored option snapshots) or
+    # PRICING_SOURCE_SYNTHETIC_PROXY (model proxy). Only the former is
+    # option-market evidence; see scripts/seed_outcomes_from_replay.py.
+    pricing_source: str = "unknown"
+
+
+PRICING_SOURCE_SNAPSHOT_REPLAY = "snapshot_replay"
+PRICING_SOURCE_SYNTHETIC_PROXY = "synthetic_proxy"
 
 
 @dataclass(frozen=True)
@@ -283,6 +292,23 @@ class SnapshotReplayPair:
 
 UNPRICEABLE_MISSING_HISTORICAL_INPUTS = "unpriceable_missing_historical_inputs"
 UNPRICEABLE_MISMATCHED_CONTRACTS = "unpriceable_mismatched_contracts"
+UNPRICEABLE_MISSING_ENTRY_STRIKE = "unpriceable_missing_entry_strike"
+UNPRICEABLE_OUTSIDE_TRADE_WINDOW = "unpriceable_outside_trade_window"
+def _new_replay_routing() -> Dict[str, int]:
+    """Per-run routing counts: recorded trades by pricing source, plus skips."""
+    return {
+        PRICING_SOURCE_SNAPSHOT_REPLAY: 0,
+        PRICING_SOURCE_SYNTHETIC_PROXY: 0,
+        'skipped_no_pair': 0,
+        'debit_gated': 0,
+    }
+
+
+_REFUSAL_DETAILS = {
+    UNPRICEABLE_MISMATCHED_CONTRACTS: "no post-event snapshot of the entry's expiries",
+    UNPRICEABLE_MISSING_ENTRY_STRIKE: "entry snapshot has no ATM strike",
+    UNPRICEABLE_OUTSIDE_TRADE_WINDOW: "no entry snapshot on/after the decision date with an exit within the hold limit",
+}
 
 
 @dataclass(frozen=True)
@@ -291,22 +317,6 @@ class SnapshotReplayRefusal:
     symbol: str
     event_date: datetime
     reason: str
-
-
-def _priced_first(candidates: "pd.DataFrame") -> "pd.DataFrame":
-    """Candidates with both stored pricing inputs first, order otherwise kept."""
-    priced = (
-        candidates["pricing_risk_free_rate"].notna() & candidates["pricing_dividend_yield"].notna()
-    )
-    return pd.concat([candidates[priced], candidates[~priced]])
-
-
-def _prefer_priced(candidates: "pd.DataFrame") -> "pd.DataFrame":
-    """Candidates with both stored pricing inputs, or all of them if none have."""
-    priced = candidates[
-        candidates["pricing_risk_free_rate"].notna() & candidates["pricing_dividend_yield"].notna()
-    ]
-    return priced if not priced.empty else candidates
 
 
 def _stored_input(value: Any) -> Optional[float]:
@@ -346,6 +356,8 @@ class InstitutionalMLDatabase:
         # Snapshot pairs refused by replay, by reason (e.g. missing stored
         # point-in-time pricing inputs). Reported after each walk-forward.
         self.replay_unpriceable: Dict[str, int] = {}
+        # How the last walk-forward routed its candidates (see _new_replay_routing).
+        self.replay_routing: Dict[str, int] = _new_replay_routing()
 
         # MarketData.app client for enhanced data quality
         self.mda_client: Optional[Any] = mda_client
@@ -711,6 +723,7 @@ class InstitutionalMLDatabase:
                         crush_edge_score REAL NOT NULL DEFAULT 0.0,
                         crush_profile_sample_size REAL NOT NULL DEFAULT 0.0,
                         execution_profile TEXT NOT NULL,
+                        pricing_source TEXT,
                         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                         FOREIGN KEY (session_id) REFERENCES backtest_sessions (session_id)
                     )
@@ -749,6 +762,13 @@ class InstitutionalMLDatabase:
                     cursor.execute(
                         "ALTER TABLE backtest_trades ADD COLUMN crush_profile_sample_size REAL NOT NULL DEFAULT 0.0"
                     )
+                if "pricing_source" not in backtest_trade_columns:
+                    # NULL on legacy rows: their pricing (snapshot vs proxy) is unknown.
+                    try:
+                        cursor.execute("ALTER TABLE backtest_trades ADD COLUMN pricing_source TEXT")
+                    except sqlite3.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
 
                 # Performance indexes for fast queries
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_calendar_spreads_symbol_date ON calendar_spreads (symbol, entry_date)")
@@ -1148,6 +1168,7 @@ class InstitutionalMLDatabase:
         # Per-run count of snapshot pairs replay refused (never accumulated
         # across runs or parameter sweeps sharing this instance).
         self.replay_unpriceable = {}
+        self.replay_routing = _new_replay_routing()
         earnings_event_mode = bool(strategy_params.get('earnings_event_mode', True))
         entry_days_before_earnings = max(1, int(strategy_params.get('entry_days_before_earnings', 7)))
         exit_days_after_earnings = max(0, int(strategy_params.get('exit_days_after_earnings', 1)))
@@ -1291,13 +1312,23 @@ class InstitutionalMLDatabase:
             scored_rows.sort(key=lambda item: item[0], reverse=True)
             for _, setup_score, row, row_hold_days, event_date, days_to_earnings, crush_context in scored_rows[:max_trades_per_day]:
                 symbol = str(getattr(row, 'symbol', 'UNKNOWN')).upper()
-                replay_key = (symbol, pd.Timestamp(event_date).strftime('%Y-%m-%d'))
+                # The entry may not be priced before the date whose features
+                # chose the trade, nor the exit beyond its hold limit.
+                decided_on = pd.Timestamp(trade_date).normalize().to_pydatetime()
+                replay_key = (
+                    symbol,
+                    pd.Timestamp(event_date).strftime('%Y-%m-%d'),
+                    decided_on.date(),
+                    int(row_hold_days),
+                )
                 snapshot_pair = None
                 if pricing_mode in {'hybrid', 'snapshot_replay'}:
                     if replay_key not in snapshot_pair_cache:
                         snapshot_pair_cache[replay_key] = self._load_snapshot_replay_pair(
                             symbol=symbol,
                             event_date=pd.Timestamp(event_date).to_pydatetime(),
+                            decided_on=decided_on,
+                            max_hold_sessions=int(row_hold_days),
                         )
                     snapshot_pair = snapshot_pair_cache.get(replay_key)
 
@@ -1308,7 +1339,7 @@ class InstitutionalMLDatabase:
                         snapshot_pair.reason,
                         symbol,
                         event_date,
-                        "no post-event snapshot of the entry's expiries",
+                        _REFUSAL_DETAILS.get(snapshot_pair.reason, snapshot_pair.reason),
                     )
                     trade = None
                 elif snapshot_pair is not None:
@@ -1341,6 +1372,7 @@ class InstitutionalMLDatabase:
                         symbol,
                         pd.Timestamp(event_date).strftime('%Y-%m-%d'),
                     )
+                    self.replay_routing['skipped_no_pair'] += 1
                     trade = None
                 else:
                     self.logger.info(
@@ -1372,10 +1404,13 @@ class InstitutionalMLDatabase:
                             trade.debit_per_contract,
                             max_entry_debit_per_contract,
                         )
+                        self.replay_routing['debit_gated'] += 1
                         trade = None
 
                 if trade is not None:
                     trades.append(trade)
+                    # Counted as recorded (after the debit gate), by pricing source.
+                    self.replay_routing[trade.pricing_source] = self.replay_routing.get(trade.pricing_source, 0) + 1
 
         walk_forward_log = self.logger.debug if bool(strategy_params.get('suppress_backtest_logs', False)) else self.logger.info
         walk_forward_log(
@@ -1383,10 +1418,10 @@ class InstitutionalMLDatabase:
         )
         if self.replay_unpriceable:
             self.logger.warning(
-                "Replay skipped snapshot pairs it could not price: %s. Missing historical "
+                "Replay refused snapshot pairs it could not price: %s. Missing historical "
                 "inputs: re-collect those snapshots (capture now stores the rate and dividend "
-                "known on each capture date). Mismatched contracts: no post-event snapshot "
-                "holds the entry's expiries.",
+                "known on each capture date). Mismatched contracts, missing entry strike, or "
+                "no snapshot inside the decision/hold window: no trade is recorded.",
                 dict(self.replay_unpriceable),
             )
         return trades
@@ -2180,69 +2215,25 @@ class InstitutionalMLDatabase:
                         skipped += 1
                         continue
 
-                    # Snapshot-date underlying close for ATM reference (not today's price).
-                    symbol_prices = pd.read_sql_query(
+                    def _align_snapshot_trade_date(target_date: date, phase: str) -> date:
                         """
-                        SELECT date, close_price
-                        FROM daily_prices
-                        WHERE symbol = ?
-                        ORDER BY date ASC
-                        """,
-                        conn,
-                        params=(symbol,),
-                    )
-                    if symbol_prices.empty:
-                        skipped += 1
-                        continue
-                    symbol_prices["date"] = pd.to_datetime(symbol_prices["date"], errors="coerce").dt.normalize()
-                    symbol_prices["close_price"] = pd.to_numeric(symbol_prices["close_price"], errors="coerce")
-                    symbol_prices = symbol_prices.dropna(subset=["date", "close_price"])
-                    if symbol_prices.empty:
-                        skipped += 1
-                        continue
-                    close_by_date = (
-                        symbol_prices.groupby("date", as_index=True)["close_price"]
-                        .last()
-                        .sort_index()
-                    )
-                    trading_dates = close_by_date.index
-
-                    def _underlying_price_at_snapshot(snap_date: date) -> float:
-                        ts = pd.Timestamp(snap_date).normalize()
-                        asof = close_by_date[close_by_date.index <= ts]
-                        if asof.empty:
-                            return float("nan")
-                        px = float(asof.iloc[-1])
-                        return px if np.isfinite(px) and px > 0 else float("nan")
-
-                    def _align_snapshot_trade_date(
-                        target_date: date,
-                        phase: str,
-                    ) -> Optional[pd.Timestamp]:
-                        """
-                        Align requested snapshot date to an actual trading session.
+                        Align a requested snapshot date to an NYSE session.
 
                         MDApp historical option-chain endpoint returns 404 for non-session
-                        dates (weekends/holidays). We map:
-                          - pre  snapshots -> nearest session on/before target date
-                          - post snapshots -> nearest session on/after target date
+                        dates (weekends/holidays). Sessions come from the exchange
+                        calendar, never from this symbol's price history, so a gap in
+                        daily_prices can never move a snapshot across the event:
+                          - pre  snapshots -> latest session on/before the target
+                            (target is before the event, so the chain is pre-event)
+                          - post snapshots -> first session on/after the target
+                            (target is after the event, so the chain is post-reaction)
                         """
-                        ts = pd.Timestamp(target_date).normalize()
                         if phase == "post":
-                            future = trading_dates[trading_dates >= ts]
-                            if len(future) > 0:
-                                return pd.Timestamp(future[0]).normalize()
-                            asof = trading_dates[trading_dates <= ts]
-                            if len(asof) > 0:
-                                return pd.Timestamp(asof[-1]).normalize()
-                            return None
-                        asof = trading_dates[trading_dates <= ts]
-                        if len(asof) == 0:
-                            future = trading_dates[trading_dates >= ts]
-                            if len(future) == 0:
-                                return None
-                            return pd.Timestamp(future[0]).normalize()
-                        return pd.Timestamp(asof[-1]).normalize()
+                            return next_session_on_or_after(target_date)
+                        aligned = target_date
+                        while not is_trading_day(aligned):
+                            aligned -= timedelta(days=1)
+                        return aligned
 
                     def _underlying_price_from_chain(chain: "pd.DataFrame") -> float:
                         """
@@ -2323,13 +2314,17 @@ class InstitutionalMLDatabase:
                             raw_snap_date = rd + timedelta(days=rel_day)
                             if raw_snap_date < cutoff or raw_snap_date >= today:
                                 continue
-                            aligned_ts = _align_snapshot_trade_date(raw_snap_date, phase)
-                            if aligned_ts is None:
-                                continue
-                            snap_date = aligned_ts.date()
+                            snap_date = _align_snapshot_trade_date(raw_snap_date, phase)
                             if snap_date < cutoff or snap_date >= today:
                                 continue
-                            snap_date_str = aligned_ts.strftime("%Y-%m-%d")
+                            # A pre snapshot must precede the event and a post snapshot
+                            # follow it (the post target is the day after the report,
+                            # so it is after the reaction for any release timing).
+                            if (phase == "pre" and snap_date >= rd) or (phase == "post" and snap_date <= rd):
+                                continue
+                            snap_date_str = snap_date.strftime("%Y-%m-%d")
+                            # The day actually captured, relative to the event.
+                            actual_rel_day = (snap_date - rd).days
 
                             try:
                                 attempts += 1
@@ -2355,9 +2350,11 @@ class InstitutionalMLDatabase:
                                     no_expiry_pairs += 1
                                     continue
 
+                                # As-traded underlying from the chain only: the stored
+                                # daily closes are split- and dividend-adjusted, so they
+                                # would mis-pick the ATM strike and mis-state the
+                                # dividend yield. No chain price -> no snapshot.
                                 snapshot_underlying = _underlying_price_from_chain(chain_df)
-                                if not np.isfinite(snapshot_underlying) or snapshot_underlying <= 0:
-                                    snapshot_underlying = _underlying_price_at_snapshot(snap_date)
                                 if not np.isfinite(snapshot_underlying) or snapshot_underlying <= 0:
                                     no_underlying += 1
                                     continue
@@ -2441,7 +2438,7 @@ class InstitutionalMLDatabase:
                                         symbol,
                                         event_date_str,
                                         snap_date_str,
-                                        int(rel_day),
+                                        int(actual_rel_day),
                                         release_timing,
                                         phase,
                                         short_exp,
@@ -2760,12 +2757,21 @@ class InstitutionalMLDatabase:
         max_pre_days: int = 12,
         min_post_days: int = 0,
         max_post_days: int = 5,
+        decided_on: Optional[datetime] = None,
+        max_hold_sessions: Optional[int] = None,
     ) -> Optional[Union[SnapshotReplayPair, SnapshotReplayRefusal]]:
         """Load the best available pre/post snapshot pair for replay pricing.
 
-        Returns None when the event lacks a pre- or post-event snapshot, and a
-        SnapshotReplayRefusal when both exist but no post-event snapshot holds
-        the pre-event snapshot's expiries.
+        ``decided_on`` is the date whose features selected the trade: the
+        entry cannot be priced from a snapshot captured before it.
+        ``max_hold_sessions`` caps the exit at that many sessions after the
+        entry snapshot (the trade's hold limit).
+
+        Returns None when the event lacks a pre- or post-event snapshot. When
+        both exist but cannot be priced as one trade, returns a
+        SnapshotReplayRefusal: no valid entry strike, no snapshot inside the
+        decision/hold window, or no post-event snapshot of the entry's
+        expiries.
         """
         event_date_str = pd.Timestamp(event_date).strftime("%Y-%m-%d")
         query = """
@@ -2813,32 +2819,66 @@ class InstitutionalMLDatabase:
         if pre_candidates.empty or post_candidates.empty:
             return None
 
-        # Entry and exit must value the SAME contracts: a post-event snapshot
-        # of other expiries has IVs for other options, and pricing them as the
-        # entry's expiries would fabricate P&L. Try pre-event snapshots latest
-        # first, preferring ones with stored point-in-time inputs (an older
-        # legacy row must not hide a priceable one), and take the earliest
-        # matching post-event snapshot, again preferring stored inputs.
-        pre_row = post_row = None
-        for candidate in _priced_first(pre_candidates.iloc[::-1]).itertuples(index=False):
-            aligned_post = post_candidates[
-                (post_candidates["short_expiry"] == candidate.short_expiry)
-                & (post_candidates["long_expiry"] == candidate.long_expiry)
-            ]
-            if not aligned_post.empty:
-                pre_row = pd.Series(candidate._asdict())
-                post_row = _prefer_priced(aligned_post).iloc[0]
-                break
-        if pre_row is None:
+        def _refuse(reason: str) -> SnapshotReplayRefusal:
             return SnapshotReplayRefusal(
                 symbol=str(symbol).upper(),
                 event_date=pd.Timestamp(event_date).to_pydatetime(),
-                reason=UNPRICEABLE_MISMATCHED_CONTRACTS,
+                reason=reason,
             )
 
-        strike = float(pre_row["atm_strike"]) if np.isfinite(pre_row["atm_strike"]) else float(post_row["atm_strike"])
-        if not np.isfinite(strike) or strike <= 0:
-            return None
+        # The entry strike comes from the entry snapshot only: taking it from
+        # the post-event snapshot would be look-ahead.
+        pre_candidates = pre_candidates[pre_candidates["atm_strike"] > 0]
+        if pre_candidates.empty:
+            return _refuse(UNPRICEABLE_MISSING_ENTRY_STRIKE)
+
+        if decided_on is not None:
+            pre_candidates = pre_candidates[
+                pre_candidates["capture_date"] >= pd.Timestamp(decided_on).normalize()
+            ]
+        if pre_candidates.empty:
+            return _refuse(UNPRICEABLE_OUTSIDE_TRADE_WINDOW)
+
+        # Entry and exit must value the SAME contracts: a post-event snapshot
+        # of other expiries has IVs for other options, and pricing them as the
+        # entry's expiries would fabricate P&L. Among same-contract pairs,
+        # prefer one priceable on both sides (stored point-in-time inputs),
+        # then the latest entry, then the earliest exit.
+        # A missing expiry identifies no contract (pandas would match NaN to NaN).
+        contract = ["short_expiry", "long_expiry"]
+        pairs = pre_candidates.dropna(subset=contract).reset_index(drop=True).merge(
+            post_candidates.dropna(subset=contract).reset_index(drop=True),
+            on=["short_expiry", "long_expiry"],
+            suffixes=("_pre", "_post"),
+        )
+        if pairs.empty:
+            return _refuse(UNPRICEABLE_MISMATCHED_CONTRACTS)
+        if max_hold_sessions is not None:
+            within_hold = [
+                post_day.date() <= add_sessions(pre_day.date(), int(max_hold_sessions))
+                for pre_day, post_day in zip(pairs["capture_date_pre"], pairs["capture_date_post"])
+            ]
+            pairs = pairs[within_hold]
+            if pairs.empty:
+                return _refuse(UNPRICEABLE_OUTSIDE_TRADE_WINDOW)
+        pairs["_priced"] = (
+            pairs["pricing_risk_free_rate_pre"].notna() & pairs["pricing_dividend_yield_pre"].notna()
+            & pairs["pricing_risk_free_rate_post"].notna() & pairs["pricing_dividend_yield_post"].notna()
+        )
+        pairs["_exit_order"] = -pairs["capture_date_post"].astype("int64")
+        best = pairs.sort_values(
+            ["_priced", "capture_date_pre", "_exit_order"], ascending=False, kind="mergesort"
+        ).iloc[0]
+
+        def _side(suffix: str) -> pd.Series:
+            row = {}
+            for col in pre_candidates.columns:
+                row[col] = best[col] if col in ("short_expiry", "long_expiry") else best[f"{col}{suffix}"]
+            return pd.Series(row)
+
+        pre_row = _side("_pre")
+        post_row = _side("_post")
+        strike = float(pre_row["atm_strike"])
 
         return SnapshotReplayPair(
             symbol=str(pre_row["symbol"]).upper(),
@@ -3052,6 +3092,7 @@ class InstitutionalMLDatabase:
             crush_edge_score=crush_edge_score,
             crush_profile_sample_size=crush_profile_sample_size,
             execution_profile=execution_profile,
+            pricing_source=PRICING_SOURCE_SNAPSHOT_REPLAY,
         )
 
     def calibrate_earnings_iv_decay_labels(self, min_pre_days: int = 1,
@@ -3120,17 +3161,23 @@ class InstitutionalMLDatabase:
             if pre_candidates.empty or post_candidates.empty:
                 continue
 
-            pre_row = pre_candidates.sort_values('capture_date').iloc[-1]
-            expiry_aligned_post = post_candidates[
-                (post_candidates['short_expiry'] == pre_row['short_expiry'])
-                & (post_candidates['long_expiry'] == pre_row['long_expiry'])
-            ]
-            if not expiry_aligned_post.empty:
-                post_row = expiry_aligned_post.sort_values('capture_date').iloc[0]
-                expiry_aligned = True
-            else:
-                post_row = post_candidates.sort_values('capture_date').iloc[0]
-                expiry_aligned = False
+            # A crush label compares the SAME contracts before and after the
+            # event (as the replay does): IVs of other expiries are not a crush.
+            # Latest pre-event snapshot that has a same-contract post-event one.
+            pre_row = post_row = None
+            for _, candidate in pre_candidates.sort_values('capture_date', ascending=False).iterrows():
+                if pd.isna(candidate['short_expiry']) or pd.isna(candidate['long_expiry']):
+                    continue
+                expiry_aligned_post = post_candidates[
+                    (post_candidates['short_expiry'] == candidate['short_expiry'])
+                    & (post_candidates['long_expiry'] == candidate['long_expiry'])
+                ]
+                if not expiry_aligned_post.empty:
+                    pre_row = candidate
+                    post_row = expiry_aligned_post.sort_values('capture_date').iloc[0]
+                    break
+            if pre_row is None:
+                continue
 
             pre_front = float(pre_row['front_iv'])
             post_front = float(post_row['front_iv'])
@@ -3150,9 +3197,6 @@ class InstitutionalMLDatabase:
             pre_dist = abs(abs(int(pre_row['relative_day'])) - min_pre_days)
             post_dist = abs(int(post_row['relative_day']) - min_post_days)
             quality_score = float(np.clip(1.0 - 0.04 * pre_dist - 0.06 * post_dist, 0.10, 1.00))
-            if not expiry_aligned:
-                # Penalize labels where pre/post snapshots do not share the same expiry pair.
-                quality_score = float(np.clip(quality_score * 0.75, 0.10, 1.00))
 
             label_rows.append({
                 'symbol': str(symbol),
@@ -3171,6 +3215,24 @@ class InstitutionalMLDatabase:
                 'quality_score': quality_score,
                 'source': 'snapshot_pair',
             })
+
+        # Snapshot labels are rebuilt from the snapshots: drop the previous
+        # ones for these events first, so a label an older rule accepted (e.g.
+        # from mismatched contracts) cannot outlive the rule.
+        rebuilt_events = [
+            (str(symbol), str(event_date))
+            for symbol, event_date in snapshots[['symbol', 'event_date']].drop_duplicates().itertuples(index=False)
+        ]
+        try:
+            with self._open_conn() as conn:
+                conn.executemany(
+                    "DELETE FROM earnings_iv_decay_labels WHERE symbol = ? AND event_date = ? AND source = 'snapshot_pair'",
+                    rebuilt_events,
+                )
+                conn.commit()
+        except Exception as e:
+            self.logger.error(f"❌ Failed to clear stale IV-decay labels: {e}")
+            return pd.DataFrame()
 
         if not label_rows:
             self.logger.warning(
@@ -3236,7 +3298,7 @@ class InstitutionalMLDatabase:
 
         query = """
             SELECT symbol, event_date, capture_date, relative_day, snapshot_phase, front_iv, back_iv,
-                   short_expiry, long_expiry, pricing_risk_free_rate, pricing_dividend_yield
+                   short_expiry, long_expiry, atm_strike, pricing_risk_free_rate, pricing_dividend_yield
             FROM earnings_option_snapshots
             ORDER BY symbol, event_date, capture_date
         """
@@ -3323,12 +3385,19 @@ class InstitutionalMLDatabase:
         events_with_pre = int((grouped['pre_count'] > 0).sum())
         events_with_post = int((grouped['post_count'] > 0).sum())
         pairable_events = int(((grouped['pre_count'] > 0) & (grouped['post_count'] > 0)).sum())
-        # Priceable: a priced pre- and a priced post-event snapshot of the SAME
-        # contracts (replay refuses pairs whose expiries differ).
+        # Priceable: a priced pre- (with an entry strike) and a priced
+        # post-event snapshot of the SAME contracts, as replay requires. A
+        # missing expiry identifies no contract (merge would match NaN to NaN).
         contract_keys = ['symbol', 'event_date', 'short_expiry', 'long_expiry']
-        priced_pairs = snapshots.loc[pre_mask & has_inputs, contract_keys].drop_duplicates().merge(
-            snapshots.loc[post_mask & has_inputs, contract_keys].drop_duplicates(),
-            on=contract_keys,
+        has_strike = pd.to_numeric(snapshots['atm_strike'], errors='coerce') > 0
+        priced_pairs = (
+            snapshots.loc[pre_mask & has_inputs & has_strike, contract_keys]
+            .dropna(subset=['short_expiry', 'long_expiry']).drop_duplicates()
+            .merge(
+                snapshots.loc[post_mask & has_inputs, contract_keys]
+                .dropna(subset=['short_expiry', 'long_expiry']).drop_duplicates(),
+                on=contract_keys,
+            )
         )
         priceable_events = int(len(priced_pairs[['symbol', 'event_date']].drop_duplicates()))
         pending_pre_only = int(((grouped['pre_count'] > 0) & (grouped['post_count'] == 0)).sum())
@@ -3649,6 +3718,7 @@ class InstitutionalMLDatabase:
             crush_edge_score=crush_edge_score,
             crush_profile_sample_size=crush_profile_sample_size,
             execution_profile=execution_profile,
+            pricing_source=PRICING_SOURCE_SYNTHETIC_PROXY,
         )
 
     def _calculate_max_drawdown(self, pnl_per_trade: np.ndarray) -> float:
@@ -3705,8 +3775,9 @@ class InstitutionalMLDatabase:
                     (session_id, symbol, structure, trade_date, event_date, days_to_earnings, contracts, hold_days, setup_score, debit_per_contract,
                      transaction_cost_per_contract, gross_return_pct, net_return_pct, pnl_per_contract,
                      underlying_return, expected_move, move_ratio, predicted_front_iv_crush_pct,
-                     crush_confidence, crush_edge_score, crush_profile_sample_size, execution_profile)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     crush_confidence, crush_edge_score, crush_profile_sample_size, execution_profile,
+                     pricing_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     (
                         trade.session_id,
@@ -3731,6 +3802,7 @@ class InstitutionalMLDatabase:
                         trade.crush_edge_score,
                         trade.crush_profile_sample_size,
                         trade.execution_profile,
+                        trade.pricing_source,
                     )
                     for trade in trades
                 ])
@@ -3884,7 +3956,9 @@ class InstitutionalMLDatabase:
         else:
             symbol_clauses.append("1=0")
         if as_of_cutoff:
-            symbol_clauses.append("event_date < ?")
+            # Point in time: a label is known only once its post-event IVs were
+            # observed, which can be days after the event itself.
+            symbol_clauses.append("post_capture_date < ?")
             symbol_params.append(as_of_cutoff)
         symbol_filter = "WHERE " + " AND ".join(symbol_clauses)
 
@@ -3922,7 +3996,7 @@ class InstitutionalMLDatabase:
                 """
                 global_params: List[Any] = []
                 if as_of_cutoff:
-                    global_query += " WHERE event_date < ?"
+                    global_query += " WHERE post_capture_date < ?"
                     global_params.append(as_of_cutoff)
                 global_row = conn.execute(global_query, global_params).fetchone()
 

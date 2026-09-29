@@ -420,7 +420,7 @@ def test_exit_without_value_is_left_alone_on_its_exit_day(tmp_path, stores):
 
 
 def _replay(symbol):
-    return {"trade_date": "2025-03-03", "event_date": "2025-03-10", "symbol": symbol, "setup_score": 0.6,
+    return {"pricing_source": "snapshot_replay", "trade_date": "2025-03-03", "event_date": "2025-03-10", "symbol": symbol, "setup_score": 0.6,
             "gross_return_pct": 0.5, "net_return_pct": 0.4, "structure": "otm_strangle"}
 
 

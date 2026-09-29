@@ -282,10 +282,10 @@ def test_counter_is_per_run_and_refused_pairs_are_not_logged_as_replays(tmp_path
     assert sum("⛔ UNPRICEABLE" in message for message in messages) == 3
 
 
-def test_replay_script_counts_unpriceable_pairs():
+def test_replay_script_reports_unpriceable_pairs():
     import scripts.run_replay_backtest as script
 
-    counter = script._ReplayCounter()
-    for text in ("⛔ UNPRICEABLE XYZ @ 2026-03-02 — x", "📸 REPLAY  XYZ", "🔮 SYNTHETIC XYZ"):
-        counter.emit(logging.LogRecord("x", logging.INFO, "", 0, text, None, None))
-    assert (counter.unpriceable, counter.replay, counter.synthetic) == (1, 1, 1)
+    db = SimpleNamespace(replay_routing={"snapshot_replay": 1, "synthetic_proxy": 1},
+                         replay_unpriceable={UNPRICEABLE_MISSING_HISTORICAL_INPUTS: 1})
+    summary = script.routing_summary(db)
+    assert (summary["unpriceable"], summary["replay"], summary["synthetic"]) == (1, 1, 1)

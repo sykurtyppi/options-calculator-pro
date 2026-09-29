@@ -294,7 +294,7 @@ def test_learning_written_after_the_claim_lapsed_is_flagged_for_repair(tmp_path,
 
 
 def _seed(tmp_path):
-    rows = [{"trade_date": "2025-01-10", "event_date": "2025-01-15", "setup_score": 0.6,
+    rows = [{"pricing_source": "snapshot_replay", "trade_date": "2025-01-10", "event_date": "2025-01-15", "setup_score": 0.6,
              "gross_return_pct": 0.05, "net_return_pct": 0.04, "symbol": "AAA"}]
     return seed_from_trades(
         rows, structure="atm_straddle", dry_run=False,

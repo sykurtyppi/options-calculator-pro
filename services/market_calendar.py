@@ -112,4 +112,11 @@ def next_session_on_or_after(day: date) -> date:
     return day
 
 
-__all__ = ["is_trading_day", "next_session_on_or_after", "nyse_holidays"]
+def add_sessions(day: date, sessions: int) -> date:
+    """The NYSE session ``sessions`` sessions after ``day`` (``day`` itself need not be one)."""
+    for _ in range(max(0, int(sessions))):
+        day = next_session_on_or_after(day + timedelta(days=1))
+    return day
+
+
+__all__ = ["add_sessions", "is_trading_day", "next_session_on_or_after", "nyse_holidays"]

@@ -161,7 +161,8 @@ def test_weekly_report_is_strict_json(tmp_path):
 def _replay(symbol, day, net, pnl=10.0):
     return {"trade_date": f"2025-01-{day:02d}", "event_date": f"2025-01-{day + 1:02d}", "symbol": symbol,
             "setup_score": 0.6, "gross_return_pct": 0.05, "net_return_pct": net,
-            "pnl_per_contract": pnl, "execution_profile": "backtest", "structure": "atm_straddle"}
+            "pnl_per_contract": pnl, "execution_profile": "backtest", "structure": "atm_straddle",
+            "pricing_source": "snapshot_replay"}
 
 
 def test_seed_skips_non_finite_rows_and_finishes(tmp_path):

@@ -560,7 +560,7 @@ class TestReplaySeeding:
                     "gross_return_pct": 0.08 + i * 0.01,  # fraction form
                     "net_return_pct": 0.05 + i * 0.01,    # fraction form
                     "pnl_per_contract": 50.0 + i * 5,
-                    "execution_profile": "institutional",
+                    "execution_profile": "institutional", "pricing_source": "snapshot_replay",
                 }
             )
         return rows
@@ -694,13 +694,13 @@ class TestReplaySeeding:
         bad = [
             {"symbol": None, "trade_date": "2024-01-10", "setup_score": 0.5,
              "gross_return_pct": 0.05, "net_return_pct": 0.03, "pnl_per_contract": 30,
-             "execution_profile": "x", "event_date": "2024-01-15", "days_to_earnings": 5},
+             "execution_profile": "x", "pricing_source": "snapshot_replay", "event_date": "2024-01-15", "days_to_earnings": 5},
             {"symbol": "AAPL", "trade_date": None, "setup_score": 0.5,
              "gross_return_pct": 0.05, "net_return_pct": 0.03, "pnl_per_contract": 30,
-             "execution_profile": "x", "event_date": "2024-01-15", "days_to_earnings": 5},
+             "execution_profile": "x", "pricing_source": "snapshot_replay", "event_date": "2024-01-15", "days_to_earnings": 5},
             {"symbol": "AAPL", "trade_date": "2024-01-10", "setup_score": None,
              "gross_return_pct": None, "net_return_pct": None, "pnl_per_contract": 30,
-             "execution_profile": "x", "event_date": "2024-01-15", "days_to_earnings": 5},
+             "execution_profile": "x", "pricing_source": "snapshot_replay", "event_date": "2024-01-15", "days_to_earnings": 5},
         ]
         result = seed_from_trades(
             good + bad,
@@ -846,7 +846,7 @@ class TestProvenance:
                 "gross_return_pct": 0.09,
                 "net_return_pct": 0.06,
                 "pnl_per_contract": 60.0,
-                "execution_profile": "institutional",
+                "execution_profile": "institutional", "pricing_source": "snapshot_replay",
             }
         ]
         seed_from_trades(
@@ -890,7 +890,7 @@ class TestProvenance:
                 "gross_return_pct": 0.07,
                 "net_return_pct": 0.05,
                 "pnl_per_contract": 50.0,
-                "execution_profile": "institutional",
+                "execution_profile": "institutional", "pricing_source": "snapshot_replay",
             }
         ]
         seed_from_trades(
