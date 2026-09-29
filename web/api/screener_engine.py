@@ -12,6 +12,7 @@ import yfinance as yf
 from utils.quotes import safe_mid
 from services.earnings_event_service import resolve_upcoming_earnings_event
 from services.market_data_client import MarketDataClient
+from services.market_calendar import is_trading_day, monthly_option_expiry
 
 ExpiryMode = Literal["front_after_earnings", "next_monthly_opex"]
 
@@ -69,11 +70,13 @@ def _spread_pct_from_bid_ask(bid: Any, ask: Any) -> Optional[float]:
 
 
 def _business_days_before(event_date: date, offset: int) -> date:
+    """The NYSE session ``offset`` sessions before ``event_date`` (weekends and
+    exchange holidays are not sessions)."""
     d = event_date
     steps = 0
     while steps < offset:
         d -= timedelta(days=1)
-        if d.weekday() < 5:
+        if is_trading_day(d):
             steps += 1
     return d
 
@@ -159,7 +162,12 @@ def _pick_front_expiry_after(expirations: Iterable[str], event_date: date) -> Op
 
 
 def _pick_next_monthly_opex(expirations: Iterable[str], event_date: date) -> Optional[str]:
-    fallback = None
+    """First listed standard monthly expiry after the event.
+
+    A monthly is the third Friday (the Thursday before when that Friday is a
+    holiday); a weekly that merely falls late in the month is not one. None
+    when no monthly is listed, rather than presenting a weekly as monthly.
+    """
     for exp_str in sorted(expirations):
         exp_norm = str(exp_str)[:10]
         try:
@@ -168,11 +176,9 @@ def _pick_next_monthly_opex(expirations: Iterable[str], event_date: date) -> Opt
             continue
         if exp_date <= event_date:
             continue
-        if fallback is None:
-            fallback = exp_norm
-        if exp_date.day >= 15:
+        if exp_date == monthly_option_expiry(exp_date.year, exp_date.month):
             return exp_norm
-    return fallback
+    return None
 
 
 def _normalize_yfinance_chain(frame: pd.DataFrame, side: str, expiry: str) -> pd.DataFrame:

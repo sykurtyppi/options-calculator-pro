@@ -112,6 +112,15 @@ def next_session_on_or_after(day: date) -> date:
     return day
 
 
+def monthly_option_expiry(year: int, month: int) -> date:
+    """Standard monthly equity option expiry: the third Friday, or the
+    session before it when that Friday is an exchange holiday."""
+    day = _nth_weekday(year, month, 4, 3)
+    while not is_trading_day(day):
+        day -= timedelta(days=1)
+    return day
+
+
 def add_sessions(day: date, sessions: int) -> date:
     """The NYSE session ``sessions`` sessions after ``day`` (``day`` itself need not be one)."""
     for _ in range(max(0, int(sessions))):
@@ -119,4 +128,4 @@ def add_sessions(day: date, sessions: int) -> date:
     return day
 
 
-__all__ = ["add_sessions", "is_trading_day", "next_session_on_or_after", "nyse_holidays"]
+__all__ = ["add_sessions", "is_trading_day", "monthly_option_expiry", "next_session_on_or_after", "nyse_holidays"]
