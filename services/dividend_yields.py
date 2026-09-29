@@ -13,7 +13,9 @@ Resolution order
 ----------------
 1. Per-symbol env override ``OPTIONS_DIVIDEND_YIELD_<SYMBOL>`` (decimal,
    e.g. 0.0085 for 0.85%). Useful for tests and known-good corrections.
-2. ``yfinance.Ticker(symbol).info['dividendYield']`` if available.
+2. yfinance ``info``, from fields whose units are unambiguous:
+   ``dividendRate`` (annual cash dividend) / the current price, else
+   ``trailingAnnualDividendYield`` (a decimal).
 3. Static fallback of 0.0 (the BSM default — same as the legacy behavior).
 
 Bounds
@@ -24,10 +26,10 @@ names correctly resolve to 0.0 with source ``"fallback_zero"`` (not an error).
 
 yfinance quirk
 --------------
-yfinance returns ``dividendYield`` in two forms across versions: sometimes a
-decimal (0.012), sometimes a percent (1.2). This module accepts either by
-treating values >= 1.0 as percent and dividing by 100. A genuine 100% yield
-would be discarded by the upper bound (0.20) — acceptable trade-off.
+``info['dividendYield']`` has been reported both as a decimal (0.012) and as
+a percent (1.2) across Yahoo/yfinance versions, and no threshold can tell
+them apart: 0.15 is either 15% or 0.15%. It is therefore never used. A
+payer without an unambiguous field falls back to 0.0, which the UI flags.
 
 Module state
 ------------
@@ -77,18 +79,22 @@ def _safe_float(value: Any) -> float:
         return float("nan")
 
 
-def _normalize_yfinance_yield(raw: Any) -> float:
-    """Coerce a yfinance dividendYield value into a decimal in [0, 0.20].
+def _yield_from_info(info: Dict[str, Any]) -> float:
+    """Decimal dividend yield from yfinance ``info``, using unambiguous fields.
 
-    yfinance reports inconsistently across versions: sometimes 0.0123,
-    sometimes 1.23 (for 1.23%). Treat >= 1.0 as percent and divide.
+    ``dividendRate`` is dollars per share per year, so dividing it by the
+    current price cannot be off by a unit. ``trailingAnnualDividendYield``
+    is always a decimal. ``dividendYield`` is ignored (see module docs).
     """
-    parsed = _safe_float(raw)
-    if not np.isfinite(parsed) or parsed < 0:
-        return float("nan")
-    if parsed >= 1.0:
-        parsed = parsed / 100.0
-    return parsed
+    rate = _safe_float(info.get("dividendRate"))
+    for key in ("regularMarketPrice", "currentPrice", "previousClose"):
+        price = _safe_float(info.get(key))
+        if np.isfinite(rate) and rate >= 0 and np.isfinite(price) and price > 0:
+            return rate / price
+    trailing = _safe_float(info.get("trailingAnnualDividendYield"))
+    if np.isfinite(trailing) and trailing >= 0:
+        return trailing
+    return float("nan")
 
 
 def _resolve_symbol_env_override(symbol: str) -> float:
@@ -145,8 +151,7 @@ def get_dividend_yield(
     try:
         import yfinance as yf  # lazy import — keep module usable without yfinance
         info = yf.Ticker(sym).info or {}
-        raw_yield = info.get("dividendYield")
-        normalized = _normalize_yfinance_yield(raw_yield)
+        normalized = _yield_from_info(info)
         if np.isfinite(normalized) and MIN_VALID_YIELD <= normalized < MAX_VALID_YIELD:
             with _dividend_lock:
                 _dividend_cache[sym] = {

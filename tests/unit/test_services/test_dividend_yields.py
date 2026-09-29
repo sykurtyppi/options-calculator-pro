@@ -69,32 +69,53 @@ class TestYfinanceFetch(unittest.TestCase):
     def setUp(self):
         reset_cache()
 
-    def test_yfinance_decimal_form(self):
-        """yfinance returns a decimal directly (e.g. 0.0085)."""
+    def test_yfinance_trailing_yield_is_a_decimal(self):
+        """trailingAnnualDividendYield is always a decimal (e.g. 0.0085)."""
         ticker_mock = MagicMock()
-        ticker_mock.info = {"dividendYield": 0.0085}
+        ticker_mock.info = {"trailingAnnualDividendYield": 0.0085}
         with patch.object(dy, "_dividend_cache", {}):
             with patch("yfinance.Ticker", return_value=ticker_mock):
                 rate, source = get_dividend_yield("KO", cache_ttl_seconds=0.0)
         self.assertAlmostEqual(rate, 0.0085, places=6)
         self.assertEqual(source, SOURCE_YFINANCE)
 
-    def test_yfinance_percent_form_normalised(self):
-        """yfinance sometimes returns a percent (e.g. 0.85 for 0.85%) —
-        treat >= 1.0 as percent and divide by 100."""
+    def test_dividend_rate_over_price_wins(self):
+        """Annual cash dividend / price has no unit ambiguity."""
         ticker_mock = MagicMock()
-        ticker_mock.info = {"dividendYield": 1.25}  # i.e. 1.25%
+        ticker_mock.info = {"dividendRate": 1.94, "regularMarketPrice": 70.0,
+                            "trailingAnnualDividendYield": 0.5, "dividendYield": 2.77}
         with patch.object(dy, "_dividend_cache", {}):
             with patch("yfinance.Ticker", return_value=ticker_mock):
                 rate, source = get_dividend_yield("KO", cache_ttl_seconds=0.0)
-        self.assertAlmostEqual(rate, 0.0125, places=6)
+        self.assertAlmostEqual(rate, 1.94 / 70.0, places=9)
         self.assertEqual(source, SOURCE_YFINANCE)
 
+    def test_ambiguous_dividend_yield_alone_is_not_trusted(self):
+        """0.15 could be 15% or 0.15%: without an unambiguous field the yield
+        falls back to 0 (flagged in the UI) instead of guessing a unit."""
+        for raw in (0.02, 0.15, 0.44, 2.6):
+            reset_cache()
+            ticker_mock = MagicMock()
+            ticker_mock.info = {"dividendYield": raw}
+            with patch.object(dy, "_dividend_cache", {}):
+                with patch("yfinance.Ticker", return_value=ticker_mock):
+                    self.assertEqual(get_dividend_yield("KO", cache_ttl_seconds=0.0),
+                                     (0.0, SOURCE_FALLBACK_ZERO))
+
+    def test_low_yields_are_not_scaled_by_100(self):
+        """A 0.15% payer (dividendRate 0.27 at $180) stays 0.0015, not 15%."""
+        ticker_mock = MagicMock()
+        ticker_mock.info = {"dividendRate": 0.27, "currentPrice": 180.0, "dividendYield": 0.15}
+        with patch.object(dy, "_dividend_cache", {}):
+            with patch("yfinance.Ticker", return_value=ticker_mock):
+                rate, _ = get_dividend_yield("XYZ", cache_ttl_seconds=0.0)
+        self.assertAlmostEqual(rate, 0.0015, places=9)
+
     def test_yfinance_missing_dividend_yields_zero(self):
-        """No dividendYield key → fall through to zero. Standard case for
+        """No dividend fields → fall through to zero. Standard case for
         most growth names (TSLA, AMZN, GOOG, etc.)."""
         ticker_mock = MagicMock()
-        ticker_mock.info = {"symbol": "TSLA"}  # no dividendYield key
+        ticker_mock.info = {"symbol": "TSLA"}  # no dividend fields
         with patch.object(dy, "_dividend_cache", {}):
             with patch("yfinance.Ticker", return_value=ticker_mock):
                 rate, source = get_dividend_yield("TSLA", cache_ttl_seconds=0.0)
@@ -117,7 +138,7 @@ class TestCaching(unittest.TestCase):
 
     def test_second_call_within_ttl_uses_cache(self):
         ticker_mock = MagicMock()
-        ticker_mock.info = {"dividendYield": 0.0042}
+        ticker_mock.info = {"trailingAnnualDividendYield": 0.0042}
         with patch("yfinance.Ticker", return_value=ticker_mock) as ticker_patch:
             first_rate, first_source = get_dividend_yield("MSFT")
             second_rate, second_source = get_dividend_yield("MSFT")
@@ -148,7 +169,7 @@ class TestEdgeCases(unittest.TestCase):
     def test_symbol_is_uppercased_before_cache_lookup(self):
         """Calling get_dividend_yield('aapl') then 'AAPL' must hit the cache."""
         ticker_mock = MagicMock()
-        ticker_mock.info = {"dividendYield": 0.0050}
+        ticker_mock.info = {"trailingAnnualDividendYield": 0.0050}
         with patch("yfinance.Ticker", return_value=ticker_mock) as ticker_patch:
             get_dividend_yield("aapl")
             get_dividend_yield("AAPL")
