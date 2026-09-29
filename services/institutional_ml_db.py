@@ -20,7 +20,7 @@ import itertools
 import math
 import threading
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Union
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -282,6 +282,23 @@ class SnapshotReplayPair:
 
 
 UNPRICEABLE_MISSING_HISTORICAL_INPUTS = "unpriceable_missing_historical_inputs"
+UNPRICEABLE_MISMATCHED_CONTRACTS = "unpriceable_mismatched_contracts"
+
+
+@dataclass(frozen=True)
+class SnapshotReplayRefusal:
+    """Pre- and post-event snapshots exist but cannot be paired for pricing."""
+    symbol: str
+    event_date: datetime
+    reason: str
+
+
+def _priced_first(candidates: "pd.DataFrame") -> "pd.DataFrame":
+    """Candidates with both stored pricing inputs first, order otherwise kept."""
+    priced = (
+        candidates["pricing_risk_free_rate"].notna() & candidates["pricing_dividend_yield"].notna()
+    )
+    return pd.concat([candidates[priced], candidates[~priced]])
 
 
 def _prefer_priced(candidates: "pd.DataFrame") -> "pd.DataFrame":
@@ -1284,7 +1301,17 @@ class InstitutionalMLDatabase:
                         )
                     snapshot_pair = snapshot_pair_cache.get(replay_key)
 
-                if snapshot_pair is not None:
+                if isinstance(snapshot_pair, SnapshotReplayRefusal):
+                    # Real snapshots exist but cannot be priced as one trade:
+                    # refused, never replaced by the synthetic proxy.
+                    self._record_replay_unpriceable(
+                        snapshot_pair.reason,
+                        symbol,
+                        event_date,
+                        "no post-event snapshot of the entry's expiries",
+                    )
+                    trade = None
+                elif snapshot_pair is not None:
                     trade = self._simulate_snapshot_replay_trade(
                         session_id=session.session_id,
                         setup_score=setup_score,
@@ -1356,9 +1383,10 @@ class InstitutionalMLDatabase:
         )
         if self.replay_unpriceable:
             self.logger.warning(
-                "Replay skipped snapshot pairs it could not price at a point in time: %s. "
-                "Re-collect those snapshots (scripts that capture historical snapshots now "
-                "store the rate and dividend known on each capture date).",
+                "Replay skipped snapshot pairs it could not price: %s. Missing historical "
+                "inputs: re-collect those snapshots (capture now stores the rate and dividend "
+                "known on each capture date). Mismatched contracts: no post-event snapshot "
+                "holds the entry's expiries.",
                 dict(self.replay_unpriceable),
             )
         return trades
@@ -2732,8 +2760,13 @@ class InstitutionalMLDatabase:
         max_pre_days: int = 12,
         min_post_days: int = 0,
         max_post_days: int = 5,
-    ) -> Optional[SnapshotReplayPair]:
-        """Load the best available pre/post snapshot pair for replay pricing."""
+    ) -> Optional[Union[SnapshotReplayPair, SnapshotReplayRefusal]]:
+        """Load the best available pre/post snapshot pair for replay pricing.
+
+        Returns None when the event lacks a pre- or post-event snapshot, and a
+        SnapshotReplayRefusal when both exist but no post-event snapshot holds
+        the pre-event snapshot's expiries.
+        """
         event_date_str = pd.Timestamp(event_date).strftime("%Y-%m-%d")
         query = """
             SELECT symbol, event_date, capture_date, relative_day, release_timing, snapshot_phase,
@@ -2780,19 +2813,28 @@ class InstitutionalMLDatabase:
         if pre_candidates.empty or post_candidates.empty:
             return None
 
-        # Prefer snapshots that carry stored point-in-time pricing inputs: an
-        # older legacy row must not hide a priceable backfilled one for the
-        # same event. Legacy rows are used only when no row has inputs (the
-        # pair is then refused as unpriceable by the replay itself).
-        pre_candidates = _prefer_priced(pre_candidates)
-        post_candidates = _prefer_priced(post_candidates)
-
-        pre_row = pre_candidates.iloc[-1]
-        aligned_post = post_candidates[
-            (post_candidates["short_expiry"] == pre_row["short_expiry"])
-            & (post_candidates["long_expiry"] == pre_row["long_expiry"])
-        ]
-        post_row = aligned_post.iloc[0] if not aligned_post.empty else post_candidates.iloc[0]
+        # Entry and exit must value the SAME contracts: a post-event snapshot
+        # of other expiries has IVs for other options, and pricing them as the
+        # entry's expiries would fabricate P&L. Try pre-event snapshots latest
+        # first, preferring ones with stored point-in-time inputs (an older
+        # legacy row must not hide a priceable one), and take the earliest
+        # matching post-event snapshot, again preferring stored inputs.
+        pre_row = post_row = None
+        for candidate in _priced_first(pre_candidates.iloc[::-1]).itertuples(index=False):
+            aligned_post = post_candidates[
+                (post_candidates["short_expiry"] == candidate.short_expiry)
+                & (post_candidates["long_expiry"] == candidate.long_expiry)
+            ]
+            if not aligned_post.empty:
+                pre_row = pd.Series(candidate._asdict())
+                post_row = _prefer_priced(aligned_post).iloc[0]
+                break
+        if pre_row is None:
+            return SnapshotReplayRefusal(
+                symbol=str(symbol).upper(),
+                event_date=pd.Timestamp(event_date).to_pydatetime(),
+                reason=UNPRICEABLE_MISMATCHED_CONTRACTS,
+            )
 
         strike = float(pre_row["atm_strike"]) if np.isfinite(pre_row["atm_strike"]) else float(post_row["atm_strike"])
         if not np.isfinite(strike) or strike <= 0:
@@ -2878,6 +2920,17 @@ class InstitutionalMLDatabase:
             return float("nan")
         return float((long_call - short_call) * 100.0)
 
+    def _record_replay_unpriceable(self, reason: str, symbol: str, event_date: Any, detail: str) -> None:
+        """Count and log a snapshot pair the replay refuses to price."""
+        self.replay_unpriceable[reason] = self.replay_unpriceable.get(reason, 0) + 1
+        self.logger.info(
+            "⛔ UNPRICEABLE %s @ %s — %s (%s)",
+            symbol,
+            pd.Timestamp(event_date).strftime('%Y-%m-%d'),
+            reason,
+            detail,
+        )
+
     def _simulate_snapshot_replay_trade(
         self,
         *,
@@ -2905,14 +2958,11 @@ class InstitutionalMLDatabase:
             snapshot_pair.post_risk_free_rate, snapshot_pair.post_dividend_yield,
         )
         if any(value is None for value in inputs):
-            self.replay_unpriceable[UNPRICEABLE_MISSING_HISTORICAL_INPUTS] = (
-                self.replay_unpriceable.get(UNPRICEABLE_MISSING_HISTORICAL_INPUTS, 0) + 1
-            )
-            self.logger.info(
-                "⛔ UNPRICEABLE %s @ %s — %s (snapshot predates stored pricing inputs)",
-                snapshot_pair.symbol,
-                pd.Timestamp(snapshot_pair.event_date).strftime('%Y-%m-%d'),
+            self._record_replay_unpriceable(
                 UNPRICEABLE_MISSING_HISTORICAL_INPUTS,
+                snapshot_pair.symbol,
+                snapshot_pair.event_date,
+                "snapshot predates stored pricing inputs",
             )
             return None
         entry_value = self._calendar_spread_market_value_from_snapshot(
@@ -3186,7 +3236,7 @@ class InstitutionalMLDatabase:
 
         query = """
             SELECT symbol, event_date, capture_date, relative_day, snapshot_phase, front_iv, back_iv,
-                   pricing_risk_free_rate, pricing_dividend_yield
+                   short_expiry, long_expiry, pricing_risk_free_rate, pricing_dividend_yield
             FROM earnings_option_snapshots
             ORDER BY symbol, event_date, capture_date
         """
@@ -3273,7 +3323,14 @@ class InstitutionalMLDatabase:
         events_with_pre = int((grouped['pre_count'] > 0).sum())
         events_with_post = int((grouped['post_count'] > 0).sum())
         pairable_events = int(((grouped['pre_count'] > 0) & (grouped['post_count'] > 0)).sum())
-        priceable_events = int(((grouped['priced_pre_count'] > 0) & (grouped['priced_post_count'] > 0)).sum())
+        # Priceable: a priced pre- and a priced post-event snapshot of the SAME
+        # contracts (replay refuses pairs whose expiries differ).
+        contract_keys = ['symbol', 'event_date', 'short_expiry', 'long_expiry']
+        priced_pairs = snapshots.loc[pre_mask & has_inputs, contract_keys].drop_duplicates().merge(
+            snapshots.loc[post_mask & has_inputs, contract_keys].drop_duplicates(),
+            on=contract_keys,
+        )
+        priceable_events = int(len(priced_pairs[['symbol', 'event_date']].drop_duplicates()))
         pending_pre_only = int(((grouped['pre_count'] > 0) & (grouped['post_count'] == 0)).sum())
         pending_post_only = int(((grouped['pre_count'] == 0) & (grouped['post_count'] > 0)).sum())
         unqualified_events = int(((grouped['pre_count'] == 0) & (grouped['post_count'] == 0)).sum())

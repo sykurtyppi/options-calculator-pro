@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from services.candidate_shadow_outcome import safe_float as _safe_float
+from services.market_calendar import next_session_on_or_after
 from services.realized_vol import rs_daily_vol_series as _rs_daily_vol_series
 from web.api.edge_constants import (
     MIN_EARNINGS_EVENTS_FOR_FULL_SIGNAL,
@@ -519,23 +520,22 @@ def post_event_valuation_days(
 ) -> Optional[int]:
     """Calendar days from entry (``as_of``) to the first session that prices the earnings reaction.
 
-    Before-open / intraday reports: the reaction prints on the earnings day
-    itself. After-close or unknown timing (conservative): the next weekday
+    Before-open / intraday reports: the reaction prints in the earnings day's
+    session. After-close or unknown timing (conservative): the next session
     after the earnings day, so a Thursday-close report is valued on Friday
-    and a Friday-close report on Monday. A date that falls on a weekend
-    rolls to Monday either way. Exchange holidays are not modelled.
-    Returns None when the earnings date is unknown or already past.
+    and a Friday-close report on Monday. Sessions come from the NYSE
+    calendar: weekends and exchange holidays roll to the next session (a
+    close before the Independence Day holiday reacts after it). Returns
+    None when the earnings date is unknown or already past.
     """
     if days_to_earnings is None or not np.isfinite(days_to_earnings) or days_to_earnings < 0:
         return None
     earnings_day = as_of + timedelta(days=int(days_to_earnings))
     timing = str(release_timing or "").strip().lower()
     if timing in _BEFORE_OR_DURING_SESSION:
-        reaction_day = earnings_day
+        reaction_day = next_session_on_or_after(earnings_day)
     else:
-        reaction_day = earnings_day + timedelta(days=1)
-    while reaction_day.weekday() >= 5:  # Saturday / Sunday: next session is Monday
-        reaction_day += timedelta(days=1)
+        reaction_day = next_session_on_or_after(earnings_day + timedelta(days=1))
     return (reaction_day - as_of).days
 
 
