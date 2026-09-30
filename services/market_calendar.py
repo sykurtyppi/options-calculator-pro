@@ -24,9 +24,13 @@ Early closes (1pm sessions) are still full sessions here.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 from typing import FrozenSet
+from zoneinfo import ZoneInfo
+
+EXCHANGE_TZ = ZoneInfo("America/New_York")
+SESSION_OPEN = time(9, 30)
 
 # Unscheduled full-day closures since 1990.
 _SPECIAL_CLOSURES: FrozenSet[date] = frozenset({
@@ -128,4 +132,32 @@ def add_sessions(day: date, sessions: int) -> date:
     return day
 
 
-__all__ = ["add_sessions", "is_trading_day", "monthly_option_expiry", "next_session_on_or_after", "nyse_holidays"]
+def quote_session(moment: datetime) -> date:
+    """The NYSE session whose quotes are current at ``moment``.
+
+    From the 09:30 New York open onwards that is the day's own session;
+    before the open, or on a non-trading day, it is the latest earlier
+    session (quotes then are that session's close). ``moment`` must be
+    timezone-aware; the machine's local clock is irrelevant.
+    """
+    if moment.tzinfo is None:
+        raise ValueError("quote_session needs a timezone-aware datetime")
+    local = moment.astimezone(EXCHANGE_TZ)
+    day = local.date()
+    if is_trading_day(day) and local.time() >= SESSION_OPEN:
+        return day
+    day -= timedelta(days=1)
+    while not is_trading_day(day):
+        day -= timedelta(days=1)
+    return day
+
+
+__all__ = [
+    "EXCHANGE_TZ",
+    "add_sessions",
+    "is_trading_day",
+    "monthly_option_expiry",
+    "next_session_on_or_after",
+    "nyse_holidays",
+    "quote_session",
+]

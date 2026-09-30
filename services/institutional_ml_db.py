@@ -19,7 +19,7 @@ import json
 import itertools
 import math
 import threading
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Tuple, Union
 import pandas as pd
 import numpy as np
@@ -31,7 +31,7 @@ from utils.logger import setup_logger as get_logger
 from utils.quotes import safe_mid
 from services import crush_features as _CF
 from services.execution_cost_model import ExecutionCostModel
-from services.market_calendar import add_sessions, is_trading_day, next_session_on_or_after
+from services.market_calendar import add_sessions, is_trading_day, next_session_on_or_after, quote_session
 
 # Optional MarketData.app client — imported lazily so the module loads even
 # when market_data_client is not yet on the path.
@@ -1891,6 +1891,12 @@ class InstitutionalMLDatabase:
         """
         Capture live option-IV snapshots around earnings events.
         This is intended for forward data collection used by IV-crush label calibration.
+
+        Each snapshot is dated by the NYSE session its quotes belong to (see
+        services.market_calendar.quote_session), never the machine's local
+        date: run before the open or on a weekend, the quotes are the last
+        session's close. relative_day and the pre/post phase follow from that
+        session, so a pre-reaction chain is never labelled post-event.
         """
         if symbols is None:
             symbols = INSTITUTIONAL_UNIVERSE[:10]
@@ -1899,7 +1905,7 @@ class InstitutionalMLDatabase:
         lookahead_days = max(1, int(lookahead_days))
         max_expiries = max(1, int(max_expiries))
 
-        today = datetime.now().date()
+        today = quote_session(self._utc_now())
         window_start = datetime.combine(today - timedelta(days=lookback_days), datetime.min.time())
         window_end = datetime.combine(today + timedelta(days=lookahead_days), datetime.min.time())
         history_padding_days = max(365, lookback_days + lookahead_days + 240)
@@ -1978,6 +1984,9 @@ class InstitutionalMLDatabase:
                                 continue
                             eligible_events += 1
 
+                            # relative_day counts from the quote session: on the
+                            # event day a before-open report has printed (post),
+                            # an after-close one has not (pre).
                             if relative_day < 0:
                                 snapshot_phase = 'pre'
                             elif relative_day > 0:
@@ -2959,6 +2968,11 @@ class InstitutionalMLDatabase:
         if not np.isfinite(short_call) or not np.isfinite(long_call):
             return float("nan")
         return float((long_call - short_call) * 100.0)
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        """Current time, timezone-aware (a seam for tests)."""
+        return datetime.now(timezone.utc)
 
     def _record_replay_unpriceable(self, reason: str, symbol: str, event_date: Any, detail: str) -> None:
         """Count and log a snapshot pair the replay refuses to price."""

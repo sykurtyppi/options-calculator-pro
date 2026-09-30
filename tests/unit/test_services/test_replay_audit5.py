@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -127,8 +127,12 @@ def test_zero_rate_close_is_a_valid_historical_rate():
 # ── 2. live capture never stores fallbacks as observed inputs ────────────────
 
 
+# Wed 2026-03-04 12:00 New York: the quote session is that day.
+_LIVE_NOW = datetime(2026, 3, 4, 17, 0, tzinfo=timezone.utc)
+
+
 def _live_db(tmp_path, *, irx_fails):
-    today = datetime.now().date()
+    today = date(2026, 3, 4)
 
     class FakeTicker:
         def __init__(self, symbol):
@@ -161,6 +165,7 @@ def _live_db(tmp_path, *, irx_fails):
             return object()
 
     db = InstitutionalMLDatabase(db_path=str(tmp_path / "i.db"))
+    db._utc_now = lambda: _LIVE_NOW
     db._get_symbol_earnings_dates = lambda **_: [{"event_date": today + timedelta(days=3), "release_timing": "AMC"}]
     db._extract_atm_iv_from_chain = lambda chain, price: (0.40, 60.0)
     with mock.patch("yfinance.Ticker", FakeTicker):
@@ -178,7 +183,7 @@ def test_live_capture_stores_point_in_time_inputs(tmp_path):
     rate, rate_source, q, q_source, observed = rows[0]
     assert rate == pytest.approx(0.0512) and rate_source == pricing_rates.SOURCE_HISTORICAL_IRX
     assert q == pytest.approx(4 * 0.51 / 60.0) and q_source == dividend_yields.SOURCE_TRAILING_HISTORICAL
-    assert observed == datetime.now().date().isoformat()
+    assert observed == "2026-03-04"
 
 
 def test_live_capture_stores_no_inputs_when_a_feed_fails(tmp_path):
