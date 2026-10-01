@@ -29,6 +29,15 @@ def _load_module():
 train_from_t9 = _load_module()
 
 
+@pytest.fixture(autouse=True)
+def _no_host_t9(monkeypatch, tmp_path):
+    """Never touch the host's T9 drive: on a machine with it mounted, listing
+    the real chains root walks thousands of directories. Tests that need a
+    T9 root point T9_CHAINS_ROOT at their own temp directory."""
+    monkeypatch.setattr(train_from_t9, "T9_CHAINS_ROOT", tmp_path / "unmounted_t9")
+    monkeypatch.setattr(train_from_t9, "DEFAULT_EARNINGS_DB", tmp_path / "unmounted_t9" / "earnings.sqlite")
+
+
 class TestScalePresets:
     def test_smoke_is_smallest(self):
         smoke = train_from_t9.SCALE_PRESETS["smoke"]
@@ -46,12 +55,14 @@ class TestScalePresets:
 
 
 class TestSymbolResolution:
-    def test_resolve_symbols_returns_list(self):
-        # We can't mock T9 here easily, so just confirm the function returns
-        # SOMETHING list-like (it falls back to an empty list if T9 isn't
-        # mounted, which is fine — preflight catches that).
+    def test_resolve_symbols_returns_list(self, monkeypatch, tmp_path):
+        # An unmounted T9 resolves to an empty list (preflight catches it);
+        # a fake universe keeps the real institutional DB module out of it.
+        fake_module = type(sys)("services.institutional_ml_db")
+        fake_module.INSTITUTIONAL_UNIVERSE = ["AAA", "BBB"]
+        monkeypatch.setitem(sys.modules, "services.institutional_ml_db", fake_module)
         symbols = train_from_t9._resolve_symbols(limit=5)
-        assert isinstance(symbols, list)
+        assert symbols == []
 
     def test_resolve_symbols_respects_limit(self, monkeypatch):
         # Mock the institutional universe import and T9 listing.
