@@ -334,7 +334,14 @@ _SNAPSHOT_PRICING_COLUMNS = {
     "pricing_dividend_yield_source": "TEXT",
     # The date the inputs were observed; equals capture_date when point in time.
     "pricing_inputs_observed_on": "TEXT",
+    # Where the EVENT date came from (marketdata_app, yfinance, proxy). A
+    # proxy date is a modelled schedule, not a reported earnings date, so
+    # its snapshots are excluded from evidence unless asked for. NULL on
+    # rows captured before this was recorded.
+    "event_source": "TEXT",
 }
+
+EVENT_SOURCE_PROXY = "proxy"
 
 class InstitutionalMLDatabase:
     """
@@ -1573,14 +1580,14 @@ class InstitutionalMLDatabase:
         # Accept both 'yfinance' and 'marketdata_app' as true (non-proxy) sources.
         _TRUE_SOURCES = {'yfinance', 'marketdata_app'}
         true_dates = sorted(
-            {(event_date, release_timing) for event_date, source, release_timing in cached
+            {(event_date, release_timing, source) for event_date, source, release_timing in cached
              if source in _TRUE_SOURCES},
             key=lambda item: item[0]
         )
         if true_dates:
             return [
-                {'event_date': event_date, 'source': 'yfinance', 'release_timing': release_timing}
-                for event_date, release_timing in true_dates
+                {'event_date': event_date, 'source': source, 'release_timing': release_timing}
+                for event_date, release_timing, source in true_dates
             ]
         proxy_dates_cached = sorted(
             {(event_date, release_timing) for event_date, source, release_timing in cached if source == 'proxy'},
@@ -1731,6 +1738,7 @@ class InstitutionalMLDatabase:
                         event_rows.append({
                             "event_date": dt,
                             "release_timing": release_timing,
+                            "source": "marketdata_app",
                         })
 
                     dedup = {}
@@ -1775,6 +1783,7 @@ class InstitutionalMLDatabase:
                     event_rows.append({
                         'event_date': dt.replace(hour=0, minute=0, second=0, microsecond=0),
                         'release_timing': release_timing,
+                        'source': 'yfinance',
                     })
 
             dedup = {}
@@ -2044,8 +2053,8 @@ class InstitutionalMLDatabase:
                                  underlying_price, source,
                                  pricing_risk_free_rate, pricing_risk_free_rate_source,
                                  pricing_dividend_yield, pricing_dividend_yield_source,
-                                 pricing_inputs_observed_on)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 pricing_inputs_observed_on, event_source)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     symbol,
@@ -2067,6 +2076,7 @@ class InstitutionalMLDatabase:
                                     None if _live_q is None else float(_live_q),
                                     str(_live_q_source),
                                     today.strftime('%Y-%m-%d'),
+                                    str(event.get('source') or 'unknown'),
                                 )
                             )
                             captured += 1
@@ -2195,6 +2205,7 @@ class InstitutionalMLDatabase:
                                     {
                                         "report_date": report_date,
                                         "release_timing": str(release_timing or "UNKNOWN").upper(),
+                                        "source": str(_source or "unknown").lower(),
                                     }
                                 )
                             except Exception:
@@ -2215,6 +2226,7 @@ class InstitutionalMLDatabase:
                                     {
                                         "report_date": report_date,
                                         "release_timing": str(event.get("release_timing", "UNKNOWN")).upper(),
+                                        "source": str(event.get("source") or "unknown").lower(),
                                     }
                                 )
                             except Exception:
@@ -2309,7 +2321,14 @@ class InstitutionalMLDatabase:
                             timing = "UNKNOWN"
                         existing = dedup_events.get(rd)
                         if existing is None or existing.get("release_timing") == "UNKNOWN":
-                            dedup_events[rd] = {"report_date": rd, "release_timing": timing}
+                            # Proxy rows only reach here when no reported date
+                            # exists (see true_events above); the source travels
+                            # with the event so its snapshots record it.
+                            dedup_events[rd] = {
+                                "report_date": rd,
+                                "release_timing": timing,
+                                "source": str(ev.get("source") or "unknown").lower(),
+                            }
 
                     # Newest first: if provider entitlement is depth-limited, we prioritize
                     # recent events and naturally avoid older unsupported ranges sooner.
@@ -2440,8 +2459,8 @@ class InstitutionalMLDatabase:
                                      underlying_price, source,
                                      pricing_risk_free_rate, pricing_risk_free_rate_source,
                                      pricing_dividend_yield, pricing_dividend_yield_source,
-                                     pricing_inputs_observed_on)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     pricing_inputs_observed_on, event_source)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
                                     (
                                         symbol,
@@ -2463,6 +2482,7 @@ class InstitutionalMLDatabase:
                                         float(_replay_q),
                                         str(_replay_q_source),
                                         snap_date_str,
+                                        str(event.get("source") or "unknown"),
                                     ),
                                 )
                                 captured += 1
@@ -2762,12 +2782,13 @@ class InstitutionalMLDatabase:
         self,
         symbol: str,
         event_date: datetime,
-        min_pre_days: int = 1,
+        min_pre_days: int = 0,
         max_pre_days: int = 12,
         min_post_days: int = 0,
         max_post_days: int = 5,
         decided_on: Optional[datetime] = None,
         max_hold_sessions: Optional[int] = None,
+        include_proxy_events: bool = False,
     ) -> Optional[Union[SnapshotReplayPair, SnapshotReplayRefusal]]:
         """Load the best available pre/post snapshot pair for replay pricing.
 
@@ -2775,6 +2796,12 @@ class InstitutionalMLDatabase:
         entry cannot be priced from a snapshot captured before it.
         ``max_hold_sessions`` caps the exit at that many sessions after the
         entry snapshot (the trade's hold limit).
+
+        Entries are snapshots labelled ``pre`` (before the reaction): an
+        after-close report's event-day close is eligible, a before-open
+        report's event-day snapshot is not. Snapshots of a proxy (modelled)
+        event date are evidence of nothing and are ignored unless
+        ``include_proxy_events``.
 
         Returns None when the event lacks a pre- or post-event snapshot. When
         both exist but cannot be priced as one trade, returns a
@@ -2786,7 +2813,7 @@ class InstitutionalMLDatabase:
         query = """
             SELECT symbol, event_date, capture_date, relative_day, release_timing, snapshot_phase,
                    short_expiry, long_expiry, atm_strike, front_iv, back_iv, underlying_price,
-                   pricing_risk_free_rate, pricing_dividend_yield
+                   pricing_risk_free_rate, pricing_dividend_yield, event_source
             FROM earnings_option_snapshots
             WHERE symbol = ? AND event_date = ?
             ORDER BY capture_date
@@ -2808,11 +2835,14 @@ class InstitutionalMLDatabase:
                     "pricing_risk_free_rate", "pricing_dividend_yield"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["capture_date", "event_date", "relative_day", "front_iv", "back_iv", "underlying_price"])
+        if not include_proxy_events:
+            df = df[df["event_source"] != EVENT_SOURCE_PROXY]
         if df.empty:
             return None
 
         pre_candidates = df[
-            (df["relative_day"] <= -max(1, int(min_pre_days)))
+            (df["snapshot_phase"] == "pre")
+            & (df["relative_day"] <= -max(0, int(min_pre_days)))
             & (df["relative_day"] >= -max(int(min_pre_days), int(max_pre_days)))
             & (df["front_iv"] > 0)
             & (df["back_iv"] > 0)
@@ -3109,21 +3139,26 @@ class InstitutionalMLDatabase:
             pricing_source=PRICING_SOURCE_SNAPSHOT_REPLAY,
         )
 
-    def calibrate_earnings_iv_decay_labels(self, min_pre_days: int = 1,
+    def calibrate_earnings_iv_decay_labels(self, min_pre_days: int = 0,
                                          max_pre_days: int = 12,
                                          min_post_days: int = 0,
-                                         max_post_days: int = 5) -> pd.DataFrame:
+                                         max_post_days: int = 5,
+                                         include_proxy_events: bool = False) -> pd.DataFrame:
         """
         Build IV-decay labels from captured pre/post earnings option snapshots.
+
+        As in replay, the pre snapshot must be labelled ``pre`` and proxy
+        (modelled) event dates are excluded unless ``include_proxy_events``.
         """
-        min_pre_days = max(1, int(min_pre_days))
+        min_pre_days = max(0, int(min_pre_days))
         max_pre_days = max(min_pre_days, int(max_pre_days))
         min_post_days = max(0, int(min_post_days))
         max_post_days = max(min_post_days, int(max_post_days))
 
         query = """
             SELECT symbol, event_date, capture_date, relative_day, release_timing, snapshot_phase,
-                   short_expiry, long_expiry, atm_strike, front_iv, back_iv, term_ratio, underlying_price
+                   short_expiry, long_expiry, atm_strike, front_iv, back_iv, term_ratio, underlying_price,
+                   event_source
             FROM earnings_option_snapshots
             ORDER BY symbol, event_date, capture_date
         """
@@ -3139,10 +3174,16 @@ class InstitutionalMLDatabase:
             return pd.DataFrame()
 
         snapshots['capture_date'] = pd.to_datetime(snapshots['capture_date'])
+        # Labels of every snapshotted event are rebuilt below, proxy ones
+        # included (their stale labels are dropped and none are rewritten).
+        all_snapshot_events = snapshots[['symbol', 'event_date']].drop_duplicates()
+        if not include_proxy_events:
+            snapshots = snapshots[snapshots['event_source'] != EVENT_SOURCE_PROXY]
         snapshot_event_count = int(snapshots[['symbol', 'event_date']].drop_duplicates().shape[0])
         pre_snapshot_count = int(
             (
-                (snapshots['relative_day'] <= -min_pre_days)
+                (snapshots['snapshot_phase'] == 'pre')
+                & (snapshots['relative_day'] <= -min_pre_days)
                 & (snapshots['relative_day'] >= -max_pre_days)
                 & (snapshots['front_iv'] > 0)
                 & (snapshots['back_iv'] > 0)
@@ -3162,6 +3203,7 @@ class InstitutionalMLDatabase:
         for (symbol, event_date), group in snapshots.groupby(['symbol', 'event_date']):
             g = group.sort_values('capture_date').copy()
             pre_candidates = g[
+                (g['snapshot_phase'] == 'pre') &
                 (g['relative_day'] <= -min_pre_days) &
                 (g['relative_day'] >= -max_pre_days) &
                 (g['front_iv'] > 0) & (g['back_iv'] > 0)
@@ -3235,7 +3277,7 @@ class InstitutionalMLDatabase:
         # from mismatched contracts) cannot outlive the rule.
         rebuilt_events = [
             (str(symbol), str(event_date))
-            for symbol, event_date in snapshots[['symbol', 'event_date']].drop_duplicates().itertuples(index=False)
+            for symbol, event_date in all_snapshot_events.itertuples(index=False)
         ]
         try:
             with self._open_conn() as conn:
@@ -3300,19 +3342,25 @@ class InstitutionalMLDatabase:
         self.logger.info(f"🧩 Calibrated {len(labels_df)} earnings IV-decay labels from snapshots")
         return labels_df
 
-    def summarize_snapshot_pairing_progress(self, min_pre_days: int = 1,
+    def summarize_snapshot_pairing_progress(self, min_pre_days: int = 0,
                                           max_pre_days: int = 12,
                                           min_post_days: int = 0,
-                                          max_post_days: int = 5) -> Dict[str, Any]:
-        """Summarize pre/post snapshot coverage needed for IV-decay label calibration."""
-        min_pre_days = max(1, int(min_pre_days))
+                                          max_post_days: int = 5,
+                                          include_proxy_events: bool = False) -> Dict[str, Any]:
+        """Summarize pre/post snapshot coverage needed for IV-decay label calibration.
+
+        Uses replay's rules: entries labelled ``pre``; proxy event dates are
+        excluded (and counted as ``proxy_events``) unless included.
+        """
+        min_pre_days = max(0, int(min_pre_days))
         max_pre_days = max(min_pre_days, int(max_pre_days))
         min_post_days = max(0, int(min_post_days))
         max_post_days = max(min_post_days, int(max_post_days))
 
         query = """
             SELECT symbol, event_date, capture_date, relative_day, snapshot_phase, front_iv, back_iv,
-                   short_expiry, long_expiry, atm_strike, pricing_risk_free_rate, pricing_dividend_yield
+                   short_expiry, long_expiry, atm_strike, pricing_risk_free_rate, pricing_dividend_yield,
+                   event_source
             FROM earnings_option_snapshots
             ORDER BY symbol, event_date, capture_date
         """
@@ -3332,6 +3380,7 @@ class InstitutionalMLDatabase:
                 'unqualified_events': 0,
                 'pairable_event_pct': 0.0,
                 'priceable_events': 0,
+                'proxy_events': 0,
                 'capture_days': 0,
                 'min_relative_day': None,
                 'max_relative_day': None,
@@ -3349,12 +3398,17 @@ class InstitutionalMLDatabase:
                 'unqualified_events': 0,
                 'pairable_event_pct': 0.0,
                 'priceable_events': 0,
+                'proxy_events': 0,
                 'capture_days': 0,
                 'min_relative_day': None,
                 'max_relative_day': None,
             }
 
         snapshots = snapshots.copy()
+        is_proxy = snapshots['event_source'] == EVENT_SOURCE_PROXY
+        proxy_events = int(snapshots.loc[is_proxy, ['symbol', 'event_date']].drop_duplicates().shape[0])
+        if not include_proxy_events:
+            snapshots = snapshots[~is_proxy].copy()
         snapshots['capture_date'] = pd.to_datetime(snapshots['capture_date'], errors='coerce')
         snapshots['relative_day'] = pd.to_numeric(snapshots['relative_day'], errors='coerce')
         snapshots['front_iv'] = pd.to_numeric(snapshots['front_iv'], errors='coerce')
@@ -3363,6 +3417,7 @@ class InstitutionalMLDatabase:
 
         pre_mask = (
             valid_iv
+            & (snapshots['snapshot_phase'] == 'pre')
             & (snapshots['relative_day'] <= -min_pre_days)
             & (snapshots['relative_day'] >= -max_pre_days)
         )
@@ -3444,6 +3499,8 @@ class InstitutionalMLDatabase:
             # Paired AND carrying stored point-in-time inputs on both sides:
             # the events replay can actually price.
             'priceable_events': priceable_events,
+            # Events dated by a proxy schedule, excluded above unless included.
+            'proxy_events': proxy_events,
             'capture_days': int(snapshots['capture_date'].dropna().dt.date.nunique()),
             'min_relative_day': min_relative_day,
             'max_relative_day': max_relative_day,

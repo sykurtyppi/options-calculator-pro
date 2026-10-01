@@ -208,8 +208,10 @@ def get_historical_dividend_yield(
     * The payout frequency comes from the gaps between recent ex-dates and
       the latest year's worth of payments is summed, so ex-date drift cannot
       pull a fifth quarterly dividend into a 365-day window.
-    * One-off special dividends (more than twice the median payment) are
-      not a recurring yield and are excluded.
+    * One-off special dividends are not a recurring yield and are excluded:
+      a payment more than twice the median of the OTHER payments, with no
+      other payment of a similar size (a repeated higher amount is a raise,
+      not a special).
     * ``underlying_price`` must be the as-traded price on ``as_of``, not a
       split- or dividend-adjusted close.
     * No dividend yet, or a dividend overdue by more than a cycle
@@ -256,9 +258,7 @@ def get_historical_dividend_yield(
         (day, amount * basis_factor) for day, amount in dividends
         if day <= as_of and amount > 0 and (as_of - day).days <= 800
     )
-    if paid:
-        typical = float(np.median([amount for _, amount in paid]))
-        paid = [(day, amount) for day, amount in paid if amount <= 2.0 * typical]
+    paid = _without_specials(paid)
     q = 0.0
     if paid:
         per_year = _payments_per_year([day for day, _ in paid])
@@ -268,6 +268,25 @@ def get_historical_dividend_yield(
     if not (MIN_VALID_YIELD <= q < MAX_VALID_YIELD):
         return None, "unavailable"
     return float(q), SOURCE_TRAILING_HISTORICAL
+
+
+def _without_specials(paid: list) -> list:
+    """``paid`` without isolated outsized (special) payments.
+
+    Leave-one-out, so a special cannot set its own yardstick: with one
+    regular payment and one special, the median of all payments sits
+    between them and would keep the special.
+    """
+    kept = []
+    for i, (day, amount) in enumerate(paid):
+        others = [other for j, (_, other) in enumerate(paid) if j != i]
+        if others:
+            typical = float(np.median(others))
+            repeated = any(abs(other - amount) <= 0.25 * amount for other in others)
+            if amount > 2.0 * typical and not repeated:
+                continue
+        kept.append((day, amount))
+    return kept
 
 
 def _dated_values(series: Any) -> list:
