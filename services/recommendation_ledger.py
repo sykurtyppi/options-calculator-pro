@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS recommendations (
     recommendation                TEXT,
     selected_structure            TEXT,
     no_trade_reason               TEXT,
+    binding_gate                  TEXT,
     data_quality_score            REAL,
     option_source                 TEXT,
     underlying_source             TEXT,
@@ -172,6 +173,7 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "recommendation": "TEXT",
     "selected_structure": "TEXT",
     "no_trade_reason": "TEXT",
+    "binding_gate": "TEXT",
     "data_quality_score": "REAL",
     "option_source": "TEXT",
     "underlying_source": "TEXT",
@@ -250,6 +252,7 @@ class RecommendationRecord:
     sample_provenance: Optional[str] = None
     schema_version: int = SCHEMA_VERSION
     engine_version: str = ENGINE_VERSION
+    binding_gate: Optional[str] = None
 
 
 def _open_db(path: Path) -> sqlite3.Connection:
@@ -341,7 +344,7 @@ class RecommendationLedger:
             INSERT OR IGNORE INTO recommendations (
                 recommendation_id, created_at, symbol, as_of_date, earnings_date,
                 earnings_source, earnings_source_confidence, earnings_source_stale,
-                recommendation, selected_structure, no_trade_reason, data_quality_score,
+                recommendation, selected_structure, no_trade_reason, binding_gate, data_quality_score,
                 option_source, underlying_source, provider_names_json,
                 quote_timestamp, quote_source, quote_quality, bid_ask_mid_json,
                 surface_quality_status, surface_quality_reasons_json, surface_quality_json,
@@ -353,7 +356,7 @@ class RecommendationLedger:
                 candidate_shadow_outcome_json, sample_provenance,
                 schema_version, engine_version
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
         """
         params = (
@@ -368,6 +371,7 @@ class RecommendationLedger:
             record.recommendation,
             record.selected_structure,
             record.no_trade_reason,
+            record.binding_gate,
             record.data_quality_score,
             record.option_source,
             record.underlying_source,
@@ -732,6 +736,7 @@ class RecommendationLedger:
                     recommendation=base.get("recommendation"),
                     selected_structure=base.get("selected_structure"),
                     no_trade_reason=base.get("no_trade_reason"),
+                    binding_gate=base.get("binding_gate"),
                     data_quality_score=base.get("data_quality_score"),
                     option_source=base.get("option_source"),
                     underlying_source=base.get("underlying_source"),
@@ -1041,6 +1046,8 @@ def build_record_from_analysis(
         reasons = selector_output.get("primary_risks") or selector_output.get("why_this_structure") or []
         no_trade_reason = "; ".join(str(item) for item in reasons[:3]) or "selector_abstained"
 
+    binding_gate = selector_output.get("binding_gate")
+
     # PR-AC commit 4: capture the experimental_contract_selection block
     # if the API response carried one (commit 3 surface). Lives in metrics
     # since the analysis payload places it alongside structure_payoff /
@@ -1082,6 +1089,7 @@ def build_record_from_analysis(
         recommendation=str(recommendation) if recommendation is not None else None,
         selected_structure=str(selected_structure) if selected_structure is not None else None,
         no_trade_reason=no_trade_reason,
+        binding_gate=str(binding_gate) if binding_gate is not None else None,
         data_quality_score=_safe_float_or_none(vol_snapshot.get("data_quality_score")),
         option_source=provider_names["option_source"],
         underlying_source=provider_names["underlying_source"],
@@ -1169,6 +1177,12 @@ def _record_content_hash(record: RecommendationRecord) -> str:
     payload = _record_to_dict(record)
     payload.pop("created_at", None)
     payload.pop("recommendation_id", None)
+    # ``binding_gate`` was added as a nullable migration column. Historical
+    # hashes predate the key entirely, so treating a new ``None`` value as
+    # content would manufacture a revision the first time an unchanged legacy
+    # record is replayed. A real gate value remains hash-significant.
+    if payload.get("binding_gate") is None:
+        payload.pop("binding_gate", None)
     serialized = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
