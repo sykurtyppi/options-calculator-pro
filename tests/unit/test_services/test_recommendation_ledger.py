@@ -250,6 +250,76 @@ def test_identical_re_record_returns_duplicate(tmp_path: Path) -> None:
     assert len(ledger.get_revisions("rec_dup")) == 1
 
 
+def test_legacy_hash_without_nullable_binding_gate_still_dedupes(tmp_path: Path) -> None:
+    """Opening a pre-binding-gate ledger must not manufacture a revision."""
+    import hashlib
+    import json
+    from dataclasses import asdict
+
+    db_path = tmp_path / "legacy_hash.sqlite"
+    record = _build_record(recommendation_id="rec_legacy_hash")
+    legacy_payload = asdict(record)
+    legacy_payload.pop("binding_gate")
+    legacy_hash_payload = dict(legacy_payload)
+    legacy_hash_payload.pop("created_at")
+    legacy_hash_payload.pop("recommendation_id")
+    legacy_hash = hashlib.sha256(
+        json.dumps(legacy_hash_payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE recommendations (recommendation_id TEXT PRIMARY KEY)"
+    )
+    conn.execute(
+        "INSERT INTO recommendations (recommendation_id) VALUES (?)",
+        (record.recommendation_id,),
+    )
+    conn.execute(
+        """
+        CREATE TABLE recommendation_revisions (
+            revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recommendation_id TEXT NOT NULL,
+            revised_at TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            UNIQUE(recommendation_id, content_hash)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO recommendation_revisions
+            (recommendation_id, revised_at, content_hash, record_json)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            record.recommendation_id,
+            "2026-09-01T00:00:00+00:00",
+            legacy_hash,
+            json.dumps(legacy_payload, sort_keys=True, default=str),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    ledger = RecommendationLedger(ledger_path=db_path)
+    assert ledger.record(record) == "duplicate"
+    assert len(ledger.get_revisions(record.recommendation_id)) == 1
+
+
+def test_new_binding_gate_value_is_a_real_content_revision(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
+    original = _build_record(recommendation_id="rec_binding_gate_change")
+    with_gate = replace(original, binding_gate="promotion_edge_below_strong")
+
+    assert ledger.record(original) == "inserted"
+    assert ledger.record(with_gate) == "revision"
+    assert len(ledger.get_revisions(original.recommendation_id)) == 2
+
+
 def test_content_change_records_revision_and_preserves_original(tmp_path: Path) -> None:
     """The critical contract: the original recommendations row must NEVER be
     overwritten. A subsequent record() with different content goes to the
@@ -2071,3 +2141,66 @@ def test_get_recommendation_ledger_no_arg_does_not_replace_when_already_initiali
 
     first.close()
     ledger_module._ledger = None
+
+
+# ── binding_gate persistence ────────────────────────────────────────────────
+# `no_trade_reason` stores the generic primary_risks bullets, which were byte
+# identical across hundreds of rows and could not be aggregated. `binding_gate`
+# records the decision rule that actually bound, so the ledger can answer why
+# the engine has been abstaining.
+
+
+def test_binding_gate_is_persisted_and_aggregatable(tmp_path):
+    import sqlite3
+    from services.recommendation_ledger import RecommendationLedger, RecommendationRecord
+
+    path = tmp_path / "ledger.sqlite"
+    ledger = RecommendationLedger(ledger_path=path)
+    for i, gate in enumerate(
+        ["weak_walk_forward_history", "weak_walk_forward_history", "non_positive_edge"]
+    ):
+        ledger.record(RecommendationRecord(
+            recommendation_id=f"r{i}", created_at=f"2026-09-22T00:0{i}:00+00:00",
+            symbol="NKE", as_of_date="2026-09-22", earnings_date="2026-09-25",
+            earnings_source="test", earnings_source_confidence=0.9,
+            earnings_source_stale=False, recommendation="No Trade",
+            selected_structure=None, no_trade_reason="generic risk bullets",
+            data_quality_score=0.74, option_source="provided",
+            underlying_source="provided", binding_gate=gate,
+        ))
+
+    rows = dict(sqlite3.connect(path).execute(
+        "SELECT binding_gate, COUNT(*) FROM recommendations GROUP BY binding_gate"
+    ).fetchall())
+    assert rows == {"weak_walk_forward_history": 2, "non_positive_edge": 1}
+
+
+def test_legacy_ledger_gains_the_column_on_open(tmp_path):
+    """Existing ledgers predate the column and must migrate, not crash."""
+    import sqlite3
+    from services.recommendation_ledger import RecommendationLedger
+
+    path = tmp_path / "legacy.sqlite"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE recommendations (recommendation_id TEXT PRIMARY KEY, symbol TEXT)")
+    con.commit()
+    con.close()
+
+    RecommendationLedger(ledger_path=path)
+    columns = {r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(recommendations)")}
+    assert "binding_gate" in columns
+
+
+def test_binding_gate_defaults_to_none_for_older_callers(tmp_path):
+    """The field is optional, so constructors written before it still work."""
+    from services.recommendation_ledger import RecommendationRecord
+
+    record = RecommendationRecord(
+        recommendation_id="r", created_at="2026-09-22T00:00:00+00:00", symbol="NKE",
+        as_of_date="2026-09-22", earnings_date="2026-09-25", earnings_source="test",
+        earnings_source_confidence=0.9, earnings_source_stale=False,
+        recommendation="Watch", selected_structure="otm_strangle",
+        no_trade_reason=None, data_quality_score=0.74,
+        option_source="provided", underlying_source="provided",
+    )
+    assert record.binding_gate is None

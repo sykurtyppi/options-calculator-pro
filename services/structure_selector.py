@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Dict, List, Optional, Sequence
 
@@ -40,6 +40,32 @@ HIGH_CONFLICT_PENALTY = 0.07
 #   veto fires when: execution_cost / gross_return >= EXECUTION_COST_DOMINATES_EDGE_RATIO
 EXECUTION_COST_DOMINATES_EDGE_RATIO = 0.50
 
+# Stable identifiers persisted by the recommendation ledger. Treat these as
+# schema values: changing a string breaks historical aggregation.
+GATE_NO_ELIGIBLE_STRUCTURE = "no_eligible_structure"
+GATE_NON_FINITE_EXPECTED_EDGE = "non_finite_expected_edge"
+GATE_NON_FINITE_EXPECTED_RETURN = "non_finite_expected_return"
+GATE_NON_FINITE_EXECUTION_PENALTY = "non_finite_execution_penalty"
+GATE_NON_FINITE_DATA_QUALITY_SCORE = "non_finite_data_quality_score"
+GATE_NON_POSITIVE_EDGE = "non_positive_edge"
+GATE_EXECUTION_PENALTY_HIGH = "execution_penalty_high"
+GATE_DATA_QUALITY_BELOW_FLOOR = "data_quality_below_floor"
+GATE_WEAK_WALK_FORWARD_HISTORY = "weak_walk_forward_history"
+GATE_EXECUTION_COST_DOMINATES_EDGE = "execution_cost_dominates_edge"
+GATE_WATCH_SCORE_GAP_SMALL = "watch_score_gap_small"
+GATE_WATCH_EDGE_BELOW_MARGINAL = "watch_edge_below_marginal"
+GATE_WATCH_EXECUTION_PENALTY_HIGH = "watch_execution_penalty_high"
+GATE_WATCH_CONFLICTING_SIGNALS = "watch_conflicting_signals"
+GATE_WATCH_DEGRADED_SURFACE = "watch_degraded_surface"
+GATE_PROMOTION_SCORE_GAP_BELOW_DOMINANT = "promotion_score_gap_below_dominant"
+GATE_PROMOTION_EDGE_BELOW_STRONG = "promotion_edge_below_strong"
+GATE_PROMOTION_EXECUTION_PENALTY_HIGH = "promotion_execution_penalty_high"
+GATE_PROMOTION_WALK_FORWARD_HISTORY_WEAK = "promotion_walk_forward_history_weak"
+GATE_PROMOTION_DATA_QUALITY_BELOW_BEST = "promotion_data_quality_below_best"
+GATE_PROMOTION_SAMPLE_CONFIDENCE_LOW = "promotion_sample_confidence_low"
+GATE_PROMOTION_SCORE_GAP_NON_FINITE = "promotion_score_gap_non_finite"
+GATE_PROMOTION_SAMPLE_CONFIDENCE_NON_FINITE = "promotion_sample_confidence_non_finite"
+
 
 @dataclass(frozen=True)
 class SelectorOutput:
@@ -68,21 +94,45 @@ class SelectorOutput:
 
     data_quality: str
     data_quality_score: float
+    binding_gate: Optional[str] = None
+    binding_gates: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
+
+
+def _ranking_key(card: StructureScorecard) -> tuple[float, int, float, str]:
+    """Return a total ordering with invalid secondary edges ranked last."""
+    edge_is_finite = bool(np.isfinite(card.expected_edge_pct))
+    normalized_edge = float(card.expected_edge_pct) if edge_is_finite else 0.0
+    return (
+        -float(card.composite_structure_score),
+        0 if edge_is_finite else 1,
+        -normalized_edge,
+        str(card.structure),
+    )
+
+
+def _finite_or_zero(value: float) -> float:
+    """Normalize an externally exposed/calculated numeric component."""
+    return float(value) if np.isfinite(value) else 0.0
 
 
 def select_best_structure(
     snapshot: VolSnapshot,
     scorecards: List[StructureScorecard],
 ) -> SelectorOutput:
-    eligible = [card for card in scorecards if card.eligible]
-    ranked = sorted(eligible, key=lambda card: (card.composite_structure_score, card.expected_edge_pct), reverse=True)
+    eligible = [
+        card
+        for card in scorecards
+        if card.eligible and np.isfinite(card.composite_structure_score)
+    ]
+    ranked = sorted(eligible, key=_ranking_key)
     runner_ups = [card.structure for card in ranked[1:3]]
     why_not = {card.structure: _explain_not_selected(card) for card in scorecards if not ranked or card.structure != ranked[0].structure}
 
     if not ranked:
+        binding_gates = [GATE_NO_ELIGIBLE_STRUCTURE]
         return SelectorOutput(
             symbol=snapshot.symbol,
             as_of=snapshot.as_of_date,
@@ -102,7 +152,9 @@ def select_best_structure(
             why_not_others=why_not,
             runner_up_structures=[],
             data_quality=snapshot.data_quality,
-            data_quality_score=float(snapshot.data_quality_score),
+            data_quality_score=_finite_or_zero(snapshot.data_quality_score),
+            binding_gate=binding_gates[0],
+            binding_gates=binding_gates,
         )
 
     top = ranked[0]
@@ -123,40 +175,91 @@ def select_best_structure(
         and _exec_cost_pct >= EXECUTION_COST_DOMINATES_EDGE_RATIO * _gross_return_pct
     )
 
-    if (
-        top.expected_edge_pct <= 0.0
-        or top.execution_penalty >= HIGH_EXECUTION_PENALTY_THRESHOLD
-        or snapshot.data_quality_score < MIN_DATA_QUALITY_FOR_ANY_TRADE
-        or weak_history
-        or _cost_dominates_edge
-    ):
+    no_trade_gates = [
+        gate
+        for condition, gate in (
+            (not np.isfinite(top.expected_edge_pct), GATE_NON_FINITE_EXPECTED_EDGE),
+            (not np.isfinite(top.expected_return_pct), GATE_NON_FINITE_EXPECTED_RETURN),
+            (not np.isfinite(top.execution_penalty), GATE_NON_FINITE_EXECUTION_PENALTY),
+            (not np.isfinite(snapshot.data_quality_score), GATE_NON_FINITE_DATA_QUALITY_SCORE),
+            (top.expected_edge_pct <= 0.0, GATE_NON_POSITIVE_EDGE),
+            (top.execution_penalty >= HIGH_EXECUTION_PENALTY_THRESHOLD, GATE_EXECUTION_PENALTY_HIGH),
+            (snapshot.data_quality_score < MIN_DATA_QUALITY_FOR_ANY_TRADE, GATE_DATA_QUALITY_BELOW_FLOOR),
+            (weak_history, GATE_WEAK_WALK_FORWARD_HISTORY),
+            (_cost_dominates_edge, GATE_EXECUTION_COST_DOMINATES_EDGE),
+        )
+        if condition
+    ]
+    watch_gates = [
+        gate
+        for condition, gate in (
+            (gap < MODERATE_SCORE_GAP, GATE_WATCH_SCORE_GAP_SMALL),
+            (top.expected_edge_pct < MARGINAL_EDGE_THRESHOLD_PCT, GATE_WATCH_EDGE_BELOW_MARGINAL),
+            (top_penalty >= WATCH_EXECUTION_PENALTY_THRESHOLD, GATE_WATCH_EXECUTION_PENALTY_HIGH),
+            (conflicting, GATE_WATCH_CONFLICTING_SIGNALS),
+            (_surface_degraded(snapshot), GATE_WATCH_DEGRADED_SURFACE),
+        )
+        if condition
+    ]
+    promotion_gates = [
+        gate
+        for condition, gate in (
+            (not np.isfinite(gap), GATE_PROMOTION_SCORE_GAP_NON_FINITE),
+            (np.isfinite(gap) and gap < DOMINANT_SCORE_GAP, GATE_PROMOTION_SCORE_GAP_BELOW_DOMINANT),
+            (
+                np.isfinite(top.expected_edge_pct) and top.expected_edge_pct < STRONG_EDGE_THRESHOLD_PCT,
+                GATE_PROMOTION_EDGE_BELOW_STRONG,
+            ),
+            (
+                np.isfinite(top.execution_penalty) and top.execution_penalty > 0.04,
+                GATE_PROMOTION_EXECUTION_PENALTY_HIGH,
+            ),
+            (top.effective_walk_forward_history_count < STRONG_WALK_FORWARD_HISTORY, GATE_PROMOTION_WALK_FORWARD_HISTORY_WEAK),
+            (
+                np.isfinite(snapshot.data_quality_score)
+                and snapshot.data_quality_score < MIN_DATA_QUALITY_FOR_BEST,
+                GATE_PROMOTION_DATA_QUALITY_BELOW_BEST,
+            ),
+            (not np.isfinite(top.sample_confidence), GATE_PROMOTION_SAMPLE_CONFIDENCE_NON_FINITE),
+            (
+                np.isfinite(top.sample_confidence) and top.sample_confidence < 0.60,
+                GATE_PROMOTION_SAMPLE_CONFIDENCE_LOW,
+            ),
+        )
+        if condition
+    ]
+
+    if no_trade_gates:
         recommendation = RECOMMENDATION_NO_TRADE
-    elif (
-        gap < MODERATE_SCORE_GAP
-        or top.expected_edge_pct < MARGINAL_EDGE_THRESHOLD_PCT
-        or top_penalty >= WATCH_EXECUTION_PENALTY_THRESHOLD
-        or conflicting
+        binding_gates = no_trade_gates
+    elif watch_gates:
         # Every structure is priced off the option surface; a surface the
         # system itself classifies as degraded demotes to Watch (recorded,
         # never actionable). The universe shadow cohort still prices these
         # events, so whether degraded surfaces really pay worse is measured.
-        or _surface_degraded(snapshot)
-    ):
         recommendation = RECOMMENDATION_WATCH
+        binding_gates = watch_gates
     elif (
-        gap >= DOMINANT_SCORE_GAP
+        np.isfinite(gap)
+        and gap >= DOMINANT_SCORE_GAP
+        and np.isfinite(top.expected_edge_pct)
         and top.expected_edge_pct >= STRONG_EDGE_THRESHOLD_PCT
+        and np.isfinite(top.execution_penalty)
         and top.execution_penalty <= 0.04
         # H1: use the EFFECTIVE history count (0 for a simulated prior) so a
         # simulated N=40 cannot clear the strong-history bar and upgrade the
         # recommendation from Candidate to Best.
         and top.effective_walk_forward_history_count >= STRONG_WALK_FORWARD_HISTORY
+        and np.isfinite(snapshot.data_quality_score)
         and snapshot.data_quality_score >= MIN_DATA_QUALITY_FOR_BEST
+        and np.isfinite(top.sample_confidence)
         and top.sample_confidence >= 0.60
     ):
         recommendation = RECOMMENDATION_BEST
+        binding_gates = []
     else:
         recommendation = RECOMMENDATION_CANDIDATE
+        binding_gates = promotion_gates
 
     confidence = _confidence_pct(
         composite=top.composite_structure_score,
@@ -184,7 +287,9 @@ def select_best_structure(
         why_not_others=why_not,
         runner_up_structures=runner_ups,
         data_quality=snapshot.data_quality,
-        data_quality_score=float(snapshot.data_quality_score),
+        data_quality_score=_finite_or_zero(snapshot.data_quality_score),
+        binding_gate=binding_gates[0] if binding_gates else None,
+        binding_gates=binding_gates,
     )
 
 
@@ -199,12 +304,15 @@ def _confidence_pct(
     sample_confidence: float,
     data_quality_score: float,
 ) -> float:
-    gap_component = float(np.clip(gap / 0.20, 0.0, 1.0))
+    composite_component = _finite_or_zero(composite)
+    gap_component = float(np.clip(_finite_or_zero(gap) / 0.20, 0.0, 1.0))
+    sample_component = _finite_or_zero(sample_confidence)
+    quality_component = _finite_or_zero(data_quality_score)
     blended = (
-        0.35 * float(np.clip(composite, 0.0, 1.0))
+        0.35 * float(np.clip(composite_component, 0.0, 1.0))
         + 0.25 * gap_component
-        + 0.20 * float(np.clip(sample_confidence, 0.0, 1.0))
-        + 0.20 * float(np.clip(data_quality_score, 0.0, 1.0))
+        + 0.20 * float(np.clip(sample_component, 0.0, 1.0))
+        + 0.20 * float(np.clip(quality_component, 0.0, 1.0))
     )
     return float(np.clip(blended * 100.0, 0.0, 100.0))
 
