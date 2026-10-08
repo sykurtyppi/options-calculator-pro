@@ -97,6 +97,7 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
     temp store are unaffected; this only governs the default fall-through.
     """
     import services.baseline_evidence_store as bes
+    import services.evidence_funnel as ef
     import services.recommendation_ledger as rl
 
     root = tmp_path_factory.mktemp("default_stores")
@@ -109,9 +110,10 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
     # fall-through path. monkeypatch auto-restores them after the test.
     monkeypatch.setattr(bes, "_DEFAULT_STORE", bes_path)
     monkeypatch.setattr(rl, "_DEFAULT_LEDGER", rl_path)
+    monkeypatch.setattr(ef, "_DEFAULT_STORE", root / "evidence" / "evidence_funnel.sqlite")
 
     def _reset_singletons():
-        for module, attr in ((bes, "_store"), (rl, "_ledger")):
+        for module, attr in ((bes, "_store"), (rl, "_ledger"), (ef, "_store")):
             existing = getattr(module, attr, None)
             if existing is not None:
                 try:

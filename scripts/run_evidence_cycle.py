@@ -29,6 +29,7 @@ except ImportError:
 from scripts.run_forward_loop import _parse_date, run_daily_cycle
 from services.automation_watchdog import IMessageConfig, send_imessage
 from services.evidence_report import build_evidence_report, build_weekly_evidence_report
+from services.evidence_funnel import build_evidence_funnel_report
 from services.provider_telemetry import build_provider_telemetry_diagnostics
 
 DEFAULT_REPORT_DIR = Path.home() / ".options_calculator_pro" / "reports" / "evidence"
@@ -61,6 +62,7 @@ def run_evidence_cycle(
         "forward_loop": forward,
         "evidence_report": report,
         "provider_telemetry": provider_telemetry,
+        "evidence_funnel": build_evidence_funnel_report(as_of=cycle_date),
         "weekly_report_due": weekly_due,
     }
     if not dry_run:
@@ -198,6 +200,11 @@ def _run_log_payload(
         "provider_fallback_count": int(provider.get("fallback_count") or 0),
         "provider_stale_count": int(provider.get("stale_count") or 0),
         "evidence_maturity_status": maturity.get("maturity_label"),
+        "cycle_run_id": forward.get("cycle_run_id"),
+        "candidates_discovered": int(entries.get("discovered") or 0),
+        "candidates_outside_dte_window": int(entries.get("outside_dte_window") or 0),
+        "candidates_analyzed": int(entries.get("analyzed") or 0),
+        "analyzer_errors": int(entries.get("analyzer_errors") or 0),
         "weekly_report_path": payload.get("weekly_report_path"),
         "warnings": report.get("warning_flags") or [],
         "error": error,

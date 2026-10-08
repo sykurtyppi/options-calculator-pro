@@ -42,6 +42,8 @@ from services.baseline_evidence_store import (
     make_universe_baseline_id,
 )
 from services.evidence_quality import evaluate_evidence_quality
+from services import evidence_funnel as funnel_mod
+from services.evidence_funnel import EvidenceFunnelStore
 from services.execution_scenarios import (
     build_execution_scenarios,
     compare_execution_scenarios,
@@ -468,6 +470,18 @@ def _loads_dict(value: Any) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _loads_list(value: Any) -> list:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def _quote_invalid_reason(row: Optional[pd.Series], *, leg: str) -> str:
@@ -1883,9 +1897,14 @@ def run_forward_screener(
     baseline_store: Optional[BaselineEvidenceStore] = None,
     symbols: Optional[list[str]] = None,
     mda_client: Any = None,
+    funnel: Optional[EvidenceFunnelStore] = None,
+    cycle_run_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
+    # Per-candidate stage record (measurement only; never recorded on dry runs).
+    funnel_store = None if dry_run else (funnel or funnel_mod.get_evidence_funnel())
+    cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(as_of)
     screener_payload = _build_forward_discovery_payload(
         today=as_of,
         symbols=symbols,
@@ -1907,22 +1926,80 @@ def run_forward_screener(
         "universe_shadow_skipped": 0,
         "universe_shadow_failures": 0,
         "discovery_source": str(screener_payload.get("source") or "unknown"),
+        "outside_dte_window": 0,
+        "analyzer_errors": 0,
+        "cycle_run_id": cycle_id,
     }
+    funnel_mod.safe_start_cycle(
+        funnel_store,
+        cycle_run_id=cycle_id,
+        as_of=as_of,
+        universe_size=len(symbols or DEFAULT_UNIVERSE),
+        discovered=summary["discovered"],
+        discovery_source=summary["discovery_source"],
+    )
 
     for row in screener_payload.get("rows", []):
         dte = row.get("days_to_earnings", row.get("dte"))
-        if dte is None or not (DTE_MIN_DEFAULT <= int(dte) <= DTE_MAX_DEFAULT):
-            continue
         symbol = str(row.get("symbol") or "").upper()
         if not symbol:
             continue
 
-        snapshot = _analyze_for_forward_loop(
-            analyzer,
-            symbol,
-            mda_client=mda_client,
-            dry_run=dry_run,
-        )
+        def _funnel(stage: str, outcome: str, reason: Optional[str] = None, **extra: Any) -> None:
+            funnel_mod.safe_record(
+                funnel_store,
+                cycle_run_id=cycle_id,
+                as_of=as_of,
+                stage=stage,
+                outcome=outcome,
+                symbol=symbol,
+                reason=reason,
+                earnings_date=extra.pop("earnings_date", row.get("earnings_date")),
+                **extra,
+            )
+
+        _funnel(funnel_mod.STAGE_DISCOVERED, funnel_mod.OUTCOME_ADVANCED,
+                detail={"discovery_source": row.get("discovery_source"), "discovery_status": row.get("status")})
+        if dte is None:
+            summary["outside_dte_window"] += 1
+            _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DROPPED, funnel_mod.REASON_MISSING_DTE)
+            continue
+        if int(dte) > DTE_MAX_DEFAULT:
+            # Not yet in the entry window: looked at again on a later cycle.
+            summary["outside_dte_window"] += 1
+            _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DEFERRED, funnel_mod.REASON_TOO_EARLY,
+                    detail={"dte": int(dte)})
+            continue
+        if int(dte) < DTE_MIN_DEFAULT:
+            summary["outside_dte_window"] += 1
+            _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DROPPED, funnel_mod.REASON_TOO_LATE,
+                    detail={"dte": int(dte)})
+            continue
+        _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_ADVANCED, detail={"dte": int(dte)})
+
+        try:
+            snapshot = _analyze_for_forward_loop(
+                analyzer,
+                symbol,
+                mda_client=mda_client,
+                dry_run=dry_run,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # One symbol's analysis failing (no market data, a provider
+            # outage) must not abort the pass for every later candidate.
+            summary["analyzer_errors"] += 1
+            _record_skip(summary, funnel_mod.REASON_ANALYZER_ERROR)
+            reason = f"{funnel_mod.REASON_ANALYZER_ERROR}:{type(exc).__name__}"
+            logger.warning("forward_loop: analysis failed for %s: %s", symbol, exc)
+            _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ERROR, reason, detail={"error": str(exc)[:300]})
+            _append_learning_log(
+                log_path,
+                {"event_type": "skip", "symbol": symbol, "structure": None, "setup_score": None,
+                 "source": "paper", "reason": reason, "error": str(exc)[:300],
+                 "discovery_source": row.get("discovery_source")},
+                dry_run=dry_run,
+            )
+            continue
         summary["analyzed"] += 1
         selector_output = _get(snapshot, "selector_output", {}) or {}
         recommendation = _get(selector_output, "recommendation", _get(snapshot, "recommendation"))
@@ -1936,6 +2013,8 @@ def run_forward_screener(
             earnings_date=earnings_date or _get(vol_snapshot, "earnings_date"),
             selected_structure=structure,
         )
+        _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
+                earnings_date=earnings_date or row.get("earnings_date"))
         if not dry_run:
             try:
                 record_recommendation(
@@ -1992,6 +2071,18 @@ def run_forward_screener(
                 logger.warning("forward_loop: universe shadow entry failed for %s: %s", symbol, exc)
 
         if recommendation not in ALLOWED_RECOMMENDATIONS or not structure or earnings_date is None:
+            if recommendation not in ALLOWED_RECOMMENDATIONS:
+                gate = _get(selector_output, "binding_gate")
+                eligibility_reason = (
+                    f"{funnel_mod.REASON_NO_TRADE}:{gate}" if gate
+                    else f"{funnel_mod.REASON_NOT_ACTIONABLE}:{recommendation}"
+                )
+            elif not structure:
+                eligibility_reason = funnel_mod.REASON_NO_STRUCTURE
+            else:
+                eligibility_reason = funnel_mod.REASON_NO_EARNINGS_DATE
+            _funnel(funnel_mod.STAGE_ELIGIBLE, funnel_mod.OUTCOME_DROPPED, eligibility_reason,
+                    recommendation_id=recommendation_id, earnings_date=earnings_date or row.get("earnings_date"))
             _record_skip(summary, "recommendation_not_actionable")
             _append_learning_log(
                 log_path,
@@ -2011,6 +2102,9 @@ def run_forward_screener(
             )
             continue
 
+        _funnel(funnel_mod.STAGE_ELIGIBLE, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
+                earnings_date=earnings_date, detail={"recommendation": recommendation, "structure": structure})
+
         existing = trade_store.find_active_trade_for_event(
             symbol=symbol,
             structure=structure,
@@ -2018,6 +2112,8 @@ def run_forward_screener(
         )
         if existing is not None:
             summary["duplicates"] += 1
+            _funnel(funnel_mod.STAGE_RECORDED, funnel_mod.OUTCOME_DROPPED, funnel_mod.REASON_DUPLICATE_ACTIVE_TRADE,
+                    recommendation_id=recommendation_id, earnings_date=earnings_date)
             _record_skip(summary, "duplicate_active_trade")
             _append_learning_log(
                 log_path,
@@ -2073,6 +2169,10 @@ def run_forward_screener(
             phase="entry",
         ).to_dict()
         if entry_mid is None or entry_mid <= 0:
+            _funnel(funnel_mod.STAGE_RECORDED, funnel_mod.OUTCOME_DROPPED,
+                    f"{funnel_mod.REASON_MISSING_ENTRY_QUOTE}:{quote.get('reason', 'missing_entry_mid')}",
+                    recommendation_id=recommendation_id, earnings_date=earnings_date,
+                    detail={"quote_source": quote.get("quote_source")})
             _record_skip(summary, str(quote.get("reason", "missing_entry_mid")))
             _append_learning_log(
                 log_path,
@@ -2188,6 +2288,11 @@ def run_forward_screener(
                 summary["baseline_skipped"] += baseline_summary["baseline_skipped"]
         if inserted:
             summary["entries"] += 1
+            _funnel(funnel_mod.STAGE_RECORDED, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
+                    trade_id=trade_id, earnings_date=earnings_date,
+                    detail={"evidence_quality_status": evidence_quality.get("evidence_quality_status"),
+                            "claim_allowed": bool(evidence_quality.get("claim_allowed")),
+                            "evidence_quality_reasons": evidence_quality.get("evidence_quality_reasons", [])})
             _append_learning_log(
                 log_path,
                 {
@@ -2210,6 +2315,8 @@ def run_forward_screener(
             )
         else:
             summary["duplicates"] += 1
+            _funnel(funnel_mod.STAGE_RECORDED, funnel_mod.OUTCOME_DROPPED, funnel_mod.REASON_DUPLICATE_TRADE_ID,
+                    recommendation_id=recommendation_id, trade_id=trade_id, earnings_date=earnings_date)
             _record_skip(summary, "duplicate_trade_id")
             _append_learning_log(
                 log_path,
@@ -2302,17 +2409,51 @@ def run_exit_detection(
     finalizer: Callable[..., Dict[str, Any]] = finalize_trade_and_update_learning,
     baseline_store: Optional[BaselineEvidenceStore] = None,
     mda_client: Any = None,
+    funnel: Optional[EvidenceFunnelStore] = None,
+    cycle_run_id: Optional[str] = None,
 ) -> Dict[str, int]:
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
     summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "refinalized": 0, "learning_retried": 0,
                "baseline_exits": 0, "baseline_skipped": 0}
+    funnel_store = None if dry_run else (funnel or funnel_mod.get_evidence_funnel())
+    cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(as_of)
+
+    def _funnel_trade(trade: Dict[str, Any], stage: str, outcome: str, reason: Optional[str] = None,
+                      detail: Optional[Dict[str, Any]] = None) -> None:
+        funnel_mod.safe_record(
+            funnel_store,
+            cycle_run_id=cycle_id,
+            as_of=as_of,
+            stage=stage,
+            outcome=outcome,
+            symbol=str(trade.get("symbol") or "UNKNOWN"),
+            reason=reason,
+            earnings_date=trade.get("earnings_date"),
+            recommendation_id=trade.get("recommendation_id"),
+            trade_id=str(trade.get("trade_id")),
+            detail=detail,
+        )
+
+    def _funnel_resolution(trade_id: str) -> None:
+        """Resolved, and whether the resolved outcome is claimable evidence."""
+        trade = trade_store.get_trade(trade_id) if hasattr(trade_store, "get_trade") else None
+        trade = dict(trade or {"trade_id": trade_id})
+        _funnel_trade(trade, funnel_mod.STAGE_RESOLVED, funnel_mod.OUTCOME_ADVANCED)
+        if bool(trade.get("claim_allowed")):
+            _funnel_trade(trade, funnel_mod.STAGE_CLAIMABLE, funnel_mod.OUTCOME_ADVANCED)
+        else:
+            reasons = _loads_list(trade.get("evidence_quality_reasons_json")) or ["claim_not_allowed"]
+            _funnel_trade(trade, funnel_mod.STAGE_CLAIMABLE, funnel_mod.OUTCOME_DROPPED,
+                          f"{funnel_mod.REASON_NOT_CLAIMABLE}:{','.join(sorted(map(str, reasons)))}")
 
     # Trades whose T-1 exit day has passed without a price become terminal
     # 'exit_missing' attrition instead of staying open forever.
     if not dry_run:
         for missing in trade_store.mark_missing_exits(as_of):
             summary["exit_missing"] += 1
+            _funnel_trade(missing, funnel_mod.STAGE_RESOLVED, funnel_mod.OUTCOME_DROPPED,
+                          f"{funnel_mod.REASON_EXIT_MISSING}:{missing.get('exit_missing_reason') or 'unknown'}")
             _append_learning_log(
                 log_path,
                 {
@@ -2337,6 +2478,8 @@ def run_exit_detection(
                 # terminal attrition instead of retrying it every run.
                 if trade_store.mark_recorded_exit_unusable(pending_id, reason=NON_FINITE_EXIT_REASON):
                     summary["exit_missing"] += 1
+                    _funnel_trade(pending, funnel_mod.STAGE_RESOLVED, funnel_mod.OUTCOME_DROPPED,
+                                  f"{funnel_mod.REASON_EXIT_MISSING}:{NON_FINITE_EXIT_REASON}")
                     _append_learning_log(
                         log_path,
                         {"event_type": "exit_missing", "symbol": pending.get("symbol"),
@@ -2357,6 +2500,7 @@ def run_exit_detection(
                 continue
             if isinstance(result, dict) and result.get("status") == "finalized":
                 summary["refinalized"] += 1
+                _funnel_resolution(pending_id)
                 _append_learning_log(
                     log_path,
                     {"event_type": "refinalize", "symbol": pending.get("symbol"),
@@ -2370,6 +2514,8 @@ def run_exit_detection(
             orphan_id = str(orphan["trade_id"])
             if trade_store.mark_recorded_exit_unusable(orphan_id, reason=EXIT_WITHOUT_VALUE_REASON):
                 summary["exit_missing"] += 1
+                _funnel_trade(orphan, funnel_mod.STAGE_RESOLVED, funnel_mod.OUTCOME_DROPPED,
+                              f"{funnel_mod.REASON_EXIT_MISSING}:{EXIT_WITHOUT_VALUE_REASON}")
                 _append_learning_log(
                     log_path,
                     {"event_type": "exit_missing", "symbol": orphan.get("symbol"),
@@ -2405,9 +2551,16 @@ def run_exit_detection(
     def _record_failed_exit(trade_id: str, reason: str) -> None:
         if not dry_run:
             trade_store.record_exit_attempt_failure(trade_id, reason=reason, attempted_on=as_of)
+        # Deferred, not dropped: a later attempt may still price it, and an exit
+        # that never does is recorded as dropped by mark_missing_exits.
+        _funnel_trade(due_rows.get(trade_id, {"trade_id": trade_id}), funnel_mod.STAGE_RESOLVED,
+                      funnel_mod.OUTCOME_DEFERRED, f"{funnel_mod.REASON_EXIT_FAILED}:{reason}")
 
+    due_rows: Dict[str, Dict[str, Any]] = {}
     for row in trade_store.trades_due_for_exit(as_of):
         trade_id = str(row["trade_id"])
+        due_rows[trade_id] = dict(row)
+        _funnel_trade(row, funnel_mod.STAGE_EXIT_DUE, funnel_mod.OUTCOME_ADVANCED)
         structure = str(row["structure"])
         symbol = str(row["symbol"]).upper()
         entry_mid = float(row["entry_mid"]) if row.get("entry_mid") is not None else None
@@ -2572,7 +2725,10 @@ def run_exit_detection(
                 continue
             if isinstance(finalize_result, dict) and finalize_result.get("status") == "claim_lost":
                 summary["skipped"] += 1
+                _funnel_trade(row, funnel_mod.STAGE_RESOLVED, funnel_mod.OUTCOME_DEFERRED,
+                              f"{funnel_mod.REASON_EXIT_FAILED}:claim_lost")
                 continue
+            _funnel_resolution(trade_id)
         summary["exits"] += 1
         _append_learning_log(
             log_path,
@@ -2617,10 +2773,13 @@ def run_daily_cycle(
     baseline_store: Optional[BaselineEvidenceStore] = None,
     symbols: Optional[list[str]] = None,
     mda_client: Any = None,
+    funnel: Optional[EvidenceFunnelStore] = None,
 ) -> Dict[str, Any]:
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
     resolved_mda_client = _get_marketdata_client(mda_client)
+    # One id ties this run's entry and exit funnel events together.
+    cycle_run_id = funnel_mod.new_cycle_run_id(as_of)
     entry_summary = run_forward_screener(
         today=as_of,
         dry_run=dry_run,
@@ -2633,6 +2792,8 @@ def run_daily_cycle(
         baseline_store=baseline_store,
         symbols=symbols,
         mda_client=resolved_mda_client,
+        funnel=funnel,
+        cycle_run_id=cycle_run_id,
     )
     exit_summary = run_exit_detection(
         today=as_of,
@@ -2643,6 +2804,8 @@ def run_daily_cycle(
         finalizer=finalizer,
         baseline_store=baseline_store,
         mda_client=resolved_mda_client,
+        funnel=funnel,
+        cycle_run_id=cycle_run_id,
     )
     diagnostics = build_learning_diagnostics()
     _append_learning_log(
@@ -2664,6 +2827,7 @@ def run_daily_cycle(
     )
     return {
         "as_of_date": as_of.isoformat(),
+        "cycle_run_id": cycle_run_id,
         "entries": entry_summary,
         "exits": exit_summary,
         "diagnostics": diagnostics,
