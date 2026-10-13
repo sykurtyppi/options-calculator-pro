@@ -48,7 +48,9 @@ def _row(symbol, score, dte=7, **extra):
     row = {
         "symbol": symbol, "ranking_score": score, "days_to_earnings": dte,
         "release_timing": "AMC", "iv_rv_ratio": 1.10, "iv30": 0.35,
-        "avg_spread_pct": 3.0, "status": "ranked",
+        "avg_spread_pct": 3.0, "term_structure_ratio": 1.0, "median_earnings_move_pct": 6.0,
+        "sample_size": 8, "earnings_source_confirmed": True, "earnings_source_stale": False,
+        "status": "ranked",
     }
     row.update(extra)
     return row
@@ -81,10 +83,12 @@ def test_selection_fails_closed_on_nonfinite_scores_and_missing_evidence():
         _row("PLACEHOLDERIV", 0.90, iv30=0.0039),       # pre-open yfinance placeholder
         _row("NANSPREAD", 0.90, avg_spread_pct=float("nan")),
         _row("GOOD", 0.90),
-        _row("NOSPREAD", 0.88, avg_spread_pct=None),    # absent spread is tolerated
+        # A missing spread is no longer neutral evidence: the liquidity input
+        # must be present (it was tolerated before).
+        _row("NOSPREAD", 0.88, avg_spread_pct=None),
     ]
     picked = select_qualifying_rows(rows, min_score=0.65, top_n=9, dte_min=3, dte_max=10)
-    assert [r["symbol"] for r in picked] == ["GOOD", "NOSPREAD"]
+    assert [r["symbol"] for r in picked] == ["GOOD"]
 
 
 def test_selection_rejects_nonfinite_threshold():
@@ -117,7 +121,8 @@ def test_selection_sorts_by_score_and_caps_at_top_n():
 def test_selection_accepts_api_shaped_dte_alias():
     """The service emits days_to_earnings; the API row calls it dte."""
     row = {"symbol": "AAA", "ranking_score": 0.80, "dte": 7, "release_timing": "AMC",
-           "iv_rv_ratio": 1.1, "atm_iv": 0.35}  # API-shaped evidence keys too
+           "iv_rv_ratio": 1.1, "atm_iv": 0.35, "spread_pct": 3.0,  # API-shaped evidence keys too
+           "term_structure_ratio": 1.0, "median_earnings_move_pct": 6.0}
     assert select_qualifying_rows([row], min_score=0.65, top_n=5, dte_min=3, dte_max=10)
 
 
@@ -131,7 +136,7 @@ def test_message_lists_setups_and_refuses_to_claim_a_win_rate():
     )
     assert "2026-08-19" in msg
     assert "AAA" in msg and "BBB" in msg
-    assert "[regime]" in msg, "regime-conditioned cheapness must be flagged"
+    assert "[regime" in msg, "regime-conditioned cheapness must be flagged"
     # The load-bearing honesty claims.
     assert "not a win probability" in msg
     assert "not financial advice" in msg.lower()
@@ -167,8 +172,9 @@ def test_dry_run_never_sends_and_never_writes_state(tmp_path, capsys):
     assert "AAA" in capsys.readouterr().out
 
 
-def test_identical_digest_is_not_resent_same_day(tmp_path):
+def test_identical_digest_is_not_resent_same_day(tmp_path, monkeypatch):
     state = tmp_path / "s.json"
+    monkeypatch.setattr("scripts.premarket_screener_alert.DEFAULT_AUDIT_PATH", tmp_path / "audit.jsonl")
     table = _table([_row("AAA", 0.90)])
     cfg = object()
     with patch("scripts.premarket_screener_alert.build_ranked_screener", return_value=table), \

@@ -223,6 +223,52 @@ def _liquidity_score(spread_pct: Optional[float]) -> float:
     return float(np.clip(score, 0.0, 1.0))
 
 
+def ranking_score_components(
+    iv_rv_ratio: Optional[float],
+    ts_ratio: Optional[float],
+    median_earnings_move_pct: Optional[float],
+    sample_size: int,
+    dte: Optional[int],
+    spread_pct: Optional[float],
+    iv_rv_har: Optional[float] = None,
+    rv_percentile_rank: Optional[float] = None,
+) -> Dict[str, Any]:
+    """The weighted parts of :func:`compute_ranking_score`, for audit trails.
+
+    Returns each component's weighted contribution (they sum to the score),
+    the IV/RV actually scored (trailing, or the regime-conditioned value),
+    and ``neutral_fallbacks``: the inputs that were missing and scored as a
+    neutral default rather than as evidence.
+    """
+    entry_iv_rv = _regime_conditioned_iv_rv(iv_rv_ratio, iv_rv_har, rv_percentile_rank)
+
+    def _missing(value: Optional[float]) -> bool:
+        return value is None or not np.isfinite(value)
+
+    fallbacks = [
+        name for name, missing in (
+            ("iv_rv", _missing(entry_iv_rv) or (entry_iv_rv is not None and entry_iv_rv <= 0)),
+            ("move_history", _missing(median_earnings_move_pct)),
+            ("term_structure", _missing(ts_ratio) or (ts_ratio is not None and ts_ratio <= 0)),
+            ("liquidity", _missing(spread_pct) or (spread_pct is not None and spread_pct < 0)),
+        ) if missing
+    ]
+    components = {
+        "iv_entry": _W_IV_ENTRY * _iv_entry_score(entry_iv_rv),
+        "move_history": _W_MOVE_HISTORY * _move_history_score(median_earnings_move_pct),
+        "term_structure": _W_TS * _ts_score(ts_ratio),
+        "dte": _W_DTE * _dte_score(dte),
+        "sample": _W_SAMPLE * _sample_score(sample_size),
+        "liquidity": _W_LIQUIDITY * _liquidity_score(spread_pct),
+    }
+    return {
+        "components": components,
+        "score": float(sum(components.values())),
+        "scored_iv_rv": entry_iv_rv,
+        "neutral_fallbacks": fallbacks,
+    }
+
+
 def compute_ranking_score(
     iv_rv_ratio: Optional[float],
     ts_ratio: Optional[float],
@@ -256,15 +302,16 @@ def compute_ranking_score(
     Returns:
         Scalar in [0, 1]. Higher = stronger setup for pre-earnings long-vega entry.
     """
-    entry_iv_rv = _regime_conditioned_iv_rv(iv_rv_ratio, iv_rv_har, rv_percentile_rank)
-    return (
-        _W_IV_ENTRY     * _iv_entry_score(entry_iv_rv)
-        + _W_MOVE_HISTORY * _move_history_score(median_earnings_move_pct)
-        + _W_TS           * _ts_score(ts_ratio)
-        + _W_DTE          * _dte_score(dte)
-        + _W_SAMPLE       * _sample_score(sample_size)
-        + _W_LIQUIDITY    * _liquidity_score(spread_pct)
-    )
+    return ranking_score_components(
+        iv_rv_ratio=iv_rv_ratio,
+        ts_ratio=ts_ratio,
+        median_earnings_move_pct=median_earnings_move_pct,
+        sample_size=sample_size,
+        dte=dte,
+        spread_pct=spread_pct,
+        iv_rv_har=iv_rv_har,
+        rv_percentile_rank=rv_percentile_rank,
+    )["score"]
 
 
 # ── Per-symbol data helpers ───────────────────────────────────────────────────
