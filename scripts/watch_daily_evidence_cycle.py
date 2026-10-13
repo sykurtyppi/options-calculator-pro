@@ -20,6 +20,7 @@ except ImportError:
     pass
 
 from services.evidence_funnel import build_evidence_funnel_health
+from services.provider_reliability import build_provider_budget_health
 from services.evidence_health import (
     EvidenceHealthConfig,
     build_candidate_exit_resolver_health,
@@ -47,6 +48,7 @@ def _build_combined_watchdog_status(
     resolver_health: Mapping[str, Any],
     job_freshness: Mapping[str, Any] | None = None,
     funnel_health: Mapping[str, Any] | None = None,
+    budget_health: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge the daily-cycle watchdog status with the candidate exit
     resolver health into a single payload suitable for
@@ -99,7 +101,12 @@ def _build_combined_watchdog_status(
     # the same alertable/non-alertable contract as the resolver issues.
     # The evidence funnel's issues (e.g. a stalled entry pipeline) follow the
     # same contract.
-    job_issues = list((job_freshness or {}).get("issues", [])) + list((funnel_health or {}).get("issues", []))
+    # So do the provider credit budget's (exhausted or nearly so).
+    job_issues = (
+        list((job_freshness or {}).get("issues", []))
+        + list((funnel_health or {}).get("issues", []))
+        + list((budget_health or {}).get("issues", []))
+    )
     job_alertable = [i for i in job_issues if i.get("alertable", True) and i.get("severity") in {"FAIL", "WARN"}]
     job_non_alertable = [i for i in job_issues if not i.get("alertable", True)]
 
@@ -123,6 +130,7 @@ def _build_combined_watchdog_status(
         "candidate_exit_resolver": resolver_health.get("summary", {}),
         "launchd_jobs": (job_freshness or {}).get("summary", {}),
         "evidence_funnel": (funnel_health or {}).get("summary", {}),
+        "provider_budget": (budget_health or {}).get("summary", {}),
     }
 
 
@@ -231,6 +239,7 @@ def main() -> int:
         resolver_health=resolver_health,
         job_freshness=job_freshness,
         funnel_health=build_evidence_funnel_health(),
+        budget_health=build_provider_budget_health(),
     )
     alert = maybe_send_watchdog_alert(
         combined_status,

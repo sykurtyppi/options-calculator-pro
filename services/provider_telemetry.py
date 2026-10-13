@@ -497,8 +497,19 @@ def record_provider_telemetry(
         logger.debug("Provider telemetry write failed: %s", exc)
 
 
+# Categories pass through unchanged, so classifying twice (a caller's
+# classify_error, then record_provider_telemetry's) keeps them.
+ERROR_CATEGORIES = frozenset({
+    "timeout", "rate_limited", "auth", "entitlement", "not_found", "empty_response", "http_error",
+    "cache_fallback", "unknown_error", "server_error", "connection_error",
+    "provider_budget_exhausted", "provider_circuit_open",
+})
+
+
 def classify_error(value: Any) -> str:
     text = str(value or "").lower()
+    if text in ERROR_CATEGORIES:
+        return text
     if "timeout" in text:
         return "timeout"
     if "rate" in text or "429" in text:
@@ -592,11 +603,21 @@ def build_provider_telemetry_diagnostics(
         avg_latency_ms=(sum(avg_latency_values) / len(avg_latency_values) if avg_latency_values else None),
         metadata=store_obj.operational_metadata(),
     )
+    from services.provider_reliability import reliability_status
+
+    reliability = reliability_status()
+    budget_level = (reliability.get("marketdata_budget") or {}).get("alert_level")
+    if budget_level in {"warning", "critical", "exhausted"}:
+        operational_health["warning_flags"].append(f"MarketData credit budget {budget_level}.")
+    for name, breaker in reliability.get("circuit_breakers", {}).items():
+        if breaker.get("state") != "closed":
+            operational_health["warning_flags"].append(f"{name} circuit breaker is {breaker['state']}.")
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "totals": totals,
         "summary_by_provider": summary,
         "failure_window": failure_window,
+        "reliability": reliability,
         "recent_events": recent_events,
         "recent_failures": recent_failures,
         "limit": max(1, min(int(limit or 100), 1_000)),
