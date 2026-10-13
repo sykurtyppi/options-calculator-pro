@@ -37,6 +37,7 @@ LABEL = "com.optionscalculator.premarket-screener-alert"
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from tests.unit.test_scripts.alert_fixtures import alert_row  # noqa: E402
 from scripts.premarket_screener_alert import (  # noqa: E402
     format_alert_message,
     main,
@@ -45,15 +46,8 @@ from scripts.premarket_screener_alert import (  # noqa: E402
 
 
 def _row(symbol, score, dte=7, **extra):
-    row = {
-        "symbol": symbol, "ranking_score": score, "days_to_earnings": dte,
-        "release_timing": "AMC", "iv_rv_ratio": 1.10, "iv30": 0.35,
-        "avg_spread_pct": 3.0, "term_structure_ratio": 1.0, "median_earnings_move_pct": 6.0,
-        "sample_size": 8, "earnings_source_confirmed": True, "earnings_source_stale": False,
-        "status": "ranked",
-    }
-    row.update(extra)
-    return row
+    # Internally consistent: ranking_score is what the row's inputs score.
+    return alert_row(symbol, score, dte=dte, **extra)
 
 
 # ── Selection ─────────────────────────────────────────────────────────────
@@ -120,9 +114,11 @@ def test_selection_sorts_by_score_and_caps_at_top_n():
 
 def test_selection_accepts_api_shaped_dte_alias():
     """The service emits days_to_earnings; the API row calls it dte."""
-    row = {"symbol": "AAA", "ranking_score": 0.80, "dte": 7, "release_timing": "AMC",
-           "iv_rv_ratio": 1.1, "atm_iv": 0.35, "spread_pct": 3.0,  # API-shaped evidence keys too
-           "term_structure_ratio": 1.0, "median_earnings_move_pct": 6.0}
+    row = alert_row("AAA", 0.80)
+    # API-shaped keys: dte, atm_iv and spread_pct instead of the service names.
+    row["dte"] = row.pop("days_to_earnings")
+    row["atm_iv"] = row.pop("iv30")
+    row["spread_pct"] = row.pop("avg_spread_pct")
     assert select_qualifying_rows([row], min_score=0.65, top_n=5, dte_min=3, dte_max=10)
 
 

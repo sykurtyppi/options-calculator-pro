@@ -77,18 +77,58 @@ DEFAULT_AUDIT_PATH = (
 )
 # Execution gate: where the screener's liquidity sub-score reaches zero.
 MAX_ATM_SPREAD_PCT = 15.0
+# The screener rounds ranking_score to 4 decimals; a recomputed score further
+# from it than this is not the score of the row's own inputs.
+SCORE_RECONCILE_TOLERANCE = 1e-4
+
+
+def _number(value: Any) -> Optional[float]:
+    """A real, finite number; else None. Strict: booleans and strings are not
+    numbers here (this boundary texts a human, so nothing is coerced)."""
+    if isinstance(value, bool) or isinstance(value, (str, bytes)):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _whole_number(value: Any) -> Optional[int]:
+    """An integral count (7 or 7.0), else None; 10.9 is not truncated to 10."""
+    f = _number(value)
+    if f is None or not f.is_integer():
+        return None
+    return int(f)
 
 
 def _row_dte(row: Mapping[str, Any]) -> Optional[int]:
-    """DTE, tolerating both the service key and the API-shaped alias."""
+    """DTE from the service key, else the API-shaped alias; must be whole."""
     for key in ("days_to_earnings", "dte"):
-        value = row.get(key)
-        if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
+        if row.get(key) is not None:
+            return _whole_number(row.get(key))
     return None
+
+
+def _row_atm_iv(row: Mapping[str, Any]) -> Optional[float]:
+    """ATM IV from ``iv30``, else the ``atm_iv`` alias. A present but invalid
+    ``iv30`` is not replaced by the alias."""
+    if row.get("iv30") is not None:
+        return _number(row.get("iv30"))
+    return _number(row.get("atm_iv"))
+
+
+def _is_stale(row: Mapping[str, Any]) -> bool:
+    """Only an explicit "not stale" (None, False, 0, "false") passes; any
+    other value counts as stale (fail closed)."""
+    value = row.get("earnings_source_stale")
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "false", "0", "no"}
+    if not isinstance(value, bool) and _number(value) == 0:
+        return False
+    return True
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -152,16 +192,18 @@ def select_qualifying_rows(
     for row in rows:
         if row.get("error") or row.get("error_note"):
             _drop("error"); continue
-        score = _finite(row.get("ranking_score"))
+        score = _number(row.get("ranking_score"))
         if score is None:
             _drop("non_finite_score"); continue
+        if not 0.0 <= score <= 1.0:
+            _drop("score_out_of_range"); continue
         dte = _row_dte(row)
         if dte is None or not (dte_min <= dte <= dte_max):
             _drop("outside_entry_window"); continue
-        iv_rv = _finite(row.get("iv_rv_ratio"))
+        iv_rv = _number(row.get("iv_rv_ratio"))
         if iv_rv is None or iv_rv <= 0:
             _drop("missing_iv_rv"); continue
-        atm_iv = _finite(row.get("iv30")) or _finite(row.get("atm_iv"))
+        atm_iv = _row_atm_iv(row)
         if atm_iv is None or not (MIN_PLAUSIBLE_ATM_IV <= atm_iv <= MAX_PLAUSIBLE_ATM_IV):
             _drop("implausible_or_missing_atm_iv"); continue
         spread = _row_spread(row)
@@ -169,12 +211,26 @@ def select_qualifying_rows(
             _drop("missing_spread"); continue
         if spread > MAX_ATM_SPREAD_PCT:
             _drop("spread_too_wide"); continue
-        if _finite(row.get("term_structure_ratio")) is None:
+        # The scorer treats a ratio <= 0 as missing (neutral 0.30).
+        term_structure = _number(row.get("term_structure_ratio"))
+        if term_structure is None or term_structure <= 0:
             _drop("missing_term_structure"); continue
-        if _finite(row.get("median_earnings_move_pct")) is None:
+        # An absolute move cannot be negative.
+        move = _number(row.get("median_earnings_move_pct"))
+        if move is None or move < 0:
             _drop("missing_move_history"); continue
-        if row.get("earnings_source_stale") is True:
+        sample_size = _whole_number(row.get("sample_size"))
+        if sample_size is None or sample_size < 0:
+            _drop("invalid_sample_size"); continue
+        if _is_stale(row):
             _drop("stale_earnings_date"); continue
+        # The score must be what its own inputs produce, with no input scored
+        # as a neutral default; the audit then records exactly what was scored.
+        breakdown = score_breakdown(row)
+        if breakdown["neutral_fallbacks"]:
+            _drop("neutral_fallback_inputs"); continue
+        if abs(breakdown["score"] - score) > SCORE_RECONCILE_TOLERANCE:
+            _drop("score_mismatch"); continue
         if score < min_score:
             _drop("below_threshold"); continue
         qualifying.append(dict(row))
@@ -189,26 +245,34 @@ def _row_spread(row: Mapping[str, Any]) -> Optional[float]:
     """The ATM spread %, tolerating both the service key and the API alias."""
     for key in ("avg_spread_pct", "spread_pct"):
         if row.get(key) is not None:
-            value = _finite(row[key])
+            value = _number(row[key])
             return value if value is not None and value >= 0 else None
     return None
 
 
 def _date_unconfirmed(row: Mapping[str, Any]) -> bool:
-    return row.get("earnings_source_confirmed") is not True
+    """The earnings layer names the confirming source (e.g. "sec_edgar"), or
+    leaves it empty; a bare True is also accepted."""
+    value = row.get("earnings_source_confirmed")
+    if value is True:
+        return False
+    return not (isinstance(value, str) and value.strip())
 
 
 def score_breakdown(row: Mapping[str, Any]) -> Dict[str, Any]:
-    """Recompute the row's score components from its own inputs (audit)."""
+    """Recompute the row's score components from its own inputs (audit).
+
+    Never raises on malformed inputs: an invalid value is passed as missing,
+    so it shows up in ``neutral_fallbacks``."""
     return ranking_score_components(
-        iv_rv_ratio=_finite(row.get("iv_rv_ratio")),
-        ts_ratio=_finite(row.get("term_structure_ratio")),
-        median_earnings_move_pct=_finite(row.get("median_earnings_move_pct")),
-        sample_size=int(row.get("sample_size") or 0),
+        iv_rv_ratio=_number(row.get("iv_rv_ratio")),
+        ts_ratio=_number(row.get("term_structure_ratio")),
+        median_earnings_move_pct=_number(row.get("median_earnings_move_pct")),
+        sample_size=max(_whole_number(row.get("sample_size")) or 0, 0),
         dte=_row_dte(row),
         spread_pct=_row_spread(row),
-        iv_rv_har=_finite(row.get("iv_rv_har")),
-        rv_percentile_rank=_finite(row.get("rv_percentile_rank")),
+        iv_rv_har=_number(row.get("iv_rv_har")),
+        rv_percentile_rank=_number(row.get("rv_percentile_rank")),
     )
 
 
@@ -216,6 +280,23 @@ def _new_york_time(moment: datetime) -> str:
     from zoneinfo import ZoneInfo
 
     return moment.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M %Z")
+
+
+def _market_phase(moment: datetime) -> str:
+    """Where ``moment`` falls relative to the NYSE regular session."""
+    from datetime import time
+    from zoneinfo import ZoneInfo
+
+    from services.market_calendar import is_trading_day
+
+    local = moment.astimezone(ZoneInfo("America/New_York"))
+    if not is_trading_day(local.date()):
+        return "US market closed today"
+    if local.time() < time(9, 30):
+        return "before the US open"
+    if local.time() >= time(16, 0):
+        return "after the US close"
+    return "after the US open"
 
 
 def _fmt(value: Any, spec: str = ".2f") -> str:
@@ -260,7 +341,7 @@ def format_alert_message(
         "",
         f"Pre-earnings long-vol candidates (heuristic score >= {min_score:g}), "
         "not a win probability. Selector approval still required.",
-        f"Built {_new_york_time(built)} (after the US open).",
+        f"Built {_new_york_time(built)} ({_market_phase(built)}).",
         "Research only - not financial advice.",
     ]
     return "\n".join(lines)
@@ -285,15 +366,35 @@ def _save_state(path: Path, payload: Mapping[str, Any]) -> None:
     tmp.replace(path)  # atomic swap; a torn write can't poison the state file
 
 
+def _json_safe(value: Any) -> Any:
+    """Strict-JSON form: non-finite floats become null (a NaN in a field the
+    gates do not use must not block the record)."""
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _append_audit(path: Path, payload: Mapping[str, Any]) -> None:
-    """Append one JSON line; an audit failure is logged, never fatal (the
-    alert has already been sent)."""
+    """Append one strict-JSON line, flushed to disk. Raises on failure."""
+    line = json.dumps(_json_safe(dict(payload)), default=str, sort_keys=True, allow_nan=False) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _try_append_audit(path: Path, payload: Mapping[str, Any]) -> bool:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(dict(payload), default=str, sort_keys=True) + "\n")
-    except OSError:
-        logger.exception("Could not append the alert audit record to %s.", path)
+        _append_audit(path, payload)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not append to the alert audit %s.", path)
+        return False
 
 
 def _finite_float_arg(text: str) -> float:
@@ -402,34 +503,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 1
 
+    # Outbox: the full audit record is built and written as "pending" BEFORE
+    # the send, so every sent alert has a durable record. If it cannot be
+    # built or written, nothing is sent.
+    import uuid
+
+    event_id = uuid.uuid4().hex
     try:
-        result = send_imessage(message, config=config)
+        record = {
+            "event_type": "premarket_alert",
+            "event_id": event_id,
+            "status": "pending",
+            "as_of_date": as_of.isoformat(),
+            "built_at_utc": built_at.isoformat(),
+            "built_at_new_york": _new_york_time(built_at),
+            "min_score": args.min_score,
+            "gates": {
+                "dte_min": args.dte_min, "dte_max": args.dte_max,
+                "max_atm_spread_pct": MAX_ATM_SPREAD_PCT,
+                "atm_iv_range": [MIN_PLAUSIBLE_ATM_IV, MAX_PLAUSIBLE_ATM_IV],
+            },
+            "screened": {"universe_size": table.get("universe_size"), "rows": len(rows),
+                         "in_entry_window": table.get("in_entry_window")},
+            "dropped": dropped,
+            "message": message,
+            "setups": [{"row": row, "score_breakdown": score_breakdown(row)} for row in qualifying],
+        }
+        _append_audit(args.audit_path, record)
     except Exception:
-        logger.exception("iMessage send failed.")
+        logger.exception("Could not record the alert audit before sending; nothing sent.")
         return 1
 
+    try:
+        result = send_imessage(message, config=config)
+    except Exception as exc:
+        logger.exception("iMessage send failed.")
+        _try_append_audit(args.audit_path, {"event_type": "premarket_alert", "event_id": event_id,
+                                            "status": "send_failed", "error": f"{type(exc).__name__}: {exc}"})
+        return 1
+
+    # Sent: the digest is saved even if the closing audit line fails, so the
+    # message is never sent twice; the "pending" record already holds the
+    # full evidence, and the failure is surfaced through the exit code.
     _save_state(args.state_path, {
         "last_digest": digest,
         "last_sent_at": datetime.now(timezone.utc).isoformat(),
         "symbols": [str(r.get("symbol")) for r in qualifying],
+        "audit_event_id": event_id,
     })
-    _append_audit(args.audit_path, {
-        "event_type": "premarket_alert_sent",
-        "as_of_date": as_of.isoformat(),
-        "built_at_utc": built_at.isoformat(),
-        "built_at_new_york": _new_york_time(built_at),
-        "min_score": args.min_score,
-        "gates": {
-            "dte_min": args.dte_min, "dte_max": args.dte_max,
-            "max_atm_spread_pct": MAX_ATM_SPREAD_PCT,
-            "atm_iv_range": [MIN_PLAUSIBLE_ATM_IV, MAX_PLAUSIBLE_ATM_IV],
-        },
-        "screened": {"universe_size": table.get("universe_size"), "rows": len(rows),
-                     "in_entry_window": table.get("in_entry_window")},
-        "dropped": dropped,
-        "message": message,
-        "setups": [{"row": row, "score_breakdown": score_breakdown(row)} for row in qualifying],
-    })
+    if not _try_append_audit(args.audit_path, {
+        "event_type": "premarket_alert", "event_id": event_id, "status": "sent",
+        "sent_at_utc": datetime.now(timezone.utc).isoformat(),
+    }):
+        logger.error("Alert %s was sent but its 'sent' audit line could not be written.", event_id)
+        return 1
     logger.info("Alert sent to %s (%s setups).", result.get("to"), len(qualifying))
     return 0
 
