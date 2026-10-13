@@ -58,6 +58,7 @@ from services.outcome_recorder import (
     make_snapshot_hash,
     make_trade_id,
 )
+from services import provider_reliability as reliability
 from services.provider_telemetry import (
     bind_candidate as bind_telemetry_candidate,
     classify_error,
@@ -139,6 +140,27 @@ def _record_skip(summary: Dict[str, Any], reason: str) -> None:
     summary["skipped"] += 1
     skip_reasons = summary.setdefault("skip_reasons", {})
     skip_reasons[reason] = int(skip_reasons.get(reason, 0)) + 1
+
+
+def _start_candidate(candidate_key: str) -> None:
+    """Tag telemetry with the candidate and start its provider-skip log."""
+    bind_telemetry_candidate(candidate_key)
+    reliability.start_skip_log()
+
+
+def _provider_skip_reason() -> Optional[str]:
+    """Why this candidate's provider calls were skipped (budget, open breaker), if any were."""
+    skips = reliability.current_skips()
+    return str(skips[0]["reason"]) if skips else None
+
+
+def _with_provider_skips(detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    out = dict(detail or {})
+    skips = reliability.current_skips()
+    if skips:
+        out["provider_skips"] = skips[:5]
+        out["provider_skip_count"] = len(skips)
+    return out
 
 
 def _analyze_for_forward_loop(
@@ -1907,7 +1929,8 @@ def run_forward_screener(*, cycle_run_id: Optional[str] = None, today: Optional[
     """Entry pass. Provider telemetry written during it carries the run id and
     the candidate (symbol|earnings date) it served."""
     cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(today or date.today())
-    with telemetry_context(cycle_run_id=cycle_id):
+    with telemetry_context(cycle_run_id=cycle_id), reliability.skip_log_scope(), \
+            reliability.request_priority(reliability.PRIORITY_ENTRY):
         return _run_forward_screener(cycle_run_id=cycle_id, today=today, **kwargs)
 
 
@@ -1932,12 +1955,14 @@ def _run_forward_screener(
     # Per-candidate stage record (measurement only; never recorded on dry runs).
     funnel_store = None if dry_run else (funnel or funnel_mod.get_evidence_funnel())
     cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(as_of)
-    screener_payload = _build_forward_discovery_payload(
-        today=as_of,
-        symbols=symbols,
-        screener_builder=screener_builder,
-        mda_client=mda_client,
-    )
+    # The discovery sweep is the lowest budget tier: it stops first.
+    with reliability.request_priority(reliability.PRIORITY_DISCOVERY):
+        screener_payload = _build_forward_discovery_payload(
+            today=as_of,
+            symbols=symbols,
+            screener_builder=screener_builder,
+            mda_client=mda_client,
+        )
     summary = {
         "entries": 0,
         "duplicates": 0,
@@ -1971,7 +1996,7 @@ def _run_forward_screener(
         symbol = str(row.get("symbol") or "").upper()
         if not symbol:
             continue
-        bind_telemetry_candidate(f"{symbol}|{row.get('earnings_date') or ''}")
+        _start_candidate(f"{symbol}|{row.get('earnings_date') or ''}")
 
         def _funnel(stage: str, outcome: str, reason: Optional[str] = None, **extra: Any) -> None:
             funnel_mod.safe_record(
@@ -2019,7 +2044,8 @@ def _run_forward_screener(
             _record_skip(summary, funnel_mod.REASON_ANALYZER_ERROR)
             reason = f"{funnel_mod.REASON_ANALYZER_ERROR}:{type(exc).__name__}"
             logger.warning("forward_loop: analysis failed for %s: %s", symbol, exc)
-            _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ERROR, reason, detail={"error": str(exc)[:300]})
+            _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ERROR, reason,
+                    detail=_with_provider_skips({"error": str(exc)[:300]}))
             _append_learning_log(
                 log_path,
                 {"event_type": "skip", "symbol": symbol, "structure": None, "setup_score": None,
@@ -2042,7 +2068,7 @@ def _run_forward_screener(
             selected_structure=structure,
         )
         _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
-                earnings_date=earnings_date or row.get("earnings_date"))
+                earnings_date=earnings_date or row.get("earnings_date"), detail=_with_provider_skips() or None)
         if not dry_run:
             try:
                 record_recommendation(
@@ -2197,10 +2223,14 @@ def _run_forward_screener(
             phase="entry",
         ).to_dict()
         if entry_mid is None or entry_mid <= 0:
+            # A skipped provider call (budget, open breaker) that the fallback
+            # could not cover is the disposition, not the fallback's symptom.
+            quote_reason = str(quote.get("reason", "missing_entry_mid"))
             _funnel(funnel_mod.STAGE_RECORDED, funnel_mod.OUTCOME_DROPPED,
-                    f"{funnel_mod.REASON_MISSING_ENTRY_QUOTE}:{quote.get('reason', 'missing_entry_mid')}",
+                    f"{funnel_mod.REASON_MISSING_ENTRY_QUOTE}:{_provider_skip_reason() or quote_reason}",
                     recommendation_id=recommendation_id, earnings_date=earnings_date,
-                    detail={"quote_source": quote.get("quote_source")})
+                    detail=_with_provider_skips({"quote_source": quote.get("quote_source"),
+                                                 "quote_reason": quote_reason}))
             _record_skip(summary, str(quote.get("reason", "missing_entry_mid")))
             _append_learning_log(
                 log_path,
@@ -2318,9 +2348,10 @@ def _run_forward_screener(
             summary["entries"] += 1
             _funnel(funnel_mod.STAGE_RECORDED, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
                     trade_id=trade_id, earnings_date=earnings_date,
-                    detail={"evidence_quality_status": evidence_quality.get("evidence_quality_status"),
-                            "claim_allowed": bool(evidence_quality.get("claim_allowed")),
-                            "evidence_quality_reasons": evidence_quality.get("evidence_quality_reasons", [])})
+                    detail=_with_provider_skips({
+                        "evidence_quality_status": evidence_quality.get("evidence_quality_status"),
+                        "claim_allowed": bool(evidence_quality.get("claim_allowed")),
+                        "evidence_quality_reasons": evidence_quality.get("evidence_quality_reasons", [])}))
             _append_learning_log(
                 log_path,
                 {
@@ -2431,7 +2462,9 @@ def run_exit_detection(*, cycle_run_id: Optional[str] = None, today: Optional[da
                        **kwargs: Any) -> Dict[str, int]:
     """Exit pass; telemetry carries the run id and the trade being exited."""
     cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(today or date.today())
-    with telemetry_context(cycle_run_id=cycle_id):
+    # Exits re-price open trades: the highest budget tier.
+    with telemetry_context(cycle_run_id=cycle_id), reliability.skip_log_scope(), \
+            reliability.request_priority(reliability.PRIORITY_EXIT):
         return _run_exit_detection(cycle_run_id=cycle_id, today=today, **kwargs)
 
 
@@ -2595,7 +2628,7 @@ def _run_exit_detection(
     due_rows: Dict[str, Dict[str, Any]] = {}
     for row in trade_store.trades_due_for_exit(as_of):
         trade_id = str(row["trade_id"])
-        bind_telemetry_candidate(trade_id)
+        _start_candidate(trade_id)
         due_rows[trade_id] = dict(row)
         _funnel_trade(row, funnel_mod.STAGE_EXIT_DUE, funnel_mod.OUTCOME_ADVANCED)
         structure = str(row["structure"])
@@ -2665,7 +2698,12 @@ def _run_exit_detection(
             quote = {**quote, "mid": None, "reason": "booked_contract_mismatch"}
         if exit_mid is None:
             summary["skipped"] += 1
-            _record_failed_exit(trade_id, str(quote.get("reason", "missing_exit_mid")))
+            exit_reason = str(quote.get("reason", "missing_exit_mid"))
+            if exit_reason != "booked_contract_mismatch":
+                # A provider call skipped for budget or an open breaker is why
+                # the exit went unpriced, not the fallback's symptom.
+                exit_reason = _provider_skip_reason() or exit_reason
+            _record_failed_exit(trade_id, exit_reason)
             _append_learning_log(
                 log_path,
                 {

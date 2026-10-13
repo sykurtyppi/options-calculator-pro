@@ -13,16 +13,20 @@ Credit budget (100k/day):
 
 from __future__ import annotations
 
+import math
 import os
+import random
 import time
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timezone, date as date_type
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 
+from services import provider_reliability as reliability
 from services.provider_telemetry import classify_error, record_provider_telemetry
 from services.option_surface_quality import diagnose_option_surface_quality
 
@@ -72,8 +76,9 @@ class MarketDataClient:
     """
     Thin, cache-enabled wrapper around the MarketData.app REST API.
 
-    The cache is an in-process dict keyed on (url, sorted params).
-    TTL varies by endpoint:
+    The cache is an in-process dict keyed on (url, sorted params), backed for
+    historical chains, earnings and expirations by a shared on-disk cache
+    (services.provider_reliability). TTL varies by endpoint:
       - Live option chains: 60 s
       - Historical option chains: 24 h (immutable after settlement)
       - Earnings calendar: 1 h
@@ -85,11 +90,23 @@ class MarketDataClient:
     # so consumers can report the active provider without an isinstance check.
     provider_name = "marketdata_app"
 
-    def __init__(self, token: Optional[str] = None):
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        *,
+        response_cache: Any = None,
+        sleep: Callable[[float], None] = time.sleep,
+        rng: Optional[random.Random] = None,
+    ):
         # Explicit token argument takes precedence.
         # Passing token="" should intentionally disable API usage (useful for tests/fallback paths).
         self.token = os.environ.get(_MARKETDATA_TOKEN_ENV, "") if token is None else token
         self._cache: Dict[str, Tuple[float, Any]] = {}
+        # Shared on-disk cache for slow-moving endpoints: None uses the default
+        # store, False disables it.
+        self._response_cache = response_cache
+        self._sleep = sleep
+        self._rng = rng or random.Random()
         self._earnings_endpoint_blocked: bool = False
         # Per-symbol oldest historical date that returned 402 for chain endpoint.
         # Requests at or before this date are skipped for the current process.
@@ -445,8 +462,11 @@ class MarketDataClient:
         cache_ttl: float = 60.0,
     ) -> Dict[str, Any]:
         """
-        Issue a GET request with caching and retry on 429 (rate-limit).
-        Raises MarketDataError on persistent failure.
+        Issue a GET request with caching, the daily credit budget, a circuit
+        breaker, and retries with jittered backoff on transient failures
+        (429, 5xx, timeouts, connection errors). Other HTTP errors are not
+        retried. Raises MarketDataError on failure or when the call is skipped.
+        Logs one telemetry row per logical request.
         """
         cache_key = url + "|" + str(sorted((params or {}).items()))
         now = time.monotonic()
@@ -457,11 +477,53 @@ class MarketDataClient:
             if now - ts < cache_ttl:
                 return cached
 
+        disk_cache = self._disk_cache() if _persistable(endpoint_type, params) else None
+        if disk_cache is not None:
+            stored = disk_cache.get(cache_key)
+            if isinstance(stored, dict):
+                self._cache[cache_key] = (now, stored)
+                return stored
+
+        provider = self.provider_name
+        priority = reliability.current_priority()
+        estimate = _estimated_credits(endpoint_type, params)
+        skip_reason = reliability.blocked_reason(provider, priority, estimate)
+        if skip_reason is not None:
+            # Not sent, so not a provider request: a pipeline row.
+            record_provider_telemetry(
+                provider_name=provider,
+                endpoint_type=endpoint_type,
+                request_kind="pipeline",
+                symbol=symbol,
+                success=False,
+                error_category=skip_reason,
+                response_quality_note=f"priority={priority}",
+            )
+            reliability.note_skip(provider=provider, endpoint_type=endpoint_type, reason=skip_reason, symbol=symbol)
+            try:
+                reliability.get_credit_budget().record_skip(provider, priority)
+            except Exception:  # noqa: BLE001
+                logger.debug("MDApp budget skip not recorded", exc_info=True)
+            raise MarketDataError(f"MDApp call skipped: {skip_reason}")
+
+        breaker = reliability.get_breaker(provider)
         max_retries = 3
-        backoff = 1.5
         start = time.perf_counter()
-        retried = False
+        last_category = "unknown_error"
+
+        def _fail(category: str, note: Optional[str] = None) -> None:
+            record_provider_telemetry(
+                provider_name=provider,
+                endpoint_type=endpoint_type,
+                symbol=symbol,
+                success=False,
+                error_category=category,
+                latency_ms=(time.perf_counter() - start) * 1000.0,
+                response_quality_note=note,
+            )
+
         for attempt in range(max_retries):
+            retry_after: Any = None
             try:
                 resp = requests.get(
                     url,
@@ -469,76 +531,72 @@ class MarketDataClient:
                     params=params,
                     timeout=15,
                 )
-                if resp.status_code == 429:
-                    retried = True
-                    wait = backoff * (attempt + 1)
-                    logger.warning("MDApp rate-limited, waiting %.1fs (attempt %d)", wait, attempt + 1)
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                data: Dict[str, Any] = resp.json()
-                self._cache[cache_key] = (now, data)
-                record_provider_telemetry(
-                    provider_name="marketdata_app",
-                    endpoint_type=endpoint_type,
-                    symbol=symbol,
-                    success=True,
-                    latency_ms=(time.perf_counter() - start) * 1000.0,
-                    response_quality_note="retried_after_rate_limit" if retried else None,
-                )
-                return data
             except requests.exceptions.Timeout:
+                last_category = "timeout"
                 logger.warning("MDApp request timeout (attempt %d): %s", attempt + 1, url)
-                if attempt == max_retries - 1:
+            except requests.exceptions.ConnectionError as exc:
+                last_category = "connection_error"
+                logger.warning("MDApp connection error (attempt %d): %s", attempt + 1, exc)
+            except requests.exceptions.RequestException as exc:
+                _fail(classify_error(str(exc)))
+                raise MarketDataError(f"MDApp request error: {exc}") from exc
+            else:
+                status = resp.status_code if isinstance(resp.status_code, int) else 200
+                if status == 429 or status >= 500:
+                    last_category = "rate_limited" if status == 429 else "server_error"
+                    retry_after = _header_map(resp).get("retry-after")
+                    logger.warning("MDApp HTTP %d (attempt %d): %s", status, attempt + 1, url)
+                else:
+                    try:
+                        resp.raise_for_status()
+                        data: Dict[str, Any] = resp.json()
+                    except requests.exceptions.HTTPError as exc:
+                        # A client error (auth, entitlement, not found) will not
+                        # change on retry and says nothing about provider health.
+                        _fail(classify_error(str(exc)))
+                        raise MarketDataError(f"MDApp HTTP error: {exc}") from exc
+                    except Exception as exc:
+                        _fail(classify_error(str(exc)))
+                        raise
+                    breaker.record_success()
+                    self._charge(resp, data, endpoint_type, params, priority, estimate)
+                    self._cache[cache_key] = (now, data)
+                    if disk_cache is not None:
+                        disk_cache.put(cache_key, data, cache_ttl)
                     record_provider_telemetry(
-                        provider_name="marketdata_app",
+                        provider_name=provider,
                         endpoint_type=endpoint_type,
                         symbol=symbol,
-                        success=False,
-                        error_category="timeout",
+                        success=True,
                         latency_ms=(time.perf_counter() - start) * 1000.0,
+                        response_quality_note=f"retried:{attempt}" if attempt else None,
                     )
-                    raise MarketDataError(f"MDApp timeout after {max_retries} attempts: {url}")
-            except requests.exceptions.HTTPError as exc:
-                record_provider_telemetry(
-                    provider_name="marketdata_app",
-                    endpoint_type=endpoint_type,
-                    symbol=symbol,
-                    success=False,
-                    error_category=classify_error(str(exc)),
-                    latency_ms=(time.perf_counter() - start) * 1000.0,
-                )
-                raise MarketDataError(f"MDApp HTTP error: {exc}") from exc
-            except requests.exceptions.RequestException as exc:
-                record_provider_telemetry(
-                    provider_name="marketdata_app",
-                    endpoint_type=endpoint_type,
-                    symbol=symbol,
-                    success=False,
-                    error_category=classify_error(str(exc)),
-                    latency_ms=(time.perf_counter() - start) * 1000.0,
-                )
-                raise MarketDataError(f"MDApp request error: {exc}") from exc
-            except Exception as exc:
-                record_provider_telemetry(
-                    provider_name="marketdata_app",
-                    endpoint_type=endpoint_type,
-                    symbol=symbol,
-                    success=False,
-                    error_category=classify_error(str(exc)),
-                    latency_ms=(time.perf_counter() - start) * 1000.0,
-                )
-                raise
+                    return data
+            if attempt < max_retries - 1:
+                self._sleep(reliability.retry_delay(attempt, retry_after=retry_after, rng=self._rng))
 
-        record_provider_telemetry(
-            provider_name="marketdata_app",
-            endpoint_type=endpoint_type,
-            symbol=symbol,
-            success=False,
-            error_category="rate_limited" if retried else "unknown_error",
-            latency_ms=(time.perf_counter() - start) * 1000.0,
-        )
-        raise MarketDataError(f"MDApp max retries exceeded: {url}")
+        breaker.record_failure()
+        _fail(last_category, note=f"failed after {max_retries} attempts")
+        raise MarketDataError(f"MDApp {last_category} after {max_retries} attempts: {url}")
+
+    def _disk_cache(self) -> Optional["reliability.ResponseCache"]:
+        if self._response_cache is False:
+            return None
+        return self._response_cache or reliability.get_response_cache()
+
+    def _charge(self, resp: Any, data: Dict[str, Any], endpoint_type: str,
+                params: Optional[Dict[str, Any]], priority: str, estimate: float) -> None:
+        headers = _header_map(resp)
+        consumed = _header_number(headers, "x-api-ratelimit-consumed")
+        credits = consumed if consumed is not None else _actual_credits(endpoint_type, params, data, estimate)
+        try:
+            reliability.get_credit_budget().charge(
+                self.provider_name, priority, credits,
+                reported_limit=_header_number(headers, "x-api-ratelimit-limit"),
+                reported_remaining=_header_number(headers, "x-api-ratelimit-remaining"),
+            )
+        except Exception:  # noqa: BLE001 - accounting must not lose a good response
+            logger.debug("MDApp credit charge not recorded", exc_info=True)
 
     @staticmethod
     def _chain_response_to_df(data: Dict[str, Any]) -> pd.DataFrame:
@@ -644,3 +702,52 @@ def _marketdata_endpoint_from_url(url: str) -> Tuple[str, Optional[str]]:
         idx = parts.index("expirations")
         return "options_expirations", parts[idx + 1].upper() if idx + 1 < len(parts) else None
     return "unknown", None
+
+
+# Endpoints whose payload does not move within its TTL. Live chains and quotes
+# are never shared across processes (a later run must not price the present
+# with an older quote).
+def _persistable(endpoint_type: str, params: Optional[Dict[str, Any]]) -> bool:
+    if endpoint_type in {"earnings", "options_expirations"}:
+        return True
+    return endpoint_type == "options_chain" and bool((params or {}).get("date"))
+
+
+def _estimated_credits(endpoint_type: str, params: Optional[Dict[str, Any]]) -> float:
+    """Upper-bound cost of a call, used to admit it under the budget."""
+    params = params or {}
+    if endpoint_type != "options_chain" or params.get("date"):
+        return 1.0
+    # Live chains cost one credit per contract returned.
+    strikes = max(1, int(params.get("strikeLimit") or 20))
+    sides = 1 if params.get("side") else 2
+    expirations = 12 if str(params.get("expiration") or "").lower() == "all" else 1
+    return float(strikes * sides * expirations)
+
+
+def _actual_credits(endpoint_type: str, params: Optional[Dict[str, Any]], data: Dict[str, Any],
+                    estimate: float) -> float:
+    """Cost of a served call when the provider did not report it."""
+    if endpoint_type != "options_chain":
+        return 1.0
+    contracts = data.get("optionSymbol") if isinstance(data, dict) else None
+    if not isinstance(contracts, list):
+        return 1.0 if (params or {}).get("date") else estimate
+    if (params or {}).get("date"):
+        return float(max(1, math.ceil(len(contracts) / 1000)))
+    return float(max(1, len(contracts)))
+
+
+def _header_map(resp: Any) -> Dict[str, Any]:
+    headers = getattr(resp, "headers", None)
+    if not isinstance(headers, Mapping):
+        return {}
+    return {str(key).lower(): value for key, value in headers.items()}
+
+
+def _header_number(headers: Dict[str, Any], name: str) -> Optional[float]:
+    try:
+        value = float(headers[name])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None

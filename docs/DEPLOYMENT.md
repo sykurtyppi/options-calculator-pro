@@ -140,6 +140,8 @@ import.
 | `OPTIONS_CALCULATOR_MAX_ML_RUNNING_JOBS` | 1 | Concurrency cap for ML training. |
 | `EVIDENCE_CYCLE_TIMEOUT_SECONDS` | 7200 | Hard cap for daily evidence cycle. |
 | `CANDIDATE_EXIT_RESOLVER_TIMEOUT_SECONDS` | 1800 | Hard cap for resolver. |
+| `OPTIONS_CALCULATOR_MARKETDATA_DAILY_CREDITS` | 100000 | MarketData.app daily credit limit for the budget (`services/provider_reliability.py`). The limit the API reports in its rate-limit headers takes precedence once seen. Discovery stops at 60% of the day's credits, entries at 85%; exits may use the rest. |
+| `OPTIONS_CALCULATOR_PROVIDER_DISK_CACHE` | 1 | Set `0` to turn off the shared on-disk cache for MarketData.app earnings, expirations and historical chains (`~/.options_calculator_pro/cache/`). Live chains and quotes are never cached on disk. |
 | `LOG_ROTATION_TIMEOUT_SECONDS` | 300 | Hard cap for log rotation. |
 
 ### D. Frontend build-time

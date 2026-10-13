@@ -32,8 +32,9 @@ from utils.quotes import safe_mid_series
 from services.earnings_move_profile import (
     normalize_release_timing as _normalize_release_timing_shared,
 )
+from services import provider_reliability as reliability
 from services.option_surface_quality import diagnose_option_surface_quality
-from services.provider_telemetry import record_provider_telemetry
+from services.provider_telemetry import classify_error, record_provider_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +114,26 @@ class YFinanceMarketDataClient:
             # silently substituting today's chain for a past date.
             return pd.DataFrame()
 
+        breaker = reliability.get_breaker(self.provider_name)
+        if not breaker.allow():
+            # Yahoo has been failing (rate limits, outages): skip the call for
+            # the cool-down instead of hammering it. Not sent, so a pipeline row.
+            record_provider_telemetry(
+                provider_name=self.provider_name,
+                endpoint_type="options_chain_quality",
+                request_kind="pipeline",
+                symbol=symbol,
+                success=False,
+                error_category=reliability.SKIP_CIRCUIT_OPEN,
+            )
+            reliability.note_skip(provider=self.provider_name, endpoint_type="options_chain",
+                                  reason=reliability.SKIP_CIRCUIT_OPEN, symbol=symbol)
+            return pd.DataFrame()
+
         try:
             t = self._ticker_factory(symbol)
             all_exps = list(t.options or [])
+            breaker.record_success()   # Yahoo answered, even if with nothing listed
             if not all_exps:
                 return self._empty_chain_telemetry(symbol, start, "no_expirations")
 
@@ -140,7 +158,10 @@ class YFinanceMarketDataClient:
             frame = pd.concat(nonempty, ignore_index=True) if nonempty else pd.DataFrame()
         except Exception as exc:
             logger.warning("yfinance get_option_chain(%s) failed: %s", symbol, exc)
-            return self._empty_chain_telemetry(symbol, start, "fetch_error")
+            category = classify_error(f"{type(exc).__name__}: {exc}")
+            if _is_transient_failure(exc, category):
+                breaker.record_failure()
+            return self._empty_chain_telemetry(symbol, start, "fetch_error", error_category=category)
 
         if frame.empty:
             return self._empty_chain_telemetry(symbol, start, "empty_after_normalize")
@@ -244,7 +265,8 @@ class YFinanceMarketDataClient:
             return df[((df["side"] == "call") & (df["strike"] > spot)) | ((df["side"] == "put") & (df["strike"] < spot))]
         return df
 
-    def _empty_chain_telemetry(self, symbol: str, start: float, note: str) -> pd.DataFrame:
+    def _empty_chain_telemetry(self, symbol: str, start: float, note: str,
+                               error_category: str = "empty_response") -> pd.DataFrame:
         record_provider_telemetry(
             provider_name=self.provider_name,
             # The only row for this fetch (no separate request row), so it is
@@ -253,7 +275,7 @@ class YFinanceMarketDataClient:
             request_kind="request",
             symbol=symbol,
             success=False,
-            error_category="empty_response",
+            error_category=error_category,
             response_quality_note=note,
             latency_ms=(time.perf_counter() - start) * 1000.0,
         )
@@ -352,6 +374,14 @@ class YFinanceMarketDataClient:
             return "during market hours"
         except Exception:
             return None
+
+
+def _is_transient_failure(exc: BaseException, category: str) -> bool:
+    """A failure that says Yahoo itself is unhealthy, not that one symbol is bad."""
+    if category in {"timeout", "rate_limited", "http_error"}:
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    return "connection" in text or "too many requests" in text
 
 
 def _to_float(value: Any) -> Optional[float]:
