@@ -223,6 +223,7 @@ class MarketDataClient:
             record_provider_telemetry(
                 provider_name="marketdata_app",
                 endpoint_type="options_chain_quality",
+                request_kind="quality",
                 symbol=symbol,
                 success=False,
                 error_category="empty_response",
@@ -246,6 +247,7 @@ class MarketDataClient:
             record_provider_telemetry(
                 provider_name="marketdata_app",
                 endpoint_type="options_chain_quality",
+                request_kind="quality",
                 symbol=symbol,
                 success=False,
                 error_category="empty_response",
@@ -302,6 +304,7 @@ class MarketDataClient:
             record_provider_telemetry(
                 provider_name="marketdata_app",
                 endpoint_type="earnings_quality",
+                request_kind="quality",
                 symbol=symbol,
                 success=False,
                 error_category="empty_response",
@@ -317,6 +320,7 @@ class MarketDataClient:
             record_provider_telemetry(
                 provider_name="marketdata_app",
                 endpoint_type="earnings_quality",
+                request_kind="quality",
                 symbol=symbol,
                 success=False,
                 error_category="empty_response",
@@ -402,6 +406,7 @@ class MarketDataClient:
             record_provider_telemetry(
                 provider_name="marketdata_app",
                 endpoint_type="quote_quality",
+                request_kind="quality",
                 symbol=symbol,
                 success=False,
                 error_category="empty_response",
@@ -418,6 +423,7 @@ class MarketDataClient:
         record_provider_telemetry(
             provider_name="marketdata_app",
             endpoint_type="quote_quality",
+            request_kind="quality",
             symbol=symbol,
             success=False,
             error_category="empty_response",

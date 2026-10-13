@@ -157,7 +157,10 @@ class YFinanceMarketDataClient:
 
         record_provider_telemetry(
             provider_name=self.provider_name,
+            # The only row for this fetch (no separate request row), so it is
+            # the request outcome, not a quality verdict on another row.
             endpoint_type="options_chain_quality",
+            request_kind="request",
             symbol=symbol,
             success=True,
             latency_ms=(time.perf_counter() - start) * 1000.0,
@@ -244,7 +247,10 @@ class YFinanceMarketDataClient:
     def _empty_chain_telemetry(self, symbol: str, start: float, note: str) -> pd.DataFrame:
         record_provider_telemetry(
             provider_name=self.provider_name,
+            # The only row for this fetch (no separate request row), so it is
+            # the request outcome, not a quality verdict on another row.
             endpoint_type="options_chain_quality",
+            request_kind="request",
             symbol=symbol,
             success=False,
             error_category="empty_response",

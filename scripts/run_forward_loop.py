@@ -58,7 +58,12 @@ from services.outcome_recorder import (
     make_snapshot_hash,
     make_trade_id,
 )
-from services.provider_telemetry import classify_error, record_provider_telemetry
+from services.provider_telemetry import (
+    bind_candidate as bind_telemetry_candidate,
+    classify_error,
+    record_provider_telemetry,
+    telemetry_context,
+)
 from services.recommendation_ledger import (
     RecommendationLedger,
     make_recommendation_id,
@@ -863,25 +868,33 @@ def fetch_structure_quote(
 ) -> Dict[str, Any]:
     start = time.perf_counter()
     resolved_mda_client = _get_marketdata_client(mda_client) if mda_client is not None else None
+    # The injected client may be the yfinance client (the default provider):
+    # label data with the provider that actually served it.
+    client_provider = str(getattr(resolved_mda_client, "provider_name", None) or "marketdata_app")
     quote_source = "yfinance"
     quote_quality = "paper_research_mid_not_execution_grade"
+    chain_from_client = False
 
+    # These rows are outcomes of this function (a usable structure quote or
+    # not), not provider calls; the calls log their own request rows.
     def _record_quote(success: bool, reason: Optional[str] = None) -> None:
         record_provider_telemetry(
             provider_name=quote_source,
             endpoint_type="forward_loop_option_quote",
+            request_kind="pipeline",
             symbol=symbol,
             success=success,
             error_category=None if success else classify_error(reason or "empty_response"),
             latency_ms=(time.perf_counter() - start) * 1000.0,
-            fallback_used=quote_source == "yfinance",
+            fallback_used=quote_source == "yfinance" and client_provider != "yfinance",
             response_quality_note=reason or "paper/research option-chain mid, not execution-grade",
         )
 
     def _record_marketdata_fallback(reason: str) -> None:
         record_provider_telemetry(
-            provider_name="marketdata_app",
+            provider_name=client_provider,
             endpoint_type="forward_loop_option_quote",
+            request_kind="pipeline",
             symbol=symbol,
             success=False,
             error_category=classify_error(reason),
@@ -943,8 +956,13 @@ def fetch_structure_quote(
         )
         mda_calls, mda_puts = _split_marketdata_chain(mda_chain)
         if not mda_calls.empty and not mda_puts.empty:
-            quote_source = "marketdata_app"
-            quote_quality = "marketdata_app_paper_research_mid_not_execution_grade"
+            chain_from_client = True
+            quote_source = client_provider
+            quote_quality = (
+                "marketdata_app_paper_research_mid_not_execution_grade"
+                if client_provider == "marketdata_app"
+                else "paper_research_mid_not_execution_grade"
+            )
             front_calls, front_puts = mda_calls, mda_puts
             chain_spot = _spot_from_marketdata_chain(mda_chain)
             if chain_spot is not None:
@@ -1405,7 +1423,7 @@ def fetch_structure_quote(
 
     if structure in {"call_calendar", "put_calendar"}:
         front_frame = front_calls if structure == "call_calendar" else front_puts
-        if quote_source == "marketdata_app" and resolved_mda_client is not None:
+        if chain_from_client and resolved_mda_client is not None:
             mda_back_chain = resolved_mda_client.get_option_chain(
                 symbol,
                 expiration=str(pricing_context["back_expiry"]),
@@ -1884,7 +1902,16 @@ def _finalize_baseline_exits(
     return summary
 
 
-def run_forward_screener(
+def run_forward_screener(*, cycle_run_id: Optional[str] = None, today: Optional[date] = None,
+                         **kwargs: Any) -> Dict[str, Any]:
+    """Entry pass. Provider telemetry written during it carries the run id and
+    the candidate (symbol|earnings date) it served."""
+    cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(today or date.today())
+    with telemetry_context(cycle_run_id=cycle_id):
+        return _run_forward_screener(cycle_run_id=cycle_id, today=today, **kwargs)
+
+
+def _run_forward_screener(
     *,
     today: Optional[date] = None,
     dry_run: bool = False,
@@ -1944,6 +1971,7 @@ def run_forward_screener(
         symbol = str(row.get("symbol") or "").upper()
         if not symbol:
             continue
+        bind_telemetry_candidate(f"{symbol}|{row.get('earnings_date') or ''}")
 
         def _funnel(stage: str, outcome: str, reason: Optional[str] = None, **extra: Any) -> None:
             funnel_mod.safe_record(
@@ -2399,7 +2427,15 @@ def _realized_trade_math(
     return gross_return_pct, pnl_per_share * 100.0, expansion_pct
 
 
-def run_exit_detection(
+def run_exit_detection(*, cycle_run_id: Optional[str] = None, today: Optional[date] = None,
+                       **kwargs: Any) -> Dict[str, int]:
+    """Exit pass; telemetry carries the run id and the trade being exited."""
+    cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(today or date.today())
+    with telemetry_context(cycle_run_id=cycle_id):
+        return _run_exit_detection(cycle_run_id=cycle_id, today=today, **kwargs)
+
+
+def _run_exit_detection(
     *,
     today: Optional[date] = None,
     dry_run: bool = False,
@@ -2559,6 +2595,7 @@ def run_exit_detection(
     due_rows: Dict[str, Dict[str, Any]] = {}
     for row in trade_store.trades_due_for_exit(as_of):
         trade_id = str(row["trade_id"])
+        bind_telemetry_candidate(trade_id)
         due_rows[trade_id] = dict(row)
         _funnel_trade(row, funnel_mod.STAGE_EXIT_DUE, funnel_mod.OUTCOME_ADVANCED)
         structure = str(row["structure"])
