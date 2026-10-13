@@ -171,7 +171,8 @@ def test_every_entry_drop_point_is_recorded_with_a_reason(tmp_path, funnel):
     assert events["LATE"]["data_qualified"] == ("dropped", ef.REASON_TOO_LATE)
     assert events["BROKEN"]["analyzed"] == ("error", "analyzer_error:ValueError")
     assert events["NOTRADE"]["eligible"] == ("dropped", "no_trade:no_trade_low_edge")
-    assert events["NOQUOTE"]["recorded"] == ("dropped", "missing_entry_quote:missing_entry_mid")
+    # Still inside its entry window, so retried on the next cycle (F4).
+    assert events["NOQUOTE"]["recorded"] == ("deferred", "missing_entry_quote:missing_entry_mid")
     assert events["GOOD"]["recorded"] == ("advanced", None)
     assert all(stage["discovered"] == ("advanced", None) for stage in events.values())
 

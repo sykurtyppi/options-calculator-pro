@@ -988,6 +988,7 @@ def _forward_record(
     selected_structure: str = "call_calendar",
     sample_provenance: str = "forward_post_freeze",
     candidate_shadow_outcome: Optional[dict] = None,
+    symbol: str = "AAPL",
 ):
     """Build a forward-post-freeze ledger record shaped the way the
     PR-AE live API path will produce one: candidate_shadow_outcome
@@ -996,7 +997,7 @@ def _forward_record(
     from services.recommendation_ledger import build_record_from_analysis
 
     analysis = SimpleNamespace(
-        symbol="AAPL",
+        symbol=symbol,
         recommendation="Candidate",
         setup_score=0.72,
         metrics={
@@ -1035,7 +1036,7 @@ def _forward_record(
              "composite_structure_score": 0.81},
         ],
         vol_snapshot={
-            "symbol": "AAPL",
+            "symbol": symbol,
             "as_of_date": as_of_date,
             "earnings_date": earnings_date,
             "earnings_source_primary": "alpha_vantage",
@@ -1331,18 +1332,21 @@ def test_pr_ae_list_pending_filters_by_sample_provenance(tmp_path: Path) -> None
     # Forward row — eligible
     ledger.record(_forward_record(
         recommendation_id="rec_fw",
+        symbol="FW",
         sample_provenance="forward_post_freeze",
         earnings_date="2026-04-01",  # well in the past
     ))
     # Historical replay row — NOT eligible
     ledger.record(_forward_record(
         recommendation_id="rec_hist",
+        symbol="HIST",
         sample_provenance="historical_replay_in_sample_or_research",
         earnings_date="2026-04-01",
     ))
     # Unknown-provenance row — NOT eligible
     ledger.record(_forward_record(
         recommendation_id="rec_unknown",
+        symbol="UNKNOWN",
         sample_provenance="unknown",
         earnings_date="2026-04-01",
     ))
@@ -1359,16 +1363,19 @@ def test_pr_ae_list_pending_filters_by_selected_structure(tmp_path: Path) -> Non
     ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
     ledger.record(_forward_record(
         recommendation_id="rec_call",
+        symbol="CALL",
         selected_structure="call_calendar",
         earnings_date="2026-04-01",
     ))
     ledger.record(_forward_record(
         recommendation_id="rec_put",
+        symbol="PUT",
         selected_structure="put_calendar",
         earnings_date="2026-04-01",
     ))
     ledger.record(_forward_record(
         recommendation_id="rec_straddle",
+        symbol="STRADDLE",
         selected_structure="atm_straddle",
         earnings_date="2026-04-01",
     ))
@@ -1507,10 +1514,12 @@ def test_pr_ae_list_pending_excludes_rows_resolved_ok(tmp_path: Path) -> None:
     ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
     ledger.record(_forward_record(
         recommendation_id="rec_pending",
+        symbol="PENDING",
         earnings_date="2026-04-01",
     ))
     ledger.record(_forward_record(
         recommendation_id="rec_resolved",
+        symbol="RESOLVED",
         earnings_date="2026-04-01",
     ))
     # Resolve one with ok
@@ -1532,10 +1541,12 @@ def test_pr_ae_list_pending_excludes_permanently_failed_rows(tmp_path: Path) -> 
     ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
     ledger.record(_forward_record(
         recommendation_id="rec_active",
+        symbol="ACTIVE",
         earnings_date="2026-04-01",
     ))
     ledger.record(_forward_record(
         recommendation_id="rec_failed",
+        symbol="FAILED",
         earnings_date="2026-04-01",
     ))
     # Mark one with permanently_failed status
@@ -1562,10 +1573,12 @@ def test_pr_ae_list_pending_includes_retrying_and_awaiting_rows(tmp_path: Path) 
     ledger = RecommendationLedger(ledger_path=tmp_path / "ledger.sqlite")
     ledger.record(_forward_record(
         recommendation_id="rec_retrying",
+        symbol="RETRYING",
         earnings_date="2026-04-01",
     ))
     ledger.record(_forward_record(
         recommendation_id="rec_awaiting",
+        symbol="AWAITING",
         earnings_date="2026-04-01",
     ))
     ledger.record_resolution_payload(

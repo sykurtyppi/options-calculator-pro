@@ -78,6 +78,15 @@ def build_forward_performance_diagnostics(
     ]
 
     no_trade_count = sum(1 for row in ledger_rows if str(row.get("recommendation") or "") == "No Trade")
+    # An event analyzed on several days is one decision: its latest analysis.
+    latest_by_event: Dict[str, Dict[str, Any]] = {}
+    for row in ledger_rows:
+        key = row.get("event_key")
+        if key and int(row.get("event_sequence") or 0) >= int(latest_by_event.get(key, {}).get("event_sequence") or 0):
+            latest_by_event[str(key)] = row
+    no_trade_event_count = sum(
+        1 for row in latest_by_event.values() if str(row.get("recommendation") or "") == "No Trade"
+    )
     # Still awaiting an outcome. An 'exited' row with a finite result is
     # already counted as resolved, so it must not also count as open.
     open_count = sum(
@@ -101,6 +110,8 @@ def build_forward_performance_diagnostics(
         },
         "total_recommendations": len(ledger_rows),
         "no_trade_count": no_trade_count,
+        "total_events": len(latest_by_event),
+        "no_trade_event_count": no_trade_event_count,
         "open_outcome_count": open_count,
         "resolved_outcome_count": len(resolved),
         "invalidated_outcome_count": invalidated_count,

@@ -77,6 +77,14 @@ REASON_MISSING_ENTRY_QUOTE = "missing_entry_quote"  # :<quote reason>
 REASON_EXIT_FAILED = "exit_failed"                # :<reason>
 REASON_EXIT_MISSING = "exit_missing"              # :<reason>
 REASON_NOT_CLAIMABLE = "not_claimable"            # :<evidence quality reasons>
+REASON_RECHECK_EXPIRED = "recheck_expired"        # :<last deferral reason>
+
+# Re-check schedule (F4): a deferred event is looked at again on its recheck
+# date even if discovery does not surface it that day, and closes as done
+# (it reached a decision) or expired (its entry window passed first).
+RECHECK_PENDING = "pending"
+RECHECK_DONE = "done"
+RECHECK_EXPIRED = "expired"
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS funnel_cycles (
@@ -105,6 +113,18 @@ CREATE TABLE IF NOT EXISTS funnel_events (
 );
 CREATE INDEX IF NOT EXISTS idx_funnel_events_as_of ON funnel_events (as_of_date, stage);
 CREATE INDEX IF NOT EXISTS idx_funnel_events_symbol ON funnel_events (symbol, earnings_date);
+CREATE TABLE IF NOT EXISTS candidate_rechecks (
+    symbol             TEXT NOT NULL,
+    earnings_date      TEXT NOT NULL,
+    recheck_on         TEXT NOT NULL,
+    reason             TEXT NOT NULL,
+    status             TEXT NOT NULL,
+    attempts_json      TEXT NOT NULL,
+    first_deferred_on  TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    PRIMARY KEY (symbol, earnings_date)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_rechecks_due ON candidate_rechecks (status, recheck_on);
 """
 
 
@@ -261,6 +281,64 @@ class EvidenceFunnelStore:
             "conversion": conversion,
         }
 
+    # ── re-check schedule ───────────────────────────────────────────────────
+
+    def schedule_recheck(self, *, symbol: str, earnings_date: Any, recheck_on: date, reason: str,
+                         as_of: date) -> None:
+        """Defer an event to ``recheck_on``, keeping its attempt history."""
+        key = (str(symbol).upper(), _iso(earnings_date))
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            prior = self._conn.execute(
+                "SELECT attempts_json, first_deferred_on, status, recheck_on, reason FROM candidate_rechecks"
+                " WHERE symbol = ? AND earnings_date = ?",
+                key,
+            ).fetchone()
+            if (prior is not None and prior["status"] == RECHECK_PENDING and prior["reason"] == reason
+                    and prior["recheck_on"] == _iso(recheck_on)):
+                return  # already scheduled (e.g. a too-early event seen again)
+            attempts = json.loads(prior["attempts_json"]) if prior else []
+            attempts.append({"date": _iso(as_of), "reason": reason})
+            self._conn.execute(
+                """INSERT OR REPLACE INTO candidate_rechecks
+                   (symbol, earnings_date, recheck_on, reason, status, attempts_json, first_deferred_on, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (*key, _iso(recheck_on), reason, RECHECK_PENDING, json.dumps(attempts),
+                 prior["first_deferred_on"] if prior else _iso(as_of), now),
+            )
+            self._conn.commit()
+
+    def close_recheck(self, *, symbol: str, earnings_date: Any, status: str = RECHECK_DONE) -> Optional[Dict[str, Any]]:
+        """Close a pending re-check; returns it (with its attempts) or None if there was none."""
+        key = (str(symbol).upper(), _iso(earnings_date))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM candidate_rechecks WHERE symbol = ? AND earnings_date = ? AND status = ?",
+                (*key, RECHECK_PENDING),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "UPDATE candidate_rechecks SET status = ?, updated_at = ? WHERE symbol = ? AND earnings_date = ?",
+                (status, datetime.now(timezone.utc).isoformat(), *key),
+            )
+            self._conn.commit()
+        return _recheck_dict(row)
+
+    def pending_rechecks(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM candidate_rechecks WHERE status = ? ORDER BY recheck_on, symbol", (RECHECK_PENDING,)
+            ).fetchall()
+        return [_recheck_dict(row) for row in rows]
+
+    def recheck_counts(self) -> Dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM candidate_rechecks GROUP BY status").fetchall()
+        counts = {RECHECK_PENDING: 0, RECHECK_DONE: 0, RECHECK_EXPIRED: 0}
+        counts.update({str(row["status"]): int(row["n"]) for row in rows})
+        return counts
+
     def cycles_without_analysis(self, *, lookback: int = 10) -> int:
         """How many of the most recent cycles in a row discovered candidates but
         analyzed none (a stalled entry pipeline)."""
@@ -280,6 +358,12 @@ class EvidenceFunnelStore:
                 else:
                     break
             return streak
+
+
+def _recheck_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    out = dict(row)
+    out["attempts"] = json.loads(out.pop("attempts_json") or "[]")
+    return out
 
 
 def safe_record(store: Optional[EvidenceFunnelStore], **kwargs: Any) -> None:
@@ -321,6 +405,7 @@ def build_evidence_funnel_report(
             "last_7_days": funnel.summarize(since=as_of - timedelta(days=6), until=as_of),
             "last_30_days": funnel.summarize(since=as_of - timedelta(days=29), until=as_of),
             "cycles_without_analysis": stalled,
+            "rechecks": funnel.recheck_counts(),
             "warnings": [],
         }
     except Exception as exc:  # noqa: BLE001

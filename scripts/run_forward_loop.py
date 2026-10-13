@@ -154,6 +154,94 @@ def _provider_skip_reason() -> Optional[str]:
     return str(skips[0]["reason"]) if skips else None
 
 
+def _recheck_rows(funnel_store: Optional[EvidenceFunnelStore], *, as_of: date, cycle_id: str,
+                  discovered_rows: list[Dict[str, Any]], summary: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """Re-checks due today that discovery did not surface, as discovery rows.
+
+    Pending re-checks whose entry window has already closed expire here with a
+    funnel drop, so every deferred event ends with a recorded outcome.
+    """
+    if funnel_store is None:
+        return []
+    try:
+        pending = funnel_store.pending_rechecks()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forward_loop: re-check schedule unreadable: %s", exc)
+        return []
+    surfaced = {str(row.get("symbol") or "").upper() for row in discovered_rows}
+    added: list[Dict[str, Any]] = []
+    for item in pending:
+        if item["symbol"] in surfaced:
+            continue  # discovery listed it today: the entry pass decides (and closes) it
+        earnings = _parse_date(item.get("earnings_date"))
+        dte = (earnings - as_of).days if earnings is not None else None
+        if dte is None or dte < DTE_MIN_DEFAULT:
+            try:
+                funnel_store.close_recheck(symbol=item["symbol"], earnings_date=item["earnings_date"],
+                                           status=funnel_mod.RECHECK_EXPIRED)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("forward_loop: could not expire re-check for %s: %s", item["symbol"], exc)
+                continue
+            summary["rechecks_expired"] += 1
+            stage = (funnel_mod.STAGE_DATA_QUALIFIED if item.get("reason") == funnel_mod.REASON_TOO_EARLY
+                     else funnel_mod.STAGE_RECORDED)
+            funnel_mod.safe_record(
+                funnel_store, cycle_run_id=cycle_id, as_of=as_of, stage=stage,
+                outcome=funnel_mod.OUTCOME_DROPPED, symbol=item["symbol"], earnings_date=item["earnings_date"],
+                reason=f"{funnel_mod.REASON_RECHECK_EXPIRED}:{item.get('reason')}",
+                detail={"attempts": item.get("attempts", [])},
+            )
+            continue
+        due = _parse_date(item.get("recheck_on"))
+        if due is None or due > as_of:
+            continue
+        surfaced.add(item["symbol"])
+        added.append({
+            "symbol": item["symbol"], "status": "recheck", "dte": dte, "days_to_earnings": dte,
+            "earnings_date": item["earnings_date"], "release_timing": None,
+            "discovery_source": "recheck", "discovery_status_reason": item.get("reason"),
+        })
+    summary["rechecks_added"] = len(added)
+    return added
+
+
+def _schedule_recheck(funnel_store: Optional[EvidenceFunnelStore], *, symbol: str, earnings_date: Optional[date],
+                      recheck_on: date, reason: str, as_of: date) -> bool:
+    """Defer an event to ``recheck_on`` if that is still inside its entry window."""
+    if funnel_store is None or earnings_date is None:
+        return False
+    if (earnings_date - recheck_on).days < DTE_MIN_DEFAULT:
+        return False
+    try:
+        funnel_store.schedule_recheck(symbol=symbol, earnings_date=earnings_date, recheck_on=recheck_on,
+                                      reason=reason, as_of=as_of)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forward_loop: could not schedule re-check for %s: %s", symbol, exc)
+        return False
+    return True
+
+
+def _close_rechecks(funnel_store: Optional[EvidenceFunnelStore], symbol: str, *earnings_dates: Any) -> list:
+    """Close the event's pending re-check (it was analyzed); returns its earlier attempts."""
+    if funnel_store is None:
+        return []
+    attempts: list = []
+    for earnings in {_iso_or_none(value) for value in earnings_dates if value}:
+        try:
+            closed = funnel_store.close_recheck(symbol=symbol, earnings_date=earnings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("forward_loop: could not close re-check for %s: %s", symbol, exc)
+            continue
+        if closed:
+            attempts.extend(closed.get("attempts", []))
+    return attempts
+
+
+def _iso_or_none(value: Any) -> Optional[str]:
+    parsed = _parse_date(value)
+    return parsed.isoformat() if parsed is not None else None
+
+
 def _with_provider_skips(detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     out = dict(detail or {})
     skips = reliability.current_skips()
@@ -1981,7 +2069,14 @@ def _run_forward_screener(
         "outside_dte_window": 0,
         "analyzer_errors": 0,
         "cycle_run_id": cycle_id,
+        "rechecks_added": 0,
+        "rechecks_expired": 0,
+        "rechecks_scheduled": 0,
     }
+    # Deferred events due today are analyzed even if discovery missed them.
+    candidate_rows = list(screener_payload.get("rows", []))
+    candidate_rows += _recheck_rows(funnel_store, as_of=as_of, cycle_id=cycle_id,
+                                    discovered_rows=candidate_rows, summary=summary)
     funnel_mod.safe_start_cycle(
         funnel_store,
         cycle_run_id=cycle_id,
@@ -1991,7 +2086,7 @@ def _run_forward_screener(
         discovery_source=summary["discovery_source"],
     )
 
-    for row in screener_payload.get("rows", []):
+    for row in candidate_rows:
         dte = row.get("days_to_earnings", row.get("dte"))
         symbol = str(row.get("symbol") or "").upper()
         if not symbol:
@@ -2018,13 +2113,26 @@ def _run_forward_screener(
             _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DROPPED, funnel_mod.REASON_MISSING_DTE)
             continue
         if int(dte) > DTE_MAX_DEFAULT:
-            # Not yet in the entry window: looked at again on a later cycle.
+            # Not yet in the entry window: scheduled for the day it enters it,
+            # so it is analyzed then even if discovery does not surface it.
             summary["outside_dte_window"] += 1
+            row_earnings = _parse_date(row.get("earnings_date"))
+            recheck_on = row_earnings - timedelta(days=DTE_MAX_DEFAULT) if row_earnings is not None else None
+            if recheck_on is not None and _schedule_recheck(
+                    funnel_store, symbol=symbol, earnings_date=row_earnings, recheck_on=recheck_on,
+                    reason=funnel_mod.REASON_TOO_EARLY, as_of=as_of):
+                summary["rechecks_scheduled"] += 1
             _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DEFERRED, funnel_mod.REASON_TOO_EARLY,
-                    detail={"dte": int(dte)})
+                    detail={"dte": int(dte), "recheck_on": recheck_on.isoformat() if recheck_on else None})
             continue
         if int(dte) < DTE_MIN_DEFAULT:
             summary["outside_dte_window"] += 1
+            if funnel_store is not None and row.get("earnings_date"):
+                try:
+                    funnel_store.close_recheck(symbol=symbol, earnings_date=row.get("earnings_date"),
+                                               status=funnel_mod.RECHECK_EXPIRED)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("forward_loop: could not expire re-check for %s: %s", symbol, exc)
             _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DROPPED, funnel_mod.REASON_TOO_LATE,
                     detail={"dte": int(dte)})
             continue
@@ -2044,8 +2152,15 @@ def _run_forward_screener(
             _record_skip(summary, funnel_mod.REASON_ANALYZER_ERROR)
             reason = f"{funnel_mod.REASON_ANALYZER_ERROR}:{type(exc).__name__}"
             logger.warning("forward_loop: analysis failed for %s: %s", symbol, exc)
+            # A failed analysis (often a provider outage) is retried on the
+            # next cycle while the event is still in its entry window.
+            retry_on = as_of + timedelta(days=1)
+            retried = _schedule_recheck(funnel_store, symbol=symbol, earnings_date=_parse_date(row.get("earnings_date")),
+                                        recheck_on=retry_on, reason=reason, as_of=as_of)
+            summary["rechecks_scheduled"] += int(retried)
             _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ERROR, reason,
-                    detail=_with_provider_skips({"error": str(exc)[:300]}))
+                    detail=_with_provider_skips({"error": str(exc)[:300],
+                                                 "recheck_on": retry_on.isoformat() if retried else None}))
             _append_learning_log(
                 log_path,
                 {"event_type": "skip", "symbol": symbol, "structure": None, "setup_score": None,
@@ -2067,8 +2182,11 @@ def _run_forward_screener(
             earnings_date=earnings_date or _get(vol_snapshot, "earnings_date"),
             selected_structure=structure,
         )
+        # Analyzed: any re-check that brought it here is done.
+        prior_attempts = _close_rechecks(funnel_store, symbol, row.get("earnings_date"), earnings_date)
         _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
-                earnings_date=earnings_date or row.get("earnings_date"), detail=_with_provider_skips() or None)
+                earnings_date=earnings_date or row.get("earnings_date"),
+                detail=_with_provider_skips({"prior_attempts": prior_attempts} if prior_attempts else None) or None)
         if not dry_run:
             try:
                 record_recommendation(
@@ -2226,11 +2344,21 @@ def _run_forward_screener(
             # A skipped provider call (budget, open breaker) that the fallback
             # could not cover is the disposition, not the fallback's symptom.
             quote_reason = str(quote.get("reason", "missing_entry_mid"))
-            _funnel(funnel_mod.STAGE_RECORDED, funnel_mod.OUTCOME_DROPPED,
-                    f"{funnel_mod.REASON_MISSING_ENTRY_QUOTE}:{_provider_skip_reason() or quote_reason}",
-                    recommendation_id=recommendation_id, earnings_date=earnings_date,
+            missing_reason = f"{funnel_mod.REASON_MISSING_ENTRY_QUOTE}:{_provider_skip_reason() or quote_reason}"
+            # Retried on the next cycle while the event is still in its entry
+            # window; dropped only when no in-window day is left.
+            retry_on = as_of + timedelta(days=1)
+            retried = _schedule_recheck(funnel_store, symbol=symbol,
+                                        earnings_date=earnings_date or _parse_date(row.get("earnings_date")),
+                                        recheck_on=retry_on, reason=missing_reason, as_of=as_of)
+            summary["rechecks_scheduled"] += int(retried)
+            _funnel(funnel_mod.STAGE_RECORDED,
+                    funnel_mod.OUTCOME_DEFERRED if retried else funnel_mod.OUTCOME_DROPPED,
+                    missing_reason, recommendation_id=recommendation_id, earnings_date=earnings_date,
                     detail=_with_provider_skips({"quote_source": quote.get("quote_source"),
-                                                 "quote_reason": quote_reason}))
+                                                 "quote_reason": quote_reason,
+                                                 "recheck_on": retry_on.isoformat() if retried else None,
+                                                 "prior_attempts": prior_attempts}))
             _record_skip(summary, str(quote.get("reason", "missing_entry_mid")))
             _append_learning_log(
                 log_path,
@@ -2349,6 +2477,7 @@ def _run_forward_screener(
             _funnel(funnel_mod.STAGE_RECORDED, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
                     trade_id=trade_id, earnings_date=earnings_date,
                     detail=_with_provider_skips({
+                        "prior_attempts": prior_attempts,
                         "evidence_quality_status": evidence_quality.get("evidence_quality_status"),
                         "claim_allowed": bool(evidence_quality.get("claim_allowed")),
                         "evidence_quality_reasons": evidence_quality.get("evidence_quality_reasons", [])}))
