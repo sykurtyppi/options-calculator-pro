@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
+from services.claim_contract import CLAIM_DISQUALIFYING_REASONS, CONTRACT_VERSION, evaluate_quote_contract
+
 import math
 
 
@@ -24,6 +26,10 @@ class EvidenceQualityResult:
     execution_grade: bool = False
     quote_issue_count: int = 0
     max_leg_spread_pct: float | None = None
+    # F5: the claim contract the entry quote was checked against, and why it
+    # failed. claim_allowed at entry means "claimable if the exit passes too".
+    claim_contract_version: str = CONTRACT_VERSION
+    claim_contract_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -58,7 +64,12 @@ def evaluate_evidence_quality(
     if quote_source == "yfinance":
         reasons.append("provider_research_grade_yfinance")
         degraded = True
-    if "paper" in quote_quality or "research" in quote_quality or "not_execution" in quote_quality:
+    contract = evaluate_quote_contract(quote)
+    if not contract.passed and (
+        "paper" in quote_quality or "research" in quote_quality or "not_execution" in quote_quality
+    ):
+        # A paper/research mid is only claimable at the contract's
+        # conservative fill; without a passing contract it stays a record.
         reasons.append("quote_not_execution_grade")
         degraded = True
 
@@ -181,14 +192,25 @@ def evaluate_evidence_quality(
         and "execution_grade" in quote_quality
         and quote_source not in {"", "yfinance"}
     )
-    claim_allowed = status == VALID_EVIDENCE and execution_grade
+    # Claims are priced at the contract's conservative fill, not the mid, so
+    # they need the contract to pass and nothing that puts the event itself in
+    # doubt; chain-wide surface warnings degrade the record but not the fill.
+    claim_allowed = (
+        execution_grade
+        or (contract.passed and status != RECORD_ONLY and not (set(reasons) & CLAIM_DISQUALIFYING_REASONS))
+    )
+    quote_issue_count = len(set(reasons))
+    if not claim_allowed:
+        # Say why it is not claimable (the funnel reports these reasons).
+        reasons.extend(contract.reasons)
     return EvidenceQualityResult(
         evidence_quality_status=status,
         evidence_quality_reasons=sorted(set(reasons)),
         claim_allowed=bool(claim_allowed),
         execution_grade=bool(execution_grade),
-        quote_issue_count=len(set(reasons)),
+        quote_issue_count=quote_issue_count,
         max_leg_spread_pct=round(max_spread_pct, 6) if max_spread_pct is not None else None,
+        claim_contract_reasons=contract.reasons,
     )
 
 

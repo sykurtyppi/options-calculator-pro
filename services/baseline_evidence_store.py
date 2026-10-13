@@ -24,6 +24,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
 
+from services.claim_contract import apply_exit_claim
 from services.outcome_recorder import _finite_or_none
 
 _DEFAULT_STORE = Path.home() / ".options_calculator_pro" / "evidence" / "baseline_evidence.sqlite"
@@ -390,6 +391,8 @@ class BaselineEvidenceStore:
                 quote_quality_at_exit = ?,
                 exit_bid_ask_mid_json = ?,
                 exit_execution_scenarios_json = ?,
+                claim_allowed = ?,
+                evidence_quality_reasons_json = ?,
                 status = ?,
                 skip_reason = ?,
                 updated_at = CURRENT_TIMESTAMP
@@ -406,13 +409,22 @@ class BaselineEvidenceStore:
             quote_quality_at_exit,
             _json(exit_bid_ask_mid or {}),
             _json(exit_execution_scenarios or {}),
-            status,
-            skip_reason,
-            baseline_id,
         )
+        tail = (status, skip_reason, baseline_id)
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
-                cur.execute(sql, params)
+                # F5: claim-eligible at entry stays claimable only if the exit
+                # passed the claim contract too.
+                prior = cur.execute(
+                    "SELECT claim_allowed, evidence_quality_reasons_json FROM baseline_trades WHERE baseline_id = ?",
+                    (baseline_id,),
+                ).fetchone()
+                claim_allowed, claim_reasons = apply_exit_claim(
+                    claim_allowed=None if prior is None or prior[0] is None else bool(prior[0]),
+                    evidence_reasons=_loads_list(prior[1]) if prior is not None else [],
+                    exit_execution_scenarios=exit_execution_scenarios,
+                )
+                cur.execute(sql, params + (_bool_int(claim_allowed), _json(claim_reasons)) + tail)
                 return cur.rowcount > 0
 
     def list_for_diagnostics(self, *, limit: int = 10_000) -> list[Dict[str, Any]]:
