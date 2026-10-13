@@ -382,7 +382,7 @@ def test_entry_pass_priorities_and_a_skip_is_the_quote_disposition(tmp_path, fun
     assert seen == {"discovery": "discovery", "SKIP": "entry", "FALLBACK": "entry", "GOOD": "entry"}
     events = {(e["symbol"], e["stage"]): e for e in funnel.events("cycle-1")}
     skipped = events[("SKIP", "recorded")]
-    assert (skipped["outcome"], skipped["reason"]) == ("dropped", f"missing_entry_quote:{pr.SKIP_BUDGET}")
+    assert (skipped["outcome"], skipped["reason"]) == ("deferred", f"missing_entry_quote:{pr.SKIP_BUDGET}")
     assert json.loads(skipped["detail_json"])["quote_reason"] == "no_spot_price"
     # A skip the fallback covered is recorded on the entry, and does not leak
     # into the next candidate.

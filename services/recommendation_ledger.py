@@ -122,6 +122,12 @@ CREATE TABLE IF NOT EXISTS recommendations (
     -- and never on `awaiting_chain_data` (data-not-ready is not a
     -- failed attempt). Defaults to 0 for existing rows on migration.
     candidate_exit_resolver_attempts INTEGER NOT NULL DEFAULT 0,
+    -- F4: one identity per earnings event (SYMBOL|earnings_date). Each
+    -- analysis stays its own immutable, dated row; event_sequence numbers
+    -- the event's analyses (1 = first), so consumers that count samples
+    -- take one decision per event instead of one per day it was analyzed.
+    event_key                     TEXT,
+    event_sequence                INTEGER,
     schema_version                INTEGER NOT NULL,
     engine_version                TEXT NOT NULL
 );
@@ -142,6 +148,8 @@ CREATE INDEX IF NOT EXISTS idx_recommendations_recommendation
 -- daily resolver tick runs.
 CREATE INDEX IF NOT EXISTS idx_recommendations_provenance_earnings
     ON recommendations (sample_provenance, earnings_date);
+CREATE INDEX IF NOT EXISTS idx_recommendations_event
+    ON recommendations (event_key, event_sequence);
 """
 
 _REVISIONS_TABLE_DDL = """
@@ -204,6 +212,10 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     # bookkeeping; never part of recommendation evidence or
     # content-hash).
     "candidate_exit_resolver_attempts": "INTEGER NOT NULL DEFAULT 0",
+    # F4 — event identity (derived from symbol + earnings_date; never part
+    # of the content hash).
+    "event_key": "TEXT",
+    "event_sequence": "INTEGER",
     "schema_version": "INTEGER NOT NULL DEFAULT 1",
     "engine_version": "TEXT NOT NULL DEFAULT 'event_vol_selector_v1'",
 }
@@ -281,6 +293,46 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for column, ddl_type in _MIGRATION_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE recommendations ADD COLUMN {column} {ddl_type}")
+    _backfill_event_identity(conn)
+
+
+def make_event_key(symbol: Any, earnings_date: Any) -> Optional[str]:
+    """The ledger's identity for one earnings event, or None without a date."""
+    day = _fmt_date(earnings_date)
+    name = str(symbol or "").strip().upper()
+    return f"{name}|{day}" if name and day else None
+
+
+def _backfill_event_identity(conn: sqlite3.Connection) -> None:
+    """Give rows written before F4 their event key and per-event sequence.
+
+    Sequences follow creation order. Only events with an unnumbered row are
+    renumbered, so rows written since keep their numbers.
+    """
+    conn.execute(
+        """
+        UPDATE recommendations
+           SET event_key = UPPER(TRIM(symbol)) || '|' || earnings_date
+         WHERE event_key IS NULL AND earnings_date IS NOT NULL AND earnings_date != ''
+           AND symbol IS NOT NULL AND TRIM(symbol) != ''
+        """
+    )
+    conn.execute(
+        """
+        WITH pending AS (
+            SELECT DISTINCT event_key FROM recommendations
+             WHERE event_key IS NOT NULL AND event_sequence IS NULL
+        ), ranked AS (
+            SELECT recommendation_id,
+                   ROW_NUMBER() OVER (PARTITION BY event_key ORDER BY created_at, recommendation_id) AS seq
+              FROM recommendations
+             WHERE event_key IN (SELECT event_key FROM pending)
+        )
+        UPDATE recommendations
+           SET event_sequence = (SELECT seq FROM ranked WHERE ranked.recommendation_id = recommendations.recommendation_id)
+         WHERE event_key IN (SELECT event_key FROM pending)
+        """
+    )
 
 
 @contextmanager
@@ -354,11 +406,18 @@ class RecommendationLedger:
                 vol_snapshot_json, structure_scorecards_json, selector_output_json,
                 explanation_json, metadata_json, picker_provenance_json,
                 candidate_shadow_outcome_json, sample_provenance,
-                schema_version, engine_version
+                schema_version, engine_version, event_key, event_sequence
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
         """
+        event_key = make_event_key(record.symbol, record.earnings_date)
+        event_sequence = None
+        if event_key is not None:
+            event_sequence = int(cur.execute(
+                "SELECT COALESCE(MAX(event_sequence), 0) + 1 FROM recommendations WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()[0])
         params = (
             record.recommendation_id,
             record.created_at,
@@ -398,6 +457,8 @@ class RecommendationLedger:
             record.sample_provenance,
             int(record.schema_version),
             record.engine_version,
+            event_key,
+            event_sequence,
         )
         content_hash = _record_content_hash(record)
         record_json = _json(_record_to_dict(record))
@@ -801,6 +862,10 @@ class RecommendationLedger:
           - ``earnings_date`` is set and ``<= now - min_days_after_event``
             so we land on a real post-event trade_date.
           - ``candidate_exit_resolver_attempts < max_attempts``.
+          - It is the event's latest analysis with the same provenance
+            (F4): an event analyzed on several days is one sample, resolved
+            from its last decision, not once per day it was analyzed. A
+            replay row for the same event never displaces a forward one.
           - The merged-view's ``candidate_shadow_outcome.status`` is
             not ``"ok"`` and does not start with ``"permanently_failed:"``.
             Rows already in those terminal states are not retried.
@@ -844,6 +909,10 @@ class RecommendationLedger:
                AND earnings_date IS NOT NULL
                AND earnings_date <= ?
                AND candidate_exit_resolver_attempts < ?
+               AND (event_key IS NULL OR event_sequence = (
+                    SELECT MAX(latest.event_sequence) FROM recommendations AS latest
+                     WHERE latest.event_key = recommendations.event_key
+                       AND latest.sample_provenance = recommendations.sample_provenance))
              ORDER BY earnings_date ASC, created_at ASC
             """,
             (
@@ -942,8 +1011,28 @@ class RecommendationLedger:
             "stale": sum(int(row["n"]) for row in stale_rows if int(row["stale"] or 0) == 1),
             "fresh_or_unknown": sum(int(row["n"]) for row in stale_rows if int(row["stale"] or 0) == 0),
         }
+        event_rows = self._conn.execute(
+            """
+            SELECT COALESCE(NULLIF(recommendation, ''), 'unknown') AS key, COUNT(*) AS n
+              FROM recommendations AS r
+             WHERE event_key IS NOT NULL
+               AND event_sequence = (SELECT MAX(event_sequence) FROM recommendations
+                                      WHERE event_key = r.event_key)
+             GROUP BY COALESCE(NULLIF(recommendation, ''), 'unknown')
+             ORDER BY n DESC, key
+            """
+        ).fetchall()
+        events_by_recommendation = {str(row["key"]): int(row["n"]) for row in event_rows}
         return {
             "total": self.count(),
+            # One decision per earnings event: its latest analysis.
+            "events": {
+                "total": sum(events_by_recommendation.values()),
+                "by_recommendation": events_by_recommendation,
+                "analyses_without_event": int(self._conn.execute(
+                    "SELECT COUNT(*) FROM recommendations WHERE event_key IS NULL"
+                ).fetchone()[0]),
+            },
             "by_selected_structure": _counts("selected_structure"),
             "by_no_trade_reason": _counts("no_trade_reason"),
             "by_earnings_source": _counts("earnings_source"),
