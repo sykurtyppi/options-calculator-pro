@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
-from services.claim_contract import CLAIM_DISQUALIFYING_REASONS, CONTRACT_VERSION, evaluate_quote_contract
+from services.claim_contract import (
+    CLAIM_DISQUALIFYING_REASONS,
+    CONTRACT_VERSION,
+    contract_verdict,
+    evaluate_quote_contract,
+)
 
 import math
 
@@ -30,6 +35,10 @@ class EvidenceQualityResult:
     # failed. claim_allowed at entry means "claimable if the exit passes too".
     claim_contract_version: str = CONTRACT_VERSION
     claim_contract_reasons: list[str] = field(default_factory=list)
+    # The entry verdict the stores require before recording a claim
+    # (services.claim_contract.entry_claim_status); kept with the entry's
+    # execution scenarios under "claim".
+    claim_verdict: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -41,6 +50,7 @@ def evaluate_evidence_quality(
     vol_snapshot: Mapping[str, Any] | None = None,
     surface_quality: Mapping[str, Any] | None = None,
     require_volume_open_interest: bool = False,
+    symbol: str | None = None,
 ) -> EvidenceQualityResult:
     """Classify whether a paper record can support evidence claims.
 
@@ -64,7 +74,10 @@ def evaluate_evidence_quality(
     if quote_source == "yfinance":
         reasons.append("provider_research_grade_yfinance")
         degraded = True
-    contract = evaluate_quote_contract(quote)
+    # Bound to the recommendation's underlying (the quote's own symbol, or
+    # the snapshot's, when the caller does not name it).
+    contract = evaluate_quote_contract(
+        quote, expected_underlying=symbol or quote.get("symbol") or snapshot.get("symbol"))
     if not contract.passed and (
         "paper" in quote_quality or "research" in quote_quality or "not_execution" in quote_quality
     ):
@@ -195,9 +208,10 @@ def evaluate_evidence_quality(
     # Claims are priced at the contract's conservative fill, not the mid, so
     # they need the contract to pass and nothing that puts the event itself in
     # doubt; chain-wide surface warnings degrade the record but not the fill.
+    # An "execution grade" label is no substitute: every claim passes the
+    # contract.
     claim_allowed = (
-        execution_grade
-        or (contract.passed and status != RECORD_ONLY and not (set(reasons) & CLAIM_DISQUALIFYING_REASONS))
+        contract.passed and status != RECORD_ONLY and not (set(reasons) & CLAIM_DISQUALIFYING_REASONS)
     )
     quote_issue_count = len(set(reasons))
     if not claim_allowed:
@@ -211,6 +225,7 @@ def evaluate_evidence_quality(
         quote_issue_count=quote_issue_count,
         max_leg_spread_pct=round(max_spread_pct, 6) if max_spread_pct is not None else None,
         claim_contract_reasons=contract.reasons,
+        claim_verdict=contract_verdict(contract),
     )
 
 

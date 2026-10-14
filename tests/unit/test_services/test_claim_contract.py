@@ -40,6 +40,7 @@ def _quote(*, source="marketdata_app", captured=CAPTURED, legs=None, quality="ma
         if leg.get("bid") is not None and leg.get("ask") is not None:
             leg.setdefault("mid", (leg["bid"] + leg["ask"]) / 2.0)
     return {
+        "symbol": "AAPL",
         "quote_source": source, "quote_quality": quality, "quote_timestamp": captured,
         "surface_quality": CLEAN_SURFACE, "bid_ask_mid": {"legs": legs},
         "mid": sum(leg.get("mid") or 0 for leg in legs.values()), "context": {},
@@ -182,16 +183,17 @@ def test_the_exit_must_pass_and_reprice_the_booked_contracts():
     assert not cc.evaluate_exit_claim(entry_quote_legs={}, exit_quote_payload=_quote())["passed"]
 
 
-def _insert(store, trade_id, *, claim_allowed=True, version=cc.CONTRACT_VERSION):
+V = cc.CONTRACT_VERSION
+ENTRY_VERDICT = {"passed": True, "reasons": [], "contract_version": V}
+
+
+def _insert(store, trade_id, *, claim_allowed=True, version=cc.CONTRACT_VERSION, entry_verdict=ENTRY_VERDICT):
     store.insert_entry(
         trade_id=trade_id, symbol="AAPL", structure="atm_straddle", entry_date=TODAY - timedelta(days=4),
         setup_score=0.6, source_type="paper", earnings_date=TODAY + timedelta(days=1), entry_mid=4.5,
         execution_penalty_at_entry=0.03, claim_allowed=claim_allowed, evidence_quality_reasons=["entry_reason"],
-        claim_contract_version=version,
+        claim_contract_version=version, entry_execution_scenarios={"claim": entry_verdict},
     )
-
-
-V = cc.CONTRACT_VERSION
 
 
 @pytest.mark.parametrize("verdict, expected_claim, expected_reasons", [
@@ -200,8 +202,8 @@ V = cc.CONTRACT_VERSION
      ["entry_reason", "exit_claim_quote_stale"]),
     # Fails closed: no verdict, a malformed one, or another version's.
     (None, 0, ["claim_exit_verdict_missing", "entry_reason"]),
-    ({"reasons": []}, 0, ["claim_exit_verdict_missing", "entry_reason"]),
-    ({"passed": "yes", "contract_version": V}, 0, ["claim_exit_verdict_missing", "entry_reason"]),
+    ({"reasons": []}, 0, ["claim_exit_verdict_malformed", "entry_reason"]),
+    ({"passed": "yes", "contract_version": V}, 0, ["claim_exit_verdict_malformed", "entry_reason"]),
     ({"passed": True, "reasons": [], "contract_version": "conservative_fill_v1"}, 0,
      ["claim_contract_version_mismatch", "entry_reason"]),
 ])
@@ -243,6 +245,7 @@ def test_the_baseline_store_folds_the_exit_verdict(tmp_path):
         entry_mid=4.5, modeled_cost_pct=None, execution_penalty_at_entry=None, data_quality_score_at_entry=None,
         iv_rv_har_at_entry=None, iv_rv_yz_at_entry=None, quote_source_at_entry="marketdata_app",
         quote_quality_at_entry=None, claim_allowed=True, baseline_id="B1", claim_contract_version=V,
+        entry_execution_scenarios={"claim": ENTRY_VERDICT},
     )
     store.update_exit(baseline_id="B1", exit_date=TODAY, exit_mid=5.0, realized_return_pct=11.0,
                       realized_expansion_pct=None, quote_source_at_exit="marketdata_app", quote_quality_at_exit=None,
@@ -280,8 +283,9 @@ def test_a_round_trip_is_claimable_only_when_both_ends_pass(tmp_path, exit_quote
         execution_penalty_at_entry=0.03, notes=json.dumps({"pricing_context": {}}),
         claim_allowed=evidence["claim_allowed"], evidence_quality_reasons=evidence["evidence_quality_reasons"],
         claim_contract_version=evidence["claim_contract_version"],
-        entry_execution_scenarios=build_execution_scenarios(
+        entry_execution_scenarios={**build_execution_scenarios(
             structure="atm_straddle", quote_payload=entry_quote, phase="entry").to_dict(),
+            "claim": evidence["claim_verdict"]},        # as the forward loop stores it
     )
     assert evidence["claim_allowed"]
 
@@ -339,3 +343,4 @@ def test_a_marketdata_chain_quote_carries_leg_contracts_and_times(monkeypatch):
     assert sorted(leg["quote_time"] for leg in legs.values()) == [
         "2026-04-21T19:59:40+00:00", "2026-04-21T19:59:45+00:00"]
     assert isinstance(pd.Timestamp(quote["quote_timestamp"]), pd.Timestamp)
+    assert quote["symbol"] == "AAPL"                  # the underlying the claim contract binds to

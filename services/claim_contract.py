@@ -10,9 +10,12 @@ A quote passes (entry or exit) when every one of these holds:
 
 1. Source: a live, quote-level feed (MarketData.app). yfinance chains are
    delayed and indicative and never pass.
-2. Contract identity: each leg names a standard OCC option symbol. An adjusted
-   contract (after a split or special dividend its root gains a digit, e.g.
-   AAPL1) does not pass, so corporate actions cannot slip into a claim.
+2. Contract identity: each leg names a standard OCC option symbol on the
+   recommendation's own underlying, with a real expiration that had not passed
+   on the quote's session day. An adjusted contract (after a split or special
+   dividend its root gains a digit, e.g. AAPL1) does not pass, so corporate
+   actions cannot slip into a claim; neither can another symbol's leg or an
+   expired contract still listed in a stale chain.
 3. Bid/ask completeness: each leg has a finite bid >= MIN_LEG_BID, an ask at
    or above the bid, and a spread within MAX_LEG_SPREAD_PCT of its mid.
 4. Synchronized, point-in-time quotes: each leg carries its own quote time,
@@ -25,7 +28,11 @@ A quote passes (entry or exit) when every one of these holds:
 
 A resolved trade is claimable when its entry and exit quotes both pass under
 this CONTRACT_VERSION and the exit re-priced exactly the contracts booked at
-entry. A missing, malformed or other-version verdict fails closed. Its claimed return
+entry. Each side's verdict is stored with the trade and must be well formed:
+``passed`` a bool, ``reasons`` a list of strings, and ``passed`` true exactly
+when there are no reasons. A missing, malformed, inconsistent or other-version
+verdict (entry or exit) fails closed, and the stores derive claimability from
+the verdicts rather than trusting a caller's flag. Its claimed return
 uses the conservative fill: the natural price (pay the ask, receive the bid)
 moved a further SLIPPAGE per leg, with commission and regulatory fees for
 every contract traded on both sides.
@@ -42,7 +49,9 @@ from services.market_calendar import EXCHANGE_TZ, SESSION_OPEN, is_trading_day, 
 
 # v2: future-dated legs, early closes, impossible contract dates and missing or
 # other-version exit verdicts all fail (v1 let each of them through).
-CONTRACT_VERSION = "conservative_fill_v2"
+# v3: legs must be on the recommendation's underlying and unexpired at the
+# quote's session; entry and exit verdicts are typed, consistent and mandatory.
+CONTRACT_VERSION = "conservative_fill_v3"
 
 CLAIM_SOURCES = frozenset({"marketdata_app"})
 MIN_LEG_BID = 0.05
@@ -71,7 +80,7 @@ CLAIM_DISQUALIFYING_REASONS = frozenset({
     "low_earnings_source_confidence",
 })
 
-_OCC_SYMBOL = re.compile(r"^[A-Z]{1,6}(\d{2})(\d{2})(\d{2})[CP](\d{8})$")
+_OCC_SYMBOL = re.compile(r"^([A-Z]{1,6})(\d{2})(\d{2})(\d{2})[CP](\d{8})$")
 
 
 @dataclass(frozen=True)
@@ -96,10 +105,24 @@ def slippage_per_share(bid: float, ask: float) -> float:
     return max(MIN_SLIPPAGE_PER_SHARE, SLIPPAGE_FRACTION_OF_SPREAD * max(0.0, ask - bid))
 
 
-def evaluate_quote_contract(quote_payload: Mapping[str, Any] | None) -> ContractCheck:
-    """Does this structure quote meet the contract (either phase)?"""
+def occ_root(symbol: Any) -> str:
+    """The OCC root a listed underlying trades under (BRK.B -> BRKB)."""
+    return re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+
+
+def evaluate_quote_contract(quote_payload: Mapping[str, Any] | None, *,
+                            expected_underlying: Optional[str] = None) -> ContractCheck:
+    """Does this structure quote meet the contract (either phase)?
+
+    ``expected_underlying`` is the recommendation's symbol (else the quote's
+    own ``symbol``); without one the legs cannot be bound to it and the quote
+    fails.
+    """
     quote = quote_payload or {}
     reasons: list[str] = []
+    underlying = occ_root(expected_underlying or quote.get("symbol"))
+    if not underlying:
+        reasons.append("claim_missing_underlying")
     source = str(quote.get("quote_source") or "").lower()
     if source not in CLAIM_SOURCES:
         reasons.append(f"claim_source_not_live:{source or 'missing'}")
@@ -110,16 +133,22 @@ def evaluate_quote_contract(quote_payload: Mapping[str, Any] | None) -> Contract
         return ContractCheck(passed=False, reasons=sorted(set(reasons + ["claim_missing_legs"])))
 
     contracts: dict[str, str] = {}
+    expirations: dict[str, date] = {}
     leg_times: list[datetime] = []
     for name, raw in legs.items():
         leg = raw if isinstance(raw, Mapping) else {}
         prefix = f"claim_{name}_"
         contract = str(leg.get("contract") or "").strip().upper()
+        parsed = _parse_occ_symbol(contract) if contract else None
         if not contract:
             reasons.append(prefix + "missing_contract")
-        elif not _valid_occ_symbol(contract):
+        elif parsed is None:
             reasons.append(prefix + "non_standard_contract")
         else:
+            root, expiration = parsed
+            if underlying and root != underlying:
+                reasons.append(prefix + "contract_not_on_underlying")
+            expirations[str(name)] = expiration
             contracts[str(name)] = contract
         bid, ask = _finite(leg.get("bid")), _finite(leg.get("ask"))
         if bid is None or ask is None:
@@ -155,6 +184,9 @@ def evaluate_quote_contract(quote_payload: Mapping[str, Any] | None) -> Contract
             close = datetime.combine(session, session_close(session), tzinfo=EXCHANGE_TZ)
             reference = min(captured, close)
             age = (reference - min(leg_times)).total_seconds()
+            for name, expiration in expirations.items():
+                if expiration < session:
+                    reasons.append(f"claim_{name}_contract_expired")
             if age > MAX_QUOTE_AGE_SECONDS:
                 reasons.append("claim_quote_stale")
             if any(stamp.astimezone(EXCHANGE_TZ).date() != session for stamp in leg_times):
@@ -178,24 +210,82 @@ def _in_session(stamp: datetime) -> bool:
     return opens <= local <= closes
 
 
-def _valid_occ_symbol(contract: str) -> bool:
-    """A standard OCC symbol with a real expiration date and a positive strike."""
+def _parse_occ_symbol(contract: str) -> Optional[tuple[str, date]]:
+    """(root, expiration) of a standard OCC symbol with a real expiration date
+    and a positive strike, else None."""
     match = _OCC_SYMBOL.match(contract)
     if match is None:
-        return False
-    year, month, day, strike = match.groups()
+        return None
+    root, year, month, day, strike = match.groups()
     try:
-        date(2000 + int(year), int(month), int(day))
+        expiration = date(2000 + int(year), int(month), int(day))
     except ValueError:
-        return False
-    return int(strike) > 0
+        return None
+    return (root, expiration) if int(strike) > 0 else None
+
+
+def contract_verdict(check: ContractCheck) -> dict[str, Any]:
+    """The stored form of one side's verdict (see ``verdict_problems``)."""
+    return {
+        "passed": bool(check.passed) and not check.reasons,
+        "reasons": list(check.reasons),
+        "contract_version": check.contract_version,
+        "leg_contracts": dict(check.leg_contracts),
+    }
+
+
+def verdict_problems(verdict: Any, *, side: str) -> list[str]:
+    """Why a stored verdict cannot be relied on; empty when it can.
+
+    Well formed means ``passed`` is a bool, ``reasons`` a list of strings,
+    ``passed`` is true exactly when ``reasons`` is empty, and the verdict was
+    made under this CONTRACT_VERSION.
+    """
+    if not isinstance(verdict, Mapping):
+        return [f"claim_{side}_verdict_missing"]
+    passed, reasons = verdict.get("passed"), verdict.get("reasons")
+    if not isinstance(passed, bool) or not isinstance(reasons, list) or not all(
+            isinstance(reason, str) for reason in reasons):
+        return [f"claim_{side}_verdict_malformed"]
+    problems = []
+    if passed == bool(reasons):
+        problems.append(f"claim_{side}_verdict_inconsistent")
+    if verdict.get("contract_version") != CONTRACT_VERSION:
+        problems.append("claim_contract_version_mismatch")
+    return problems
+
+
+def _verdict_reasons(verdict: Any) -> list[str]:
+    reasons = verdict.get("reasons") if isinstance(verdict, Mapping) else None
+    return [reason for reason in reasons if isinstance(reason, str)] if isinstance(reasons, list) else []
+
+
+def entry_claim_status(
+    *, claim_allowed: Any, claim_contract_version: Any, entry_execution_scenarios: Any,
+) -> tuple[Optional[bool], list[str]]:
+    """The claim flag a store may record at entry, and why it was withdrawn.
+
+    A caller's ``claim_allowed=True`` stands only with a well-formed, passing
+    entry verdict (``entry_execution_scenarios["claim"]``) made under this
+    CONTRACT_VERSION, recorded under that same version.
+    """
+    if claim_allowed is None or not bool(claim_allowed):
+        return (None if claim_allowed is None else False), []
+    verdict = entry_execution_scenarios.get("claim") if isinstance(entry_execution_scenarios, Mapping) else None
+    problems = verdict_problems(verdict, side="entry")
+    if not problems and not verdict["passed"]:
+        problems = sorted(set(_verdict_reasons(verdict))) or ["claim_entry_verdict_failed"]
+    if claim_contract_version != CONTRACT_VERSION and "claim_contract_version_mismatch" not in problems:
+        problems.append("claim_contract_version_mismatch")
+    return (False, sorted(set(problems))) if problems else (True, [])
 
 
 def evaluate_exit_claim(
     *, entry_quote_legs: Mapping[str, Any] | None, exit_quote_payload: Mapping[str, Any] | None,
+    expected_underlying: Optional[str] = None,
 ) -> dict[str, Any]:
     """The exit side of a claim: the exit quote passes and re-priced the booked contracts."""
-    exit_check = evaluate_quote_contract(exit_quote_payload)
+    exit_check = evaluate_quote_contract(exit_quote_payload, expected_underlying=expected_underlying)
     reasons = [f"exit_{reason}" for reason in exit_check.reasons]
     entry_contracts = {
         str(name): str((leg or {}).get("contract") or "").strip().upper()
@@ -215,27 +305,29 @@ def evaluate_exit_claim(
 
 def apply_exit_claim(
     *, claim_allowed: Any, evidence_reasons: list[str], exit_execution_scenarios: Mapping[str, Any] | None,
-    entry_contract_version: Optional[str] = None,
+    entry_contract_version: Optional[str] = None, entry_execution_scenarios: Any = None,
 ) -> tuple[Optional[bool], list[str]]:
     """Fold the exit claim verdict into a row's entry-time claim fields.
 
-    Fails closed: an entry that was claim-eligible stays claimable only if the
-    exit verdict is present, well-formed, passed, and was made under this
-    CONTRACT_VERSION, as was the entry. Anything else (a legacy caller with no
-    verdict, a malformed one, an entry or exit checked under another version)
-    makes the row non-claimable and says why. A row that was never
-    claim-eligible is left as it was.
+    Fails closed: an entry that was claim-eligible stays claimable only if
+    both its stored entry verdict and the exit verdict are well formed (see
+    ``verdict_problems``), passed, and were made under this CONTRACT_VERSION,
+    as was the entry. Anything else (a legacy caller with no verdict, a
+    malformed or self-contradictory one, a passed verdict that still lists
+    reasons, another version) makes the row non-claimable and says why. A row
+    that was never claim-eligible is left as it was.
     """
-    reasons = list(evidence_reasons)
+    reasons = [str(reason) for reason in evidence_reasons if isinstance(reason, str)]
     if claim_allowed is None or not bool(claim_allowed):
         return (None if claim_allowed is None else False), reasons
+    entry_allowed, entry_problems = entry_claim_status(
+        claim_allowed=claim_allowed, claim_contract_version=entry_contract_version,
+        entry_execution_scenarios=entry_execution_scenarios)
     verdict = (exit_execution_scenarios or {}).get("claim") if isinstance(exit_execution_scenarios, Mapping) else None
-    if not isinstance(verdict, Mapping) or not isinstance(verdict.get("passed"), bool):
-        return False, sorted(set(reasons + ["claim_exit_verdict_missing"]))
-    reasons = sorted(set(reasons + [str(r) for r in verdict.get("reasons") or []]))
-    if entry_contract_version != CONTRACT_VERSION or verdict.get("contract_version") != CONTRACT_VERSION:
-        return False, sorted(set(reasons + ["claim_contract_version_mismatch"]))
-    return verdict["passed"], reasons
+    exit_problems = verdict_problems(verdict, side="exit")
+    reasons = sorted(set(reasons + entry_problems + exit_problems + _verdict_reasons(verdict)))
+    passed = bool(entry_allowed) and not exit_problems and verdict["passed"] is True
+    return passed, reasons
 
 
 def claimable_under_current_contract(row: Mapping[str, Any]) -> Optional[bool]:
@@ -272,6 +364,7 @@ def _parse_time(value: Any) -> Optional[datetime]:
 
 __all__ = [
     "CLAIM_DISQUALIFYING_REASONS", "CONTRACT_VERSION", "ContractCheck", "apply_exit_claim",
-    "claimable_under_current_contract",
+    "claimable_under_current_contract", "contract_verdict", "entry_claim_status", "occ_root",
+    "verdict_problems",
     "evaluate_exit_claim", "evaluate_quote_contract", "fee_per_share", "slippage_per_share",
 ]

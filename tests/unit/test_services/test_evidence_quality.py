@@ -30,7 +30,9 @@ def _clean_surface() -> dict:
     }
 
 
-def test_execution_grade_quote_with_clean_surface_can_support_claims() -> None:
+def test_an_execution_grade_label_alone_does_not_support_claims() -> None:
+    # PR K: the label used to bypass the claim contract. A quote with no leg
+    # contracts, quote times or underlying is valid evidence, not a claim.
     result = evaluate_evidence_quality(
         quote_payload=_quote(),
         surface_quality=_clean_surface(),
@@ -38,7 +40,9 @@ def test_execution_grade_quote_with_clean_surface_can_support_claims() -> None:
 
     assert result["evidence_quality_status"] == VALID_EVIDENCE
     assert result["execution_grade"] is True
-    assert result["claim_allowed"] is True
+    assert result["claim_allowed"] is False
+    assert result["claim_verdict"]["passed"] is False
+    assert "claim_call_missing_contract" in result["evidence_quality_reasons"]
 
 
 def test_absent_surface_is_degraded_not_valid() -> None:

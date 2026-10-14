@@ -24,7 +24,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
 
-from services.claim_contract import apply_exit_claim
+from services.claim_contract import apply_exit_claim, entry_claim_status
 from services.outcome_recorder import _finite_or_none
 
 _DEFAULT_STORE = Path.home() / ".options_calculator_pro" / "evidence" / "baseline_evidence.sqlite"
@@ -207,6 +207,13 @@ class BaselineEvidenceStore:
         days_to_earnings_at_entry: Optional[int] = None,
     ) -> bool:
         baseline_id = baseline_id or make_baseline_id(recommendation_id, baseline_name)
+        # The store records a claim only on a well-formed, passing entry
+        # verdict under the current contract, never on the caller's flag alone.
+        claim_allowed, withdrawn = entry_claim_status(
+            claim_allowed=claim_allowed, claim_contract_version=claim_contract_version,
+            entry_execution_scenarios=entry_execution_scenarios)
+        if withdrawn:
+            evidence_quality_reasons = sorted(set(list(evidence_quality_reasons or []) + withdrawn))
         sql = """
             INSERT INTO baseline_trades (
                 baseline_id, recommendation_id, symbol, baseline_name, structure,
@@ -423,8 +430,8 @@ class BaselineEvidenceStore:
                 # F5: claim-eligible at entry stays claimable only if the exit
                 # passed the claim contract too.
                 prior = cur.execute(
-                    "SELECT claim_allowed, evidence_quality_reasons_json, claim_contract_version"
-                    " FROM baseline_trades WHERE baseline_id = ?",
+                    "SELECT claim_allowed, evidence_quality_reasons_json, claim_contract_version,"
+                    " entry_execution_scenarios_json FROM baseline_trades WHERE baseline_id = ?",
                     (baseline_id,),
                 ).fetchone()
                 claim_allowed, claim_reasons = apply_exit_claim(
@@ -432,6 +439,7 @@ class BaselineEvidenceStore:
                     evidence_reasons=_loads_list(prior[1]) if prior is not None else [],
                     exit_execution_scenarios=exit_execution_scenarios,
                     entry_contract_version=prior[2] if prior is not None else None,
+                    entry_execution_scenarios=_stored_json(prior[3]) if prior is not None else None,
                 )
                 cur.execute(sql, params + (_bool_int(claim_allowed), _json(claim_reasons)) + tail)
                 return cur.rowcount > 0
@@ -563,3 +571,13 @@ def get_baseline_evidence_store(store_path: Optional[Path] = None) -> BaselineEv
             if _store is None:
                 _store = BaselineEvidenceStore(store_path=store_path or _DEFAULT_STORE)
     return _store
+
+
+def _stored_json(value: Any) -> Any:
+    """A stored JSON column, or None when absent or unreadable (fails closed)."""
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value) if value else None
+    except (TypeError, ValueError):
+        return None

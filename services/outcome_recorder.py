@@ -47,7 +47,7 @@ from typing import Any, Dict, Generator, Optional
 
 import numpy as np
 
-from services.claim_contract import apply_exit_claim
+from services.claim_contract import apply_exit_claim, entry_claim_status
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +347,13 @@ class OutcomeStore:
         Returns True on successful insert, False if trade_id already exists
         (the existing row is left untouched — safe to call repeatedly).
         """
+        # The store records a claim only on a well-formed, passing entry
+        # verdict under the current contract, never on the caller's flag alone.
+        claim_allowed, withdrawn = entry_claim_status(
+            claim_allowed=claim_allowed, claim_contract_version=claim_contract_version,
+            entry_execution_scenarios=entry_execution_scenarios)
+        if withdrawn:
+            evidence_quality_reasons = sorted(set(list(evidence_quality_reasons or []) + withdrawn))
         sql = """
             INSERT OR IGNORE INTO outcome_trades (
                 trade_id, symbol, structure, release_timing, recommendation_id,
@@ -504,8 +511,8 @@ class OutcomeStore:
                 # F5: an entry that was claim-eligible stays claimable only if
                 # its exit passed the claim contract too.
                 prior = cur.execute(
-                    "SELECT claim_allowed, evidence_quality_reasons_json, claim_contract_version"
-                    " FROM outcome_trades WHERE trade_id = ?",
+                    "SELECT claim_allowed, evidence_quality_reasons_json, claim_contract_version,"
+                    " entry_execution_scenarios_json FROM outcome_trades WHERE trade_id = ?",
                     (trade_id,),
                 ).fetchone()
                 claim_allowed, claim_reasons = apply_exit_claim(
@@ -513,6 +520,7 @@ class OutcomeStore:
                     evidence_reasons=_loads_list(prior[1]) if prior is not None else [],
                     exit_execution_scenarios=exit_execution_scenarios,
                     entry_contract_version=prior[2] if prior is not None else None,
+                    entry_execution_scenarios=_stored_json(prior[3]) if prior is not None else None,
                 )
                 cur.execute(sql, params + (_bool_int(claim_allowed), _json_payload(claim_reasons)) + tail)
                 updated = cur.rowcount > 0
@@ -1772,3 +1780,13 @@ def get_outcome_store(store_path: Optional[Path] = None) -> OutcomeStore:
             if _store is None:
                 _store = OutcomeStore(store_path=store_path or _DEFAULT_STORE)
     return _store
+
+
+def _stored_json(value: Any) -> Any:
+    """A stored JSON column, or None when absent or unreadable (fails closed)."""
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value) if value else None
+    except (TypeError, ValueError):
+        return None

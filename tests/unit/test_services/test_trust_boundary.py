@@ -29,7 +29,7 @@ PUT = "AAPL260424P00100000"
 
 def _quote(*, captured, call_time, put_time=None, call=CALL, put=PUT):
     return {
-        "quote_source": "marketdata_app", "quote_timestamp": captured,
+        "symbol": "AAPL", "quote_source": "marketdata_app", "quote_timestamp": captured,
         "bid_ask_mid": {"legs": {
             "call": {"contract": call, "bid": 2.4, "ask": 2.6, "mid": 2.5, "quote_time": call_time},
             "put": {"contract": put, "bid": 1.9, "ask": 2.1, "mid": 2.0, "quote_time": put_time or call_time},
@@ -59,7 +59,8 @@ def test_an_early_close_ends_the_session_at_13_00():
     assert "claim_call_quote_outside_session" in late.reasons
     # The closing quotes (12:59 ET) are fresh against the 13:00 close, not a 16:00 one.
     closing = cc.evaluate_quote_contract(_quote(captured="2026-11-27T18:30:00+00:00",
-                                                call_time="2026-11-27T17:59:30+00:00"))
+                                                call_time="2026-11-27T17:59:30+00:00",
+                                                call="AAPL261204C00100000", put="AAPL261204P00100000"))
     assert closing.passed, closing.reasons
     stale = cc.evaluate_quote_contract(_quote(captured="2026-11-27T21:00:00+00:00",
                                               call_time="2026-11-27T17:40:00+00:00"))
@@ -96,7 +97,8 @@ PASSED = {"claim": {"passed": True, "reasons": [], "contract_version": V}}
 ])
 def test_the_exit_verdict_is_required(claim_allowed, scenarios, entry_version, expected):
     result, _ = cc.apply_exit_claim(claim_allowed=claim_allowed, evidence_reasons=[],
-                                    exit_execution_scenarios=scenarios, entry_contract_version=entry_version)
+                                    exit_execution_scenarios=scenarios, entry_contract_version=entry_version,
+                                    entry_execution_scenarios=PASSED)
     assert result is expected
 
 
@@ -113,7 +115,7 @@ def test_entries_carry_the_contract_version():
     quote = {**_quote(captured="2026-04-21T20:30:00+00:00", call_time="2026-04-21T19:59:40+00:00"),
              "surface_quality": {"status": "clean_surface"}}
     result = evaluate_evidence_quality(quote_payload=quote)
-    assert result.claim_allowed and result.claim_contract_version == V == "conservative_fill_v2"
+    assert result.claim_allowed and result.claim_contract_version == V == "conservative_fill_v3"
 
 
 # ── event identity under concurrency ────────────────────────────────────────
@@ -208,6 +210,7 @@ def test_a_baseline_exit_needs_the_entry_version_too(tmp_path):
             modeled_cost_pct=None, execution_penalty_at_entry=None, data_quality_score_at_entry=None,
             iv_rv_har_at_entry=None, iv_rv_yz_at_entry=None, quote_source_at_entry="marketdata_app",
             quote_quality_at_entry=None, claim_allowed=True, baseline_id=baseline_id, claim_contract_version=version,
+            entry_execution_scenarios=PASSED,
         )
         store.update_exit(baseline_id=baseline_id, exit_date=date(2026, 4, 23), exit_mid=5.0, realized_return_pct=11.0,
                           realized_expansion_pct=None, quote_source_at_exit="marketdata_app",
@@ -226,7 +229,7 @@ def test_reports_ignore_claims_resolved_under_an_older_contract(tmp_path):
     for trade_id in ("T_OLD", "T_V2"):
         store.insert_entry(trade_id=trade_id, symbol="AAPL", structure="atm_straddle", entry_date=date(2026, 4, 20),
                            setup_score=0.6, source_type="paper", earnings_date=date(2026, 4, 24), entry_mid=4.0,
-                           claim_allowed=True, claim_contract_version=V)
+                           claim_allowed=True, claim_contract_version=V, entry_execution_scenarios=PASSED)
         store.update_exit(trade_id=trade_id, exit_date=date(2026, 4, 23), exit_mid=4.4, realized_return_pct=10.0,
                           realized_expansion_pct=5.0, exit_execution_scenarios=PASSED)
         store.mark_finalized(trade_id)

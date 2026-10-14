@@ -1,4 +1,4 @@
-# Claim contract: `conservative_fill_v2`
+# Claim contract: `conservative_fill_v3`
 
 Forward paper outcomes are priced from option-chain snapshots, not broker
 fills. This contract decides when such an outcome may be **claimed** as
@@ -20,6 +20,8 @@ A structure quote passes, at entry or at exit, only if every rule holds.
 |---|---|
 | Source | Live quote-level feed: `marketdata_app`. yfinance chains are delayed and indicative and never pass. |
 | Contract identity | Every leg names a standard OCC option symbol (`ROOT` `YYMMDD` `C/P` `strike×1000`) with a real expiration date and a positive strike. |
+| Underlying | Every leg's root is the recommendation's own underlying (share-class punctuation dropped: `BRK.B` trades as `BRKB`). The symbol comes from the caller, else the quote's `symbol`; with neither, the quote fails (`claim_missing_underlying`). A leg on another symbol fails (`claim_<leg>_contract_not_on_underlying`). |
+| Unexpired | No leg expired before the quote's session day; expiration day itself is still live (`claim_<leg>_contract_expired`). |
 | Corporate actions | An adjusted contract (its root gains a digit after a split or special dividend, e.g. `AAPL1`) fails identity, so adjusted deliverables never enter a claim. |
 | Bid/ask completeness | Every leg has a finite bid ≥ $0.05, an ask ≥ the bid, and a spread ≤ 25% of its mid. |
 | Leg quote times | Every leg carries its own quote time (MarketData `updated`), inside the regular session of an NYSE trading day: 09:30 to the close plus 15 minutes. The close is 16:00 ET, or 13:00 ET on early-close days (July 3, the day after Thanksgiving, December 24, when each is a trading day). |
@@ -41,17 +43,29 @@ A resolved outcome is claimable when all three hold:
 
 Chain-wide surface-quality warnings, such as IV anomalies on other strikes, degrade the record but not the fill, so they do not block a claim.
 
-At entry, `claim_allowed` means "claimable if the exit passes too", and the row stores the `claim_contract_version` it was checked under.
+A label is not a pass: a quote marked "execution grade" is claimable only if it passes the contract like any other.
 
-When the exit is recorded, the store keeps `claim_allowed` only if all of these hold, and adds the exit's reasons to `evidence_quality_reasons`:
+### Verdicts
 
-- the exit verdict is present and well-formed
-- the exit passed
+Each side's verdict is stored with the trade: the entry verdict in `entry_execution_scenarios.claim`, the exit verdict in `exit_execution_scenarios.claim`. A verdict is well formed when:
+
+- `passed` is a bool and `reasons` is a list of strings
+- `passed` is true exactly when `reasons` is empty
+- `contract_version` is the current version
+
+At entry, `claim_allowed` means "claimable if the exit passes too", and the row stores the `claim_contract_version` it was checked under. The outcome and baseline stores do not take a caller's `claim_allowed=True` on trust: they record it only with a well-formed, passing entry verdict under the current version, and otherwise store `claim_allowed = 0` with the reason.
+
+When the exit is recorded, the store keeps `claim_allowed` only if all of these hold, and adds the verdicts' reasons to `evidence_quality_reasons`:
+
+- the stored entry verdict is still present, well formed and passed
+- the exit verdict is present, well formed and passed
 - both the entry and the exit were checked under the current version
 
 Anything else fails closed:
 
-- **No verdict, or a malformed one:** `claim_exit_verdict_missing`
+- **No verdict:** `claim_entry_verdict_missing` / `claim_exit_verdict_missing`
+- **Wrong types (e.g. `reasons` a string):** `claim_<side>_verdict_malformed`
+- **`passed` disagreeing with `reasons` (a pass that lists a reason, or a failure with none):** `claim_<side>_verdict_inconsistent`
 - **Entry or exit checked under another version:** `claim_contract_version_mismatch`
 
 Reports count a row as claimable only under the current version, so claims made under different rules are never pooled.
@@ -70,7 +84,8 @@ diagnostics, under `claimable_evidence.claimable_returns`:
 ## Versions
 
 - `conservative_fill_v1` (#170): let through future-dated legs, quotes after an early close, impossible contract dates, and entries with no exit verdict.
-- `conservative_fill_v2` (current): all of these fail.
+- `conservative_fill_v2` (#172): all of these fail. Still let through expired contracts, legs on another underlying, a `passed` verdict listing blocking reasons, string `reasons`, entries with no entry verdict, and execution-grade labels without the contract.
+- `conservative_fill_v3` (current): all of these fail. Rows claimed under v2 are not pooled with v3 claims.
 
 ## What this does not cover
 

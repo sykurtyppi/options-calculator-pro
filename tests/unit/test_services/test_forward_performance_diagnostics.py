@@ -114,6 +114,7 @@ def _record_and_resolve(
         entry_execution_scenarios={
             "scenario_values": {"mid": 4.0, "cross_50": 4.4},
             "spread_as_pct_of_premium": 10.0 if data_quality_score >= 0.5 else 32.0,
+            "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION},
         },
     )
     outcomes.update_exit(
