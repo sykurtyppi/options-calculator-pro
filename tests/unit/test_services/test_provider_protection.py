@@ -164,7 +164,9 @@ def test_reservations_hold_credits_until_settled_or_released(monkeypatch, budget
     assert budget.reserve("yfinance", pr.PRIORITY_DISCOVERY, 10**9) == pr.UNMETERED
 
 
-def test_a_reservation_left_by_a_dead_process_expires(tmp_path, monkeypatch):
+def test_a_reservation_left_by_a_dead_process_stays_counted_as_unreconciled(tmp_path, monkeypatch):
+    # PR L: the process may have been charged before it died, so its hold
+    # never just stops counting; past the TTL it becomes unreconciled spend.
     monkeypatch.setenv(pr.DAILY_CREDITS_ENV, "100")
     clock = [datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)]
     store = pr.CreditBudget(tmp_path / "b.sqlite", now=lambda: clock[0])
@@ -172,8 +174,11 @@ def test_a_reservation_left_by_a_dead_process_expires(tmp_path, monkeypatch):
         assert store.reserve("marketdata_app", pr.PRIORITY_DISCOVERY, 60)
         assert store.reserve("marketdata_app", pr.PRIORITY_DISCOVERY, 1) is None
         clock[0] += timedelta(seconds=pr.RESERVATION_TTL_SECONDS + 1)
-        assert store.status()["reserved"] == 0                 # stops counting, even before a purge
-        assert store.reserve("marketdata_app", pr.PRIORITY_DISCOVERY, 1)
+        assert store.status()["reserved"] == 60                # still held, even before a purge
+        assert store.reserve("marketdata_app", pr.PRIORITY_DISCOVERY, 1) is None
+        status = store.status()
+        assert (status["reserved"], status["unreconciled"], status["spent"]) == (0, 60, 60)
+        assert store.reserve("marketdata_app", pr.PRIORITY_ENTRY, 1)    # higher tiers still fit
     finally:
         store.close()
 

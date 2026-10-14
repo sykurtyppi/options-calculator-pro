@@ -120,6 +120,7 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
     # or cached responses never carry across tests.
     monkeypatch.setattr(pr, "_DEFAULT_BUDGET_STORE", root / "telemetry" / "provider_budget.sqlite")
     monkeypatch.setattr(pr, "_DEFAULT_CACHE_STORE", root / "cache" / "provider_response_cache.sqlite")
+    monkeypatch.setattr(pr, "_DEFAULT_UNMETERED_LOG", root / "telemetry" / "unmetered_provider_calls.jsonl")
 
     def _reset_singletons():
         pr.reset_breakers()
