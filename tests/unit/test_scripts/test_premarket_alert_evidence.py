@@ -117,8 +117,8 @@ def test_a_sent_alert_is_audited_in_full(tmp_path):
         assert main(["--state-path", str(tmp_path / "s.json"), "--audit-path", str(audit)]) == 0
     assert send.call_count == 1
     records = [json.loads(line) for line in audit.read_text().splitlines()]
-    # Outbox: the full record is written as pending BEFORE the send, then closed.
-    assert [r["status"] for r in records] == ["pending", "sent"]
+    # Outbox: the full record is written as prepared BEFORE the send, then closed.
+    assert [r["status"] for r in records] == ["prepared", "accepted"]
     assert records[0]["event_id"] == records[1]["event_id"]
     record = records[0]
     assert record["dropped"] == {"spread_too_wide": 1}
@@ -243,7 +243,7 @@ def test_a_failed_send_is_recorded_and_not_marked_sent(tmp_path):
     code, send, state = _send(tmp_path, audit, [_row("TSLA")], send={"side_effect": RuntimeError("osascript")})
     assert code == 1 and send.call_count == 1 and not state.exists()
     statuses = [json.loads(line)["status"] for line in audit.read_text().splitlines()]
-    assert statuses == ["pending", "send_failed"]
+    assert statuses == ["prepared", "failed"]
 
 
 def test_a_sent_alert_whose_closing_line_fails_exits_nonzero_but_is_not_resent(tmp_path):
@@ -253,7 +253,7 @@ def test_a_sent_alert_whose_closing_line_fails_exits_nonzero_but_is_not_resent(t
     assert code == 1 and send.call_count == 1
     assert json.loads(state.read_text())["symbols"] == ["TSLA"]       # digest saved: no double send
     (pending,) = [json.loads(line) for line in audit.read_text().splitlines()]
-    assert pending["status"] == "pending" and pending["setups"][0]["row"]["symbol"] == "TSLA"
+    assert pending["status"] == "prepared" and pending["setups"][0]["row"]["symbol"] == "TSLA"
 
 
 def test_non_finite_values_in_ungated_fields_do_not_block_the_record(tmp_path):

@@ -11,10 +11,13 @@ Design notes
 ------------
 * **No backend dependency.** The screener is called in-process, so the job
   does not require uvicorn to be running.
-* **Idempotent per day.** The alert digest (date + qualifying symbols) is
-  recorded under ``~/.options_calculator_pro/state/``. A re-run on the same
-  day with the same qualifying set is a no-op unless ``--force`` is passed,
-  matching the forward-paper-collector's idempotency discipline.
+* **Sent at most once.** Each alert digest (date + qualifying symbols) is
+  reserved in a durable outbox (``services.alert_outbox``) before anything is
+  handed to Messages, so concurrent runs cannot both send. A timed-out
+  hand-off is recorded as ``delivery_unknown`` and never retried
+  automatically; an unreadable outbox or state file is quarantined and
+  nothing is sent. A re-run with the same qualifying set is a no-op unless
+  ``--force`` is passed.
 * **Silence is a valid outcome.** Qualifying setups are rare by design
   (~10-40/year). "Nothing qualified" exits 0 without sending, rather than
   manufacturing a daily message the operator learns to ignore.
@@ -35,7 +38,8 @@ Design notes
   11:00 ET in daylight time, 10:00 ET in standard time, always after the
   09:30 ET open. The message states the New York time it was built.
 
-Exit codes: ``0`` success (sent, or nothing to send), ``1`` failure.
+Exit codes: ``0`` success (accepted, already sent, or nothing to send);
+``1`` failure, or a delivery that is unknown and needs a look.
 """
 from __future__ import annotations
 
@@ -44,6 +48,7 @@ import json
 import logging
 import math
 import os
+import subprocess
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -62,6 +67,16 @@ try:
 except ImportError:
     pass
 
+from services.alert_outbox import (  # noqa: E402
+    ACCEPTED,
+    DELIVERY_UNKNOWN,
+    FAILED,
+    PREPARED,
+    PROVIDER_SUBMITTED,
+    AlertOutbox,
+    OutboxCorrupt,
+    quarantine,
+)
 from services.automation_watchdog import IMessageConfig, send_imessage  # noqa: E402
 from services.screener_service import build_ranked_screener, ranking_score_components  # noqa: E402
 
@@ -352,18 +367,42 @@ def _digest(as_of: date, rows: Sequence[Mapping[str, Any]]) -> str:
     return f"{as_of.isoformat()}|{symbols}"
 
 
+class StateUnreadable(RuntimeError):
+    """The idempotency state exists but cannot be read; never treated as empty."""
+
+
 def _load_state(path: Path) -> Dict[str, Any]:
+    """The last-sent state; {} only when there is none yet."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise StateUnreadable(f"{path}: {exc}") from exc
+    try:
+        payload = json.loads(text)
+    except ValueError as exc:
+        raise StateUnreadable(f"{path}: not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise StateUnreadable(f"{path}: not a JSON object")
+    return payload
 
 
 def _save_state(path: Path, payload: Mapping[str, Any]) -> None:
+    import tempfile
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(dict(payload), indent=2), encoding="utf-8")
-    tmp.replace(path)  # atomic swap; a torn write can't poison the state file
+    # A temp file of its own per writer: concurrent runs never share one.
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(payload), indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)  # atomic swap; a torn write can't poison the state file
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 def _json_safe(value: Any) -> Any:
@@ -432,6 +471,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Idempotency state file.")
     parser.add_argument("--audit-path", type=Path, default=DEFAULT_AUDIT_PATH,
                         help="JSONL audit trail of every sent alert.")
+    parser.add_argument("--outbox-path", type=Path, default=None,
+                        help="Durable send outbox (default: next to the state file).")
     return parser.parse_args(argv)
 
 
@@ -481,16 +522,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     built_at = datetime.now(timezone.utc)
     message = format_alert_message(qualifying, as_of=as_of, min_score=args.min_score, built_at=built_at)
     digest = _digest(as_of, qualifying)
-    state = _load_state(args.state_path)
 
     # Dry run is a preview and must stay observable, so it is checked BEFORE
-    # the idempotency digest — otherwise once a real alert has gone out,
+    # the idempotency checks — otherwise once a real alert has gone out,
     # --dry-run prints "already sent" instead of the message you asked to see.
     if args.dry_run:
         print(message)
         logger.info("Dry run — not sent, state not written.")
         return 0
 
+    # Two independent guards against a second send: the last-sent state file
+    # and the outbox. Neither is ever read as empty when it is unreadable.
+    try:
+        state = _load_state(args.state_path)
+    except StateUnreadable as exc:
+        moved = quarantine(args.state_path)
+        logger.error("Alert state is unreadable (%s); moved to %s. Nothing sent.", exc, moved)
+        return 1
     if not args.force and state.get("last_digest") == digest:
         logger.info("Identical alert already sent today (digest match); skipping.")
         return 0
@@ -503,17 +551,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 1
 
-    # Outbox: the full audit record is built and written as "pending" BEFORE
-    # the send, so every sent alert has a durable record. If it cannot be
-    # built or written, nothing is sent.
     import uuid
 
     event_id = uuid.uuid4().hex
+    outbox_path = args.outbox_path or args.state_path.with_name("premarket_alert_outbox.sqlite")
+    try:
+        outbox = AlertOutbox(outbox_path)
+    except OutboxCorrupt as exc:
+        moved = quarantine(outbox_path)
+        logger.error("Alert outbox is unreadable (%s); moved to %s. Nothing sent.", exc, moved)
+        return 1
+    # --force sends again under a fresh key; otherwise one key per digest.
+    alert_key = f"{digest}|force|{event_id}" if args.force else digest
+    reservation = outbox.reserve(alert_key, event_id=event_id)
+    if not reservation.acquired:
+        # A hand-off that timed out, or one whose run died mid-send (still
+        # "provider_submitted" long after any live run would have finished),
+        # may have been delivered: flag it, never resend it.
+        if reservation.status == DELIVERY_UNKNOWN or (
+                reservation.status == PROVIDER_SUBMITTED and outbox.is_stale(alert_key)):
+            logger.error("Alert %s: an earlier send may or may not have been delivered; "
+                         "not resending automatically.", digest)
+            return 1
+        logger.info("Alert %s already %s; not sending again.", digest, reservation.status)
+        return 0
+
+    def _audit_status(status: str, **extra: Any) -> bool:
+        return _try_append_audit(args.audit_path, {
+            "event_type": "premarket_alert", "event_id": event_id, "alert_key": alert_key,
+            "status": status, "at_utc": datetime.now(timezone.utc).isoformat(), **extra,
+        })
+
+    # The full audit record is written as "prepared" BEFORE the send, so every
+    # sent alert has a durable record. If it cannot be written, nothing is sent.
     try:
         record = {
             "event_type": "premarket_alert",
             "event_id": event_id,
-            "status": "pending",
+            "alert_key": alert_key,
+            "status": PREPARED,
+            "attempt": reservation.attempts,
             "as_of_date": as_of.isoformat(),
             "built_at_utc": built_at.isoformat(),
             "built_at_new_york": _new_york_time(built_at),
@@ -530,35 +607,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "setups": [{"row": row, "score_breakdown": score_breakdown(row)} for row in qualifying],
         }
         _append_audit(args.audit_path, record)
-    except Exception:
-        logger.exception("Could not record the alert audit before sending; nothing sent.")
-        return 1
-
-    try:
-        result = send_imessage(message, config=config)
     except Exception as exc:
-        logger.exception("iMessage send failed.")
-        _try_append_audit(args.audit_path, {"event_type": "premarket_alert", "event_id": event_id,
-                                            "status": "send_failed", "error": f"{type(exc).__name__}: {exc}"})
+        logger.exception("Could not record the alert audit before sending; nothing sent.")
+        outbox.transition(alert_key, event_id=event_id, to=FAILED, error=f"audit: {type(exc).__name__}")
         return 1
 
-    # Sent: the digest is saved even if the closing audit line fails, so the
-    # message is never sent twice; the "pending" record already holds the
-    # full evidence, and the failure is surfaced through the exit code.
-    _save_state(args.state_path, {
-        "last_digest": digest,
-        "last_sent_at": datetime.now(timezone.utc).isoformat(),
-        "symbols": [str(r.get("symbol")) for r in qualifying],
-        "audit_event_id": event_id,
-    })
-    if not _try_append_audit(args.audit_path, {
-        "event_type": "premarket_alert", "event_id": event_id, "status": "sent",
-        "sent_at_utc": datetime.now(timezone.utc).isoformat(),
-    }):
-        logger.error("Alert %s was sent but its 'sent' audit line could not be written.", event_id)
+    # Committed before the hand-off: if this run dies mid-send, the alert is
+    # treated as possibly delivered and never resent automatically.
+    outbox.transition(alert_key, event_id=event_id, to=PROVIDER_SUBMITTED)
+    try:
+        # No automatic retry: a timed-out hand-off may already have gone out.
+        result = send_imessage(message, config=config, retries=0)
+    except subprocess.TimeoutExpired as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        outbox.transition(alert_key, event_id=event_id, to=DELIVERY_UNKNOWN, error=error)
+        logger.error("iMessage hand-off timed out; delivery unknown, not retried.")
+        _audit_status(DELIVERY_UNKNOWN, error=error)
         return 1
-    logger.info("Alert sent to %s (%s setups).", result.get("to"), len(qualifying))
-    return 0
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        outbox.transition(alert_key, event_id=event_id, to=FAILED, error=error)
+        logger.exception("iMessage send failed; nothing was sent.")
+        _audit_status(FAILED, error=error)
+        return 1
+
+    outbox.transition(alert_key, event_id=event_id, to=ACCEPTED, detail={"to": result.get("to")})
+    # Accepted: the outbox already prevents a resend, so a failure to update
+    # the state file or the closing audit line is reported but never resends.
+    code = 0
+    try:
+        _save_state(args.state_path, {
+            "last_digest": digest,
+            "last_sent_at": datetime.now(timezone.utc).isoformat(),
+            "symbols": [str(r.get("symbol")) for r in qualifying],
+            "audit_event_id": event_id,
+        })
+    except Exception:
+        logger.exception("Alert %s was accepted but the state file could not be updated.", event_id)
+        code = 1
+    if not _audit_status(ACCEPTED):
+        logger.error("Alert %s was accepted but its closing audit line could not be written.", event_id)
+        code = 1
+    logger.info("Alert accepted for %s (%s setups).", result.get("to"), len(qualifying))
+    return code
 
 
 if __name__ == "__main__":
