@@ -145,6 +145,12 @@ import.
 | `OPTIONS_CALCULATOR_PROVIDER_DISK_CACHE` | 1 | Set `0` to turn off the shared on-disk cache for MarketData.app earnings, expirations and historical chains (`~/.options_calculator_pro/cache/`). Live chains and quotes are never cached on disk. |
 | `LOG_ROTATION_TIMEOUT_SECONDS` | 300 | Hard cap for log rotation. |
 
+**MarketData.app credit ledger** (`~/.options_calculator_pro/telemetry/provider_budget.sqlite`):
+
+- **Settlement:** each call holds its estimated cost, then settles at its actual cost in one transaction. A hold that is never settled (a crash, or a ledger that could not be written at settlement) stays counted as spent. After 10 minutes it moves to `unreconciled`, and the budget health reports it.
+- **Provider quota:** what the API reports in its rate-limit headers is kept per quota window, until the reset time the API gave. Within a window the remaining balance only goes down, so a late, older response cannot raise it.
+- **Unusable ledger:** if the ledger cannot be read or written, discovery and entry calls are not made (`provider_budget_unavailable`). Exit calls still go out, so open trades are valued at their exit time. Each one is first appended to `~/.options_calculator_pro/telemetry/unmetered_provider_calls.jsonl`, and refused if that write fails. The budget health check raises an alert for an unreadable ledger and for any such exit call in the last 7 days. After an incident, reconcile those calls against the provider dashboard.
+
 ### D. Frontend build-time
 
 `VITE_API_BASE` is substituted at `npm run build` time and validated at

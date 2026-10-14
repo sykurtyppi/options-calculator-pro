@@ -494,10 +494,18 @@ class MarketDataClient:
             try:
                 # Admit and hold the estimated cost atomically across processes.
                 reservation = reliability.get_credit_budget().reserve(provider, priority, estimate)
-            except Exception:  # noqa: BLE001 - an unreadable ledger must not stop data collection
-                logger.debug("MDApp budget unavailable", exc_info=True)
-                reservation = reliability.UNMETERED
-            if reservation is None:
+            except Exception as exc:  # noqa: BLE001
+                # An unusable ledger is no budget at all: only an exit goes
+                # out, and only once that bypass is durably recorded.
+                logger.warning("MDApp credit ledger unusable: %s", exc)
+                reservation = None
+                if reliability.unmetered_exit_allowed(provider=provider, priority=priority,
+                                                      endpoint_type=endpoint_type, symbol=symbol, error=exc):
+                    reservation = reliability.UNMETERED
+                else:
+                    breaker.release_probe()
+                    skip_reason = reliability.SKIP_BUDGET_UNAVAILABLE
+            if reservation is None and skip_reason is None:
                 breaker.release_probe()
                 skip_reason = reliability.SKIP_BUDGET
         if skip_reason is not None:
@@ -594,6 +602,8 @@ class MarketDataClient:
                         breaker.record_success()
                         health_reported = True
                         self._charge(resp, data, endpoint_type, params, priority, estimate, reservation)
+                        # Served, and possibly charged even if settlement
+                        # failed: never release this hold below.
                         settled = True
                         self._cache[cache_key] = (now, data)
                         if disk_cache is not None:
@@ -654,7 +664,10 @@ class MarketDataClient:
         try:
             reliability.get_credit_budget().settle(reservation, self.provider_name, priority, credits)
         except Exception:  # noqa: BLE001 - accounting must not lose a good response
-            logger.debug("MDApp credit charge not recorded", exc_info=True)
+            # The settlement rolled back, so the hold stays and later counts
+            # as unreconciled spend: the cost is never silently dropped.
+            logger.warning("MDApp credit settlement not recorded; the hold stays as unreconciled spend",
+                           exc_info=True)
 
     @staticmethod
     def _chain_response_to_df(data: Dict[str, Any]) -> pd.DataFrame:

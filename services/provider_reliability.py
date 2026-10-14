@@ -72,6 +72,9 @@ PRIORITY_CEILINGS = {PRIORITY_EXIT: 1.0, PRIORITY_ENTRY: 0.85, PRIORITY_DISCOVER
 
 SKIP_BUDGET = "provider_budget_exhausted"
 SKIP_CIRCUIT_OPEN = "provider_circuit_open"
+# The credit ledger could not be read or written: discovery and entry calls
+# are not made (budget protection must not vanish when the ledger does).
+SKIP_BUDGET_UNAVAILABLE = "provider_budget_unavailable"
 
 MARKETDATA_PROVIDER = "marketdata_app"
 DAILY_CREDITS_ENV = "OPTIONS_CALCULATOR_MARKETDATA_DAILY_CREDITS"
@@ -99,6 +102,9 @@ _BUDGET_TZ = ZoneInfo("America/New_York")
 _ROOT = Path.home() / ".options_calculator_pro"
 _DEFAULT_BUDGET_STORE = _ROOT / "telemetry" / "provider_budget.sqlite"
 _DEFAULT_CACHE_STORE = _ROOT / "cache" / "provider_response_cache.sqlite"
+# Exit calls made while the ledger was unusable: append-only, outside the
+# ledger, so the bypass is durable and visible (see unmetered_exit_allowed).
+_DEFAULT_UNMETERED_LOG = _ROOT / "telemetry" / "unmetered_provider_calls.jsonl"
 
 
 # ── request priority and the per-candidate skip log ─────────────────────────
@@ -301,7 +307,22 @@ CREATE TABLE IF NOT EXISTS provider_credit_reservations (
     credits         REAL NOT NULL,
     created_at      TEXT NOT NULL
 );
+-- A hold never settled or released within RESERVATION_TTL_SECONDS (a crash,
+-- an unwritable ledger at settlement): its call may have been charged, so it
+-- stays counted as spent rather than vanishing.
+CREATE TABLE IF NOT EXISTS provider_credit_unreconciled (
+    reservation_id  TEXT PRIMARY KEY,
+    provider        TEXT NOT NULL,
+    budget_day      TEXT NOT NULL,
+    priority        TEXT NOT NULL,
+    credits         REAL NOT NULL,
+    created_at      TEXT NOT NULL,
+    expired_at      TEXT NOT NULL
+);
 """
+
+# provider_reported_quota is keyed by quota window: "reset:<ISO time>" when
+# the provider said when its quota resets, else the local budget day.
 
 
 def _reset_offset() -> timedelta:
@@ -374,23 +395,50 @@ class CreditBudget:
                                      "skipped": int(r["skipped_count"])} for r in rows}
 
     def _reported(self, provider: str, day: str, now: datetime) -> Optional[sqlite3.Row]:
-        row = self._conn.execute(
-            "SELECT reported_limit, reported_remaining, reported_at, reported_reset_at FROM provider_reported_quota "
-            "WHERE provider = ? AND budget_day = ?", (provider, day),
+        """What the provider last said about the quota window ``now`` is in.
+
+        A window the provider gave a reset time for holds until that time,
+        whatever the local budget day says; without one it is the budget day.
+        """
+        rows = self._conn.execute(
+            "SELECT reported_limit, reported_remaining, reported_at, reported_reset_at FROM provider_reported_quota"
+            " WHERE provider = ? AND reported_reset_at IS NOT NULL ORDER BY reported_reset_at",
+            (provider,),
+        ).fetchall()
+        for row in rows:
+            if datetime.fromisoformat(row["reported_reset_at"]) > now:
+                return row                   # the earliest reset still ahead: the current window
+        return self._conn.execute(
+            "SELECT reported_limit, reported_remaining, reported_at, reported_reset_at FROM provider_reported_quota"
+            " WHERE provider = ? AND budget_day = ? AND reported_reset_at IS NULL", (provider, day),
         ).fetchone()
-        if row is not None and row["reported_reset_at"]:
-            # The provider said when this quota resets; past that it is stale.
-            if now >= datetime.fromisoformat(row["reported_reset_at"]):
-                return None
-        return row
 
     def _reserved(self, provider: str, day: str, now: datetime) -> float:
-        cutoff = (now - timedelta(seconds=RESERVATION_TTL_SECONDS)).isoformat()
+        # Every hold counts until it is settled, released or moved to
+        # unreconciled; none silently stops counting when it ages.
         row = self._conn.execute(
             "SELECT COALESCE(SUM(credits), 0) FROM provider_credit_reservations"
-            " WHERE provider = ? AND budget_day = ? AND created_at > ?", (provider, day, cutoff),
+            " WHERE provider = ? AND budget_day = ?", (provider, day),
         ).fetchone()
         return float(row[0] or 0.0)
+
+    def _unreconciled(self, provider: str, day: str) -> float:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(credits), 0) FROM provider_credit_unreconciled"
+            " WHERE provider = ? AND budget_day = ?", (provider, day),
+        ).fetchone()
+        return float(row[0] or 0.0)
+
+    def _expire_stale_holds(self, now: datetime) -> None:
+        """Move holds older than the TTL to unreconciled (inside a write transaction)."""
+        cutoff = (now - timedelta(seconds=RESERVATION_TTL_SECONDS)).isoformat()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO provider_credit_unreconciled"
+            " (reservation_id, provider, budget_day, priority, credits, created_at, expired_at)"
+            " SELECT reservation_id, provider, budget_day, priority, credits, created_at, ?"
+            " FROM provider_credit_reservations WHERE created_at <= ?", (now.isoformat(), cutoff),
+        )
+        self._conn.execute("DELETE FROM provider_credit_reservations WHERE created_at <= ?", (cutoff,))
 
     def status(self, provider: str = MARKETDATA_PROVIDER) -> Dict[str, Any]:
         with self._lock:
@@ -401,9 +449,11 @@ class CreditBudget:
         by_priority = self._spent(provider, day)
         reported = self._reported(provider, day, now)
         reserved = self._reserved(provider, day, now)
+        unreconciled = self._unreconciled(provider, day)
         limit = configured_daily_limit(provider)
         limit_source = "env" if os.environ.get(DAILY_CREDITS_ENV) else "default"
-        local_spent = sum(item["credits"] for item in by_priority.values())
+        # Unreconciled holds count as spent: the call may have been charged.
+        local_spent = sum(item["credits"] for item in by_priority.values()) + unreconciled
         spent = local_spent
         if reported is not None and reported["reported_limit"] is not None:
             limit = float(reported["reported_limit"])
@@ -428,6 +478,8 @@ class CreditBudget:
             "spent": round(spent, 3),
             # In flight: admitted but not yet settled against actual cost.
             "reserved": round(reserved, 3),
+            # Holds that expired unsettled, counted as spent (accounting unknown).
+            "unreconciled": round(unreconciled, 3),
             "remaining": None if limit == float("inf") else round(max(0.0, limit - spent - reserved), 3),
             "utilization": round(utilization, 6),
             "alert_level": level,
@@ -464,8 +516,7 @@ class CreditBudget:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                cutoff = (now - timedelta(seconds=RESERVATION_TTL_SECONDS)).isoformat()
-                self._conn.execute("DELETE FROM provider_credit_reservations WHERE created_at <= ?", (cutoff,))
+                self._expire_stale_holds(now)
                 if not self._fits(self._status_locked(provider, now), priority, estimated_credits):
                     self._conn.commit()
                     return None
@@ -495,59 +546,105 @@ class CreditBudget:
     def settle(self, reservation_id: Optional[str], provider: str, priority: str, credits: float, *,
                reported_limit: Optional[float] = None, reported_remaining: Optional[float] = None,
                reported_reset_at: Optional[datetime] = None) -> None:
-        """Replace a reservation with the call's actual cost (reconciliation)."""
-        self.release(reservation_id)
-        self.charge(provider, priority, credits, reported_limit=reported_limit,
-                    reported_remaining=reported_remaining, reported_reset_at=reported_reset_at)
+        """Replace a reservation with the call's actual cost (reconciliation).
+
+        One write transaction: the hold is removed and the charge added
+        together, so no other process can reserve in between against a total
+        that has momentarily lost both, and a failure leaves the hold in place
+        (it later expires to unreconciled, still counted as spent).
+        """
+        now = self._now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if reservation_id and reservation_id != UNMETERED:
+                    self._conn.execute("DELETE FROM provider_credit_reservations WHERE reservation_id = ?",
+                                       (reservation_id,))
+                self._bump_locked(provider, priority, now, credits=max(0.0, float(credits)), requests=1)
+                self._record_quota_locked(provider, now, reported_limit, reported_remaining, reported_reset_at)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        self._maybe_alert(provider)
 
     # writes
 
+    def _bump_locked(self, provider: str, priority: str, now: datetime, *, credits: float = 0.0,
+                     requests: int = 0, skipped: int = 0) -> None:
+        self._conn.execute(
+            """INSERT INTO provider_credit_spend
+                   (provider, budget_day, priority, credits, request_count, skipped_count, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(provider, budget_day, priority) DO UPDATE SET
+                   credits = credits + excluded.credits,
+                   request_count = request_count + excluded.request_count,
+                   skipped_count = skipped_count + excluded.skipped_count,
+                   updated_at = excluded.updated_at""",
+            (provider, budget_day(now), priority, float(credits), int(requests), int(skipped), now.isoformat()),
+        )
+
     def _bump(self, provider: str, priority: str, *, credits: float = 0.0, requests: int = 0,
               skipped: int = 0) -> None:
-        day = budget_day(self._now())
-        stamp = self._now().isoformat()
         with self._lock:
-            self._conn.execute(
-                """INSERT INTO provider_credit_spend
-                       (provider, budget_day, priority, credits, request_count, skipped_count, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(provider, budget_day, priority) DO UPDATE SET
-                       credits = credits + excluded.credits,
-                       request_count = request_count + excluded.request_count,
-                       skipped_count = skipped_count + excluded.skipped_count,
-                       updated_at = excluded.updated_at""",
-                (provider, day, priority, float(credits), int(requests), int(skipped), stamp),
-            )
+            self._bump_locked(provider, priority, self._now(), credits=credits, requests=requests, skipped=skipped)
             self._conn.commit()
 
     def charge(self, provider: str, priority: str, credits: float, *,
                reported_limit: Optional[float] = None, reported_remaining: Optional[float] = None,
                reported_reset_at: Optional[datetime] = None) -> None:
-        self._bump(provider, priority, credits=max(0.0, float(credits)), requests=1)
-        self.record_reported_quota(provider, reported_limit=reported_limit, reported_remaining=reported_remaining,
-                                   reported_reset_at=reported_reset_at)
+        self.settle(None, provider, priority, credits, reported_limit=reported_limit,
+                    reported_remaining=reported_remaining, reported_reset_at=reported_reset_at)
+
+    def _record_quota_locked(self, provider: str, now: datetime, reported_limit: Optional[float],
+                             reported_remaining: Optional[float], reported_reset_at: Optional[datetime]) -> None:
+        """Fold one response's quota headers into its window (inside a write transaction).
+
+        Responses can arrive out of order, so within a window the remaining
+        balance only goes down: a late response carrying an older, higher
+        balance never raises it. A late response for a window that has
+        already reset is stored under that window, which is never read again
+        (see ``_reported``).
+        """
+        if reported_limit is None and reported_remaining is None:
+            return
+        reset_iso = reported_reset_at.astimezone(timezone.utc).isoformat() if reported_reset_at else None
+        window = f"reset:{reset_iso}" if reset_iso is not None else budget_day(now)
+        prior = self._conn.execute(
+            "SELECT reported_limit, reported_remaining FROM provider_reported_quota"
+            " WHERE provider = ? AND budget_day = ?", (provider, window),
+        ).fetchone()
+        remaining = reported_remaining
+        if prior is not None and prior["reported_remaining"] is not None:
+            remaining = (float(prior["reported_remaining"]) if reported_remaining is None
+                         else min(float(prior["reported_remaining"]), float(reported_remaining)))
+        limit = reported_limit if reported_limit is not None else (prior["reported_limit"] if prior else None)
+        self._conn.execute(
+            """INSERT INTO provider_reported_quota
+                   (provider, budget_day, reported_limit, reported_remaining, reported_at, reported_reset_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(provider, budget_day) DO UPDATE SET
+                   reported_limit = excluded.reported_limit,
+                   reported_remaining = excluded.reported_remaining,
+                   reported_at = excluded.reported_at,
+                   reported_reset_at = excluded.reported_reset_at""",
+            (provider, window, limit, remaining, now.isoformat(), reset_iso),
+        )
 
     def record_reported_quota(self, provider: str, *, reported_limit: Optional[float] = None,
                               reported_remaining: Optional[float] = None,
                               reported_reset_at: Optional[datetime] = None) -> None:
         """Keep what the provider says about the quota, from any response (errors included)."""
         if reported_limit is not None or reported_remaining is not None:
-            day = budget_day(self._now())
             with self._lock:
-                self._conn.execute(
-                    """INSERT INTO provider_reported_quota
-                           (provider, budget_day, reported_limit, reported_remaining, reported_at,
-                            reported_reset_at)
-                       VALUES (?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(provider, budget_day) DO UPDATE SET
-                           reported_limit = COALESCE(excluded.reported_limit, reported_limit),
-                           reported_remaining = COALESCE(excluded.reported_remaining, reported_remaining),
-                           reported_at = excluded.reported_at,
-                           reported_reset_at = COALESCE(excluded.reported_reset_at, reported_reset_at)""",
-                    (provider, day, reported_limit, reported_remaining, self._now().isoformat(),
-                     reported_reset_at.isoformat() if reported_reset_at else None),
-                )
-                self._conn.commit()
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self._record_quota_locked(provider, self._now(), reported_limit, reported_remaining,
+                                              reported_reset_at)
+                    self._conn.commit()
+                except BaseException:
+                    self._conn.rollback()
+                    raise
         self._maybe_alert(provider)
 
     def record_skip(self, provider: str, priority: str) -> None:
@@ -584,12 +681,65 @@ def blocked_reason(provider: str, priority: Optional[str] = None, estimated_cred
     """
     if not get_breaker(provider).allow():
         return SKIP_CIRCUIT_OPEN
+    tier = priority or current_priority()
     try:
-        allowed = get_credit_budget().allows(provider, priority or current_priority(), estimated_credits)
-    except Exception:  # noqa: BLE001 - an unreadable ledger must not stop data collection
-        logger.debug("provider budget unavailable", exc_info=True)
-        return None
+        allowed = get_credit_budget().allows(provider, tier, estimated_credits)
+    except Exception:  # noqa: BLE001
+        logger.warning("provider budget unavailable", exc_info=True)
+        # Fails closed, except for exits (see unmetered_exit_allowed).
+        return None if tier == PRIORITY_EXIT else SKIP_BUDGET_UNAVAILABLE
     return None if allowed else SKIP_BUDGET
+
+
+def unmetered_exit_allowed(*, provider: str, priority: str, endpoint_type: str, symbol: Optional[str],
+                           error: BaseException, log_path: Optional[Path] = None) -> bool:
+    """May a call go out while the credit ledger is unusable?
+
+    Only an exit (an open trade is valued at its exit time or not at all),
+    and only once the bypass is durably written to an append-only log outside
+    the ledger, which the provider-budget health check reports as an alert.
+    Discovery and entry calls fail closed. A bypass that cannot be recorded
+    is not taken.
+    """
+    if priority != PRIORITY_EXIT:
+        return False
+    path = Path(log_path or _DEFAULT_UNMETERED_LOG)
+    record = {
+        "at": datetime.now(timezone.utc).isoformat(), "provider": provider, "priority": priority,
+        "endpoint_type": endpoint_type, "symbol": symbol,
+        "ledger_error": f"{type(error).__name__}: {str(error)[:200]}",
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        logger.error("unmetered exit call refused: the bypass could not be recorded", exc_info=True)
+        return False
+    logger.error("credit ledger unusable; exit call to %s made UNMETERED and recorded in %s", provider, path)
+    return True
+
+
+def unmetered_exit_calls(*, since: datetime, log_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Recorded unmetered exit calls at or after ``since`` (unreadable lines are counted, not hidden)."""
+    path = Path(log_path or _DEFAULT_UNMETERED_LOG)
+    if not path.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+            when = datetime.fromisoformat(str(item.get("at")))
+        except (ValueError, TypeError):
+            out.append({"at": None, "unreadable": True})
+            continue
+        if when >= since:
+            out.append(item)
+    return out
 
 
 def reliability_status() -> Dict[str, Any]:
@@ -602,18 +752,45 @@ def reliability_status() -> Dict[str, Any]:
     return {"marketdata_budget": budget, "circuit_breakers": breakers}
 
 
-def build_provider_budget_health(*, budget: Optional[CreditBudget] = None) -> Dict[str, Any]:
+def build_provider_budget_health(*, budget: Optional[CreditBudget] = None,
+                                 unmetered_log: Optional[Path] = None) -> Dict[str, Any]:
     """Watchdog issues for the MarketData credit budget, in the evidence-health issue shape."""
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    try:
+        bypasses = unmetered_exit_calls(since=week_ago, log_path=unmetered_log)
+    except OSError as exc:
+        bypasses = [{"at": None, "unreadable": True, "error": str(exc)[:200]}]
+    bypass_issues = []
+    if bypasses:
+        bypass_issues.append({
+            "severity": "WARN",
+            "alertable": True,
+            "message": (
+                f"{len(bypasses)} MarketData exit call(s) in the last 7 days went out UNMETERED while the "
+                "credit ledger was unusable; reconcile spend against the provider dashboard."
+            ),
+        })
     try:
         status = (budget or get_credit_budget()).status(MARKETDATA_PROVIDER)
     except Exception as exc:  # noqa: BLE001
+        # Discovery and entry calls are refused while this lasts: alert.
         return {
-            "summary": {"error": f"{type(exc).__name__}: {exc}"},
-            "issues": [{"severity": "WARN", "alertable": False,
-                        "message": f"Provider credit budget unreadable: {type(exc).__name__}"}],
+            "summary": {"error": f"{type(exc).__name__}: {exc}", "unmetered_exit_calls_7d": len(bypasses)},
+            "issues": [{"severity": "WARN", "alertable": True,
+                        "message": (f"Provider credit budget unreadable ({type(exc).__name__}): discovery and "
+                                    "entry calls are refused until it is repaired.")}] + bypass_issues,
         }
     level = status["alert_level"]
-    issues = []
+    issues = list(bypass_issues)
+    if status.get("unreconciled"):
+        issues.append({
+            "severity": "WARN",
+            "alertable": False,
+            "message": (
+                f"{status['unreconciled']:.0f} MarketData credits held by calls that never settled are "
+                f"counted as spent on {status['budget_day']} (accounting unknown)."
+            ),
+        })
     if level != "ok":
         issues.append({
             "severity": "WARN",
@@ -625,9 +802,10 @@ def build_provider_budget_health(*, budget: Optional[CreditBudget] = None) -> Di
                 f"{status['daily_limit']:.0f} credits used on {status['budget_day']}."
             ),
         })
-    return {"summary": {key: status[key] for key in ("budget_day", "daily_limit", "limit_source", "spent",
-                                                     "utilization", "alert_level")},
-            "issues": issues}
+    summary = {key: status[key] for key in ("budget_day", "daily_limit", "limit_source", "spent", "reserved",
+                                            "unreconciled", "utilization", "alert_level")}
+    summary["unmetered_exit_calls_7d"] = len(bypasses)
+    return {"summary": summary, "issues": issues}
 
 
 # ── persistent response cache ───────────────────────────────────────────────
@@ -713,8 +891,8 @@ def get_response_cache(store_path: Optional[Path] = None) -> Optional[ResponseCa
 
 __all__ = [
     "PRIORITIES", "PRIORITY_CEILINGS", "PRIORITY_DISCOVERY", "PRIORITY_ENTRY", "PRIORITY_EXIT",
-    "SKIP_BUDGET", "SKIP_CIRCUIT_OPEN", "CircuitBreaker", "CreditBudget", "ResponseCache",
+    "SKIP_BUDGET", "SKIP_BUDGET_UNAVAILABLE", "SKIP_CIRCUIT_OPEN", "CircuitBreaker", "CreditBudget", "ResponseCache",
     "blocked_reason", "build_provider_budget_health", "current_priority", "current_skips", "get_breaker", "get_credit_budget",
     "get_response_cache", "note_skip", "reliability_status", "request_priority", "reset_breakers",
-    "retry_delay", "skip_log_scope", "start_skip_log",
+    "retry_delay", "skip_log_scope", "start_skip_log", "unmetered_exit_allowed", "unmetered_exit_calls",
 ]
