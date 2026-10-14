@@ -112,9 +112,11 @@ def test_a_timed_out_hand_off_is_unknown_and_never_retried(tmp_path):
     assert code == 1 and calls == []
 
 
-def test_a_refused_send_went_nowhere_and_may_be_retried(tmp_path):
+def test_a_send_that_never_started_went_nowhere_and_may_be_retried(tmp_path):
+    # PR M: only an error proving osascript never ran is a retryable failure
+    # (a non-zero exit after it ran is delivery_unknown, see test_alert_delivery).
     def refused(_message):
-        raise subprocess.CalledProcessError(1, "osascript", stderr="buddy not found")
+        raise FileNotFoundError(2, "No such file or directory", "osascript")
 
     code, calls = _run(tmp_path, send=refused)
     assert code == 1 and len(calls) == 1

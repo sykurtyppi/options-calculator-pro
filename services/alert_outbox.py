@@ -23,10 +23,18 @@ submitting leaves a ``prepared`` row, which a later run may reclaim after
 RESERVATION_LEASE_SECONDS; a crash after ``provider_submitted`` is treated
 like a timeout (never resent). An unreadable outbox is never treated as
 empty: callers quarantine it and send nothing.
+
+Quarantining moves the only record of what was already sent, so a fresh
+outbox must not become a new send authority on its own: ``quarantine_outbox``
+first writes a durable marker next to the outbox (``tombstone_path``), and
+while it exists no alert is sent until an operator has reconciled the
+quarantined file and cleared it. If the marker cannot be written, the damaged
+outbox is left in place, which keeps every run from sending.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -216,12 +224,62 @@ class AlertOutbox:
                 raise
 
 
-def quarantine(path: Path) -> Optional[Path]:
+def tombstone_path(outbox_path: Path) -> Path:
+    """Where the marker of a quarantined outbox is kept (next to the outbox)."""
+    outbox_path = Path(outbox_path)
+    return outbox_path.with_name(outbox_path.name + ".quarantined.json")
+
+
+def read_tombstone(outbox_path: Path) -> Optional[dict]:
+    """The quarantine marker, or None if there is none. An unreadable marker
+    still blocks sending (returned with ``unreadable``)."""
+    marker = tombstone_path(outbox_path)
+    if not marker.exists():
+        return None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"unreadable": f"{type(exc).__name__}: {exc}"}
+    return payload if isinstance(payload, dict) else {"unreadable": "not an object"}
+
+
+def quarantine_outbox(outbox_path: Path, *, reason: str) -> Optional[Path]:
+    """Move a damaged outbox aside, leaving a durable marker that blocks sends.
+
+    The marker is written (and fsynced) before the move. If it cannot be
+    written, nothing is moved and OSError propagates: the damaged outbox then
+    keeps blocking every run, as the marker would have.
+    """
+    outbox_path = Path(outbox_path)
+    marker = tombstone_path(outbox_path)
+    stamp = _now()
+    target = outbox_path.with_name(f"{outbox_path.name}.corrupt-{stamp.strftime('%Y%m%dT%H%M%S%fZ')}")
+    payload = {"quarantined_at": stamp.isoformat(), "outbox": str(outbox_path), "moved_to": str(target),
+               "reason": str(reason)[:500]}
+    tmp = marker.with_name(marker.name + f".{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, marker)
+    return quarantine(outbox_path, target=target)
+
+
+def clear_tombstone(outbox_path: Path) -> bool:
+    """An operator has reconciled the quarantined outbox: allow sends again."""
+    marker = tombstone_path(outbox_path)
+    if not marker.exists():
+        return False
+    marker.unlink()
+    return True
+
+
+def quarantine(path: Path, *, target: Optional[Path] = None) -> Optional[Path]:
     """Move an unreadable state file aside (kept for inspection); returns where."""
     path = Path(path)
     if not path.exists():
         return None
-    target = path.with_name(f"{path.name}.corrupt-{_now().strftime('%Y%m%dT%H%M%S%fZ')}")
+    target = target or path.with_name(f"{path.name}.corrupt-{_now().strftime('%Y%m%dT%H%M%S%fZ')}")
     path.replace(target)
     for suffix in ("-wal", "-shm"):
         side = path.with_name(path.name + suffix)
@@ -232,5 +290,6 @@ def quarantine(path: Path) -> Optional[Path]:
 
 __all__ = [
     "ACCEPTED", "DELIVERY_UNKNOWN", "FAILED", "PREPARED", "PROVIDER_SUBMITTED", "AlertOutbox",
-    "InvalidTransition", "OutboxCorrupt", "OutboxUnavailable", "Reservation", "quarantine",
+    "InvalidTransition", "OutboxCorrupt", "OutboxUnavailable", "Reservation", "clear_tombstone", "quarantine",
+    "quarantine_outbox", "read_tombstone", "tombstone_path",
 ]

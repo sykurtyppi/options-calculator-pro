@@ -15,8 +15,11 @@ Design notes
   reserved in a durable outbox (``services.alert_outbox``) before anything is
   handed to Messages, so concurrent runs cannot both send. A timed-out
   hand-off is recorded as ``delivery_unknown`` and never retried
-  automatically; an unreadable outbox or state file is quarantined and
-  nothing is sent. A re-run with the same qualifying set is a no-op unless
+  automatically, as is any error once ``osascript`` has been launched (only
+  an error that proves it never started is a retryable ``failed``). An
+  unreadable outbox or state file is quarantined and nothing is sent; a
+  quarantined outbox leaves a marker that blocks every send until an
+  operator reconciles it (``--outbox-reconciled``). A re-run with the same qualifying set is a no-op unless
   ``--force`` is passed.
 * **Silence is a valid outcome.** Qualifying setups are rare by design
   (~10-40/year). "Nothing qualified" exits 0 without sending, rather than
@@ -48,7 +51,6 @@ import json
 import logging
 import math
 import os
-import subprocess
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -76,8 +78,13 @@ from services.alert_outbox import (  # noqa: E402
     AlertOutbox,
     OutboxCorrupt,
     OutboxUnavailable,
+    clear_tombstone,
     quarantine,
+    quarantine_outbox,
+    read_tombstone,
+    tombstone_path,
 )
+from services.external_io_gate import ExternalIOBlocked  # noqa: E402
 from services.automation_watchdog import IMessageConfig, send_imessage  # noqa: E402
 from services.screener_service import build_ranked_screener, ranking_score_components  # noqa: E402
 
@@ -474,7 +481,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="JSONL audit trail of every sent alert.")
     parser.add_argument("--outbox-path", type=Path, default=None,
                         help="Durable send outbox (default: next to the state file).")
+    parser.add_argument("--outbox-reconciled", action="store_true",
+                        help="An operator has checked the quarantined outbox against what was actually "
+                             "sent: clear its marker and allow sending again.")
     return parser.parse_args(argv)
+
+
+def _never_launched(exc: BaseException) -> bool:
+    """Does this error prove osascript never started (so nothing went out)?
+
+    Only two do: the external-IO gate refusing before any process, and the
+    OS failing to execute osascript at all (an OSError naming it: not found,
+    not permitted, not executable). Everything else, a timeout, a non-zero
+    exit, an error decoding its output, may follow the hand-off.
+    """
+    if isinstance(exc, ExternalIOBlocked):
+        return True
+    return isinstance(exc, OSError) and Path(str(getattr(exc, "filename", "") or "")).name == "osascript"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -556,11 +579,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     event_id = uuid.uuid4().hex
     outbox_path = args.outbox_path or args.state_path.with_name("premarket_alert_outbox.sqlite")
+    # A quarantined outbox took the record of what was sent with it: a fresh
+    # one is no send authority until an operator has reconciled.
+    if args.outbox_reconciled and clear_tombstone(outbox_path):
+        logger.warning("Outbox quarantine marker cleared by the operator (%s).", tombstone_path(outbox_path))
+    marker = read_tombstone(outbox_path)
+    if marker is not None:
+        logger.error("Alert outbox was quarantined (%s); nothing is sent until it is reconciled. "
+                     "Check the quarantined file against what was sent, then re-run with "
+                     "--outbox-reconciled.", marker)
+        return 1
     try:
         outbox = AlertOutbox(outbox_path)
     except OutboxCorrupt as exc:
-        moved = quarantine(outbox_path)
-        logger.error("Alert outbox is damaged (%s); moved to %s. Nothing sent.", exc, moved)
+        try:
+            moved = quarantine_outbox(outbox_path, reason=str(exc))
+        except OSError:
+            logger.exception("Alert outbox is damaged (%s) and its quarantine marker could not be written; "
+                             "left in place. Nothing sent.", exc)
+            return 1
+        logger.error("Alert outbox is damaged (%s); moved to %s and sends are blocked until it is "
+                     "reconciled. Nothing sent.", exc, moved)
         return 1
     except OutboxUnavailable as exc:
         # Contention or I/O, not damage: leave the outbox where it is.
@@ -623,17 +662,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         # No automatic retry: a timed-out hand-off may already have gone out.
         result = send_imessage(message, config=config, retries=0)
-    except subprocess.TimeoutExpired as exc:
+    except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
+        if _never_launched(exc):
+            outbox.transition(alert_key, event_id=event_id, to=FAILED, error=error)
+            logger.exception("iMessage hand-off never started; nothing was sent.")
+            _audit_status(FAILED, error=error)
+            return 1
+        # osascript was launched: a timeout, a non-zero exit or an error
+        # reading its output may all come after Messages took the alert.
         outbox.transition(alert_key, event_id=event_id, to=DELIVERY_UNKNOWN, error=error)
-        logger.error("iMessage hand-off timed out; delivery unknown, not retried.")
+        logger.error("iMessage hand-off ended with %s after osascript started; delivery unknown, "
+                     "not retried.", error)
         _audit_status(DELIVERY_UNKNOWN, error=error)
-        return 1
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        outbox.transition(alert_key, event_id=event_id, to=FAILED, error=error)
-        logger.exception("iMessage send failed; nothing was sent.")
-        _audit_status(FAILED, error=error)
         return 1
 
     outbox.transition(alert_key, event_id=event_id, to=ACCEPTED, detail={"to": result.get("to")})
