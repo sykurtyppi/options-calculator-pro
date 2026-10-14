@@ -83,10 +83,12 @@ def build_forward_performance_diagnostics(
 
     no_trade_count = sum(1 for row in ledger_rows if str(row.get("recommendation") or "") == "No Trade")
     # An event analyzed on several days is one decision: its latest analysis.
+    # An event whose earnings date moved counts once, under its current date.
+    superseded = getattr(ledger_obj, "superseded_event_keys", dict)()
     latest_by_event: Dict[str, Dict[str, Any]] = {}
     for row in ledger_rows:
         key = row.get("event_key")
-        if key and int(row.get("event_sequence") or 0) >= int(latest_by_event.get(key, {}).get("event_sequence") or 0):
+        if key and key not in superseded and int(row.get("event_sequence") or 0) >= int(latest_by_event.get(key, {}).get("event_sequence") or 0):
             latest_by_event[str(key)] = row
     no_trade_event_count = sum(
         1 for row in latest_by_event.values() if str(row.get("recommendation") or "") == "No Trade"

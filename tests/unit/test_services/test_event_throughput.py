@@ -109,7 +109,7 @@ def test_summaries_count_events_by_their_latest_decision(tmp_path, ledger):
     summary = ledger.summarize()
     assert summary["total"] == 3
     assert summary["events"] == {"total": 2, "by_recommendation": {"Candidate": 1, "No Trade": 1},
-                                 "analyses_without_event": 0}
+                                 "analyses_without_event": 0, "superseded": 0}
     diagnostics = build_forward_performance_diagnostics(
         ledger=ledger, outcome_store=OutcomeStore(store_path=tmp_path / "o.sqlite"),
         baseline_store=BaselineEvidenceStore(tmp_path / "b.sqlite"),
@@ -226,7 +226,7 @@ def test_a_recheck_whose_window_closed_expires_with_a_reason(tmp_path, funnel):
     outcome, reason, detail = _event(funnel, "c1", "GONE", "recorded")
     assert (outcome, reason) == ("dropped", "recheck_expired:missing_entry_quote:no_spot_price")
     assert len(detail["attempts"]) == 1
-    assert funnel.recheck_counts() == {"pending": 0, "done": 0, "expired": 1}
+    assert funnel.recheck_counts() == {"pending": 0, "done": 0, "expired": 1, "superseded": 0}
 
 
 def test_a_failed_analysis_is_retried_next_cycle(tmp_path, funnel):
@@ -258,4 +258,4 @@ def test_a_dry_run_schedules_nothing(tmp_path, funnel):
 def test_the_funnel_report_counts_rechecks(funnel):
     funnel.schedule_recheck(symbol="A", earnings_date="2026-05-01", recheck_on=TODAY, reason="x", as_of=TODAY)
     report = ef.build_evidence_funnel_report(as_of=TODAY, store=funnel)
-    assert report["rechecks"] == {"pending": 1, "done": 0, "expired": 0}
+    assert report["rechecks"] == {"pending": 1, "done": 0, "expired": 0, "superseded": 0}
