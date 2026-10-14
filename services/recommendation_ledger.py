@@ -271,6 +271,7 @@ def _open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     # PR-T: the module-level
     # _WRITE_LOCK serializes in-process writers and WAL handles concurrent
@@ -279,7 +280,16 @@ def _open_db(path: Path) -> sqlite3.Connection:
     # OperationalError after SQLite's tiny default 5s busy timeout.
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_TABLE_DDL)
-    _migrate(conn)
+    # Migrations run under the database's write lock: concurrent processes
+    # opening an older ledger take turns, and each re-reads the schema once it
+    # holds the lock, so none repeats another's ALTER TABLE.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _migrate(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     conn.executescript(_INDEX_DDL)
     conn.executescript(_REVISIONS_TABLE_DDL)
     conn.executescript(_REVISIONS_INDEX_DDL)
@@ -294,6 +304,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if column not in existing:
             conn.execute(f"ALTER TABLE recommendations ADD COLUMN {column} {ddl_type}")
     _backfill_event_identity(conn)
+    # One row per (event, sequence), enforced by the database (F4 allocated
+    # sequences with a read-then-insert that could race across processes).
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_recommendations_event_sequence"
+        " ON recommendations (event_key, event_sequence)"
+    )
 
 
 def make_event_key(symbol: Any, earnings_date: Any) -> Optional[str]:
@@ -306,8 +322,9 @@ def make_event_key(symbol: Any, earnings_date: Any) -> Optional[str]:
 def _backfill_event_identity(conn: sqlite3.Connection) -> None:
     """Give rows written before F4 their event key and per-event sequence.
 
-    Sequences follow creation order. Only events with an unnumbered row are
-    renumbered, so rows written since keep their numbers.
+    Sequences follow creation order. Only events with an unnumbered row, or
+    with two rows sharing a number (written by racing processes before the
+    unique index existed), are renumbered; every other event keeps its numbers.
     """
     conn.execute(
         """
@@ -322,6 +339,10 @@ def _backfill_event_identity(conn: sqlite3.Connection) -> None:
         WITH pending AS (
             SELECT DISTINCT event_key FROM recommendations
              WHERE event_key IS NOT NULL AND event_sequence IS NULL
+            UNION
+            SELECT event_key FROM recommendations
+             WHERE event_key IS NOT NULL AND event_sequence IS NOT NULL
+             GROUP BY event_key, event_sequence HAVING COUNT(*) > 1
         ), ranked AS (
             SELECT recommendation_id,
                    ROW_NUMBER() OVER (PARTITION BY event_key ORDER BY created_at, recommendation_id) AS seq
@@ -338,6 +359,11 @@ def _backfill_event_identity(conn: sqlite3.Connection) -> None:
 @contextmanager
 def _tx(conn: sqlite3.Connection) -> Generator[sqlite3.Cursor, None, None]:
     cur = conn.cursor()
+    if not conn.in_transaction:
+        # Take the write lock up front: reads in the transaction (e.g. the
+        # next event_sequence) then cannot be invalidated by another process
+        # writing between the read and the insert.
+        cur.execute("BEGIN IMMEDIATE")
     try:
         yield cur
         conn.commit()

@@ -18,6 +18,7 @@ import pytest
 
 import scripts.run_forward_loop as forward_loop
 from scripts.seed_outcomes_from_replay import seed_from_trades
+from services.claim_contract import CONTRACT_VERSION
 from services.baseline_evidence_store import BaselineEvidenceStore
 from services.calibration_service import IVExpansionCalibration
 from services.evidence_report import build_evidence_report, build_weekly_evidence_report
@@ -36,13 +37,16 @@ def _entry(store, i, *, claim):
         trade_id=f"T{i}", recommendation_id=f"rec-{i}", symbol=f"S{i}", structure="otm_strangle",
         entry_date=EXIT - timedelta(days=5), earnings_date=EXIT + timedelta(days=1),
         setup_score=0.6, source_type="paper", entry_mid=2.0, claim_allowed=claim,
+        claim_contract_version=CONTRACT_VERSION if claim else None,
     )
 
 
 def _resolved(store, i, ret, *, claim):
     _entry(store, i, claim=claim)
     store.update_exit(trade_id=f"T{i}", exit_date=EXIT, exit_mid=2.0, realized_return_pct=ret,
-                      realized_expansion_pct=ret)
+                      realized_expansion_pct=ret,
+                      exit_execution_scenarios={"claim": {"passed": True, "reasons": [],
+                                                          "contract_version": CONTRACT_VERSION}})
     store.mark_finalized(f"T{i}")
 
 

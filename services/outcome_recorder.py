@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS outcome_trades (
     evidence_quality_status         TEXT,
     evidence_quality_reasons_json   TEXT,
     claim_allowed                   INTEGER,
+    claim_contract_version          TEXT,
     execution_grade                 INTEGER,
     entry_quote_source              TEXT,
     entry_quote_quality             TEXT,
@@ -158,6 +159,7 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "evidence_quality_status": "TEXT",
     "evidence_quality_reasons_json": "TEXT",
     "claim_allowed": "INTEGER",
+    "claim_contract_version": "TEXT",
     "execution_grade": "INTEGER",
     "entry_quote_source": "TEXT",
     "entry_quote_quality": "TEXT",
@@ -329,6 +331,7 @@ class OutcomeStore:
         evidence_quality_reasons: Optional[list[str]] = None,
         claim_allowed: Optional[bool] = None,
         execution_grade: Optional[bool] = None,
+        claim_contract_version: Optional[str] = None,
         entry_quote_source: Optional[str] = None,
         entry_quote_quality: Optional[str] = None,
         entry_quote_timestamp: Optional[str] = None,
@@ -418,6 +421,11 @@ class OutcomeStore:
             with _tx(self._conn) as cur:
                 cur.execute(sql, params)
                 inserted = cur.rowcount > 0
+                if inserted and claim_contract_version is not None:
+                    # The claim contract the entry was checked under: a claim
+                    # is only ever folded with a verdict of the same version.
+                    cur.execute("UPDATE outcome_trades SET claim_contract_version = ? WHERE trade_id = ?",
+                                (str(claim_contract_version), trade_id))
         if inserted:
             logger.debug("outcome_store: inserted entry trade_id=%s", trade_id)
         else:
@@ -496,13 +504,15 @@ class OutcomeStore:
                 # F5: an entry that was claim-eligible stays claimable only if
                 # its exit passed the claim contract too.
                 prior = cur.execute(
-                    "SELECT claim_allowed, evidence_quality_reasons_json FROM outcome_trades WHERE trade_id = ?",
+                    "SELECT claim_allowed, evidence_quality_reasons_json, claim_contract_version"
+                    " FROM outcome_trades WHERE trade_id = ?",
                     (trade_id,),
                 ).fetchone()
                 claim_allowed, claim_reasons = apply_exit_claim(
                     claim_allowed=None if prior is None or prior[0] is None else bool(prior[0]),
                     evidence_reasons=_loads_list(prior[1]) if prior is not None else [],
                     exit_execution_scenarios=exit_execution_scenarios,
+                    entry_contract_version=prior[2] if prior is not None else None,
                 )
                 cur.execute(sql, params + (_bool_int(claim_allowed), _json_payload(claim_reasons)) + tail)
                 updated = cur.rowcount > 0

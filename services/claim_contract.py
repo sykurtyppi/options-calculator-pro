@@ -15,14 +15,17 @@ A quote passes (entry or exit) when every one of these holds:
    AAPL1) does not pass, so corporate actions cannot slip into a claim.
 3. Bid/ask completeness: each leg has a finite bid >= MIN_LEG_BID, an ask at
    or above the bid, and a spread within MAX_LEG_SPREAD_PCT of its mid.
-4. Synchronized, fresh quotes: each leg carries its own quote time, inside the
-   regular session of the quote's session day; the legs are within
-   MAX_LEG_SKEW_SECONDS of each other; and the oldest leg is within
+4. Synchronized, point-in-time quotes: each leg carries its own quote time,
+   inside the regular session of the quote's session day (13:00 on NYSE
+   early-close days); no leg is newer than the capture time (beyond
+   MAX_CLOCK_SKEW_SECONDS), so nothing unknown at capture can enter; the legs
+   are within MAX_LEG_SKEW_SECONDS of each other; and the oldest leg is within
    MAX_QUOTE_AGE_SECONDS of the reference time (the capture time, or the
-   16:00 close when captured after it).
+   session close when captured after it).
 
-A resolved trade is claimable when its entry and exit quotes both pass and
-the exit re-priced exactly the contracts booked at entry. Its claimed return
+A resolved trade is claimable when its entry and exit quotes both pass under
+this CONTRACT_VERSION and the exit re-priced exactly the contracts booked at
+entry. A missing, malformed or other-version verdict fails closed. Its claimed return
 uses the conservative fill: the natural price (pay the ask, receive the bid)
 moved a further SLIPPAGE per leg, with commission and regulatory fees for
 every contract traded on both sides.
@@ -32,21 +35,25 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
-from services.market_calendar import EXCHANGE_TZ, SESSION_OPEN, is_trading_day, quote_session
+from services.market_calendar import EXCHANGE_TZ, SESSION_OPEN, is_trading_day, quote_session, session_close
 
-CONTRACT_VERSION = "conservative_fill_v1"
+# v2: future-dated legs, early closes, impossible contract dates and missing or
+# other-version exit verdicts all fail (v1 let each of them through).
+CONTRACT_VERSION = "conservative_fill_v2"
 
 CLAIM_SOURCES = frozenset({"marketdata_app"})
 MIN_LEG_BID = 0.05
 MAX_LEG_SPREAD_PCT = 25.0
 MAX_LEG_SKEW_SECONDS = 60.0
 MAX_QUOTE_AGE_SECONDS = 300.0
-SESSION_CLOSE = time(16, 0)
+# A leg may carry a quote time at most this far past the capture time
+# (provider and local clocks differ slightly); anything newer is look-ahead.
+MAX_CLOCK_SKEW_SECONDS = 5.0
 # Quotes stamped a few minutes after the bell still belong to the session.
-SESSION_CLOSE_GRACE = time(16, 15)
+SESSION_CLOSE_GRACE = timedelta(minutes=15)
 
 # Conservative fill, per leg per share (one contract = CONTRACT_MULTIPLIER shares).
 CONTRACT_MULTIPLIER = 100
@@ -64,7 +71,7 @@ CLAIM_DISQUALIFYING_REASONS = frozenset({
     "low_earnings_source_confidence",
 })
 
-_OCC_SYMBOL = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+_OCC_SYMBOL = re.compile(r"^[A-Z]{1,6}(\d{2})(\d{2})(\d{2})[CP](\d{8})$")
 
 
 @dataclass(frozen=True)
@@ -108,8 +115,10 @@ def evaluate_quote_contract(quote_payload: Mapping[str, Any] | None) -> Contract
         leg = raw if isinstance(raw, Mapping) else {}
         prefix = f"claim_{name}_"
         contract = str(leg.get("contract") or "").strip().upper()
-        if not _OCC_SYMBOL.match(contract):
-            reasons.append(prefix + ("missing_contract" if not contract else "non_standard_contract"))
+        if not contract:
+            reasons.append(prefix + "missing_contract")
+        elif not _valid_occ_symbol(contract):
+            reasons.append(prefix + "non_standard_contract")
         else:
             contracts[str(name)] = contract
         bid, ask = _finite(leg.get("bid")), _finite(leg.get("ask"))
@@ -127,8 +136,7 @@ def evaluate_quote_contract(quote_payload: Mapping[str, Any] | None) -> Contract
         if stamp is None:
             reasons.append(prefix + "missing_quote_time")
         else:
-            local = stamp.astimezone(EXCHANGE_TZ)
-            if not is_trading_day(local.date()) or not (SESSION_OPEN <= local.time() <= SESSION_CLOSE_GRACE):
+            if not _in_session(stamp):
                 reasons.append(prefix + "quote_outside_session")
             leg_times.append(stamp)
 
@@ -141,8 +149,10 @@ def evaluate_quote_contract(quote_payload: Mapping[str, Any] | None) -> Contract
         if captured is None:
             reasons.append("claim_missing_capture_time")
         else:
+            if (max(leg_times) - captured).total_seconds() > MAX_CLOCK_SKEW_SECONDS:
+                reasons.append("claim_quote_after_capture")
             session = quote_session(captured)
-            close = datetime.combine(session, SESSION_CLOSE, tzinfo=EXCHANGE_TZ)
+            close = datetime.combine(session, session_close(session), tzinfo=EXCHANGE_TZ)
             reference = min(captured, close)
             age = (reference - min(leg_times)).total_seconds()
             if age > MAX_QUOTE_AGE_SECONDS:
@@ -156,6 +166,29 @@ def evaluate_quote_contract(quote_payload: Mapping[str, Any] | None) -> Contract
         max_leg_skew_seconds=None if skew is None else round(skew, 3),
         quote_age_seconds=None if age is None else round(age, 3),
     )
+
+
+def _in_session(stamp: datetime) -> bool:
+    local = stamp.astimezone(EXCHANGE_TZ)
+    day = local.date()
+    if not is_trading_day(day):
+        return False
+    opens = datetime.combine(day, SESSION_OPEN, tzinfo=EXCHANGE_TZ)
+    closes = datetime.combine(day, session_close(day), tzinfo=EXCHANGE_TZ) + SESSION_CLOSE_GRACE
+    return opens <= local <= closes
+
+
+def _valid_occ_symbol(contract: str) -> bool:
+    """A standard OCC symbol with a real expiration date and a positive strike."""
+    match = _OCC_SYMBOL.match(contract)
+    if match is None:
+        return False
+    year, month, day, strike = match.groups()
+    try:
+        date(2000 + int(year), int(month), int(day))
+    except ValueError:
+        return False
+    return int(strike) > 0
 
 
 def evaluate_exit_claim(
@@ -182,17 +215,38 @@ def evaluate_exit_claim(
 
 def apply_exit_claim(
     *, claim_allowed: Any, evidence_reasons: list[str], exit_execution_scenarios: Mapping[str, Any] | None,
+    entry_contract_version: Optional[str] = None,
 ) -> tuple[Optional[bool], list[str]]:
     """Fold the exit claim verdict into a row's entry-time claim fields.
 
-    An entry that was claim-eligible stays claimable only if the exit passed.
-    Without an exit verdict (legacy callers) the row is left as it was.
+    Fails closed: an entry that was claim-eligible stays claimable only if the
+    exit verdict is present, well-formed, passed, and was made under this
+    CONTRACT_VERSION, as was the entry. Anything else (a legacy caller with no
+    verdict, a malformed one, an entry or exit checked under another version)
+    makes the row non-claimable and says why. A row that was never
+    claim-eligible is left as it was.
     """
+    reasons = list(evidence_reasons)
+    if claim_allowed is None or not bool(claim_allowed):
+        return (None if claim_allowed is None else False), reasons
     verdict = (exit_execution_scenarios or {}).get("claim") if isinstance(exit_execution_scenarios, Mapping) else None
-    if not isinstance(verdict, Mapping):
-        return (None if claim_allowed is None else bool(claim_allowed)), list(evidence_reasons)
-    reasons = sorted(set(list(evidence_reasons) + [str(r) for r in verdict.get("reasons") or []]))
-    return bool(claim_allowed) and bool(verdict.get("passed")), reasons
+    if not isinstance(verdict, Mapping) or not isinstance(verdict.get("passed"), bool):
+        return False, sorted(set(reasons + ["claim_exit_verdict_missing"]))
+    reasons = sorted(set(reasons + [str(r) for r in verdict.get("reasons") or []]))
+    if entry_contract_version != CONTRACT_VERSION or verdict.get("contract_version") != CONTRACT_VERSION:
+        return False, sorted(set(reasons + ["claim_contract_version_mismatch"]))
+    return verdict["passed"], reasons
+
+
+def claimable_under_current_contract(row: Mapping[str, Any]) -> Optional[bool]:
+    """A stored row's claim status for reporting: claimable only under this
+    CONTRACT_VERSION, so claims made under different rules are never pooled.
+    None when the row never had a claim status."""
+    raw = row.get("claim_allowed")
+    if raw is None:
+        return None
+    allowed = str(raw).strip().lower() in {"1", "true", "yes"} if isinstance(raw, str) else bool(raw)
+    return allowed and row.get("claim_contract_version") == CONTRACT_VERSION
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -218,5 +272,6 @@ def _parse_time(value: Any) -> Optional[datetime]:
 
 __all__ = [
     "CLAIM_DISQUALIFYING_REASONS", "CONTRACT_VERSION", "ContractCheck", "apply_exit_claim",
+    "claimable_under_current_contract",
     "evaluate_exit_claim", "evaluate_quote_contract", "fee_per_share", "slippage_per_share",
 ]

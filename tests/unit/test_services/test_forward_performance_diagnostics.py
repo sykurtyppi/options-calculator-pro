@@ -4,6 +4,7 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+from services.claim_contract import CONTRACT_VERSION
 from services.baseline_evidence_store import BaselineEvidenceStore
 from services.forward_performance_diagnostics import build_forward_performance_diagnostics
 from services.outcome_recorder import OutcomeStore
@@ -102,6 +103,8 @@ def _record_and_resolve(
         evidence_quality_status="degraded_evidence",
         evidence_quality_reasons=["quote_not_execution_grade"],
         claim_allowed=claim_allowed,
+        # Claims count only under the current claim contract.
+        claim_contract_version=CONTRACT_VERSION if claim_allowed else None,
         execution_grade=False,
         surface_quality={
             "status": "degraded_surface" if data_quality_score < 0.5 else "clean_surface",
@@ -127,6 +130,8 @@ def _record_and_resolve(
                     "cross_50": realized_return_pct - 2.0,
                 }
             },
+            # The exit passed the claim contract (claims fail closed without it).
+            "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION},
         },
     )
 

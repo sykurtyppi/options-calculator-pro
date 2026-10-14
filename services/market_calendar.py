@@ -31,6 +31,8 @@ from zoneinfo import ZoneInfo
 
 EXCHANGE_TZ = ZoneInfo("America/New_York")
 SESSION_OPEN = time(9, 30)
+SESSION_CLOSE = time(16, 0)
+EARLY_CLOSE = time(13, 0)
 
 # Unscheduled full-day closures since 1990.
 _SPECIAL_CLOSURES: FrozenSet[date] = frozenset({
@@ -104,6 +106,22 @@ def nyse_holidays(year: int) -> FrozenSet[date]:
     return frozenset(days)
 
 
+def nyse_early_closes(year: int) -> FrozenSet[date]:
+    """Sessions that close at 13:00 ET: July 3, the day after Thanksgiving and
+    Christmas Eve, each only when it is itself a trading day."""
+    days = {
+        date(year, 7, 3),
+        _nth_weekday(year, 11, 3, 4) + timedelta(days=1),
+        date(year, 12, 24),
+    }
+    return frozenset(day for day in days if is_trading_day(day))
+
+
+def session_close(day: date) -> time:
+    """The regular-session close on ``day`` (13:00 on early-close days)."""
+    return EARLY_CLOSE if day in nyse_early_closes(day.year) else SESSION_CLOSE
+
+
 def is_trading_day(day: date) -> bool:
     """True when NYSE holds a regular (full or early-close) session on ``day``."""
     return day.weekday() < 5 and day not in nyse_holidays(day.year)
@@ -153,7 +171,11 @@ def quote_session(moment: datetime) -> date:
 
 
 __all__ = [
+    "EARLY_CLOSE",
     "EXCHANGE_TZ",
+    "SESSION_CLOSE",
+    "nyse_early_closes",
+    "session_close",
     "add_sessions",
     "is_trading_day",
     "monthly_option_expiry",
