@@ -552,10 +552,12 @@ def _mid_from_row(row: Optional[pd.Series]) -> Optional[float]:
     return float(mid) if mid > 0 else None
 
 
-def _exit_claim(entry_execution_scenarios: Any, exit_quote: Dict[str, Any]) -> Dict[str, Any]:
-    """The exit half of the claim contract, checked against the booked entry legs."""
+def _exit_claim(entry_execution_scenarios: Any, exit_quote: Dict[str, Any], *, symbol: Any) -> Dict[str, Any]:
+    """The exit half of the claim contract, checked against the booked entry legs
+    and the trade's own underlying."""
     entry = entry_execution_scenarios if isinstance(entry_execution_scenarios, dict) else {}
-    return evaluate_exit_claim(entry_quote_legs=entry.get("legs") or {}, exit_quote_payload=exit_quote)
+    return evaluate_exit_claim(entry_quote_legs=entry.get("legs") or {}, exit_quote_payload=exit_quote,
+                               expected_underlying=str(symbol or "") or None)
 
 
 def _leg_quote_time(value: Any) -> Optional[str]:
@@ -1086,7 +1088,8 @@ def fetch_structure_quote(
         )
 
     def _payload(**kwargs: Any) -> Dict[str, Any]:
-        return _quote_payload(
+        # The underlying the legs must be on (claim contract).
+        return {"symbol": str(symbol).upper(), **_quote_payload(
             source=quote_source,
             quality=quote_quality,
             source_quality_note=(
@@ -1094,7 +1097,7 @@ def fetch_structure_quote(
                 "Not execution-grade and not a live broker fill."
             ),
             **kwargs,
-        )
+        )}
 
     ticker: Optional[yf.Ticker] = None
     options: list[str] = []
@@ -1738,12 +1741,15 @@ def _record_baseline_entries(
         evidence_quality = evaluate_evidence_quality(
             quote_payload=quote,
             vol_snapshot=vol_snapshot,
+            symbol=symbol,
         ).to_dict()
         entry_execution_scenarios = build_execution_scenarios(
             structure=structure,
             quote_payload=quote,
             phase="entry",
         ).to_dict()
+        # The entry verdict the store checks before recording any claim.
+        entry_execution_scenarios["claim"] = evidence_quality.get("claim_verdict") or {}
         entered = entry_mid is not None and entry_mid > 0
         inserted = baseline_store.insert_entry(
             recommendation_id=recommendation_id,
@@ -2060,7 +2066,7 @@ def _finalize_baseline_exits(
                         structure=structure,
                         capital_at_risk=capital_at_risk,
                     ),
-                    "claim": _exit_claim(row.get("entry_execution_scenarios_json"), quote),
+                    "claim": _exit_claim(row.get("entry_execution_scenarios_json"), quote, symbol=row.get("symbol")),
                 },
                 status="resolved",
                 exit_repricing=exit_repricing,
@@ -2437,12 +2443,15 @@ def _run_forward_screener(
         evidence_quality = evaluate_evidence_quality(
             quote_payload=quote,
             vol_snapshot=vol_snapshot,
+            symbol=symbol,
         ).to_dict()
         entry_execution_scenarios = build_execution_scenarios(
             structure=structure,
             quote_payload=quote,
             phase="entry",
         ).to_dict()
+        # The entry verdict the store checks before recording any claim.
+        entry_execution_scenarios["claim"] = evidence_quality.get("claim_verdict") or {}
         if entry_mid is None or entry_mid <= 0:
             # A skipped provider call (budget, open breaker) that the fallback
             # could not cover is the disposition, not the fallback's symptom.
@@ -2998,7 +3007,7 @@ def _run_exit_detection(
             **exit_execution_scenarios,
             "scenario_outcomes": scenario_outcomes,
             "contract_verification": contract_verification,
-            "claim": _exit_claim(entry_execution_scenarios, quote),
+            "claim": _exit_claim(entry_execution_scenarios, quote, symbol=row.get("symbol")),
         }
 
         if not dry_run:

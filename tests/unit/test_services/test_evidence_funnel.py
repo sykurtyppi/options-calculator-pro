@@ -18,6 +18,7 @@ import scripts.run_forward_loop as forward_loop
 from scripts.run_evidence_cycle import _run_log_payload
 from scripts.watch_daily_evidence_cycle import _build_combined_watchdog_status
 from services import evidence_funnel as ef
+from services.claim_contract import CONTRACT_VERSION
 from services.baseline_evidence_store import BaselineEvidenceStore
 from services.outcome_recorder import OutcomeStore, make_trade_id
 from services.recommendation_ledger import RecommendationLedger
@@ -199,6 +200,8 @@ def _insert_trade(store, symbol, earnings, *, claim_allowed=False, marker="m"):
         setup_score=0.6, source_type="paper", earnings_date=earnings, entry_mid=5.0,
         execution_penalty_at_entry=0.03, notes=json.dumps({"pricing_context": {"marker": marker}}),
         claim_allowed=claim_allowed, evidence_quality_reasons=["quote_not_execution_grade"],
+        claim_contract_version=CONTRACT_VERSION if claim_allowed else None,
+        entry_execution_scenarios={"claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION}},
     )
     return trade_id
 
