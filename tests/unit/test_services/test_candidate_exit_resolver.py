@@ -781,6 +781,8 @@ def test_resolver_one_bad_row_does_not_abort_run(tmp_path: Path) -> None:
         recommendation_id="rec_bad",
         earnings_date="2026-05-21",  # earlier earnings → processed first
         as_of_date="2026-05-14",
+        # Another symbol: one symbol's two dates a day apart are one moved event.
+        symbol="MSFT",
     )
 
     entry_chain = _toy_chain(

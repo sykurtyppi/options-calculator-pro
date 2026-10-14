@@ -170,6 +170,30 @@ CREATE INDEX IF NOT EXISTS idx_revisions_revised_at
     ON recommendation_revisions (revised_at);
 """
 
+# Moved earnings dates: an event first analyzed under one date and later under
+# a corrected one is the same corporate event. The earlier key is recorded as
+# superseded (its rows stay, immutable) and drops out of per-event views.
+_SUPERSESSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS event_supersessions (
+    event_key            TEXT PRIMARY KEY,
+    superseded_by        TEXT NOT NULL,
+    symbol               TEXT NOT NULL,
+    detected_as_of       TEXT,
+    recommendation_id    TEXT,
+    detected_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_supersessions_by ON event_supersessions (superseded_by);
+"""
+
+# Two dates for one symbol this close together are one event that moved
+# (earnings are quarterly, so distinct events sit ~90 days apart).
+EVENT_MOVE_WINDOW_DAYS = 30
+
+# SQL fragment: keep rows whose event has not been superseded.
+_NOT_SUPERSEDED_SQL = (
+    "(event_key IS NULL OR event_key NOT IN (SELECT event_key FROM event_supersessions))"
+)
+
 _MIGRATION_COLUMNS: Dict[str, str] = {
     "created_at": "TEXT",
     "symbol": "TEXT",
@@ -293,6 +317,7 @@ def _open_db(path: Path) -> sqlite3.Connection:
     conn.executescript(_INDEX_DDL)
     conn.executescript(_REVISIONS_TABLE_DDL)
     conn.executescript(_REVISIONS_INDEX_DDL)
+    conn.executescript(_SUPERSESSIONS_DDL)
     conn.commit()
     return conn
 
@@ -317,6 +342,83 @@ def make_event_key(symbol: Any, earnings_date: Any) -> Optional[str]:
     day = _fmt_date(earnings_date)
     name = str(symbol or "").strip().upper()
     return f"{name}|{day}" if name and day else None
+
+
+def is_moved_event_date(old_date: Any, new_date: Any, *, as_of: Any) -> bool:
+    """Is ``new_date``, learned at ``as_of``, a move of the event filed under ``old_date``?
+
+    Yes when the two dates differ by at most EVENT_MOVE_WINDOW_DAYS and the
+    old date had not passed by ``as_of`` (point in time: an earlier date that
+    already passed was its own event, however close the next one is).
+    """
+    old_day, new_day, seen = _parse_day(old_date), _parse_day(new_date), _parse_day(as_of)
+    if old_day is None or new_day is None or seen is None or old_day == new_day:
+        return False
+    return abs((new_day - old_day).days) <= EVENT_MOVE_WINDOW_DAYS and old_day >= seen
+
+
+def _parse_day(value: Any) -> Optional[date]:
+    text = _fmt_date(value)
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _supersede_moved_events(cur: sqlite3.Cursor, record: "RecommendationRecord", event_key: Optional[str]) -> None:
+    """File the event's earlier-date keys as superseded by ``event_key``.
+
+    The newest information decides: the key analyzed at the latest as_of is
+    current, once a later analysis carries a different date within the move
+    window (see ``is_moved_event_date``). A row carrying older information than an existing key of the
+    same event (a replay, a late backfill) is itself filed as superseded.
+    """
+    as_of = _fmt_date(record.as_of_date)
+    if event_key is None or not as_of:
+        return
+    symbol = record.symbol.strip().upper()
+    new_date = event_key.split("|", 1)[1]
+    others = cur.execute(
+        """SELECT event_key, MAX(as_of_date) AS latest_as_of FROM recommendations
+            WHERE symbol = ? AND event_key IS NOT NULL AND event_key != ?
+            GROUP BY event_key""",
+        (symbol, event_key),
+    ).fetchall()
+    now = datetime.now(timezone.utc).isoformat()
+    newer = [
+        row for row in others
+        if (_fmt_date(row["latest_as_of"]) or "") > as_of
+        and is_moved_event_date(new_date, str(row["event_key"]).split("|", 1)[1], as_of=row["latest_as_of"])
+    ]
+    if newer:
+        current = max(newer, key=lambda row: (_fmt_date(row["latest_as_of"]) or "", str(row["event_key"])))
+        cur.execute(
+            "INSERT OR IGNORE INTO event_supersessions"
+            " (event_key, superseded_by, symbol, detected_as_of, recommendation_id, detected_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (event_key, str(current["event_key"]), symbol, _fmt_date(current["latest_as_of"]), None, now),
+        )
+        return
+    # Only a later analysis corrects a date: two dates seen on the same day
+    # are ambiguous and both stand.
+    moved = [
+        row for row in others
+        if (_fmt_date(row["latest_as_of"]) or "") < as_of
+        and is_moved_event_date(str(row["event_key"]).split("|", 1)[1], new_date, as_of=as_of)
+    ]
+    if not moved:
+        return
+    # This date is the current one, even if an earlier move had filed it away.
+    cur.execute("DELETE FROM event_supersessions WHERE event_key = ?", (event_key,))
+    for row in moved:
+        cur.execute(
+            "INSERT OR REPLACE INTO event_supersessions"
+            " (event_key, superseded_by, symbol, detected_as_of, recommendation_id, detected_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (str(row["event_key"]), event_key, symbol, as_of, record.recommendation_id, now),
+        )
 
 
 def _backfill_event_identity(conn: sqlite3.Connection) -> None:
@@ -492,6 +594,8 @@ class RecommendationLedger:
 
         cur.execute(insert_sql, params)
         first_time = cur.rowcount > 0
+        if first_time:
+            _supersede_moved_events(cur, record, event_key)
 
         # Always stamp the current content into recommendation_revisions.
         # On first record, this writes the "version 1" row so the full
@@ -892,6 +996,8 @@ class RecommendationLedger:
             (F4): an event analyzed on several days is one sample, resolved
             from its last decision, not once per day it was analyzed. A
             replay row for the same event never displaces a forward one.
+          - Its event was not superseded by a moved earnings date: the
+            event resolves under its corrected date, not the stale one.
           - The merged-view's ``candidate_shadow_outcome.status`` is
             not ``"ok"`` and does not start with ``"permanently_failed:"``.
             Rows already in those terminal states are not retried.
@@ -939,8 +1045,9 @@ class RecommendationLedger:
                     SELECT MAX(latest.event_sequence) FROM recommendations AS latest
                      WHERE latest.event_key = recommendations.event_key
                        AND latest.sample_provenance = recommendations.sample_provenance))
+               AND {not_superseded}
              ORDER BY earnings_date ASC, created_at ASC
-            """,
+            """.format(not_superseded=_NOT_SUPERSEDED_SQL),
             (
                 sample_provenance,
                 selected_structure,
@@ -994,6 +1101,7 @@ class RecommendationLedger:
                     SELECT MAX(latest.event_sequence) FROM recommendations AS latest
                      WHERE latest.event_key = recommendations.event_key
                        AND latest.sample_provenance = recommendations.sample_provenance)
+               AND {_NOT_SUPERSEDED_SQL}
              ORDER BY earnings_date ASC, symbol ASC
             """,
             params,
@@ -1072,12 +1180,13 @@ class RecommendationLedger:
             "fresh_or_unknown": sum(int(row["n"]) for row in stale_rows if int(row["stale"] or 0) == 0),
         }
         event_rows = self._conn.execute(
-            """
+            f"""
             SELECT COALESCE(NULLIF(recommendation, ''), 'unknown') AS key, COUNT(*) AS n
               FROM recommendations AS r
              WHERE event_key IS NOT NULL
                AND event_sequence = (SELECT MAX(event_sequence) FROM recommendations
                                       WHERE event_key = r.event_key)
+               AND {_NOT_SUPERSEDED_SQL}
              GROUP BY COALESCE(NULLIF(recommendation, ''), 'unknown')
              ORDER BY n DESC, key
             """
@@ -1092,6 +1201,10 @@ class RecommendationLedger:
                 "analyses_without_event": int(self._conn.execute(
                     "SELECT COUNT(*) FROM recommendations WHERE event_key IS NULL"
                 ).fetchone()[0]),
+                # Earlier keys of events whose earnings date moved (not counted above).
+                "superseded": int(self._conn.execute(
+                    "SELECT COUNT(*) FROM event_supersessions"
+                ).fetchone()[0]),
             },
             "by_selected_structure": _counts("selected_structure"),
             "by_no_trade_reason": _counts("no_trade_reason"),
@@ -1099,6 +1212,11 @@ class RecommendationLedger:
             "by_recommendation": _counts("recommendation"),
             "by_stale_source_flag": stale_counts,
         }
+
+    def superseded_event_keys(self) -> Dict[str, str]:
+        """Event key -> the key that superseded it (moved earnings dates)."""
+        rows = self._conn.execute("SELECT event_key, superseded_by FROM event_supersessions").fetchall()
+        return {str(row["event_key"]): str(row["superseded_by"]) for row in rows}
 
     def count(self, *, symbol: Optional[str] = None) -> int:
         if symbol:

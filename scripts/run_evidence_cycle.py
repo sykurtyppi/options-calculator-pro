@@ -14,6 +14,7 @@ import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -205,10 +206,23 @@ def _run_log_payload(
         "candidates_outside_dte_window": int(entries.get("outside_dte_window") or 0),
         "candidates_analyzed": int(entries.get("analyzed") or 0),
         "analyzer_errors": int(entries.get("analyzer_errors") or 0),
+        "candidates_malformed": int(entries.get("malformed_discovery_rows") or 0),
+        "evidence_funnel_status": _funnel_status(entries, exits),
+        "evidence_funnel_dropped_writes": max(
+            int((part.get("evidence_funnel") or {}).get("dropped_writes") or 0) for part in (entries, exits)
+        ),
         "weekly_report_path": payload.get("weekly_report_path"),
         "warnings": report.get("warning_flags") or [],
         "error": error,
     }
+
+
+def _funnel_status(*passes: dict) -> Optional[str]:
+    """The run's funnel status: the worst of its passes (unavailable > degraded > ok)."""
+    order = {"unavailable": 3, "degraded": 2, "ok": 1, "dry_run": 0}
+    statuses = [str((part.get("evidence_funnel") or {}).get("status") or "") for part in passes]
+    known = [status for status in statuses if status in order]
+    return max(known, key=order.__getitem__) if known else None
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:

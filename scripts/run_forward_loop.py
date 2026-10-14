@@ -168,6 +168,7 @@ def _recheck_rows(funnel_store: Optional[EvidenceFunnelStore], *, as_of: date, c
         pending = funnel_store.pending_rechecks()
     except Exception as exc:  # noqa: BLE001
         logger.warning("forward_loop: re-check schedule unreadable: %s", exc)
+        funnel_mod.note_dropped_write(funnel_store, cycle_run_id=cycle_id, as_of=as_of)
         return []
     surfaced = {str(row.get("symbol") or "").upper() for row in discovered_rows}
     added: list[Dict[str, Any]] = []
@@ -182,6 +183,7 @@ def _recheck_rows(funnel_store: Optional[EvidenceFunnelStore], *, as_of: date, c
                                            status=funnel_mod.RECHECK_EXPIRED)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("forward_loop: could not expire re-check for %s: %s", item["symbol"], exc)
+                funnel_mod.note_dropped_write(funnel_store, cycle_run_id=cycle_id, as_of=as_of)
                 continue
             summary["rechecks_expired"] += 1
             stage = (funnel_mod.STAGE_DATA_QUALIFIED if item.get("reason") == funnel_mod.REASON_TOO_EARLY
@@ -236,6 +238,29 @@ def _close_rechecks(funnel_store: Optional[EvidenceFunnelStore], symbol: str, *e
         if closed:
             attempts.extend(closed.get("attempts", []))
     return attempts
+
+
+def _supersede_rechecks(funnel_store: Optional[EvidenceFunnelStore], symbol: str, earnings_date: Any, *,
+                        as_of: date, summary: Dict[str, Any]) -> list:
+    """Close re-checks filed under an earlier date of this (moved) event."""
+    if funnel_store is None or not earnings_date:
+        return []
+    try:
+        closed = funnel_store.supersede_rechecks(symbol=symbol, earnings_date=earnings_date, as_of=as_of)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("forward_loop: could not supersede re-checks for %s: %s", symbol, exc)
+        funnel_mod.note_dropped_write(funnel_store, cycle_run_id=summary.get("cycle_run_id"), as_of=as_of)
+        return []
+    summary["rechecks_superseded"] = int(summary.get("rechecks_superseded", 0)) + len(closed)
+    return [{"earnings_date": item["earnings_date"], "reason": item.get("reason")} for item in closed]
+
+
+def _finish_funnel(funnel_store: Optional[EvidenceFunnelStore], *, cycle_id: str, as_of: date,
+                   dry_run: bool) -> Dict[str, Any]:
+    """The pass's funnel status for its summary (ok / degraded / unavailable)."""
+    if dry_run:
+        return {"status": "dry_run", "dropped_writes": 0}
+    return funnel_mod.safe_finish_cycle(funnel_store, cycle_run_id=cycle_id, as_of=as_of)
 
 
 def _iso_or_none(value: Any) -> Optional[str]:
@@ -356,7 +381,21 @@ def _get_marketdata_client(candidate: Any = None) -> Optional[Any]:
     return resolved if resolved.is_available() else None
 
 
+def _malformed_discovery_rows(rows: list, *, source: str) -> list[Dict[str, Any]]:
+    """Discovery rows with no symbol: kept for the funnel (field names only)."""
+    out = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            out.append({"source": source, "index": index, "fields": [], "earnings_date": None})
+        elif not str(row.get("symbol") or "").strip():
+            out.append({"source": source, "index": index, "fields": sorted(map(str, row.keys()))[:20],
+                        "earnings_date": _iso_or_none(row.get("earnings_date"))})
+    return out
+
+
 def _normalize_discovery_row(row: Dict[str, Any], *, today: date, source: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(row, dict):
+        return None
     symbol = str(row.get("symbol") or "").upper()
     if not symbol:
         return None
@@ -393,6 +432,7 @@ def _build_forward_discovery_payload(
     mda_client: Any,
 ) -> Dict[str, Any]:
     universe = symbols or DEFAULT_UNIVERSE
+    malformed: list[Dict[str, Any]] = []
 
     # Default forward-loop discovery prefers the edge screener because it uses
     # the more reliable ticker.calendar/info earnings path plus MarketData-aware
@@ -413,9 +453,11 @@ def _build_forward_discovery_payload(
             )
             if normalized is not None
         ]
+        malformed = _malformed_discovery_rows(payload.get("rows", []), source="edge_screener")
         if normalized_rows:
             return {
                 "rows": normalized_rows,
+                "malformed_rows": malformed,
                 "source": "edge_screener",
                 "summary": {
                     "qualified_count": payload.get("qualified_count", 0),
@@ -435,6 +477,7 @@ def _build_forward_discovery_payload(
     ]
     return {
         "rows": normalized_rows,
+        "malformed_rows": malformed + _malformed_discovery_rows(payload.get("rows", []), source="ranked_screener"),
         "source": "ranked_screener",
         "summary": {},
     }
@@ -2072,7 +2115,9 @@ def _run_forward_screener(
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
     # Per-candidate stage record (measurement only; never recorded on dry runs).
-    funnel_store = None if dry_run else (funnel or funnel_mod.get_evidence_funnel())
+    # Measurement only: a store that cannot be opened leaves this cycle
+    # unmeasured (and says so in the summary), never stops the entry pass.
+    funnel_store = None if dry_run else funnel_mod.open_evidence_funnel(funnel)
     cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(as_of)
     # The discovery sweep is the lowest budget tier: it stops first.
     with reliability.request_priority(reliability.PRIORITY_DISCOVERY):
@@ -2103,6 +2148,8 @@ def _run_forward_screener(
         "rechecks_added": 0,
         "rechecks_expired": 0,
         "rechecks_scheduled": 0,
+        "rechecks_superseded": 0,
+        "malformed_discovery_rows": len(screener_payload.get("malformed_rows", [])),
     }
     # Deferred events due today are analyzed even if discovery missed them.
     candidate_rows = list(screener_payload.get("rows", []))
@@ -2116,6 +2163,15 @@ def _run_forward_screener(
         discovered=summary["discovered"],
         discovery_source=summary["discovery_source"],
     )
+    # Discovery rows without a symbol cannot be analyzed; each is recorded
+    # (not silently dropped) under a subject of its own.
+    for malformed in screener_payload.get("malformed_rows", []):
+        funnel_mod.safe_record(
+            funnel_store, cycle_run_id=cycle_id, as_of=as_of, stage=funnel_mod.STAGE_DISCOVERED,
+            outcome=funnel_mod.OUTCOME_DROPPED, symbol="", reason=funnel_mod.REASON_MISSING_SYMBOL,
+            subject=f"malformed:{malformed['source']}:{malformed['index']}",
+            earnings_date=malformed.get("earnings_date"), detail={"fields": malformed.get("fields", [])},
+        )
 
     for row in candidate_rows:
         dte = row.get("days_to_earnings", row.get("dte"))
@@ -2137,8 +2193,13 @@ def _run_forward_screener(
                 **extra,
             )
 
-        _funnel(funnel_mod.STAGE_DISCOVERED, funnel_mod.OUTCOME_ADVANCED,
-                detail={"discovery_source": row.get("discovery_source"), "discovery_status": row.get("status")})
+        # A re-check filed under an earlier date of this same event (its
+        # earnings date moved) is superseded, not left pending to expire.
+        superseded = _supersede_rechecks(funnel_store, symbol, row.get("earnings_date"), as_of=as_of, summary=summary)
+        discovered_detail = {"discovery_source": row.get("discovery_source"), "discovery_status": row.get("status")}
+        if superseded:
+            discovered_detail["superseded_rechecks"] = superseded
+        _funnel(funnel_mod.STAGE_DISCOVERED, funnel_mod.OUTCOME_ADVANCED, detail=discovered_detail)
         if dte is None:
             summary["outside_dte_window"] += 1
             _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DROPPED, funnel_mod.REASON_MISSING_DTE)
@@ -2158,14 +2219,22 @@ def _run_forward_screener(
             continue
         if int(dte) < DTE_MIN_DEFAULT:
             summary["outside_dte_window"] += 1
+            expired = None
             if funnel_store is not None and row.get("earnings_date"):
                 try:
-                    funnel_store.close_recheck(symbol=symbol, earnings_date=row.get("earnings_date"),
-                                               status=funnel_mod.RECHECK_EXPIRED)
+                    expired = funnel_store.close_recheck(symbol=symbol, earnings_date=row.get("earnings_date"),
+                                                         status=funnel_mod.RECHECK_EXPIRED)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("forward_loop: could not expire re-check for %s: %s", symbol, exc)
+                    funnel_mod.note_dropped_write(funnel_store, cycle_run_id=cycle_id, as_of=as_of)
+            late_detail: Dict[str, Any] = {"dte": int(dte)}
+            if expired:
+                # The same expiry the re-check sweep counts, reached via discovery.
+                summary["rechecks_expired"] += 1
+                late_detail["recheck_expired"] = {"reason": expired.get("reason"),
+                                                  "attempts": expired.get("attempts", [])}
             _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DROPPED, funnel_mod.REASON_TOO_LATE,
-                    detail={"dte": int(dte)})
+                    detail=late_detail)
             continue
         _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_ADVANCED, detail={"dte": int(dte)})
 
@@ -2215,6 +2284,9 @@ def _run_forward_screener(
         )
         # Analyzed: any re-check that brought it here is done.
         prior_attempts = _close_rechecks(funnel_store, symbol, row.get("earnings_date"), earnings_date)
+        if earnings_date is not None and _iso_or_none(row.get("earnings_date")) != earnings_date.isoformat():
+            # Analysis found a different date than discovery: the event moved.
+            _supersede_rechecks(funnel_store, symbol, earnings_date, as_of=as_of, summary=summary)
         _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
                 earnings_date=earnings_date or row.get("earnings_date"),
                 detail=_with_provider_skips({"prior_attempts": prior_attempts} if prior_attempts else None) or None)
@@ -2554,6 +2626,7 @@ def _run_forward_screener(
                 },
                 dry_run=dry_run,
             )
+    summary["evidence_funnel"] = _finish_funnel(funnel_store, cycle_id=cycle_id, as_of=as_of, dry_run=dry_run)
     return summary
 
 
@@ -2646,7 +2719,7 @@ def _run_exit_detection(
     trade_store = store or OutcomeStore()
     summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "refinalized": 0, "learning_retried": 0,
                "baseline_exits": 0, "baseline_skipped": 0}
-    funnel_store = None if dry_run else (funnel or funnel_mod.get_evidence_funnel())
+    funnel_store = None if dry_run else funnel_mod.open_evidence_funnel(funnel)
     cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(as_of)
 
     def _funnel_trade(trade: Dict[str, Any], stage: str, outcome: str, reason: Optional[str] = None,
@@ -2993,6 +3066,7 @@ def _run_exit_detection(
         mda_client=mda_client,
     )
     summary.update(baseline_summary)
+    summary["evidence_funnel"] = _finish_funnel(funnel_store, cycle_id=cycle_id, as_of=as_of, dry_run=dry_run)
     return summary
 
 
