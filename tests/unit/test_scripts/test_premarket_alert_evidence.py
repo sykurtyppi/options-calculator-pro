@@ -240,7 +240,9 @@ def test_an_unwritable_audit_blocks_the_send(tmp_path):
 
 def test_a_failed_send_is_recorded_and_not_marked_sent(tmp_path):
     audit = tmp_path / "audit.jsonl"
-    code, send, state = _send(tmp_path, audit, [_row("TSLA")], send={"side_effect": RuntimeError("osascript")})
+    # osascript could not be executed at all: provably nothing went out.
+    code, send, state = _send(tmp_path, audit, [_row("TSLA")],
+                              send={"side_effect": FileNotFoundError(2, "No such file or directory", "osascript")})
     assert code == 1 and send.call_count == 1 and not state.exists()
     statuses = [json.loads(line)["status"] for line in audit.read_text().splitlines()]
     assert statuses == ["prepared", "failed"]
