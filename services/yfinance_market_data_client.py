@@ -133,8 +133,8 @@ class YFinanceMarketDataClient:
         try:
             t = self._ticker_factory(symbol)
             all_exps = list(t.options or [])
-            breaker.record_success()   # Yahoo answered, even if with nothing listed
             if not all_exps:
+                breaker.record_success()   # Yahoo answered: nothing is listed
                 return self._empty_chain_telemetry(symbol, start, "no_expirations")
 
             if expiration and str(expiration).lower() != "all":
@@ -144,6 +144,7 @@ class YFinanceMarketDataClient:
             else:
                 target_exps = all_exps[:1]
             if not target_exps:
+                breaker.record_success()   # Yahoo answered: that expiration is not listed
                 return self._empty_chain_telemetry(symbol, start, "expiration_not_listed")
 
             spot = self.get_quote(symbol)
@@ -161,7 +162,11 @@ class YFinanceMarketDataClient:
             category = classify_error(f"{type(exc).__name__}: {exc}")
             if _is_transient_failure(exc, category):
                 breaker.record_failure()
+            else:
+                breaker.release_probe()   # a bad symbol says nothing about Yahoo's health
             return self._empty_chain_telemetry(symbol, start, "fetch_error", error_category=category)
+        # Only now, with every requested chain fetched, did the operation succeed.
+        breaker.record_success()
 
         if frame.empty:
             return self._empty_chain_telemetry(symbol, start, "empty_after_normalize")

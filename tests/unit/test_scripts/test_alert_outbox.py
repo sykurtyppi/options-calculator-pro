@@ -267,3 +267,39 @@ def test_concurrent_state_writes_each_use_their_own_temp_file(tmp_path):
     assert errors == []
     assert set(json.loads(path.read_text())) == {"writer", "i"}
     assert not list(tmp_path.glob("*.tmp"))
+
+
+
+def test_a_locked_outbox_is_waited_for_not_quarantined(tmp_path, monkeypatch):
+    import sqlite3
+
+    real_open = ob.AlertOutbox._open
+    failures = iter([sqlite3.OperationalError("database is locked")] * 3)
+
+    def flaky_open(self):
+        error = next(failures, None)
+        if error is not None:
+            raise error
+        return real_open(self)
+
+    monkeypatch.setattr(ob.AlertOutbox, "_open", flaky_open)
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
+    code, calls = _run(tmp_path)
+    assert code == 0 and len(calls) == 1
+    assert not list(tmp_path.glob("*.corrupt-*"))
+
+
+@pytest.mark.parametrize("error", ["disk I/O error", "database is locked"])
+def test_an_unavailable_outbox_sends_nothing_and_is_left_in_place(tmp_path, monkeypatch, error):
+    import sqlite3
+
+    def failing_open(self):
+        raise sqlite3.OperationalError(error)
+
+    monkeypatch.setattr(ob.AlertOutbox, "_open", failing_open)
+    monkeypatch.setattr(ob.time, "sleep", lambda _s: None)
+    (tmp_path / "premarket_alert_outbox.sqlite").write_bytes(b"")
+    code, calls = _run(tmp_path)
+    assert code == 1 and calls == []
+    assert (tmp_path / "premarket_alert_outbox.sqlite").exists()
+    assert not list(tmp_path.glob("*.corrupt-*"))

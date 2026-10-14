@@ -13,12 +13,26 @@ Request priorities (highest first), bound by the caller with
 - ``discovery``: the screener sweep. Stops first.
 
 Each tier may spend up to its ceiling share of the daily limit, so the last
-credits are always left for exits. When the provider reports its own quota in
-response headers, the reported remaining credits win over the local estimate.
+credits are always left for exits. A call is admitted by ``reserve``, which
+checks the ceiling and holds the call's estimated cost in one write
+transaction, so concurrent processes cannot both pass a check that only one
+fits; the hold is settled at the actual cost (the provider's consumed-credits
+header when present) or released if the call was not served. When the
+provider reports its quota in response headers, on errors as well as
+successes, the reported remaining credits win over the local estimate, until
+the reset time it reported. A 429 that says the quota is used up is not
+retried and marks the budget exhausted; concurrency throttling and plain
+rate limits are retried with backoff.
+
+The budget window starts at RESET_TIME_ENV (New York time; midnight unless
+set). That default is not verified against the provider; set it to the
+plan's documented reset.
 
 A circuit breaker opens after consecutive transient failures (timeouts,
 5xx, connection errors, rate limits after retries) and skips calls for a
-cool-down instead of sending them. A skipped call is not a provider request:
+cool-down instead of sending them. Half-open, it lets one probe through at
+a time. It is per process: it protects a run, not every process on the
+machine. A skipped call is not a provider request:
 it is recorded as a ``pipeline`` telemetry row and in the per-candidate skip
 log the forward loop turns into an evidence-funnel disposition.
 
@@ -40,7 +54,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 from zoneinfo import ZoneInfo
@@ -62,6 +76,14 @@ SKIP_CIRCUIT_OPEN = "provider_circuit_open"
 MARKETDATA_PROVIDER = "marketdata_app"
 DAILY_CREDITS_ENV = "OPTIONS_CALCULATOR_MARKETDATA_DAILY_CREDITS"
 DEFAULT_DAILY_CREDITS = 100_000
+# When the provider's daily credits reset, as HH:MM New York time. The
+# default (midnight) is not verified against MarketData.app; a reset time the
+# provider reports in its X-Api-Ratelimit-Reset header always wins over it.
+RESET_TIME_ENV = "OPTIONS_CALCULATOR_MARKETDATA_RESET_ET"
+# A reservation whose request never settled (the process died) stops
+# counting after this long.
+RESERVATION_TTL_SECONDS = 600
+UNMETERED = "unmetered"
 DISK_CACHE_ENV = "OPTIONS_CALCULATOR_PROVIDER_DISK_CACHE"
 
 QUOTA_WARNING_UTILIZATION = 0.80
@@ -163,9 +185,16 @@ def retry_delay(
 class CircuitBreaker:
     """Opens after ``threshold`` consecutive transient failures.
 
-    While open, ``allow()`` is False until the cool-down passes; then calls
-    are let through again (half-open). The next success closes the breaker;
-    the next failure re-opens it for another cool-down.
+    While open, ``allow()`` is False until the cool-down passes. Then exactly
+    one call is let through as a probe (half-open); every other caller is
+    still refused until the probe reports. Its success closes the breaker, its
+    failure re-opens it for another cool-down. A probe that reports neither
+    (e.g. a client error that says nothing about provider health) calls
+    ``release_probe``; one that is lost entirely expires after a cool-down so
+    the breaker can never wedge open.
+
+    The breaker is per process: it protects one run from hammering a failing
+    provider, not every process on the machine.
     """
 
     def __init__(self, *, threshold: int = BREAKER_FAILURE_THRESHOLD,
@@ -178,20 +207,34 @@ class CircuitBreaker:
         self.consecutive_failures = 0
         self.opened_at: Optional[float] = None
         self.open_count = 0
+        self.probe_started_at: Optional[float] = None
 
     def allow(self) -> bool:
         with self._lock:
             if self.opened_at is None:
                 return True
-            return self._clock() - self.opened_at >= self.cooldown_seconds
+            now = self._clock()
+            if now - self.opened_at < self.cooldown_seconds:
+                return False
+            if self.probe_started_at is not None and now - self.probe_started_at < self.cooldown_seconds:
+                return False  # a probe is already out
+            self.probe_started_at = now
+            return True
+
+    def release_probe(self) -> None:
+        """The probe's outcome says nothing about provider health; let another probe go."""
+        with self._lock:
+            self.probe_started_at = None
 
     def record_success(self) -> None:
         with self._lock:
             self.consecutive_failures = 0
             self.opened_at = None
+            self.probe_started_at = None
 
     def record_failure(self) -> None:
         with self._lock:
+            self.probe_started_at = None
             self.consecutive_failures += 1
             # The count only resets on success, so a failed half-open trial
             # re-opens the breaker too.
@@ -250,14 +293,35 @@ CREATE TABLE IF NOT EXISTS provider_reported_quota (
     reported_at         TEXT NOT NULL,
     PRIMARY KEY (provider, budget_day)
 );
+CREATE TABLE IF NOT EXISTS provider_credit_reservations (
+    reservation_id  TEXT PRIMARY KEY,
+    provider        TEXT NOT NULL,
+    budget_day      TEXT NOT NULL,
+    priority        TEXT NOT NULL,
+    credits         REAL NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 
+def _reset_offset() -> timedelta:
+    raw = str(os.environ.get(RESET_TIME_ENV, "") or "").strip()
+    try:
+        hours, minutes = (int(part) for part in raw.split(":")) if raw else (0, 0)
+        if 0 <= hours < 24 and 0 <= minutes < 60:
+            return timedelta(hours=hours, minutes=minutes)
+    except ValueError:
+        pass
+    logger.warning("ignoring %s=%r (expected HH:MM)", RESET_TIME_ENV, raw)
+    return timedelta(0)
+
+
 def budget_day(now: Optional[datetime] = None) -> str:
+    """The budget window ``now`` falls in, named by the New York date it began."""
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(_BUDGET_TZ).date().isoformat()
+    return (moment.astimezone(_BUDGET_TZ) - _reset_offset()).date().isoformat()
 
 
 def configured_daily_limit(provider: str = MARKETDATA_PROVIDER) -> float:
@@ -285,6 +349,13 @@ class CreditBudget:
         self._conn = open_db_conn(self.store_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_BUDGET_DDL)
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(provider_reported_quota)")}
+        if "reported_reset_at" not in columns:
+            try:
+                self._conn.execute("ALTER TABLE provider_reported_quota ADD COLUMN reported_reset_at TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         self._conn.commit()
         self._alerted: Dict[str, str] = {}
 
@@ -302,17 +373,34 @@ class CreditBudget:
         return {str(r["priority"]): {"credits": float(r["credits"]), "requests": int(r["request_count"]),
                                      "skipped": int(r["skipped_count"])} for r in rows}
 
-    def _reported(self, provider: str, day: str) -> Optional[sqlite3.Row]:
-        return self._conn.execute(
-            "SELECT reported_limit, reported_remaining, reported_at FROM provider_reported_quota "
+    def _reported(self, provider: str, day: str, now: datetime) -> Optional[sqlite3.Row]:
+        row = self._conn.execute(
+            "SELECT reported_limit, reported_remaining, reported_at, reported_reset_at FROM provider_reported_quota "
             "WHERE provider = ? AND budget_day = ?", (provider, day),
         ).fetchone()
+        if row is not None and row["reported_reset_at"]:
+            # The provider said when this quota resets; past that it is stale.
+            if now >= datetime.fromisoformat(row["reported_reset_at"]):
+                return None
+        return row
+
+    def _reserved(self, provider: str, day: str, now: datetime) -> float:
+        cutoff = (now - timedelta(seconds=RESERVATION_TTL_SECONDS)).isoformat()
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(credits), 0) FROM provider_credit_reservations"
+            " WHERE provider = ? AND budget_day = ? AND created_at > ?", (provider, day, cutoff),
+        ).fetchone()
+        return float(row[0] or 0.0)
 
     def status(self, provider: str = MARKETDATA_PROVIDER) -> Dict[str, Any]:
-        day = budget_day(self._now())
         with self._lock:
-            by_priority = self._spent(provider, day)
-            reported = self._reported(provider, day)
+            return self._status_locked(provider, self._now())
+
+    def _status_locked(self, provider: str, now: datetime) -> Dict[str, Any]:
+        day = budget_day(now)
+        by_priority = self._spent(provider, day)
+        reported = self._reported(provider, day, now)
+        reserved = self._reserved(provider, day, now)
         limit = configured_daily_limit(provider)
         limit_source = "env" if os.environ.get(DAILY_CREDITS_ENV) else "default"
         local_spent = sum(item["credits"] for item in by_priority.values())
@@ -338,21 +426,79 @@ class CreditBudget:
             "daily_limit": None if limit == float("inf") else limit,
             "limit_source": limit_source,
             "spent": round(spent, 3),
-            "remaining": None if limit == float("inf") else round(max(0.0, limit - spent), 3),
+            # In flight: admitted but not yet settled against actual cost.
+            "reserved": round(reserved, 3),
+            "remaining": None if limit == float("inf") else round(max(0.0, limit - spent - reserved), 3),
             "utilization": round(utilization, 6),
             "alert_level": level,
             "by_priority": by_priority,
             "ceilings": dict(PRIORITY_CEILINGS),
         }
 
-    def allows(self, provider: str, priority: str, estimated_credits: float = 1.0) -> bool:
-        if provider != MARKETDATA_PROVIDER:
-            return True
-        status = self.status(provider)
+    @staticmethod
+    def _fits(status: Dict[str, Any], priority: str, estimated_credits: float) -> bool:
         if status["daily_limit"] is None:
             return True
         ceiling = PRIORITY_CEILINGS.get(priority, PRIORITY_CEILINGS[DEFAULT_PRIORITY]) * status["daily_limit"]
-        return status["spent"] + max(0.0, float(estimated_credits)) <= ceiling
+        return status["spent"] + status["reserved"] + max(0.0, float(estimated_credits)) <= ceiling
+
+    def allows(self, provider: str, priority: str, estimated_credits: float = 1.0) -> bool:
+        """Would a call fit now? Advisory: only ``reserve`` admits atomically."""
+        if provider != MARKETDATA_PROVIDER:
+            return True
+        return self._fits(self.status(provider), priority, estimated_credits)
+
+    def reserve(self, provider: str, priority: str, estimated_credits: float) -> Optional[str]:
+        """Admit a call and hold its estimated cost, atomically across processes.
+
+        Returns a reservation id to ``settle`` (actual cost) or ``release``
+        (not charged), or None when the call does not fit under the tier's
+        ceiling. Check and hold happen under the database write lock, so two
+        processes can no longer both pass a check the second would fail.
+        """
+        if provider != MARKETDATA_PROVIDER:
+            return UNMETERED
+        import uuid
+
+        now = self._now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cutoff = (now - timedelta(seconds=RESERVATION_TTL_SECONDS)).isoformat()
+                self._conn.execute("DELETE FROM provider_credit_reservations WHERE created_at <= ?", (cutoff,))
+                if not self._fits(self._status_locked(provider, now), priority, estimated_credits):
+                    self._conn.commit()
+                    return None
+                reservation_id = uuid.uuid4().hex
+                self._conn.execute(
+                    "INSERT INTO provider_credit_reservations"
+                    " (reservation_id, provider, budget_day, priority, credits, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (reservation_id, provider, budget_day(now), priority, max(0.0, float(estimated_credits)),
+                     now.isoformat()),
+                )
+                self._conn.commit()
+                return reservation_id
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def release(self, reservation_id: Optional[str]) -> None:
+        """The call was not charged (refused, failed before the provider counted it)."""
+        if not reservation_id or reservation_id == UNMETERED:
+            return
+        with self._lock:
+            self._conn.execute("DELETE FROM provider_credit_reservations WHERE reservation_id = ?",
+                               (reservation_id,))
+            self._conn.commit()
+
+    def settle(self, reservation_id: Optional[str], provider: str, priority: str, credits: float, *,
+               reported_limit: Optional[float] = None, reported_remaining: Optional[float] = None,
+               reported_reset_at: Optional[datetime] = None) -> None:
+        """Replace a reservation with the call's actual cost (reconciliation)."""
+        self.release(reservation_id)
+        self.charge(provider, priority, credits, reported_limit=reported_limit,
+                    reported_remaining=reported_remaining, reported_reset_at=reported_reset_at)
 
     # writes
 
@@ -375,20 +521,31 @@ class CreditBudget:
             self._conn.commit()
 
     def charge(self, provider: str, priority: str, credits: float, *,
-               reported_limit: Optional[float] = None, reported_remaining: Optional[float] = None) -> None:
+               reported_limit: Optional[float] = None, reported_remaining: Optional[float] = None,
+               reported_reset_at: Optional[datetime] = None) -> None:
         self._bump(provider, priority, credits=max(0.0, float(credits)), requests=1)
+        self.record_reported_quota(provider, reported_limit=reported_limit, reported_remaining=reported_remaining,
+                                   reported_reset_at=reported_reset_at)
+
+    def record_reported_quota(self, provider: str, *, reported_limit: Optional[float] = None,
+                              reported_remaining: Optional[float] = None,
+                              reported_reset_at: Optional[datetime] = None) -> None:
+        """Keep what the provider says about the quota, from any response (errors included)."""
         if reported_limit is not None or reported_remaining is not None:
             day = budget_day(self._now())
             with self._lock:
                 self._conn.execute(
                     """INSERT INTO provider_reported_quota
-                           (provider, budget_day, reported_limit, reported_remaining, reported_at)
-                       VALUES (?, ?, ?, ?, ?)
+                           (provider, budget_day, reported_limit, reported_remaining, reported_at,
+                            reported_reset_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
                        ON CONFLICT(provider, budget_day) DO UPDATE SET
                            reported_limit = COALESCE(excluded.reported_limit, reported_limit),
-                           reported_remaining = excluded.reported_remaining,
-                           reported_at = excluded.reported_at""",
-                    (provider, day, reported_limit, reported_remaining, self._now().isoformat()),
+                           reported_remaining = COALESCE(excluded.reported_remaining, reported_remaining),
+                           reported_at = excluded.reported_at,
+                           reported_reset_at = COALESCE(excluded.reported_reset_at, reported_reset_at)""",
+                    (provider, day, reported_limit, reported_remaining, self._now().isoformat(),
+                     reported_reset_at.isoformat() if reported_reset_at else None),
                 )
                 self._conn.commit()
         self._maybe_alert(provider)
@@ -420,7 +577,11 @@ def get_credit_budget(store_path: Optional[Path] = None) -> CreditBudget:
 
 
 def blocked_reason(provider: str, priority: Optional[str] = None, estimated_credits: float = 1.0) -> Optional[str]:
-    """Why a call to ``provider`` at ``priority`` would be skipped now, or None."""
+    """Why a call to ``provider`` at ``priority`` would be skipped now, or None.
+
+    Advisory only (it takes a half-open probe when it allows one); a caller
+    that will spend credits reserves them with ``CreditBudget.reserve``.
+    """
     if not get_breaker(provider).allow():
         return SKIP_CIRCUIT_OPEN
     try:

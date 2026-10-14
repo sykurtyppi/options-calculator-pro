@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -63,7 +64,19 @@ CREATE TABLE IF NOT EXISTS alert_outbox (
 
 
 class OutboxCorrupt(RuntimeError):
-    """The outbox cannot be read; it must not be treated as empty."""
+    """The outbox file is damaged; it must not be treated as empty."""
+
+
+class OutboxUnavailable(RuntimeError):
+    """The outbox could not be opened just now (locked, I/O). Not damage:
+    never quarantined, and nothing is sent."""
+
+
+# Messages SQLite uses for a damaged file, as opposed to a busy or
+# temporarily unreadable one.
+_CORRUPTION_MARKERS = ("not a database", "malformed", "corrupt", "unsupported file format")
+_BUSY_MARKERS = ("locked", "busy")
+OPEN_ATTEMPTS = 20
 
 
 class InvalidTransition(RuntimeError):
@@ -87,19 +100,40 @@ class AlertOutbox:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
         self._lock = threading.Lock()
+        # Several runs opening (or first creating) the outbox at once can meet
+        # a briefly locked file: that is contention, not damage, so it is
+        # retried, and only a genuinely damaged file is reported as corrupt.
+        for attempt in range(OPEN_ATTEMPTS):
+            try:
+                self._conn = self._open()
+                return
+            except OutboxCorrupt:
+                raise
+            except sqlite3.DatabaseError as exc:
+                message = str(exc).lower()
+                if any(marker in message for marker in _CORRUPTION_MARKERS):
+                    raise OutboxCorrupt(str(exc)) from exc
+                if not any(marker in message for marker in _BUSY_MARKERS):
+                    raise OutboxUnavailable(str(exc)) from exc
+                time.sleep(0.05 * (attempt + 1))
+        raise OutboxUnavailable(f"{self.path} stayed locked")
+
+    def _open(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=30.0, isolation_level=None)
         try:
-            self._conn = sqlite3.connect(str(self.path), timeout=30.0, isolation_level=None)
-            self._conn.row_factory = sqlite3.Row
-            check = self._conn.execute("PRAGMA quick_check").fetchone()
+            conn.row_factory = sqlite3.Row
+            check = conn.execute("PRAGMA quick_check").fetchone()
             if check is None or str(check[0]).lower() != "ok":
                 raise OutboxCorrupt(f"integrity check failed: {check[0] if check else 'no result'}")
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.executescript(_DDL)
-            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(alert_outbox)")}
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(_DDL)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(alert_outbox)")}
             if not {"alert_key", "status", "event_id", "updated_at"} <= columns:
                 raise OutboxCorrupt("alert_outbox table has an unexpected shape")
-        except sqlite3.DatabaseError as exc:
-            raise OutboxCorrupt(str(exc)) from exc
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
     def close(self) -> None:
         self._conn.close()
@@ -198,5 +232,5 @@ def quarantine(path: Path) -> Optional[Path]:
 
 __all__ = [
     "ACCEPTED", "DELIVERY_UNKNOWN", "FAILED", "PREPARED", "PROVIDER_SUBMITTED", "AlertOutbox",
-    "InvalidTransition", "OutboxCorrupt", "Reservation", "quarantine",
+    "InvalidTransition", "OutboxCorrupt", "OutboxUnavailable", "Reservation", "quarantine",
 ]

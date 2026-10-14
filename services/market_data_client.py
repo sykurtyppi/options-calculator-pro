@@ -487,7 +487,19 @@ class MarketDataClient:
         provider = self.provider_name
         priority = reliability.current_priority()
         estimate = _estimated_credits(endpoint_type, params)
-        skip_reason = reliability.blocked_reason(provider, priority, estimate)
+        breaker = reliability.get_breaker(provider)
+        skip_reason = None if breaker.allow() else reliability.SKIP_CIRCUIT_OPEN
+        reservation: Optional[str] = reliability.UNMETERED
+        if skip_reason is None:
+            try:
+                # Admit and hold the estimated cost atomically across processes.
+                reservation = reliability.get_credit_budget().reserve(provider, priority, estimate)
+            except Exception:  # noqa: BLE001 - an unreadable ledger must not stop data collection
+                logger.debug("MDApp budget unavailable", exc_info=True)
+                reservation = reliability.UNMETERED
+            if reservation is None:
+                breaker.release_probe()
+                skip_reason = reliability.SKIP_BUDGET
         if skip_reason is not None:
             # Not sent, so not a provider request: a pipeline row.
             record_provider_telemetry(
@@ -506,10 +518,11 @@ class MarketDataClient:
                 logger.debug("MDApp budget skip not recorded", exc_info=True)
             raise MarketDataError(f"MDApp call skipped: {skip_reason}")
 
-        breaker = reliability.get_breaker(provider)
         max_retries = 3
         start = time.perf_counter()
         last_category = "unknown_error"
+        settled = False
+        health_reported = False
 
         def _fail(category: str, note: Optional[str] = None) -> None:
             record_provider_telemetry(
@@ -522,62 +535,109 @@ class MarketDataClient:
                 response_quality_note=note,
             )
 
-        for attempt in range(max_retries):
-            retry_after: Any = None
-            try:
-                resp = requests.get(
-                    url,
-                    headers=self._headers(),
-                    params=params,
-                    timeout=15,
-                )
-            except requests.exceptions.Timeout:
-                last_category = "timeout"
-                logger.warning("MDApp request timeout (attempt %d): %s", attempt + 1, url)
-            except requests.exceptions.ConnectionError as exc:
-                last_category = "connection_error"
-                logger.warning("MDApp connection error (attempt %d): %s", attempt + 1, exc)
-            except requests.exceptions.RequestException as exc:
-                _fail(classify_error(str(exc)))
-                raise MarketDataError(f"MDApp request error: {exc}") from exc
-            else:
-                status = resp.status_code if isinstance(resp.status_code, int) else 200
-                if status == 429 or status >= 500:
-                    last_category = "rate_limited" if status == 429 else "server_error"
-                    retry_after = _header_map(resp).get("retry-after")
-                    logger.warning("MDApp HTTP %d (attempt %d): %s", status, attempt + 1, url)
-                else:
-                    try:
-                        resp.raise_for_status()
-                        data: Dict[str, Any] = resp.json()
-                    except requests.exceptions.HTTPError as exc:
-                        # A client error (auth, entitlement, not found) will not
-                        # change on retry and says nothing about provider health.
-                        _fail(classify_error(str(exc)))
-                        raise MarketDataError(f"MDApp HTTP error: {exc}") from exc
-                    except Exception as exc:
-                        _fail(classify_error(str(exc)))
-                        raise
-                    breaker.record_success()
-                    self._charge(resp, data, endpoint_type, params, priority, estimate)
-                    self._cache[cache_key] = (now, data)
-                    if disk_cache is not None:
-                        disk_cache.put(cache_key, data, cache_ttl)
-                    record_provider_telemetry(
-                        provider_name=provider,
-                        endpoint_type=endpoint_type,
-                        symbol=symbol,
-                        success=True,
-                        latency_ms=(time.perf_counter() - start) * 1000.0,
-                        response_quality_note=f"retried:{attempt}" if attempt else None,
+        try:
+            for attempt in range(max_retries):
+                retry_after: Any = None
+                try:
+                    resp = requests.get(
+                        url,
+                        headers=self._headers(),
+                        params=params,
+                        timeout=15,
                     )
-                    return data
-            if attempt < max_retries - 1:
-                self._sleep(reliability.retry_delay(attempt, retry_after=retry_after, rng=self._rng))
+                except requests.exceptions.Timeout:
+                    last_category = "timeout"
+                    logger.warning("MDApp request timeout (attempt %d): %s", attempt + 1, url)
+                except requests.exceptions.ConnectionError as exc:
+                    last_category = "connection_error"
+                    logger.warning("MDApp connection error (attempt %d): %s", attempt + 1, exc)
+                except requests.exceptions.RequestException as exc:
+                    _fail(classify_error(str(exc)))
+                    raise MarketDataError(f"MDApp request error: {exc}") from exc
+                else:
+                    # What the provider says about the quota counts on every
+                    # response, errors included.
+                    self._record_reported_quota(resp)
+                    status = resp.status_code if isinstance(resp.status_code, int) else 200
+                    if status == 429:
+                        kind = _classify_429(resp)
+                        if kind == QUOTA_EXHAUSTED:
+                            # Retrying cannot help before the quota resets, and
+                            # it is the budget's job, not the breaker's.
+                            _fail(QUOTA_EXHAUSTED, note="provider reports the credit quota is used up")
+                            try:
+                                # The budget sees the exhaustion even without headers.
+                                reliability.get_credit_budget().record_reported_quota(
+                                    provider, reported_remaining=0.0)
+                            except Exception:  # noqa: BLE001
+                                logger.debug("MDApp quota exhaustion not recorded", exc_info=True)
+                            raise MarketDataError(f"MDApp credit quota exhausted: {url}")
+                        last_category = kind
+                        retry_after = _header_map(resp).get("retry-after")
+                        logger.warning("MDApp HTTP 429 %s (attempt %d): %s", kind, attempt + 1, url)
+                    elif status >= 500:
+                        last_category = "server_error"
+                        retry_after = _header_map(resp).get("retry-after")
+                        logger.warning("MDApp HTTP %d (attempt %d): %s", status, attempt + 1, url)
+                    else:
+                        try:
+                            resp.raise_for_status()
+                            data: Dict[str, Any] = resp.json()
+                        except requests.exceptions.HTTPError as exc:
+                            # A client error (auth, entitlement, not found) will not
+                            # change on retry and says nothing about provider health.
+                            _fail(classify_error(str(exc)))
+                            raise MarketDataError(f"MDApp HTTP error: {exc}") from exc
+                        except Exception as exc:
+                            _fail(classify_error(str(exc)))
+                            raise
+                        breaker.record_success()
+                        health_reported = True
+                        self._charge(resp, data, endpoint_type, params, priority, estimate, reservation)
+                        settled = True
+                        self._cache[cache_key] = (now, data)
+                        if disk_cache is not None:
+                            disk_cache.put(cache_key, data, cache_ttl)
+                        record_provider_telemetry(
+                            provider_name=provider,
+                            endpoint_type=endpoint_type,
+                            symbol=symbol,
+                            success=True,
+                            latency_ms=(time.perf_counter() - start) * 1000.0,
+                            response_quality_note=f"retried:{attempt}" if attempt else None,
+                        )
+                        return data
+                if attempt < max_retries - 1:
+                    self._sleep(reliability.retry_delay(attempt, retry_after=retry_after, rng=self._rng))
 
-        breaker.record_failure()
-        _fail(last_category, note=f"failed after {max_retries} attempts")
-        raise MarketDataError(f"MDApp {last_category} after {max_retries} attempts: {url}")
+            breaker.record_failure()
+            health_reported = True
+            _fail(last_category, note=f"failed after {max_retries} attempts")
+            raise MarketDataError(f"MDApp {last_category} after {max_retries} attempts: {url}")
+        finally:
+            if not settled:
+                # Not served, so not charged: free the held estimate.
+                try:
+                    reliability.get_credit_budget().release(reservation)
+                except Exception:  # noqa: BLE001
+                    logger.debug("MDApp reservation not released", exc_info=True)
+            if not health_reported:
+                breaker.release_probe()
+
+    def _record_reported_quota(self, resp: Any) -> None:
+        headers = _header_map(resp)
+        limit = _header_number(headers, "x-api-ratelimit-limit")
+        remaining = _header_number(headers, "x-api-ratelimit-remaining")
+        reset = _header_number(headers, "x-api-ratelimit-reset")
+        if limit is None and remaining is None:
+            return
+        try:
+            reliability.get_credit_budget().record_reported_quota(
+                self.provider_name, reported_limit=limit, reported_remaining=remaining,
+                reported_reset_at=datetime.fromtimestamp(reset, tz=timezone.utc) if reset else None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("MDApp reported quota not recorded", exc_info=True)
 
     def _disk_cache(self) -> Optional["reliability.ResponseCache"]:
         if self._response_cache is False:
@@ -585,16 +645,14 @@ class MarketDataClient:
         return self._response_cache or reliability.get_response_cache()
 
     def _charge(self, resp: Any, data: Dict[str, Any], endpoint_type: str,
-                params: Optional[Dict[str, Any]], priority: str, estimate: float) -> None:
+                params: Optional[Dict[str, Any]], priority: str, estimate: float,
+                reservation: Optional[str] = None) -> None:
+        """Settle the reservation at the call's actual cost (reconciliation)."""
         headers = _header_map(resp)
         consumed = _header_number(headers, "x-api-ratelimit-consumed")
         credits = consumed if consumed is not None else _actual_credits(endpoint_type, params, data, estimate)
         try:
-            reliability.get_credit_budget().charge(
-                self.provider_name, priority, credits,
-                reported_limit=_header_number(headers, "x-api-ratelimit-limit"),
-                reported_remaining=_header_number(headers, "x-api-ratelimit-remaining"),
-            )
+            reliability.get_credit_budget().settle(reservation, self.provider_name, priority, credits)
         except Exception:  # noqa: BLE001 - accounting must not lose a good response
             logger.debug("MDApp credit charge not recorded", exc_info=True)
 
@@ -736,6 +794,29 @@ def _actual_credits(endpoint_type: str, params: Optional[Dict[str, Any]], data: 
     if (params or {}).get("date"):
         return float(max(1, math.ceil(len(contracts) / 1000)))
     return float(max(1, len(contracts)))
+
+
+QUOTA_EXHAUSTED = "quota_exhausted"
+CONCURRENCY_THROTTLED = "concurrency_throttled"
+RATE_LIMITED = "rate_limited"
+
+
+def _classify_429(resp: Any) -> str:
+    """Why the provider throttled: the day's credits are gone (not retryable
+    before the reset), too many requests in flight, or a transient rate limit."""
+    headers = _header_map(resp)
+    if _header_number(headers, "x-api-ratelimit-remaining") == 0:
+        return QUOTA_EXHAUSTED
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    text = str((body or {}).get("errmsg") or "" if isinstance(body, dict) else body or "").lower()
+    if "concurren" in text or "simultaneous" in text:
+        return CONCURRENCY_THROTTLED
+    if any(word in text for word in ("credit", "quota", "daily limit", "plan limit")):
+        return QUOTA_EXHAUSTED
+    return RATE_LIMITED
 
 
 def _header_map(resp: Any) -> Dict[str, Any]:

@@ -75,6 +75,7 @@ from services.alert_outbox import (  # noqa: E402
     PROVIDER_SUBMITTED,
     AlertOutbox,
     OutboxCorrupt,
+    OutboxUnavailable,
     quarantine,
 )
 from services.automation_watchdog import IMessageConfig, send_imessage  # noqa: E402
@@ -559,7 +560,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         outbox = AlertOutbox(outbox_path)
     except OutboxCorrupt as exc:
         moved = quarantine(outbox_path)
-        logger.error("Alert outbox is unreadable (%s); moved to %s. Nothing sent.", exc, moved)
+        logger.error("Alert outbox is damaged (%s); moved to %s. Nothing sent.", exc, moved)
+        return 1
+    except OutboxUnavailable as exc:
+        # Contention or I/O, not damage: leave the outbox where it is.
+        logger.error("Alert outbox is unavailable right now (%s). Nothing sent.", exc)
         return 1
     # --force sends again under a fresh key; otherwise one key per digest.
     alert_key = f"{digest}|force|{event_id}" if args.force else digest

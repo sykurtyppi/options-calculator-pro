@@ -502,7 +502,7 @@ def record_provider_telemetry(
 ERROR_CATEGORIES = frozenset({
     "timeout", "rate_limited", "auth", "entitlement", "not_found", "empty_response", "http_error",
     "cache_fallback", "unknown_error", "server_error", "connection_error",
-    "provider_budget_exhausted", "provider_circuit_open",
+    "provider_budget_exhausted", "provider_circuit_open", "quota_exhausted", "concurrency_throttled",
 })
 
 
