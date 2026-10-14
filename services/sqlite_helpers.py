@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Union
+from typing import Callable, Union
 
 # 5-second busy timeout matches the existing recommendation_ledger
 # convention (Hardening P1-5 set this in
@@ -116,7 +116,29 @@ def open_db_conn(
     return conn
 
 
+def migrate_under_lock(conn: sqlite3.Connection, migrate: Callable[[sqlite3.Connection], None]) -> None:
+    """Run a schema migration inside the database's write lock.
+
+    Several processes opening an older file at once would otherwise each read
+    the schema, each find a column missing, and all but one crash on
+    ``duplicate column``. Under ``BEGIN IMMEDIATE`` they take turns, and each
+    one's ``migrate`` re-reads the schema once it holds the lock, so a later
+    process finds the work done. ``migrate`` must therefore check before it
+    changes anything. Waits up to the connection's busy timeout for the lock.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        migrate(conn)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 __all__ = [
     "DEFAULT_BUSY_TIMEOUT_MS",
+    "migrate_under_lock",
     "open_db_conn",
 ]

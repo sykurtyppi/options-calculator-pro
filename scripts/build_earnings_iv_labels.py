@@ -79,6 +79,7 @@ import re
 import sqlite3
 import sys
 import time
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -379,7 +380,10 @@ def _ensure_schema(db_path: Path, logger: logging.Logger) -> None:
     ALTER TABLE ADD COLUMN (column-existence checked before each ALTER).
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(str(db_path)) as conn:
+    # closing(): ``with sqlite3.connect()`` commits but never closes, and a
+    # leaked connection's file handle drops this process's SQLite locks when
+    # it is finally closed (e.g. a forked worker), undoing the lock below.
+    with closing(sqlite3.connect(str(db_path))) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(_EARNINGS_EVENTS_DDL)
@@ -393,7 +397,10 @@ def _ensure_schema(db_path: Path, logger: logging.Logger) -> None:
             "ON earnings_events (symbol, event_date)"
         )
 
-        # Add extended columns if missing (handles existing DB with base schema)
+        # Add extended columns if missing (handles existing DB with base
+        # schema), under the write lock so concurrent runs take turns.
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
         existing = {row[1] for row in conn.execute(
             "PRAGMA table_info(earnings_iv_decay_labels)"
         ).fetchall()}

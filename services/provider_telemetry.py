@@ -140,6 +140,13 @@ class ProviderTelemetryEvent:
     candidate_key: Optional[str] = None
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {str(row["name"]) for row in conn.execute("PRAGMA table_info(provider_telemetry)").fetchall()}
+    for column, ddl in _MIGRATION_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE provider_telemetry ADD COLUMN {column} {ddl}")
+
+
 def _open_db(path: Path) -> sqlite3.Connection:
     # PR #73 P1: route through the shared sqlite_helpers helper so
     # this DB gets WAL journal mode. Pre-fix used SQLite's default
@@ -154,18 +161,12 @@ def _open_db(path: Path) -> sqlite3.Connection:
     #
     # busy_timeout is set explicitly (5000 ms) for clarity; Python's
     # sqlite3.connect() already defaults to timeout=5.0 s.
-    from services.sqlite_helpers import open_db_conn
+    from services.sqlite_helpers import migrate_under_lock, open_db_conn
     conn = open_db_conn(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(_TABLE_DDL)
-    existing = {str(row["name"]) for row in conn.execute("PRAGMA table_info(provider_telemetry)").fetchall()}
-    for column, ddl in _MIGRATION_COLUMNS.items():
-        if column not in existing:
-            try:
-                conn.execute(f"ALTER TABLE provider_telemetry ADD COLUMN {column} {ddl}")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
+    # Serialized: processes opening an older file at once take turns.
+    migrate_under_lock(conn, _migrate)
     conn.executescript(_INDEX_DDL)
     conn.commit()
     return conn
