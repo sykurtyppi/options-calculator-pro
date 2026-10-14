@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS baseline_trades (
     evidence_quality_status      TEXT,
     evidence_quality_reasons_json TEXT,
     claim_allowed                INTEGER,
+    claim_contract_version       TEXT,
     execution_grade              INTEGER,
     entry_execution_scenarios_json TEXT,
     surface_quality_status       TEXT,
@@ -118,6 +119,7 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "evidence_quality_status": "TEXT",
     "evidence_quality_reasons_json": "TEXT",
     "claim_allowed": "INTEGER",
+    "claim_contract_version": "TEXT",
     "execution_grade": "INTEGER",
     "entry_execution_scenarios_json": "TEXT",
     "exit_execution_scenarios_json": "TEXT",
@@ -191,6 +193,7 @@ class BaselineEvidenceStore:
         evidence_quality_reasons: Optional[list[str]] = None,
         claim_allowed: Optional[bool] = None,
         execution_grade: Optional[bool] = None,
+        claim_contract_version: Optional[str] = None,
         entry_execution_scenarios: Optional[Dict[str, Any]] = None,
         surface_quality: Optional[Dict[str, Any]] = None,
         status: str = "open",
@@ -291,7 +294,11 @@ class BaselineEvidenceStore:
                 if status == "entry_skipped":
                     failed_attempts = failed_attempts + [{"date": _fmt_date(entry_date), "reason": skip_reason}]
                 cur.execute(sql, params + (attempt_count, _json(failed_attempts)))
-                return cur.rowcount > 0
+                inserted = cur.rowcount > 0
+                if inserted and claim_contract_version is not None:
+                    cur.execute("UPDATE baseline_trades SET claim_contract_version = ? WHERE baseline_id = ?",
+                                (str(claim_contract_version), baseline_id))
+                return inserted
 
     def recorded_universe_baselines(self, symbol: str, earnings_date: Any) -> set[str]:
         """Baseline names already ENTERED for this event in the universe cohort.
@@ -416,13 +423,15 @@ class BaselineEvidenceStore:
                 # F5: claim-eligible at entry stays claimable only if the exit
                 # passed the claim contract too.
                 prior = cur.execute(
-                    "SELECT claim_allowed, evidence_quality_reasons_json FROM baseline_trades WHERE baseline_id = ?",
+                    "SELECT claim_allowed, evidence_quality_reasons_json, claim_contract_version"
+                    " FROM baseline_trades WHERE baseline_id = ?",
                     (baseline_id,),
                 ).fetchone()
                 claim_allowed, claim_reasons = apply_exit_claim(
                     claim_allowed=None if prior is None or prior[0] is None else bool(prior[0]),
                     evidence_reasons=_loads_list(prior[1]) if prior is not None else [],
                     exit_execution_scenarios=exit_execution_scenarios,
+                    entry_contract_version=prior[2] if prior is not None else None,
                 )
                 cur.execute(sql, params + (_bool_int(claim_allowed), _json(claim_reasons)) + tail)
                 return cur.rowcount > 0

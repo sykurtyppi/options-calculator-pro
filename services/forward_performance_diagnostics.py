@@ -21,7 +21,7 @@ from services.baseline_evidence_store import (
     get_baseline_evidence_store,
     is_booked_strike_exit,
 )
-from services.claim_contract import CONTRACT_VERSION
+from services.claim_contract import CONTRACT_VERSION, claimable_under_current_contract
 from services.outcome_recorder import OutcomeStore, get_outcome_store
 from services.recommendation_ledger import RecommendationLedger, get_recommendation_ledger
 
@@ -216,7 +216,7 @@ def _merged_outcome(outcome: Dict[str, Any], ledger_row: Optional[Dict[str, Any]
         "iv_rv_har": _num(outcome.get("iv_rv_har")),
         "liquidity_tier": outcome.get("liquidity_tier"),
         "evidence_quality_status": outcome.get("evidence_quality_status"),
-        "claim_allowed": _boolish(outcome.get("claim_allowed")),
+        "claim_allowed": claimable_under_current_contract(outcome),
         "execution_grade": _boolish(outcome.get("execution_grade")),
         "surface_quality_status": outcome.get("surface_quality_status") or (ledger_row or {}).get("surface_quality_status"),
         "surface_quality_reasons": _as_list(outcome.get("surface_quality_reasons_json") or (ledger_row or {}).get("surface_quality_reasons_json")),
@@ -244,7 +244,7 @@ def _merged_baseline(row: Dict[str, Any]) -> Dict[str, Any]:
         "realized_expansion_pct": _num(row.get("realized_expansion_pct")),
         "data_quality_score": _num(row.get("data_quality_score_at_entry")),
         "evidence_quality_status": row.get("evidence_quality_status"),
-        "claim_allowed": _boolish(row.get("claim_allowed")),
+        "claim_allowed": claimable_under_current_contract(row),
         "execution_grade": _boolish(row.get("execution_grade")),
         "surface_quality_status": row.get("surface_quality_status"),
         "entry_spread_cost_pct": _scenario_spread_pct(row.get("entry_execution_scenarios_json")),

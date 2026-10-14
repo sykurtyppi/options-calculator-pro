@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 
+from services.claim_contract import claimable_under_current_contract
 from services.baseline_evidence_store import (
     COHORT_PAIRED,
     COHORT_UNIVERSE,
@@ -537,7 +538,7 @@ def _simple_iv_rv_filter(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _claimable_resolved_count(selected: Iterable[Dict[str, Any]]) -> int:
     """Resolved, finite, valid selector outcomes that are claim-allowed."""
-    return sum(1 for row in selected if _truthy(row.get("claim_allowed")))
+    return sum(1 for row in selected if claimable_under_current_contract(row))
 
 
 def _evidence_quality_summary(
@@ -556,8 +557,9 @@ def _evidence_quality_summary(
             baseline_rows,
             lambda row: row.get("evidence_quality_status") or "legacy_unclassified",
         ),
-        "claim_allowed_count": sum(1 for row in all_rows if _truthy(row.get("claim_allowed"))),
-        "claim_blocked_count": sum(1 for row in all_rows if row.get("claim_allowed") is not None and not _truthy(row.get("claim_allowed"))),
+        # Claims count only under the current claim contract (see claim_contract).
+        "claim_allowed_count": sum(1 for row in all_rows if claimable_under_current_contract(row)),
+        "claim_blocked_count": sum(1 for row in all_rows if claimable_under_current_contract(row) is False),
         "execution_grade_count": sum(1 for row in all_rows if _truthy(row.get("execution_grade"))),
         "record_only_count": sum(1 for row in all_rows if row.get("evidence_quality_status") == "record_only"),
         "degraded_count": sum(1 for row in all_rows if row.get("evidence_quality_status") == "degraded_evidence"),

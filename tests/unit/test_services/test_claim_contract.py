@@ -182,18 +182,28 @@ def test_the_exit_must_pass_and_reprice_the_booked_contracts():
     assert not cc.evaluate_exit_claim(entry_quote_legs={}, exit_quote_payload=_quote())["passed"]
 
 
-def _insert(store, trade_id, *, claim_allowed=True):
+def _insert(store, trade_id, *, claim_allowed=True, version=cc.CONTRACT_VERSION):
     store.insert_entry(
         trade_id=trade_id, symbol="AAPL", structure="atm_straddle", entry_date=TODAY - timedelta(days=4),
         setup_score=0.6, source_type="paper", earnings_date=TODAY + timedelta(days=1), entry_mid=4.5,
         execution_penalty_at_entry=0.03, claim_allowed=claim_allowed, evidence_quality_reasons=["entry_reason"],
+        claim_contract_version=version,
     )
 
 
+V = cc.CONTRACT_VERSION
+
+
 @pytest.mark.parametrize("verdict, expected_claim, expected_reasons", [
-    ({"passed": True, "reasons": []}, 1, ["entry_reason"]),
-    ({"passed": False, "reasons": ["exit_claim_quote_stale"]}, 0, ["entry_reason", "exit_claim_quote_stale"]),
-    (None, 1, ["entry_reason"]),                              # no verdict: left as it was
+    ({"passed": True, "reasons": [], "contract_version": V}, 1, ["entry_reason"]),
+    ({"passed": False, "reasons": ["exit_claim_quote_stale"], "contract_version": V}, 0,
+     ["entry_reason", "exit_claim_quote_stale"]),
+    # Fails closed: no verdict, a malformed one, or another version's.
+    (None, 0, ["claim_exit_verdict_missing", "entry_reason"]),
+    ({"reasons": []}, 0, ["claim_exit_verdict_missing", "entry_reason"]),
+    ({"passed": "yes", "contract_version": V}, 0, ["claim_exit_verdict_missing", "entry_reason"]),
+    ({"passed": True, "reasons": [], "contract_version": "conservative_fill_v1"}, 0,
+     ["claim_contract_version_mismatch", "entry_reason"]),
 ])
 def test_the_outcome_store_folds_the_exit_verdict(tmp_path, verdict, expected_claim, expected_reasons):
     store = OutcomeStore(store_path=tmp_path / "o.sqlite")
@@ -211,8 +221,18 @@ def test_an_ineligible_entry_is_not_made_claimable_by_its_exit(tmp_path):
     store = OutcomeStore(store_path=tmp_path / "o.sqlite")
     _insert(store, "T1", claim_allowed=False)
     store.update_exit(trade_id="T1", exit_date=TODAY, exit_mid=5.0, realized_return_pct=11.0,
-                      exit_execution_scenarios={"claim": {"passed": True, "reasons": []}})
+                      exit_execution_scenarios={"claim": {"passed": True, "reasons": [], "contract_version": V}})
     assert store.get_trade("T1")["claim_allowed"] == 0
+
+
+def test_an_entry_checked_under_another_version_is_not_claimable(tmp_path):
+    store = OutcomeStore(store_path=tmp_path / "o.sqlite")
+    _insert(store, "T1", version=None)                      # e.g. entered before versions were stored
+    store.update_exit(trade_id="T1", exit_date=TODAY, exit_mid=5.0, realized_return_pct=11.0,
+                      exit_execution_scenarios={"claim": {"passed": True, "reasons": [], "contract_version": V}})
+    row = store.get_trade("T1")
+    assert row["claim_allowed"] == 0
+    assert "claim_contract_version_mismatch" in json.loads(row["evidence_quality_reasons_json"])
 
 
 def test_the_baseline_store_folds_the_exit_verdict(tmp_path):
@@ -222,7 +242,7 @@ def test_the_baseline_store_folds_the_exit_verdict(tmp_path):
         entry_date=TODAY - timedelta(days=4), earnings_date=TODAY + timedelta(days=1), selector_structure=None,
         entry_mid=4.5, modeled_cost_pct=None, execution_penalty_at_entry=None, data_quality_score_at_entry=None,
         iv_rv_har_at_entry=None, iv_rv_yz_at_entry=None, quote_source_at_entry="marketdata_app",
-        quote_quality_at_entry=None, claim_allowed=True, baseline_id="B1",
+        quote_quality_at_entry=None, claim_allowed=True, baseline_id="B1", claim_contract_version=V,
     )
     store.update_exit(baseline_id="B1", exit_date=TODAY, exit_mid=5.0, realized_return_pct=11.0,
                       realized_expansion_pct=None, quote_source_at_exit="marketdata_app", quote_quality_at_exit=None,
@@ -259,6 +279,7 @@ def test_a_round_trip_is_claimable_only_when_both_ends_pass(tmp_path, exit_quote
         setup_score=0.6, source_type="paper", earnings_date=earnings, entry_mid=4.5,
         execution_penalty_at_entry=0.03, notes=json.dumps({"pricing_context": {}}),
         claim_allowed=evidence["claim_allowed"], evidence_quality_reasons=evidence["evidence_quality_reasons"],
+        claim_contract_version=evidence["claim_contract_version"],
         entry_execution_scenarios=build_execution_scenarios(
             structure="atm_straddle", quote_payload=entry_quote, phase="entry").to_dict(),
     )
