@@ -47,6 +47,8 @@ from typing import Any, Dict, Generator, Optional
 
 import numpy as np
 
+from services.claim_contract import apply_exit_claim
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_STORE = Path(
@@ -465,6 +467,8 @@ class OutcomeStore:
                 exit_quote_timestamp    = ?,
                 exit_bid_ask_mid_json   = ?,
                 exit_execution_scenarios_json = ?,
+                claim_allowed           = ?,
+                evidence_quality_reasons_json = ?,
                 status                 = CASE WHEN status = 'finalizing' THEN 'finalizing' ELSE 'exited' END,
                 updated_at             = CURRENT_TIMESTAMP
             WHERE trade_id = ?
@@ -485,13 +489,22 @@ class OutcomeStore:
             exit_quote_timestamp,
             _json_payload(exit_bid_ask_mid or {}),
             _json_payload(exit_execution_scenarios or {}),
-            trade_id,
-            owner,
-            owner,
         )
+        tail = (trade_id, owner, owner)
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
-                cur.execute(sql, params)
+                # F5: an entry that was claim-eligible stays claimable only if
+                # its exit passed the claim contract too.
+                prior = cur.execute(
+                    "SELECT claim_allowed, evidence_quality_reasons_json FROM outcome_trades WHERE trade_id = ?",
+                    (trade_id,),
+                ).fetchone()
+                claim_allowed, claim_reasons = apply_exit_claim(
+                    claim_allowed=None if prior is None or prior[0] is None else bool(prior[0]),
+                    evidence_reasons=_loads_list(prior[1]) if prior is not None else [],
+                    exit_execution_scenarios=exit_execution_scenarios,
+                )
+                cur.execute(sql, params + (_bool_int(claim_allowed), _json_payload(claim_reasons)) + tail)
                 updated = cur.rowcount > 0
         if updated:
             logger.debug("outcome_store: updated exit trade_id=%s", trade_id)
@@ -1214,6 +1227,16 @@ def _fmt_date(d: Any) -> Optional[str]:
     if isinstance(d, date):
         return d.isoformat()
     return str(d)
+
+
+def _loads_list(value: Any) -> list:
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value) if value else []
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 def _json_payload(value: Any) -> str:

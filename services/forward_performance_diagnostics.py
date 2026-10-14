@@ -21,6 +21,7 @@ from services.baseline_evidence_store import (
     get_baseline_evidence_store,
     is_booked_strike_exit,
 )
+from services.claim_contract import CONTRACT_VERSION
 from services.outcome_recorder import OutcomeStore, get_outcome_store
 from services.recommendation_ledger import RecommendationLedger, get_recommendation_ledger
 
@@ -35,6 +36,9 @@ _CONFIDENCE_BUCKETS = (
     (75.0, 90.0, "75-90"),
     (90.0, 100.000001, "90-100"),
 )
+
+# The three prices a claimable outcome is reported at.
+CLAIM_REPORT_LEVELS = ("mid", "natural", "conservative_fill")
 
 
 def build_forward_performance_diagnostics(
@@ -133,7 +137,20 @@ def build_forward_performance_diagnostics(
             "claimable_count": sum(1 for row in resolved if bool(row.get("claim_allowed"))),
             "non_claimable_count": sum(1 for row in resolved if row.get("claim_allowed") is not None and not bool(row.get("claim_allowed"))),
             "execution_grade_count": sum(1 for row in resolved if bool(row.get("execution_grade"))),
-            "paper_research_label": "Claimability requires execution-grade evidence; paper/research rows remain observational.",
+            "paper_research_label": (
+                "Claimable outcomes passed the claim contract at entry and exit; their claimed return "
+                "is the conservative fill, not the mid. Other paper/research rows remain observational."
+            ),
+            "claim_contract_version": CONTRACT_VERSION,
+            # Claimable outcomes three ways: midpoint, natural price, and the
+            # conservative fill the claim is priced at.
+            "claimable_returns": {
+                level: stats
+                for level, stats in _execution_scenario_stats(
+                    [row for row in resolved if bool(row.get("claim_allowed"))]
+                ).items()
+                if level in CLAIM_REPORT_LEVELS
+            },
         },
         "outcome_count_by_symbol": _count_by(resolved, lambda item: item["symbol"] or "UNKNOWN"),
         "calibration_buckets": _bucket_rows(resolved),

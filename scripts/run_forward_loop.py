@@ -43,6 +43,7 @@ from services.baseline_evidence_store import (
 )
 from services.evidence_quality import evaluate_evidence_quality
 from services import evidence_funnel as funnel_mod
+from services.claim_contract import evaluate_exit_claim
 from services.evidence_funnel import EvidenceFunnelStore
 from services.execution_scenarios import (
     build_execution_scenarios,
@@ -508,6 +509,30 @@ def _mid_from_row(row: Optional[pd.Series]) -> Optional[float]:
     return float(mid) if mid > 0 else None
 
 
+def _exit_claim(entry_execution_scenarios: Any, exit_quote: Dict[str, Any]) -> Dict[str, Any]:
+    """The exit half of the claim contract, checked against the booked entry legs."""
+    entry = entry_execution_scenarios if isinstance(entry_execution_scenarios, dict) else {}
+    return evaluate_exit_claim(entry_quote_legs=entry.get("legs") or {}, exit_quote_payload=exit_quote)
+
+
+def _leg_quote_time(value: Any) -> Optional[str]:
+    """A chain row's quote timestamp (unix seconds or ISO) as UTC ISO, else None."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)) or str(value).strip().isdigit():
+            seconds = float(value)
+            if not math.isfinite(seconds) or seconds <= 0:
+                return None
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+        parsed = pd.Timestamp(value)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    if pd.isna(parsed) or parsed.tzinfo is None:
+        return None
+    return parsed.tz_convert("UTC").isoformat()
+
+
 def _quote_fields_from_row(
     row: Optional[pd.Series],
     *,
@@ -528,6 +553,10 @@ def _quote_fields_from_row(
         "volume": _safe_float(row.get("volume")),
         "open_interest": _safe_float(row.get("openInterest", row.get("open_interest"))),
         "implied_volatility": _safe_float(row.get("impliedVolatility", row.get("iv"))),
+        # The leg's own quote time (MarketData.app chains carry it as
+        # "updated"); the claim contract needs it to check the legs were
+        # quoted together. yfinance chains have none.
+        "quote_time": _leg_quote_time(row.get("updated")),
     }
     if quote_quality_label is not None:
         payload["quote_quality_label"] = quote_quality_label
@@ -1987,6 +2016,7 @@ def _finalize_baseline_exits(
                         structure=structure,
                         capital_at_risk=capital_at_risk,
                     ),
+                    "claim": _exit_claim(row.get("entry_execution_scenarios_json"), quote),
                 },
                 status="resolved",
                 exit_repricing=exit_repricing,
@@ -2893,6 +2923,7 @@ def _run_exit_detection(
             **exit_execution_scenarios,
             "scenario_outcomes": scenario_outcomes,
             "contract_verification": contract_verification,
+            "claim": _exit_claim(entry_execution_scenarios, quote),
         }
 
         if not dry_run:

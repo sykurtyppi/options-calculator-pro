@@ -1,18 +1,27 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 import math
 
+from services.claim_contract import fee_per_share, slippage_per_share
 from utils.quotes import safe_mid
 
 
-SCENARIO_LEVELS: tuple[tuple[str, float], ...] = (
+# How far each leg's fill moves from its mid, as a fraction of its full
+# bid-ask spread: 0.5 is the natural price (pay the ask, receive the bid).
+# "cross_50" and the legacy "conservative" are that same price, kept so stored
+# rows keep their meaning; "natural" names it. "conservative_fill" is the claim
+# price (services/claim_contract.py): natural plus slippage and fees for every
+# contract.
+SCENARIO_LEVELS: tuple[tuple[str, Optional[float]], ...] = (
     ("mid", 0.0),
     ("cross_25", 0.25),
     ("cross_50", 0.50),
     ("conservative", 0.50),
+    ("natural", 0.50),
+    ("conservative_fill", None),
 )
 
 
@@ -212,7 +221,7 @@ def _scenario_value(
     *,
     legs: Mapping[str, Mapping[str, Any]],
     signs: Mapping[str, int],
-    distance: float,
+    distance: Optional[float],
     phase: str,
 ) -> float | None:
     if not legs:
@@ -226,11 +235,21 @@ def _scenario_value(
         if bid is None or ask is None or mid is None or ask < bid:
             return None
         spread = ask - bid
-        if phase == "entry":
-            fill = mid + sign * distance * spread
+        if distance is None:
+            # Conservative fill: the natural side, a further slippage, and the
+            # fees, all against us. In the signed sum "against us" is up at
+            # entry (pay more / receive less) and down at exit.
+            adverse = 0.5 * spread + slippage_per_share(bid, ask)
+            cost = fee_per_share()
         else:
-            fill = mid - sign * distance * spread
-        value += sign * fill
+            adverse = distance * spread
+            cost = 0.0
+        if phase == "entry":
+            fill = mid + sign * adverse
+            value += sign * fill + cost
+        else:
+            fill = mid - sign * adverse
+            value += sign * fill - cost
     return value
 
 
