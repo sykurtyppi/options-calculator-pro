@@ -941,6 +941,40 @@ class RecommendationLedger:
             eligible.append(merged)
         return eligible
 
+    def latest_event_rows(
+        self,
+        *,
+        sample_provenance: str = SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+        selected_structure: Optional[str] = "call_calendar",
+    ) -> List[Dict[str, Any]]:
+        """Each event's latest decision (merged with its latest resolution).
+
+        The same one-row-per-event rule the candidate-exit resolver uses: the
+        latest analysis with this provenance; ``selected_structure`` filters
+        that row (None keeps any structure).
+        """
+        params: list = [sample_provenance]
+        structure_sql = ""
+        if selected_structure is not None:
+            structure_sql = " AND selected_structure = ?"
+            params.append(selected_structure)
+        rows = self._conn.execute(
+            f"""
+            SELECT recommendation_id
+              FROM recommendations
+             WHERE sample_provenance = ?{structure_sql}
+               AND event_key IS NOT NULL
+               AND event_sequence = (
+                    SELECT MAX(latest.event_sequence) FROM recommendations AS latest
+                     WHERE latest.event_key = recommendations.event_key
+                       AND latest.sample_provenance = recommendations.sample_provenance)
+             ORDER BY earnings_date ASC, symbol ASC
+            """,
+            params,
+        ).fetchall()
+        merged = (self.get_with_latest_resolution(str(row["recommendation_id"])) for row in rows)
+        return [row for row in merged if row is not None]
+
     def list_recent(
         self,
         *,

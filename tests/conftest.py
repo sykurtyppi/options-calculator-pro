@@ -98,6 +98,7 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
     """
     import services.baseline_evidence_store as bes
     import services.evidence_funnel as ef
+    import services.outcome_recorder as orec
     import services.provider_reliability as pr
     import services.recommendation_ledger as rl
 
@@ -112,6 +113,9 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(bes, "_DEFAULT_STORE", bes_path)
     monkeypatch.setattr(rl, "_DEFAULT_LEDGER", rl_path)
     monkeypatch.setattr(ef, "_DEFAULT_STORE", root / "evidence" / "evidence_funnel.sqlite")
+    # The outcome store too: reports read it through the default getter
+    # (e.g. the funnel report's per-event exits).
+    monkeypatch.setattr(orec, "_DEFAULT_STORE", root / "outcomes" / "outcome_store.sqlite")
     # Provider credit budget and response cache: a per-test ledger, so spend
     # or cached responses never carry across tests.
     monkeypatch.setattr(pr, "_DEFAULT_BUDGET_STORE", root / "telemetry" / "provider_budget.sqlite")
@@ -119,7 +123,8 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
 
     def _reset_singletons():
         pr.reset_breakers()
-        for module, attr in ((bes, "_store"), (rl, "_ledger"), (ef, "_store"), (pr, "_budget"), (pr, "_cache")):
+        for module, attr in ((bes, "_store"), (rl, "_ledger"), (ef, "_store"), (pr, "_budget"), (pr, "_cache"),
+                               (orec, "_store")):
             existing = getattr(module, attr, None)
             if existing is not None:
                 try:

@@ -412,6 +412,15 @@ def build_evidence_funnel_report(
         return {"error": f"{type(exc).__name__}: {exc}", "warnings": ["evidence_funnel_unavailable"]}
     if stalled >= int(stalled_threshold):
         report["warnings"].append("entry_pipeline_stalled")
+    # F6: exit-due -> resolved per event, across the paper, baseline and
+    # resolver tracks (each keeps its own per-trade stages above).
+    try:
+        from services.event_resolution import load_event_resolutions, summarize_event_resolutions
+
+        report["event_exits"] = summarize_event_resolutions(load_event_resolutions(as_of=as_of))
+    except Exception as exc:  # noqa: BLE001
+        report["event_exits"] = {"error": f"{type(exc).__name__}: {exc}"}
+        report["warnings"].append("event_exits_unavailable")
     return report
 
 
