@@ -182,10 +182,15 @@ def load_event_resolutions(
     from services.outcome_recorder import get_outcome_store
     from services.recommendation_ledger import get_recommendation_ledger
 
-    paper = (outcome_store or get_outcome_store()).list_for_diagnostics(
-        limit=max_rows, evidence="valid", source="forward")
-    baselines = (baseline_store or get_baseline_evidence_store()).list_for_diagnostics(limit=max_rows)
-    resolver = (ledger or get_recommendation_ledger()).latest_event_rows()
+    from services.event_reconciliation import drop_superseded, superseded_keys
+
+    ledger_obj = ledger or get_recommendation_ledger()
+    superseded = superseded_keys(ledger_obj)
+    paper = drop_superseded((outcome_store or get_outcome_store()).list_for_diagnostics(
+        limit=max_rows, evidence="valid", source="forward"), superseded)
+    baselines = drop_superseded(
+        (baseline_store or get_baseline_evidence_store()).list_for_diagnostics(limit=max_rows), superseded)
+    resolver = ledger_obj.latest_event_rows()
     return build_event_resolutions(as_of=as_of, paper_rows=paper, baseline_rows=baselines,
                                    resolver_rows=resolver, event_keys=event_keys)
 

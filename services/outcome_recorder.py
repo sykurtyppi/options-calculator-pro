@@ -191,6 +191,8 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "evidence_valid": "INTEGER",
     "invalidated_at": "TEXT",
     "invalidation_reason": "TEXT",
+    # PR O: the durable corporate-event id (recommendation_ledger event_identity).
+    "event_id": "TEXT",
     # Exit attrition. An exit is valued only on T-1 (the day before earnings).
     # A trade that could not be priced that day is moved to the terminal
     # status 'exit_missing' once the day has passed, instead of staying
@@ -1076,6 +1078,17 @@ class OutcomeStore:
             "invalidated_at": stamp,
             "invalidation_reason": reason,
         }
+
+    def record_event_ids(self, event_ids: Dict[str, str]) -> int:
+        """Attach durable event ids (trade_id -> event_id) where none is set yet."""
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                changed = 0
+                for trade_id, event_id in event_ids.items():
+                    cur.execute("UPDATE outcome_trades SET event_id = ? WHERE trade_id = ? AND event_id IS NULL",
+                                (event_id, trade_id))
+                    changed += cur.rowcount
+                return changed
 
     def diagnostics(self) -> Dict[str, Any]:
         total = self.count()

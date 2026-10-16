@@ -143,6 +143,15 @@ CREATE TABLE IF NOT EXISTS candidate_rechecks (
     PRIMARY KEY (symbol, earnings_date)
 );
 CREATE INDEX IF NOT EXISTS idx_candidate_rechecks_due ON candidate_rechecks (status, recheck_on);
+-- PR O: every observed move of an event's date (append-only), so a chain of
+-- moves (A -> B -> C -> A) is one event even after a re-check is re-filed.
+CREATE TABLE IF NOT EXISTS recheck_moves (
+    symbol             TEXT NOT NULL,
+    from_date          TEXT NOT NULL,
+    to_date            TEXT NOT NULL,
+    seen_on            TEXT NOT NULL,
+    PRIMARY KEY (symbol, from_date, to_date)
+);
 CREATE TABLE IF NOT EXISTS funnel_write_health (
     cycle_run_id       TEXT PRIMARY KEY,
     as_of_date         TEXT NOT NULL,
@@ -464,12 +473,14 @@ class EvidenceFunnelStore:
 
     def supersede_rechecks(self, *, symbol: str, earnings_date: Any, as_of: date) -> List[Dict[str, Any]]:
         """The event's earnings date moved to ``earnings_date``: close the
-        symbol's pending re-checks filed under its earlier date.
+        symbol's pending re-checks filed under its earlier dates.
 
-        The same corporate event, by the ledger's rule (see
-        ``recommendation_ledger.is_moved_event_date``): another date within
-        the move window that had not yet passed at ``as_of``. Returns the
-        superseded re-checks.
+        A pending re-check's event is every date on its chain of observed
+        moves (``recheck_moves``, kept even when a re-check is re-filed). The
+        new date is that event when it is a move of any date on the chain
+        (``recommendation_ledger.is_moved_event_date``), so
+        A -> B -> C -> A leaves one pending re-check, not two. A date that had already passed at ``as_of`` was its own
+        event and is never superseded. Returns the superseded re-checks.
         """
         from services.recommendation_ledger import is_moved_event_date
 
@@ -479,17 +490,32 @@ class EvidenceFunnelStore:
         name = str(symbol).upper()
         closed: List[Dict[str, Any]] = []
         with self._lock:
+            links = self._conn.execute(
+                "SELECT from_date, to_date FROM recheck_moves WHERE symbol = ?", (name,),
+            ).fetchall()
+            moves = [(str(a), str(b)) for a, b in links]
             rows = self._conn.execute(
                 "SELECT * FROM candidate_rechecks WHERE symbol = ? AND status = ? AND earnings_date != ?",
                 (name, RECHECK_PENDING, new_date),
             ).fetchall()
             for row in rows:
-                if not is_moved_event_date(row["earnings_date"], new_date, as_of=as_of):
+                old_date = str(row["earnings_date"])
+                if old_date < _iso(as_of):
+                    continue
+                # Its event is every date on its chain; the new date is that
+                # event if it is a move of any date on it (a date already on
+                # the chain always is: every link was itself such a move).
+                chain = _linked_dates(old_date, moves)
+                if not any(is_moved_event_date(day, new_date, as_of=as_of) for day in chain):
                     continue
                 self._conn.execute(
                     "UPDATE candidate_rechecks SET status = ?, superseded_by = ?, updated_at = ?"
                     " WHERE symbol = ? AND earnings_date = ?",
-                    (RECHECK_SUPERSEDED, new_date, datetime.now(timezone.utc).isoformat(), name, row["earnings_date"]),
+                    (RECHECK_SUPERSEDED, new_date, datetime.now(timezone.utc).isoformat(), name, old_date),
+                )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO recheck_moves (symbol, from_date, to_date, seen_on) VALUES (?, ?, ?, ?)",
+                    (name, old_date, new_date, _iso(as_of)),
                 )
                 closed.append(_recheck_dict(row))
             if closed:
@@ -529,6 +555,21 @@ class EvidenceFunnelStore:
                 else:
                     break
             return streak
+
+
+def _linked_dates(start: str, links: List[tuple]) -> set:
+    """Every date connected to ``start`` through superseded_by links."""
+    neighbours: Dict[str, set] = {}
+    for old, new in links:
+        neighbours.setdefault(old, set()).add(new)
+        neighbours.setdefault(new, set()).add(old)
+    seen, frontier = {start}, [start]
+    while frontier:
+        for nxt in neighbours.get(frontier.pop(), ()):
+            if nxt not in seen:
+                seen.add(nxt)
+                frontier.append(nxt)
+    return seen
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
