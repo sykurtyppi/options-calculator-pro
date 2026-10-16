@@ -425,6 +425,11 @@ class InstitutionalMLDatabase:
 
                 # Enable foreign keys
                 cursor.execute("PRAGMA foreign_keys = ON")
+                # The whole schema setup runs under the write lock, so
+                # processes opening an older file at once take turns and
+                # each re-reads the columns before adding any (committed
+                # below; the connection context rolls back on error).
+                cursor.execute("BEGIN IMMEDIATE")
 
                 # Ticker universe table
                 cursor.execute("""

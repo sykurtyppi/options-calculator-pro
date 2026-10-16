@@ -471,11 +471,12 @@ def _open_db(path: Path) -> sqlite3.Connection:
     # file lock per write transaction — concurrent launchd writers
     # would contend on that lock and rows could be lost if the caller
     # swallowed the resulting OperationalError.
-    from services.sqlite_helpers import open_db_conn
+    from services.sqlite_helpers import migrate_under_lock, open_db_conn
     conn = open_db_conn(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(_TABLE_DDL)
-    _migrate(conn)
+    # Serialized: processes opening an older file at once take turns.
+    migrate_under_lock(conn, _migrate)
     conn.executescript(_INDEX_DDL)
     conn.commit()
     return conn

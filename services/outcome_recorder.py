@@ -243,12 +243,13 @@ def _open_db(store_path: Path) -> sqlite3.Connection:
     # to pick up busy_timeout=5000 alongside WAL. foreign_keys=ON
     # stays applied locally since the helper deliberately doesn't
     # opinionate on per-DB pragmas beyond the contention-safety set.
-    from services.sqlite_helpers import open_db_conn
+    from services.sqlite_helpers import migrate_under_lock, open_db_conn
     conn = open_db_conn(store_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_TABLE_DDL)
-    _migrate_schema(conn)
+    # Serialized: processes opening an older file at once take turns.
+    migrate_under_lock(conn, _migrate_schema)
     conn.executescript(_INDEX_DDL)
     conn.commit()
     return conn

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 from datetime import date, datetime, timezone
@@ -168,7 +169,7 @@ def new_cycle_run_id(as_of: date) -> str:
 
 class EvidenceFunnelStore:
     def __init__(self, store_path: Path = _DEFAULT_STORE) -> None:
-        from services.sqlite_helpers import open_db_conn
+        from services.sqlite_helpers import migrate_under_lock, open_db_conn
 
         self._path = Path(store_path)
         self._lock = threading.Lock()
@@ -176,10 +177,7 @@ class EvidenceFunnelStore:
         try:
             self._conn.row_factory = sqlite3.Row
             self._conn.executescript(_DDL)
-            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(candidate_rechecks)")}
-            if "superseded_by" not in columns:
-                self._conn.execute("ALTER TABLE candidate_rechecks ADD COLUMN superseded_by TEXT")
-            self._conn.commit()
+            migrate_under_lock(self._conn, _migrate)
         except BaseException:
             self._conn.close()
             raise
@@ -533,6 +531,13 @@ class EvidenceFunnelStore:
             return streak
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Columns added after the first release (run under the write lock)."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(candidate_rechecks)")}
+    if "superseded_by" not in columns:
+        conn.execute("ALTER TABLE candidate_rechecks ADD COLUMN superseded_by TEXT")
+
+
 def _recheck_dict(row: sqlite3.Row) -> Dict[str, Any]:
     out = dict(row)
     out["attempts"] = json.loads(out.pop("attempts_json") or "[]")
@@ -588,6 +593,54 @@ def safe_finish_cycle(store: Optional[EvidenceFunnelStore], *, cycle_run_id: str
     return {"status": status, "dropped_writes": dropped, "dropped_writes_persisted": persisted if dropped else None}
 
 
+# A funnel unreadable for one cycle is a warning; unreadable for longer than
+# this is sustained blindness and fails the evidence-health check.
+FUNNEL_UNAVAILABLE_GRACE_SECONDS = 3600
+
+
+def _unavailable_marker(store_path: Optional[Path] = None) -> Path:
+    path = Path(store_path or _DEFAULT_STORE)
+    return path.with_name(path.name + ".unavailable.json")
+
+
+def note_funnel_unavailable(error: BaseException, *, store_path: Optional[Path] = None,
+                            now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    """Record that the funnel could not be used, keeping when it was first seen.
+
+    Kept outside the database (which is what failed). Returns the record, or
+    None when even the marker cannot be written; the health check then
+    cannot tell a transient failure from a lasting one and alerts at once.
+    """
+    marker = _unavailable_marker(store_path)
+    stamp = (now or datetime.now(timezone.utc)).isoformat()
+    record: Dict[str, Any] = {"since": stamp, "observations": 0}
+    try:
+        prior = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else None
+        if isinstance(prior, dict) and prior.get("since"):
+            record.update(prior)
+    except (OSError, ValueError):
+        pass
+    record.update({"last_seen": stamp, "last_error": f"{type(error).__name__}: {str(error)[:200]}",
+                   "observations": int(record.get("observations") or 0) + 1})
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_name(marker.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, marker)
+    except OSError:
+        logger.warning("evidence funnel: could not record its unavailability", exc_info=True)
+        return None
+    return record
+
+
+def note_funnel_available(*, store_path: Optional[Path] = None) -> None:
+    """The funnel opened and read fine: any unavailability has ended."""
+    try:
+        _unavailable_marker(store_path).unlink(missing_ok=True)
+    except OSError:
+        logger.debug("evidence funnel: could not clear the unavailability marker", exc_info=True)
+
+
 def open_evidence_funnel(store: Optional[EvidenceFunnelStore] = None) -> Optional[EvidenceFunnelStore]:
     """The funnel store, or None if it cannot be opened (locked, unwritable).
 
@@ -597,10 +650,13 @@ def open_evidence_funnel(store: Optional[EvidenceFunnelStore] = None) -> Optiona
     if store is not None:
         return store
     try:
-        return get_evidence_funnel()
+        opened = get_evidence_funnel()
     except Exception as exc:  # noqa: BLE001
         logger.warning("evidence funnel: store unavailable, this cycle is not measured: %s", exc)
+        note_funnel_unavailable(exc)
         return None
+    note_funnel_available()
+    return opened
 
 
 DEFAULT_STALLED_CYCLES_THRESHOLD = 3
@@ -650,20 +706,39 @@ def build_evidence_funnel_health(
     store: Optional[EvidenceFunnelStore] = None,
     stalled_threshold: int = DEFAULT_STALLED_CYCLES_THRESHOLD,
     as_of: Optional[date] = None,
+    now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Watchdog issues for the funnel, in the evidence-health issue shape."""
     from datetime import timedelta
 
+    store_path = store.path if store is not None else None
+    moment = now or datetime.now(timezone.utc)
     try:
         funnel = store or get_evidence_funnel()
         stalled = funnel.cycles_without_analysis()
         dropped = funnel.recent_dropped_writes(since=(as_of or date.today()) - timedelta(days=6))
     except Exception as exc:  # noqa: BLE001
+        record = note_funnel_unavailable(exc, store_path=store_path, now=moment)
+        if record is None:
+            unavailable_for = None
+            sustained = True        # cannot be tracked, so cannot be shown to be transient
+        else:
+            unavailable_for = (moment - datetime.fromisoformat(record["since"])).total_seconds()
+            sustained = unavailable_for >= FUNNEL_UNAVAILABLE_GRACE_SECONDS
+        duration = ("for an unknown time" if unavailable_for is None
+                    else f"for {unavailable_for / 3600:.1f} h")
         return {
-            "summary": {"error": f"{type(exc).__name__}: {exc}"},
-            "issues": [{"severity": "WARN", "alertable": False,
-                        "message": f"Evidence funnel unreadable: {type(exc).__name__}"}],
+            "summary": {"error": f"{type(exc).__name__}: {exc}", "unavailable_since": (record or {}).get("since"),
+                        "unavailable_seconds": unavailable_for},
+            "issues": [{
+                "severity": "WARN",
+                # One cycle's lock is a warning; lasting blindness fails the check.
+                "alertable": sustained,
+                "message": (f"Evidence funnel unreadable ({type(exc).__name__}) {duration}: "
+                            "forward cycles are not being measured."),
+            }],
         }
+    note_funnel_available(store_path=store_path)
     issues = []
     if stalled >= int(stalled_threshold):
         issues.append({
@@ -710,6 +785,8 @@ __all__ = [
     "get_evidence_funnel",
     "new_cycle_run_id",
     "note_dropped_write",
+    "note_funnel_available",
+    "note_funnel_unavailable",
     "open_evidence_funnel",
     "safe_finish_cycle",
     "safe_record",

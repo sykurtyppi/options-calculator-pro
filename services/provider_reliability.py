@@ -325,6 +325,13 @@ CREATE TABLE IF NOT EXISTS provider_credit_unreconciled (
 # the provider said when its quota resets, else the local budget day.
 
 
+def _migrate_budget(conn: sqlite3.Connection) -> None:
+    """Columns added after the first release (run under the write lock)."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(provider_reported_quota)")}
+    if "reported_reset_at" not in columns:
+        conn.execute("ALTER TABLE provider_reported_quota ADD COLUMN reported_reset_at TEXT")
+
+
 def _reset_offset() -> timedelta:
     raw = str(os.environ.get(RESET_TIME_ENV, "") or "").strip()
     try:
@@ -361,7 +368,7 @@ class CreditBudget:
 
     def __init__(self, store_path: Path = _DEFAULT_BUDGET_STORE,
                  now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
-        from services.sqlite_helpers import open_db_conn
+        from services.sqlite_helpers import migrate_under_lock, open_db_conn
 
         self.store_path = Path(store_path)
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -370,14 +377,7 @@ class CreditBudget:
         self._conn = open_db_conn(self.store_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_BUDGET_DDL)
-        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(provider_reported_quota)")}
-        if "reported_reset_at" not in columns:
-            try:
-                self._conn.execute("ALTER TABLE provider_reported_quota ADD COLUMN reported_reset_at TEXT")
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
-        self._conn.commit()
+        migrate_under_lock(self._conn, _migrate_budget)
         self._alerted: Dict[str, str] = {}
 
     def close(self) -> None:
