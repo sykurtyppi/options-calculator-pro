@@ -20,7 +20,7 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
 
@@ -139,7 +139,18 @@ _MIGRATION_COLUMNS: Dict[str, str] = {
     "days_to_earnings_at_entry": "INTEGER",
     "entry_attempt_count": "INTEGER",
     "failed_entry_attempts_json": "TEXT",
+    # PR O: the durable corporate-event id (recommendation_ledger
+    # event_identity), and evidence invalidation as in the outcome store:
+    # NULL = valid; 0 = invalidated (kept for audit, never exited, excluded
+    # from diagnostics), e.g. a baseline filed under a superseded event date.
+    "event_id": "TEXT",
+    "evidence_valid": "INTEGER",
+    "invalidated_at": "TEXT",
+    "invalidation_reason": "TEXT",
 }
+
+# SQL: a row that is still evidence (never invalidated).
+_VALID_SQL = "COALESCE(evidence_valid, 1) != 0"
 
 
 def make_baseline_id(recommendation_id: str, baseline_name: str) -> str:
@@ -340,8 +351,9 @@ class BaselineEvidenceStore:
                 -- same T-1 day; never on a later day (different horizon).
                 OR (status = 'exit_skipped' AND exit_date = ?)
               )
+              AND {valid}
             ORDER BY entry_date, symbol, baseline_name
-            """,
+            """.format(valid=_VALID_SQL),
             (target, _fmt_date(as_of_date)),
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
@@ -361,7 +373,8 @@ class BaselineEvidenceStore:
                     WHERE status = 'open'
                       AND earnings_date IS NOT NULL
                       AND earnings_date <= ?
-                    """,
+                      AND {valid}
+                    """.format(valid=_VALID_SQL),
                     (_fmt_date(as_of_date),),
                 ).fetchall()
                 cur.execute(
@@ -373,7 +386,8 @@ class BaselineEvidenceStore:
                     WHERE status = 'open'
                       AND earnings_date IS NOT NULL
                       AND earnings_date <= ?
-                    """,
+                      AND {valid}
+                    """.format(valid=_VALID_SQL),
                     (_fmt_date(as_of_date),),
                 )
         return [dict(row) for row in due]
@@ -412,6 +426,7 @@ class BaselineEvidenceStore:
                 updated_at = CURRENT_TIMESTAMP
             WHERE baseline_id = ?
               AND status IN ('open', 'exit_skipped')
+              AND COALESCE(evidence_valid, 1) != 0
         """
         params = (
             _fmt_date(exit_date),
@@ -444,18 +459,48 @@ class BaselineEvidenceStore:
                 cur.execute(sql, params + (_bool_int(claim_allowed), _json(claim_reasons)) + tail)
                 return cur.rowcount > 0
 
-    def list_for_diagnostics(self, *, limit: int = 10_000) -> list[Dict[str, Any]]:
+    def list_for_diagnostics(self, *, limit: int = 10_000, include_invalid: bool = False) -> list[Dict[str, Any]]:
+        """Recent baseline rows; invalidated ones only when asked (audit)."""
         capped = max(1, min(int(limit or 10_000), 50_000))
+        where = "" if include_invalid else f"WHERE {_VALID_SQL}"
         rows = self._conn.execute(
-            """
+            f"""
             SELECT *
             FROM baseline_trades
+            {where}
             ORDER BY COALESCE(exit_date, updated_at, created_at) DESC, created_at DESC
             LIMIT ?
             """,
             (capped,),
         ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+    def invalidate(self, baseline_id: str, *, reason: str, invalidated_at: Optional[datetime] = None) -> bool:
+        """Mark a baseline as invalid evidence, keeping it for audit. Returns
+        whether it was valid until now."""
+        reason = str(reason or "").strip()
+        if not reason:
+            raise ValueError("invalidate: a non-empty reason is required")
+        stamp = (invalidated_at or datetime.now(timezone.utc)).isoformat()
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    f"UPDATE baseline_trades SET evidence_valid = 0, invalidated_at = ?, invalidation_reason = ?,"
+                    f" updated_at = CURRENT_TIMESTAMP WHERE baseline_id = ? AND {_VALID_SQL}",
+                    (stamp, reason, baseline_id),
+                )
+                return cur.rowcount > 0
+
+    def record_event_ids(self, event_ids: Dict[str, str]) -> int:
+        """Attach durable event ids (baseline_id -> event_id) where none is set yet."""
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                changed = 0
+                for baseline_id, event_id in event_ids.items():
+                    cur.execute("UPDATE baseline_trades SET event_id = ? WHERE baseline_id = ? AND event_id IS NULL",
+                                (event_id, baseline_id))
+                    changed += cur.rowcount
+                return changed
 
     def count(self) -> int:
         return int(self._conn.execute("SELECT COUNT(*) FROM baseline_trades").fetchone()[0])

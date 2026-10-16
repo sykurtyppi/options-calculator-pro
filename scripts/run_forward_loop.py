@@ -3115,6 +3115,17 @@ def run_daily_cycle(
         funnel=funnel,
         cycle_run_id=cycle_run_id,
     )
+    # Evidence booked under an earnings date that has since moved is
+    # invalidated before the exit pass, so it is neither exited nor learned.
+    event_reconciliation = None
+    if not dry_run:
+        from services.event_reconciliation import safe_reconcile_moved_events
+        from services.recommendation_ledger import get_recommendation_ledger
+
+        event_reconciliation = safe_reconcile_moved_events(
+            ledger=ledger or get_recommendation_ledger(), outcome_store=trade_store,
+            baseline_store=baseline_store or get_baseline_evidence_store(),
+        )
     exit_summary = run_exit_detection(
         today=as_of,
         dry_run=dry_run,
@@ -3149,6 +3160,7 @@ def run_daily_cycle(
         "as_of_date": as_of.isoformat(),
         "cycle_run_id": cycle_run_id,
         "entries": entry_summary,
+        "event_reconciliation": event_reconciliation,
         "exits": exit_summary,
         "diagnostics": diagnostics,
         "dry_run": dry_run,

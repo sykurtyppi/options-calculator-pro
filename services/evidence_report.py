@@ -6,6 +6,7 @@ against shadow baselines without presenting either as execution-grade live P&L.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from services.baseline_evidence_store import (
     is_booked_strike_exit,
 )
 from services.data_quality_diagnostics import build_data_quality_diagnostics
+from services.event_reconciliation import drop_superseded, superseded_keys
 from services.evidence_maturity import build_evidence_maturity
 from services.evidence_statistics import (
     METHOD_NOTE,
@@ -40,7 +42,20 @@ MIN_RESOLVED_SAMPLE = 30
 
 # Mirrors scripts/run_forward_loop.ALLOWED_RECOMMENDATIONS (services must not
 # import from scripts).
+logger = logging.getLogger(__name__)
+
 ACTIONABLE_RECOMMENDATIONS = frozenset({"Best Candidate", "Candidate"})
+
+
+def _superseded(ledger: Any) -> Dict[str, str]:
+    """Superseded event keys from the ledger; {} when it cannot be read."""
+    try:
+        from services.recommendation_ledger import get_recommendation_ledger
+
+        return superseded_keys(ledger or get_recommendation_ledger())
+    except Exception:  # noqa: BLE001
+        logger.warning("evidence report: superseded event keys unavailable", exc_info=True)
+        return {}
 
 
 def build_evidence_report(
@@ -49,14 +64,18 @@ def build_evidence_report(
     outcome_store: Optional[OutcomeStore] = None,
     max_rows: int = 10_000,
     recent_limit: int = 25,
+    ledger: Any = None,
 ) -> Dict[str, Any]:
-    baselines = (baseline_store or get_baseline_evidence_store()).list_for_diagnostics(limit=max_rows)
+    superseded = _superseded(ledger)
+    baselines = drop_superseded(
+        (baseline_store or get_baseline_evidence_store()).list_for_diagnostics(limit=max_rows), superseded)
     outcome_obj = outcome_store or get_outcome_store()
     forward = build_forward_performance_diagnostics(
         outcome_store=outcome_obj,
         baseline_store=baseline_store or get_baseline_evidence_store(),
         max_rows=max_rows,
         recent_limit=recent_limit,
+        **({"ledger": ledger} if ledger is not None else {}),
     )
     # Invalidated outcomes stay in the store for audit but never count as
     # evidence: not in performance, quality, realism or maturity figures. The
@@ -64,7 +83,8 @@ def build_evidence_report(
     # Forward evidence only: seeded replay/backtest rows share the store but
     # are never forward evidence (they would otherwise fill the gate's day
     # span, resolved count and calibration buckets). Counted separately below.
-    outcomes = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward")
+    outcomes = drop_superseded(
+        outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward"), superseded)
     invalidated = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid", source="forward")
     replay_rows = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="replay")
     selected = [row for row in outcomes if _is_resolved(row)]
