@@ -23,6 +23,7 @@ from services.baseline_evidence_store import (
 )
 from services.claim_contract import CONTRACT_VERSION, claimable_under_current_contract
 from services.outcome_recorder import OutcomeStore, get_outcome_store
+from services.event_reconciliation import drop_superseded, superseded_keys
 from services.recommendation_ledger import RecommendationLedger, get_recommendation_ledger
 
 LOW_QUALITY_THRESHOLD = 0.60
@@ -60,6 +61,11 @@ def build_forward_performance_diagnostics(
     outcomes = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward")
     invalidated_count = len(outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid", source="forward"))
     baseline_rows = baseline_obj.list_for_diagnostics(limit=max_rows)
+    # Evidence booked under an earnings date that has since moved is not
+    # evidence about the event (reconciliation also invalidates it durably).
+    superseded = superseded_keys(ledger_obj)
+    outcomes = drop_superseded(outcomes, superseded)
+    baseline_rows = drop_superseded(baseline_rows, superseded)
     ledger_by_id = {
         str(row.get("recommendation_id")): row
         for row in ledger_rows
@@ -84,7 +90,6 @@ def build_forward_performance_diagnostics(
     no_trade_count = sum(1 for row in ledger_rows if str(row.get("recommendation") or "") == "No Trade")
     # An event analyzed on several days is one decision: its latest analysis.
     # An event whose earnings date moved counts once, under its current date.
-    superseded = getattr(ledger_obj, "superseded_event_keys", dict)()
     latest_by_event: Dict[str, Dict[str, Any]] = {}
     for row in ledger_rows:
         key = row.get("event_key")
