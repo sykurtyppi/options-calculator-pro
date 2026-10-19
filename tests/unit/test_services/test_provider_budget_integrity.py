@@ -262,3 +262,238 @@ def test_skip_reason_is_a_known_category():
 
     assert classify_error(pr.SKIP_BUDGET_UNAVAILABLE) == pr.SKIP_BUDGET_UNAVAILABLE
     assert mdc.MarketDataError
+
+
+# ── independent audit of main at bfc48f5 ─────────────────────────────────────
+
+
+def test_a_failed_single_write_never_leaves_the_ledger_stuck(tmp_path):
+    # A lock timeout on release() used to leave an implicit transaction open,
+    # so every later reserve() raised and the healthy ledger looked unusable.
+    from services.sqlite_helpers import open_db_conn
+
+    store = pr.CreditBudget(tmp_path / "b.sqlite")
+    try:
+        store._conn.execute("PRAGMA busy_timeout=100")
+        held = store.reserve(MD, pr.PRIORITY_ENTRY, 10)
+        other = open_db_conn(tmp_path / "b.sqlite", busy_timeout_ms=0)
+        other.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError):
+            store.release(held)
+        other.rollback()
+        other.close()
+        assert store._conn.in_transaction is False
+        assert store.reserve(MD, pr.PRIORITY_ENTRY, 1)
+    finally:
+        store.close()
+
+
+def test_a_failed_skip_count_never_leaves_the_ledger_stuck(tmp_path):
+    # record_skip is one write without its own transaction: in autocommit it
+    # cannot leave one open when the lock times out.
+    from services.sqlite_helpers import open_db_conn
+
+    store = pr.CreditBudget(tmp_path / "b.sqlite")
+    try:
+        store._conn.execute("PRAGMA busy_timeout=100")
+        other = open_db_conn(tmp_path / "b.sqlite", busy_timeout_ms=0)
+        other.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError):
+            store.record_skip(MD, pr.PRIORITY_DISCOVERY)
+        other.rollback()
+        other.close()
+        assert store._conn.in_transaction is False
+        assert store.reserve(MD, pr.PRIORITY_ENTRY, 1)
+    finally:
+        store.close()
+
+
+def test_a_cache_write_that_fails_is_logged_not_raised(tmp_path):
+    from services.sqlite_helpers import open_db_conn
+
+    cache = pr.ResponseCache(tmp_path / "cache.sqlite")
+    cache._conn.execute("PRAGMA busy_timeout=50")
+    blocker = open_db_conn(tmp_path / "cache.sqlite", busy_timeout_ms=0)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        cache.put("k", {"a": 1}, 60)                 # must not raise
+    finally:
+        blocker.rollback()
+        blocker.close()
+    try:
+        assert cache._conn.in_transaction is False
+        cache.put("k", {"a": 1}, 60)
+        assert cache.get("k") == {"a": 1}
+    finally:
+        cache.close()
+
+
+def test_an_exhaustion_without_a_reset_lands_in_the_current_window(tmp_path):
+    clock = [T0]
+    store = _store(tmp_path, clock)
+    try:
+        reset = T0 + timedelta(hours=9)
+        store.record_reported_quota(MD, reported_limit=100_000, reported_remaining=50_000, reported_reset_at=reset)
+        store.record_reported_quota(MD, reported_remaining=0.0)        # a 429 "quota used up" with no headers
+        assert store.status()["alert_level"] == "exhausted"
+        assert store.reserve(MD, pr.PRIORITY_DISCOVERY, 1) is None
+        clock[0] = reset + timedelta(minutes=1)                       # the provider reset as it said
+        assert store.status()["alert_level"] == "ok"
+    finally:
+        store.close()
+
+
+def test_a_day_row_from_before_a_passed_reset_is_not_read(tmp_path):
+    clock = [T0]
+    store = _store(tmp_path, clock)
+    try:
+        store.record_reported_quota(MD, reported_remaining=0.0)        # no reset known yet: the day row
+        reset = T0 + timedelta(hours=1)
+        clock[0] = T0 + timedelta(minutes=5)
+        store.record_reported_quota(MD, reported_limit=100, reported_remaining=0, reported_reset_at=reset)
+        clock[0] = reset + timedelta(minutes=1)
+        assert store.status()["alert_level"] == "ok"                   # not blocked until local midnight
+        assert store.reserve(MD, pr.PRIORITY_EXIT, 1)
+    finally:
+        store.close()
+
+
+def test_a_hold_taken_before_midnight_counts_after_it(tmp_path, monkeypatch):
+    monkeypatch.setenv(pr.DAILY_CREDITS_ENV, "1000")
+    clock = [datetime(2026, 10, 20, 3, 59, 59, tzinfo=timezone.utc)]   # 23:59:59 New York
+    store = _store(tmp_path, clock)
+    try:
+        assert store.reserve(MD, pr.PRIORITY_DISCOVERY, 480)
+        clock[0] += timedelta(seconds=2)
+        assert store.status()["reserved"] == 480
+        assert store.reserve(MD, pr.PRIORITY_DISCOVERY, 480) is None  # 480 + 480 > the 600 ceiling
+    finally:
+        store.close()
+
+
+def test_a_late_settlement_is_not_counted_twice(tmp_path, monkeypatch):
+    monkeypatch.setenv(pr.DAILY_CREDITS_ENV, "10000")
+    clock = [T0]
+    store = _store(tmp_path, clock)
+    try:
+        slow = store.reserve(MD, pr.PRIORITY_ENTRY, 400)
+        late = store.reserve(MD, pr.PRIORITY_ENTRY, 300)
+        clock[0] += timedelta(seconds=pr.RESERVATION_TTL_SECONDS + 1)
+        store.reserve(MD, pr.PRIORITY_EXIT, 1)                         # moves both to unreconciled
+        store.settle(slow, MD, pr.PRIORITY_ENTRY, 400)
+        store.release(late)
+        status = store.status()
+        assert (status["spent"], status["unreconciled"]) == (400, 0)
+    finally:
+        store.close()
+
+
+def test_a_zero_limit_is_exhausted_not_ok(tmp_path):
+    store = _store(tmp_path, [T0])
+    try:
+        store.record_reported_quota(MD, reported_limit=0, reported_remaining=0)
+        health = pr.build_provider_budget_health(budget=store, unmetered_log=tmp_path / "none.jsonl")
+        assert health["summary"]["alert_level"] == "exhausted" and health["issues"]
+    finally:
+        store.close()
+
+
+def test_a_timezone_less_bypass_line_is_unreadable_not_a_crash(tmp_path):
+    log = tmp_path / "log.jsonl"
+    log.write_text(json.dumps({"at": "2026-10-19T10:00:00"}) + "\n" + json.dumps(["not", "a", "dict"]) + "\n")
+    calls = pr.unmetered_exit_calls(since=datetime.now(timezone.utc) - timedelta(days=7), log_path=log)
+    assert calls == [{"at": None, "unreadable": True}] * 2
+
+
+def _chain_response(body_text=None, headers=None, status=200):
+    from unittest.mock import MagicMock
+
+    resp = MagicMock()
+    resp.status_code = status
+    resp.headers = dict(headers or {})
+    if body_text is None:
+        resp.json.return_value = {"s": "ok"}
+    else:
+        resp.json.side_effect = ValueError("Unterminated string")
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+def test_a_served_but_unreadable_response_is_charged(monkeypatch, telemetry, budget):  # noqa: F811
+    client, calls, _ = _client(monkeypatch, [_chain_response(body_text="{", headers={"X-Api-Ratelimit-Consumed": "480"}),
+                                             _chain_response(body_text="{")])
+    with pr.request_priority(pr.PRIORITY_DISCOVERY):
+        client.get_option_chain("AAPL", expiration="2026-11-20", strike_limit=20)
+        client.get_option_chain("MSFT", expiration="2026-11-20", strike_limit=20)
+    status = budget.status()
+    # 480 as reported, then the 40-credit estimate when nothing was reported.
+    assert (status["spent"], status["reserved"]) == (520, 0)
+
+
+def test_a_client_error_that_reports_a_charge_is_charged(monkeypatch, telemetry, budget):  # noqa: F811
+    client, _, _ = _client(monkeypatch, [_response(404, headers={"X-Api-Ratelimit-Consumed": "1"}), _response(404)])
+    client.get_expirations("AAPL")
+    client.get_expirations("MSFT")
+    assert (budget.status()["spent"], budget.status()["reserved"]) == (1, 0)
+
+
+def test_an_all_expirations_chain_is_sized_from_the_known_list():
+    assert mdc._estimated_credits("options_chain", {"strikeLimit": 10, "expiration": "all"},
+                                  expirations_known=30) == 600
+    assert mdc._estimated_credits("options_chain", {"strikeLimit": 10, "expiration": "all"}) == (
+        10 * 2 * mdc.DEFAULT_ALL_EXPIRATIONS)
+    assert mdc._estimated_credits("options_chain", {"strikeLimit": 10, "expiration": "2026-11-20"}) == 20
+
+
+def test_the_client_remembers_each_symbols_expiration_count(monkeypatch, telemetry, budget):  # noqa: F811
+    exps = {"s": "ok", "expirations": [f"2026-11-{d:02d}" for d in range(1, 31)]}
+    client, _, _ = _client(monkeypatch, [_response(200, body=exps)])
+    client.get_expirations("spy")
+    assert client._expiration_counts["SPY"] == 30
+
+
+def test_a_failed_cache_write_keeps_the_paid_response(tmp_path, monkeypatch, telemetry, budget):  # noqa: F811
+    from services.sqlite_helpers import open_db_conn
+
+    cache = pr.ResponseCache(tmp_path / "cache.sqlite")
+    cache._conn.execute("PRAGMA busy_timeout=50")
+    blocker = open_db_conn(tmp_path / "cache.sqlite", busy_timeout_ms=0)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        body = {"s": "ok", "expirations": ["2026-11-20"]}
+        client, _, _ = _client(monkeypatch, [_response(200, body=body)], response_cache=cache)
+        assert client.get_expirations("AAPL") == ["2026-11-20"]
+    finally:
+        blocker.rollback()
+        blocker.close()
+        cache.close()
+
+
+def test_a_cache_that_raises_does_not_lose_the_paid_response(monkeypatch, telemetry, budget):  # noqa: F811
+    class _Broken:
+        def get_with_age(self, key):
+            return None
+
+        def put(self, key, payload, ttl):
+            raise RuntimeError("disk full")
+
+    body = {"s": "ok", "expirations": ["2026-11-20"]}
+    client, _, _ = _client(monkeypatch, [_response(200, body=body)], response_cache=_Broken())
+    assert client.get_expirations("AAPL") == ["2026-11-20"]
+
+
+def test_a_disk_entry_keeps_its_age_in_memory(tmp_path, monkeypatch, telemetry, budget):  # noqa: F811
+    wall, mono = [1_000_000.0], [5_000.0]
+    cache = pr.ResponseCache(tmp_path / "cache.sqlite", clock=lambda: wall[0])
+    url = f"{mdc._MARKETDATA_BASE_URL}/options/expirations/AAPL/"
+    cache.put(url + "|[]", {"s": "ok", "expirations": ["2026-10-23"]}, 300)
+    wall[0] += 299
+    mono[0] += 299
+    client, calls, _ = _client(monkeypatch, [_response(200, body={"s": "ok", "expirations": ["2026-10-30"]})],
+                               response_cache=cache)
+    monkeypatch.setattr(mdc.time, "monotonic", lambda: mono[0])
+    assert client.get_expirations("AAPL") == ["2026-10-23"] and calls == []
+    wall[0] += 290
+    mono[0] += 290                                       # 589 s after it was stored: stale
+    assert client.get_expirations("AAPL") == ["2026-10-30"] and len(calls) == 1
+    cache.close()

@@ -114,7 +114,9 @@ def _record_and_resolve(
         entry_execution_scenarios={
             "scenario_values": {"mid": 4.0, "cross_50": 4.4},
             "spread_as_pct_of_premium": 10.0 if data_quality_score >= 0.5 else 32.0,
-            "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION},
+            "legs": {"call": {"contract": "AAPL260501C00100000"}},
+            "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION,
+                      "leg_contracts": {"call": "AAPL260501C00100000"}},
         },
     )
     outcomes.update_exit(
@@ -132,7 +134,9 @@ def _record_and_resolve(
                 }
             },
             # The exit passed the claim contract (claims fail closed without it).
-            "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION},
+            "legs": {"call": {"contract": "AAPL260501C00100000"}},
+            "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION,
+                      "leg_contracts": {"call": "AAPL260501C00100000"}},
         },
     )
 

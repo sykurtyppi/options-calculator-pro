@@ -43,7 +43,7 @@ from services.baseline_evidence_store import (
 )
 from services.evidence_quality import evaluate_evidence_quality
 from services import evidence_funnel as funnel_mod
-from services.claim_contract import evaluate_exit_claim
+from services.claim_contract import claimable_under_current_contract, evaluate_exit_claim
 from services.evidence_funnel import EvidenceFunnelStore
 from services.execution_scenarios import (
     build_execution_scenarios,
@@ -2752,10 +2752,14 @@ def _run_exit_detection(
         trade = trade_store.get_trade(trade_id) if hasattr(trade_store, "get_trade") else None
         trade = dict(trade or {"trade_id": trade_id})
         _funnel_trade(trade, funnel_mod.STAGE_RESOLVED, funnel_mod.OUTCOME_ADVANCED)
-        if bool(trade.get("claim_allowed")):
+        # The reports' rule: claimable only under the current contract version.
+        if claimable_under_current_contract(trade):
             _funnel_trade(trade, funnel_mod.STAGE_CLAIMABLE, funnel_mod.OUTCOME_ADVANCED)
         else:
-            reasons = _loads_list(trade.get("evidence_quality_reasons_json")) or ["claim_not_allowed"]
+            reasons = list(_loads_list(trade.get("evidence_quality_reasons_json")))
+            if bool(trade.get("claim_allowed")):
+                reasons.append("claim_contract_version_mismatch")
+            reasons = reasons or ["claim_not_allowed"]
             _funnel_trade(trade, funnel_mod.STAGE_CLAIMABLE, funnel_mod.OUTCOME_DROPPED,
                           f"{funnel_mod.REASON_NOT_CLAIMABLE}:{','.join(sorted(map(str, reasons)))}")
 

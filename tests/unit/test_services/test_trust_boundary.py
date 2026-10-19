@@ -81,7 +81,9 @@ def test_impossible_contracts_fail_identity(contract):
 # ── claims fail closed ──────────────────────────────────────────────────────
 
 V = cc.CONTRACT_VERSION
-PASSED = {"claim": {"passed": True, "reasons": [], "contract_version": V}}
+PASSED = {"legs": {"call": {"contract": "AAPL260424C00100000"}},
+          "claim": {"passed": True, "reasons": [], "contract_version": V,
+                    "leg_contracts": {"call": "AAPL260424C00100000"}}}
 
 
 @pytest.mark.parametrize("claim_allowed, scenarios, entry_version, expected", [

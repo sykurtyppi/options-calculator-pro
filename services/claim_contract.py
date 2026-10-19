@@ -262,12 +262,16 @@ def _verdict_reasons(verdict: Any) -> list[str]:
 
 def entry_claim_status(
     *, claim_allowed: Any, claim_contract_version: Any, entry_execution_scenarios: Any,
+    evidence_reasons: Any = None, entry_quote_source: Any = None,
 ) -> tuple[Optional[bool], list[str]]:
     """The claim flag a store may record at entry, and why it was withdrawn.
 
     A caller's ``claim_allowed=True`` stands only with a well-formed, passing
     entry verdict (``entry_execution_scenarios["claim"]``) made under this
-    CONTRACT_VERSION, recorded under that same version.
+    CONTRACT_VERSION, recorded under that same version, and bound to the
+    stored entry: the verdict's contracts are the booked legs' contracts, the
+    stored entry source (when given) is a claim source, and no recorded
+    evidence reason disqualifies a claim (CLAIM_DISQUALIFYING_REASONS).
     """
     if claim_allowed is None or not bool(claim_allowed):
         return (None if claim_allowed is None else False), []
@@ -275,9 +279,32 @@ def entry_claim_status(
     problems = verdict_problems(verdict, side="entry")
     if not problems and not verdict["passed"]:
         problems = sorted(set(_verdict_reasons(verdict))) or ["claim_entry_verdict_failed"]
+    booked = _booked_contracts(entry_execution_scenarios)
+    if not problems and (booked is None or booked != _verdict_contracts(verdict)):
+        problems.append("claim_entry_verdict_not_for_booked_legs")
     if claim_contract_version != CONTRACT_VERSION and "claim_contract_version_mismatch" not in problems:
         problems.append("claim_contract_version_mismatch")
+    if entry_quote_source is not None and str(entry_quote_source).strip().lower() not in CLAIM_SOURCES:
+        problems.append(f"claim_source_not_live:{str(entry_quote_source).strip().lower() or 'missing'}")
+    if isinstance(evidence_reasons, (list, tuple, set, frozenset)):
+        problems.extend(str(reason) for reason in evidence_reasons if reason in CLAIM_DISQUALIFYING_REASONS)
     return (False, sorted(set(problems))) if problems else (True, [])
+
+
+def _booked_contracts(entry_execution_scenarios: Any) -> Optional[dict[str, str]]:
+    legs = entry_execution_scenarios.get("legs") if isinstance(entry_execution_scenarios, Mapping) else None
+    if not isinstance(legs, Mapping):
+        return None
+    contracts = {str(name): str((leg or {}).get("contract") or "").strip().upper()
+                 for name, leg in legs.items() if isinstance(leg, Mapping)}
+    return contracts if contracts and all(contracts.values()) else None
+
+
+def _verdict_contracts(verdict: Any) -> Optional[dict[str, str]]:
+    contracts = verdict.get("leg_contracts") if isinstance(verdict, Mapping) else None
+    if not isinstance(contracts, Mapping) or not contracts:
+        return None
+    return {str(name): str(contract or "").strip().upper() for name, contract in contracts.items()}
 
 
 def evaluate_exit_claim(
@@ -322,7 +349,7 @@ def apply_exit_claim(
         return (None if claim_allowed is None else False), reasons
     entry_allowed, entry_problems = entry_claim_status(
         claim_allowed=claim_allowed, claim_contract_version=entry_contract_version,
-        entry_execution_scenarios=entry_execution_scenarios)
+        entry_execution_scenarios=entry_execution_scenarios, evidence_reasons=reasons)
     verdict = (exit_execution_scenarios or {}).get("claim") if isinstance(exit_execution_scenarios, Mapping) else None
     exit_problems = verdict_problems(verdict, side="exit")
     reasons = sorted(set(reasons + entry_problems + exit_problems + _verdict_reasons(verdict)))
@@ -342,6 +369,8 @@ def claimable_under_current_contract(row: Mapping[str, Any]) -> Optional[bool]:
 
 
 def _finite(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -353,11 +382,12 @@ def _parse_time(value: Any) -> Optional[datetime]:
     """A timezone-aware time from an ISO string or unix seconds, else None."""
     if value is None or value == "" or isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc) if math.isfinite(float(value)) else None
     try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc) if math.isfinite(float(value)) else None
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
+        # Out-of-range epochs (unix milliseconds, say) are unparseable, not fatal.
         return None
     return parsed if parsed.tzinfo is not None else None
 

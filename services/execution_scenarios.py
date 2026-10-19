@@ -135,6 +135,7 @@ def compare_execution_scenarios(
     risk_base = _finite_float(capital_at_risk)
     returns: dict[str, float | None] = {}
     pnl: dict[str, float | None] = {}
+    mid_entry = _finite_float(entry_values.get("mid"))
     for name, _distance in SCENARIO_LEVELS:
         entry_val = _finite_float(entry_values.get(name))
         exit_val = _finite_float(exit_values.get(name))
@@ -156,16 +157,18 @@ def compare_execution_scenarios(
         if is_credit:
             pnl_per_share = entry_val - exit_val
             if entry_val <= 0:
-                # This scenario says the "credit" structure was actually opened
-                # for a DEBIT, so capital at risk is not the position's nominal
-                # max loss and no coherent return base exists. The P&L is still
-                # arithmetically meaningful; the ratio would not be (dividing an
-                # adverse-fill numerator by a mid-fill base inflates it by an
-                # order of magnitude). Report the P&L, withhold the return.
-                pnl[name] = round(pnl_per_share * 100.0, 6)
-                returns[name] = None
-                continue
-            base = risk_base if _has_risk_base else entry_val
+                # This fill opened the "credit" structure for a debit: its
+                # capital at risk is the spread width less this fill's credit,
+                # i.e. the mid-fill max loss plus what the fill gave up against
+                # the mid. Withholding the return instead dropped exactly the
+                # worst claimable fills from the claimed (conservative) figure.
+                if mid_entry is None or risk_base is None:
+                    pnl[name] = round(pnl_per_share * 100.0, 6)
+                    returns[name] = None
+                    continue
+                base = risk_base + (mid_entry - entry_val)
+            else:
+                base = risk_base if _has_risk_base else entry_val
         else:
             pnl_per_share = exit_val - entry_val
             base = entry_val
@@ -260,6 +263,8 @@ def _sum_or_none(values: list[Any]) -> float | None:
 
 
 def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
         parsed = float(value)
     except (TypeError, ValueError):

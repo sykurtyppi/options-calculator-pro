@@ -354,7 +354,8 @@ class OutcomeStore:
         # verdict under the current contract, never on the caller's flag alone.
         claim_allowed, withdrawn = entry_claim_status(
             claim_allowed=claim_allowed, claim_contract_version=claim_contract_version,
-            entry_execution_scenarios=entry_execution_scenarios)
+            entry_execution_scenarios=entry_execution_scenarios,
+            evidence_reasons=list(evidence_quality_reasons or []), entry_quote_source=entry_quote_source)
         if withdrawn:
             evidence_quality_reasons = sorted(set(list(evidence_quality_reasons or []) + withdrawn))
         sql = """

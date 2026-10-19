@@ -184,7 +184,8 @@ def test_the_exit_must_pass_and_reprice_the_booked_contracts():
 
 
 V = cc.CONTRACT_VERSION
-ENTRY_VERDICT = {"passed": True, "reasons": [], "contract_version": V}
+BOOKED_LEGS = {"call": {"contract": CALL}}
+ENTRY_VERDICT = {"passed": True, "reasons": [], "contract_version": V, "leg_contracts": {"call": CALL}}
 
 
 def _insert(store, trade_id, *, claim_allowed=True, version=cc.CONTRACT_VERSION, entry_verdict=ENTRY_VERDICT):
@@ -192,7 +193,7 @@ def _insert(store, trade_id, *, claim_allowed=True, version=cc.CONTRACT_VERSION,
         trade_id=trade_id, symbol="AAPL", structure="atm_straddle", entry_date=TODAY - timedelta(days=4),
         setup_score=0.6, source_type="paper", earnings_date=TODAY + timedelta(days=1), entry_mid=4.5,
         execution_penalty_at_entry=0.03, claim_allowed=claim_allowed, evidence_quality_reasons=["entry_reason"],
-        claim_contract_version=version, entry_execution_scenarios={"claim": entry_verdict},
+        claim_contract_version=version, entry_execution_scenarios={"legs": BOOKED_LEGS, "claim": entry_verdict},
     )
 
 
@@ -245,7 +246,7 @@ def test_the_baseline_store_folds_the_exit_verdict(tmp_path):
         entry_mid=4.5, modeled_cost_pct=None, execution_penalty_at_entry=None, data_quality_score_at_entry=None,
         iv_rv_har_at_entry=None, iv_rv_yz_at_entry=None, quote_source_at_entry="marketdata_app",
         quote_quality_at_entry=None, claim_allowed=True, baseline_id="B1", claim_contract_version=V,
-        entry_execution_scenarios={"claim": ENTRY_VERDICT},
+        entry_execution_scenarios={"legs": BOOKED_LEGS, "claim": ENTRY_VERDICT},
     )
     store.update_exit(baseline_id="B1", exit_date=TODAY, exit_mid=5.0, realized_return_pct=11.0,
                       realized_expansion_pct=None, quote_source_at_exit="marketdata_app", quote_quality_at_exit=None,

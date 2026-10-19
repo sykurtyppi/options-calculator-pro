@@ -151,13 +151,7 @@ def build_forward_performance_diagnostics(
             "claim_contract_version": CONTRACT_VERSION,
             # Claimable outcomes three ways: midpoint, natural price, and the
             # conservative fill the claim is priced at.
-            "claimable_returns": {
-                level: stats
-                for level, stats in _execution_scenario_stats(
-                    [row for row in resolved if bool(row.get("claim_allowed"))]
-                ).items()
-                if level in CLAIM_REPORT_LEVELS
-            },
+            "claimable_returns": _claimable_returns([row for row in resolved if bool(row.get("claim_allowed"))]),
         },
         "outcome_count_by_symbol": _count_by(resolved, lambda item: item["symbol"] or "UNKNOWN"),
         "calibration_buckets": _bucket_rows(resolved),
@@ -380,6 +374,25 @@ def _earnings_confidence_bucket(item: Dict[str, Any]) -> str:
     if confidence < 0.90:
         return "0.75-0.90"
     return "0.90-1.00"
+
+
+def _claimable_returns(claimable: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Claimable outcomes at each claim level, over the same rows.
+
+    Every level must cover every claimable row: a level missing for a row
+    (no return at that fill) is reported as withheld, and the level carries
+    ``complete=False`` so a smaller, flattering sample is never read as the
+    claimed return.
+    """
+    stats = _execution_scenario_stats(claimable)
+    out: Dict[str, Dict[str, Any]] = {}
+    for level in CLAIM_REPORT_LEVELS:
+        level_stats = dict(stats.get(level) or _group_stats([]))
+        withheld = len(claimable) - int(level_stats.get("n") or 0)
+        level_stats["withheld_count"] = withheld
+        level_stats["complete"] = withheld == 0
+        out[level] = level_stats
+    return out
 
 
 def _execution_scenario_stats(items: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:

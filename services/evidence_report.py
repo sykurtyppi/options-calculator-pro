@@ -568,6 +568,9 @@ def _evidence_quality_summary(
     outcome_rows = list(outcomes)
     baseline_rows = list(baselines)
     all_rows = outcome_rows + baseline_rows
+    resolved_rows = [row for row in outcome_rows if _is_resolved(row)] + [
+        row for row in baseline_rows if str(row.get("status") or "") == "resolved"]
+    resolved_ids = {id(row) for row in resolved_rows}
     return {
         "selector_status_counts": _count_by(
             outcome_rows,
@@ -577,9 +580,13 @@ def _evidence_quality_summary(
             baseline_rows,
             lambda row: row.get("evidence_quality_status") or "legacy_unclassified",
         ),
-        # Claims count only under the current claim contract (see claim_contract).
-        "claim_allowed_count": sum(1 for row in all_rows if claimable_under_current_contract(row)),
-        "claim_blocked_count": sum(1 for row in all_rows if claimable_under_current_contract(row) is False),
+        # Claims count only under the current claim contract (see claim_contract),
+        # and only on resolved outcomes: an open entry is claim-eligible, not
+        # claimed evidence (counting it hid the "no claimable evidence" warning).
+        "claim_allowed_count": sum(1 for row in resolved_rows if claimable_under_current_contract(row)),
+        "claim_blocked_count": sum(1 for row in resolved_rows if claimable_under_current_contract(row) is False),
+        "claim_eligible_unresolved_count": sum(
+            1 for row in all_rows if claimable_under_current_contract(row) and id(row) not in resolved_ids),
         "execution_grade_count": sum(1 for row in all_rows if _truthy(row.get("execution_grade"))),
         "record_only_count": sum(1 for row in all_rows if row.get("evidence_quality_status") == "record_only"),
         "degraded_count": sum(1 for row in all_rows if row.get("evidence_quality_status") == "degraded_evidence"),
@@ -615,6 +622,9 @@ def _surface_quality_summary(
     outcome_rows = list(outcomes)
     baseline_rows = list(baselines)
     all_rows = outcome_rows + baseline_rows
+    resolved_rows = [row for row in outcome_rows if _is_resolved(row)] + [
+        row for row in baseline_rows if str(row.get("status") or "") == "resolved"]
+    resolved_ids = {id(row) for row in resolved_rows}
     return {
         "selector_status_counts": _count_by(outcome_rows, lambda row: row.get("surface_quality_status") or "legacy_unclassified"),
         "baseline_status_counts": _count_by(baseline_rows, lambda row: row.get("surface_quality_status") or "legacy_unclassified"),

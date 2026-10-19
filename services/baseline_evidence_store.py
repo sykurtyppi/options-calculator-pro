@@ -222,7 +222,8 @@ class BaselineEvidenceStore:
         # verdict under the current contract, never on the caller's flag alone.
         claim_allowed, withdrawn = entry_claim_status(
             claim_allowed=claim_allowed, claim_contract_version=claim_contract_version,
-            entry_execution_scenarios=entry_execution_scenarios)
+            entry_execution_scenarios=entry_execution_scenarios,
+            evidence_reasons=list(evidence_quality_reasons or []), entry_quote_source=quote_source_at_entry)
         if withdrawn:
             evidence_quality_reasons = sorted(set(list(evidence_quality_reasons or []) + withdrawn))
         sql = """
@@ -449,13 +450,21 @@ class BaselineEvidenceStore:
                     " entry_execution_scenarios_json FROM baseline_trades WHERE baseline_id = ?",
                     (baseline_id,),
                 ).fetchone()
-                claim_allowed, claim_reasons = apply_exit_claim(
-                    claim_allowed=None if prior is None or prior[0] is None else bool(prior[0]),
-                    evidence_reasons=_loads_list(prior[1]) if prior is not None else [],
-                    exit_execution_scenarios=exit_execution_scenarios,
-                    entry_contract_version=prior[2] if prior is not None else None,
-                    entry_execution_scenarios=_stored_json(prior[3]) if prior is not None else None,
-                )
+                entry_claim = None if prior is None or prior[0] is None else bool(prior[0])
+                entry_reasons = _loads_list(prior[1]) if prior is not None else []
+                if status == "resolved":
+                    claim_allowed, claim_reasons = apply_exit_claim(
+                        claim_allowed=entry_claim,
+                        evidence_reasons=entry_reasons,
+                        exit_execution_scenarios=exit_execution_scenarios,
+                        entry_contract_version=prior[2] if prior is not None else None,
+                        entry_execution_scenarios=_stored_json(prior[3]) if prior is not None else None,
+                    )
+                else:
+                    # A skipped attempt has no exit to judge and may be retried
+                    # the same day: the entry claim stands until an exit is
+                    # recorded (folding here withdrew it for good).
+                    claim_allowed, claim_reasons = entry_claim, entry_reasons
                 cur.execute(sql, params + (_bool_int(claim_allowed), _json(claim_reasons)) + tail)
                 return cur.rowcount > 0
 

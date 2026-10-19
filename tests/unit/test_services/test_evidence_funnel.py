@@ -201,7 +201,9 @@ def _insert_trade(store, symbol, earnings, *, claim_allowed=False, marker="m"):
         execution_penalty_at_entry=0.03, notes=json.dumps({"pricing_context": {"marker": marker}}),
         claim_allowed=claim_allowed, evidence_quality_reasons=["quote_not_execution_grade"],
         claim_contract_version=CONTRACT_VERSION if claim_allowed else None,
-        entry_execution_scenarios={"claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION}},
+        entry_execution_scenarios={"legs": {"call": {"contract": "SHOP260424C00100000"}},
+                                   "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION,
+                                             "leg_contracts": {"call": "SHOP260424C00100000"}}},
     )
     return trade_id
 

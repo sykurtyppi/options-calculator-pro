@@ -102,6 +102,9 @@ class MarketDataClient:
         # Passing token="" should intentionally disable API usage (useful for tests/fallback paths).
         self.token = os.environ.get(_MARKETDATA_TOKEN_ENV, "") if token is None else token
         self._cache: Dict[str, Tuple[float, Any]] = {}
+        # Listed expirations per symbol, from get_expirations: sizes the
+        # credit estimate of an all-expirations chain.
+        self._expiration_counts: Dict[str, int] = {}
         # Shared on-disk cache for slow-moving endpoints: None uses the default
         # store, False disables it.
         self._response_cache = response_cache
@@ -153,6 +156,7 @@ class MarketDataClient:
                     result.append(str(item)[:10])
             except Exception:
                 continue
+        self._expiration_counts[symbol.upper()] = len(result)
         return sorted(result)
 
     # ------------------------------------------------------------------
@@ -479,14 +483,18 @@ class MarketDataClient:
 
         disk_cache = self._disk_cache() if _persistable(endpoint_type, params) else None
         if disk_cache is not None:
-            stored = disk_cache.get(cache_key)
+            getter = getattr(disk_cache, "get_with_age", None)
+            found = getter(cache_key) if callable(getter) else (disk_cache.get(cache_key), 0.0)
+            stored, age = found if found else (None, 0.0)
             if isinstance(stored, dict):
-                self._cache[cache_key] = (now, stored)
+                # Keeps its age: a disk entry is not fresh again in memory.
+                self._cache[cache_key] = (now - float(age or 0.0), stored)
                 return stored
 
         provider = self.provider_name
         priority = reliability.current_priority()
-        estimate = _estimated_credits(endpoint_type, params)
+        estimate = _estimated_credits(endpoint_type, params,
+                                      expirations_known=self._expiration_counts.get(str(symbol or "").upper()))
         breaker = reliability.get_breaker(provider)
         skip_reason = None if breaker.allow() else reliability.SKIP_CIRCUIT_OPEN
         reservation: Optional[str] = reliability.UNMETERED
@@ -594,9 +602,14 @@ class MarketDataClient:
                         except requests.exceptions.HTTPError as exc:
                             # A client error (auth, entitlement, not found) will not
                             # change on retry and says nothing about provider health.
+                            settled = self._settle_if_charged(resp, priority, reservation, fallback=None)
                             _fail(classify_error(str(exc)))
                             raise MarketDataError(f"MDApp HTTP error: {exc}") from exc
                         except Exception as exc:
+                            # Served (2xx) but unreadable: the provider has
+                            # charged it, so it settles at the reported cost,
+                            # else the estimate, never as uncharged.
+                            settled = self._settle_if_charged(resp, priority, reservation, fallback=estimate)
                             _fail(classify_error(str(exc)))
                             raise
                         breaker.record_success()
@@ -607,7 +620,10 @@ class MarketDataClient:
                         settled = True
                         self._cache[cache_key] = (now, data)
                         if disk_cache is not None:
-                            disk_cache.put(cache_key, data, cache_ttl)
+                            try:
+                                disk_cache.put(cache_key, data, cache_ttl)
+                            except Exception:  # noqa: BLE001 - never lose a paid response to the cache
+                                logger.warning("MDApp response cache write failed", exc_info=True)
                         record_provider_telemetry(
                             provider_name=provider,
                             endpoint_type=endpoint_type,
@@ -654,6 +670,21 @@ class MarketDataClient:
             return None
         return self._response_cache or reliability.get_response_cache()
 
+    def _settle_if_charged(self, resp: Any, priority: str, reservation: Optional[str], *,
+                           fallback: Optional[float]) -> bool:
+        """Settle a response that may have been charged but carried no usable
+        data: at X-Api-Ratelimit-Consumed if reported, else ``fallback`` (None
+        means not charged: the hold is released). Returns whether it settled."""
+        consumed = _header_number(_header_map(resp), "x-api-ratelimit-consumed")
+        credits = consumed if consumed is not None else fallback
+        if credits is None:
+            return False
+        try:
+            reliability.get_credit_budget().settle(reservation, self.provider_name, priority, credits)
+        except Exception:  # noqa: BLE001
+            logger.warning("MDApp credit settlement not recorded", exc_info=True)
+        return True
+
     def _charge(self, resp: Any, data: Dict[str, Any], endpoint_type: str,
                 params: Optional[Dict[str, Any]], priority: str, estimate: float,
                 reservation: Optional[str] = None) -> None:
@@ -664,10 +695,15 @@ class MarketDataClient:
         try:
             reliability.get_credit_budget().settle(reservation, self.provider_name, priority, credits)
         except Exception:  # noqa: BLE001 - accounting must not lose a good response
-            # The settlement rolled back, so the hold stays and later counts
-            # as unreconciled spend: the cost is never silently dropped.
-            logger.warning("MDApp credit settlement not recorded; the hold stays as unreconciled spend",
-                           exc_info=True)
+            if reservation == reliability.UNMETERED:
+                # An unmetered (audited) exit has no hold to fall back on.
+                logger.error("MDApp unmetered call's cost (%.0f credits) not recorded in the ledger", credits,
+                             exc_info=True)
+            else:
+                # The settlement rolled back, so the hold stays and later
+                # counts as unreconciled spend: the cost is never dropped.
+                logger.warning("MDApp credit settlement not recorded; the hold stays as unreconciled spend",
+                               exc_info=True)
 
     @staticmethod
     def _chain_response_to_df(data: Dict[str, Any]) -> pd.DataFrame:
@@ -784,16 +820,30 @@ def _persistable(endpoint_type: str, params: Optional[Dict[str, Any]]) -> bool:
     return endpoint_type == "options_chain" and bool((params or {}).get("date"))
 
 
-def _estimated_credits(endpoint_type: str, params: Optional[Dict[str, Any]]) -> float:
-    """Upper-bound cost of a call, used to admit it under the budget."""
+# Expirations assumed for an all-expirations chain when the symbol's list is
+# not known yet: generous, since an index can list 30 or more.
+DEFAULT_ALL_EXPIRATIONS = 40
+
+
+def _estimated_credits(endpoint_type: str, params: Optional[Dict[str, Any]], *,
+                       expirations_known: Optional[int] = None) -> float:
+    """Estimated cost of a call, held against the budget until it settles.
+
+    An estimate, not a bound: the call settles at what the provider reports
+    (or the contracts returned). An all-expirations chain is sized from the
+    symbol's known expiration count, else DEFAULT_ALL_EXPIRATIONS.
+    """
     params = params or {}
     if endpoint_type != "options_chain" or params.get("date"):
         return 1.0
     # Live chains cost one credit per contract returned.
     strikes = max(1, int(params.get("strikeLimit") or 20))
     sides = 1 if params.get("side") else 2
-    expirations = 12 if str(params.get("expiration") or "").lower() == "all" else 1
-    return float(strikes * sides * expirations)
+    if str(params.get("expiration") or "").lower() == "all":
+        expirations = int(expirations_known) if expirations_known else DEFAULT_ALL_EXPIRATIONS
+    else:
+        expirations = 1
+    return float(strikes * sides * max(1, expirations))
 
 
 def _actual_credits(endpoint_type: str, params: Optional[Dict[str, Any]], data: Dict[str, Any],
