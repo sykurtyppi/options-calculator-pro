@@ -1,9 +1,34 @@
 /// <reference types="vitest/config" />
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { execFileSync } from 'node:child_process'
+
+// The commit this bundle was built from, so a served dist/ can name its
+// source. Unknown stays null rather than guessed.
+function gitBuildInfo() {
+  const git = (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  try {
+    return { git_sha: git(['rev-parse', 'HEAD']), dirty: git(['status', '--porcelain', '--untracked-files=no']) !== '' }
+  } catch {
+    return { git_sha: null, dirty: null }
+  }
+}
+
+const BUILD_INFO = { ...gitBuildInfo(), built_at: new Date().toISOString() }
+
+// Writes dist/build-info.json, which /api/version reads to compare the
+// served bundle with the code the API runs.
+const buildInfoAsset = {
+  name: 'ocp-build-info',
+  apply: 'build',
+  generateBundle() {
+    this.emitFile({ type: 'asset', fileName: 'build-info.json', source: `${JSON.stringify(BUILD_INFO, null, 2)}\n` })
+  },
+}
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), buildInfoAsset],
+  define: { __OCP_BUILD__: JSON.stringify(BUILD_INFO) },
   // Vitest config for rendered-component tests. Scoped to *.dom.test.{js,jsx}
   // ONLY, so it never collects the node:test pure-function suites (which run
   // under `npm test` via `node --test 'src/**/*.test.js'`). The two runners are

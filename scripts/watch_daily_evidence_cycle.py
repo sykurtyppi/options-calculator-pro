@@ -19,6 +19,7 @@ try:
 except ImportError:
     pass
 
+from services.code_identity import build_code_identity_health, deployment_drift
 from services.evidence_funnel import build_evidence_funnel_health
 from services.provider_reliability import build_provider_budget_health
 from services.evidence_health import (
@@ -49,6 +50,7 @@ def _build_combined_watchdog_status(
     job_freshness: Mapping[str, Any] | None = None,
     funnel_health: Mapping[str, Any] | None = None,
     budget_health: Mapping[str, Any] | None = None,
+    code_health: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Merge the daily-cycle watchdog status with the candidate exit
     resolver health into a single payload suitable for
@@ -101,11 +103,13 @@ def _build_combined_watchdog_status(
     # the same alertable/non-alertable contract as the resolver issues.
     # The evidence funnel's issues (e.g. a stalled entry pipeline) follow the
     # same contract.
-    # So do the provider credit budget's (exhausted or nearly so).
+    # So do the provider credit budget's (exhausted or nearly so), and code
+    # drift (the jobs running a stale or different checkout).
     job_issues = (
         list((job_freshness or {}).get("issues", []))
         + list((funnel_health or {}).get("issues", []))
         + list((budget_health or {}).get("issues", []))
+        + list((code_health or {}).get("issues", []))
     )
     job_alertable = [i for i in job_issues if i.get("alertable", True) and i.get("severity") in {"FAIL", "WARN"}]
     job_non_alertable = [i for i in job_issues if not i.get("alertable", True)]
@@ -131,7 +135,18 @@ def _build_combined_watchdog_status(
         "launchd_jobs": (job_freshness or {}).get("summary", {}),
         "evidence_funnel": (funnel_health or {}).get("summary", {}),
         "provider_budget": (budget_health or {}).get("summary", {}),
+        "code_identity": (code_health or {}).get("summary", {}),
     }
+
+
+def _report_code_identity(report_path: Path) -> Mapping[str, Any] | None:
+    """The code identity today's report recorded, or None when it has none."""
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    identity = report.get("code_identity") if isinstance(report, dict) else None
+    return identity if isinstance(identity, dict) else None
 
 
 def main() -> int:
@@ -167,6 +182,8 @@ def main() -> int:
     )
     parser.add_argument("--not-due-before-hour", type=int, default=22)
     parser.add_argument("--not-due-before-minute", type=int, default=15)
+    parser.add_argument("--no-fetch", action="store_true",
+                        help="Compare the checkout with the last fetched origin/main instead of fetching.")
     parser.add_argument("--force-alert", action="store_true", help="Send even if this failure was already alerted.")
     parser.add_argument(
         "--dry-run-alert",
@@ -240,6 +257,10 @@ def main() -> int:
         job_freshness=job_freshness,
         funnel_health=build_evidence_funnel_health(),
         budget_health=build_provider_budget_health(),
+        code_health=build_code_identity_health(
+            deployment_drift(fetch=not args.no_fetch),
+            _report_code_identity(Path(status["report_path"])),
+        ),
     )
     alert = maybe_send_watchdog_alert(
         combined_status,

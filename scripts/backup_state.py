@@ -28,6 +28,16 @@ executing.
 All other files are copied byte-for-byte (logs, JSONL telemetry,
 JSON state).
 
+Manifest
+--------
+Each archive carries ``BACKUP_MANIFEST.json`` at its root: the commit the
+backing-up checkout was at, and for every file its size and SHA-256, plus
+for each SQLite snapshot its ``integrity_check`` result, ``user_version``
+and a hash of its schema. ``restore_state.py`` verifies the restored files
+against it. A snapshot that fails ``integrity_check`` is still archived
+(it may be the best copy there is) but the run exits 3 so it is not
+mistaken for a clean backup.
+
 Archive format
 --------------
 A timestamped ``.tar.gz`` written to the output directory. The
@@ -56,6 +66,8 @@ Exit codes
   1 — state directory missing or empty (nothing to back up).
   2 — fatal error during backup (SQLite snapshot failed, tar write
       failed, etc.). Details on stderr.
+  3 — archive written, but at least one SQLite snapshot failed
+      ``integrity_check``. Details on stderr and in the manifest.
 
 Concurrency
 -----------
@@ -73,13 +85,21 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
+import json
 import shutil
 import sqlite3
 import sys
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from services.code_identity import source_identity  # noqa: E402
 
 # Bumped whenever the on-disk archive layout changes in a way that
 # breaks restore. The restore script will refuse to extract an
@@ -90,12 +110,19 @@ ARCHIVE_SCHEMA_VERSION = 1
 DEFAULT_STATE_DIR = Path.home() / ".options_calculator_pro"
 DEFAULT_RETENTION = 14
 
+# Written at the archive root; must match restore_state.MANIFEST_NAME.
+MANIFEST_NAME = "BACKUP_MANIFEST.json"
+MANIFEST_VERSION = 1
+
 # Paths inside the state dir we DO NOT include in the backup.
 # Relative to the state dir root.
 _SKIP_PATH_NAMES = frozenset({
     # Self-skip: backups subdir, otherwise we'd recursively include
     # every prior archive on each run.
     "backups",
+    # A manifest left in the state dir by a restore describes that older
+    # archive, not this one.
+    MANIFEST_NAME,
 })
 
 
@@ -141,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        _write_archive(state_dir=state_dir, archive_path=archive_path)
+        manifest = _write_archive(state_dir=state_dir, archive_path=archive_path)
     except Exception as exc:  # noqa: BLE001 — surface everything to operator
         print(
             f"[backup_state] FAILED writing archive {archive_path.name}: "
@@ -157,14 +184,30 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     size_bytes = archive_path.stat().st_size
+    code = manifest["code_identity"]
     print(
-        f"[backup_state] wrote {archive_path.name} ({size_bytes:,} bytes)"
+        f"[backup_state] wrote {archive_path.name} ({size_bytes:,} bytes, "
+        f"sha256 {_sha256_file(archive_path)}, "
+        f"{len(manifest['files'])} files, code {code.get('git_sha') or 'unknown'}"
+        f"{' (dirty)' if code.get('dirty') else ''})"
     )
 
     pruned = _prune_old_archives(output_dir, retention=args.retention)
     for old in pruned:
         print(f"[backup_state] pruned old archive {old.name}")
 
+    damaged = [
+        entry for entry in manifest["files"]
+        if "sqlite" in entry and entry["sqlite"]["integrity_check"] != "ok"
+    ]
+    if damaged:
+        for entry in damaged:
+            print(
+                f"[backup_state] WARNING: snapshot of {entry['path']} failed "
+                f"integrity_check: {entry['sqlite']['integrity_check']}",
+                file=sys.stderr,
+            )
+        return 3
     return 0
 
 
@@ -261,12 +304,13 @@ def _next_available_archive_path(*, output_dir: Path, timestamp: str) -> Path:
             )
 
 
-def _write_archive(*, state_dir: Path, archive_path: Path) -> None:
+def _write_archive(*, state_dir: Path, archive_path: Path) -> dict[str, Any]:
     """Materialize the backup into a staging directory, then tar+gz it.
 
     Two-phase write so a crash during SQLite snapshot doesn't leave
     a half-written tarball at the destination. The staging dir
-    auto-cleans via TemporaryDirectory context.
+    auto-cleans via TemporaryDirectory context. Returns the manifest
+    written into the archive.
     """
     with tempfile.TemporaryDirectory(prefix="ocp-backup-") as staging_str:
         staging = Path(staging_str)
@@ -274,6 +318,11 @@ def _write_archive(*, state_dir: Path, archive_path: Path) -> None:
         staged_root.mkdir()
 
         _populate_staging(source=state_dir, dest=staged_root)
+        manifest = _build_manifest(staged_root)
+        (staged_root / MANIFEST_NAME).write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
         # Write tar.gz from the staging tree. Using a tar.gz (not
         # just .tar) keeps backup archives small enough to be
@@ -281,6 +330,66 @@ def _write_archive(*, state_dir: Path, archive_path: Path) -> None:
         # folder.
         with tarfile.open(archive_path, mode="w:gz") as tf:
             tf.add(staged_root, arcname=state_dir.name)
+    return manifest
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sqlite_facts(path: Path) -> dict[str, Any]:
+    """integrity_check, user_version and a schema hash of a staged snapshot.
+
+    Opened read-only and immutable: the snapshot is about to be hashed,
+    so reading it must not change a byte.
+    """
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro&immutable=1", uri=True)
+    except sqlite3.Error as exc:
+        return {"integrity_check": f"could not open: {exc}", "user_version": None, "schema_sha256": None}
+    try:
+        rows = conn.execute("PRAGMA integrity_check").fetchall()
+        integrity = "ok" if rows == [("ok",)] else ("; ".join(str(r[0]) for r in rows) or "no rows returned")
+        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        schema = conn.execute(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master "
+            "ORDER BY type, name"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return {"integrity_check": f"integrity_check raised: {exc}", "user_version": None, "schema_sha256": None}
+    finally:
+        conn.close()
+    return {
+        "integrity_check": integrity,
+        "user_version": user_version,
+        "schema_sha256": hashlib.sha256(json.dumps(schema).encode("utf-8")).hexdigest(),
+        "schema_objects": len(schema),
+    }
+
+
+def _build_manifest(staged_root: Path) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    for path in sorted(p for p in staged_root.rglob("*") if p.is_file()):
+        entry: dict[str, Any] = {
+            "path": path.relative_to(staged_root).as_posix(),
+            "bytes": path.stat().st_size,
+        }
+        if path.suffix in _SQLITE_PRIMARY_SUFFIXES:
+            # Checked before hashing so the hash covers the bytes checked.
+            entry["sqlite"] = _sqlite_facts(path)
+        entry["sha256"] = _sha256_file(path)
+        files.append(entry)
+    return {
+        "manifest_version": MANIFEST_VERSION,
+        "archive_schema_version": ARCHIVE_SCHEMA_VERSION,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "code_identity": source_identity(),
+        "files": files,
+    }
 
 
 def _populate_staging(*, source: Path, dest: Path) -> None:

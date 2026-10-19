@@ -29,6 +29,7 @@ except ImportError:
 
 from scripts.run_forward_loop import _parse_date, run_daily_cycle
 from services.automation_watchdog import IMessageConfig, send_imessage
+from services.code_identity import source_identity
 from services.evidence_report import build_evidence_report, build_weekly_evidence_report
 from services.evidence_funnel import build_evidence_funnel_report
 from services.provider_telemetry import build_provider_telemetry_diagnostics
@@ -50,6 +51,8 @@ def run_evidence_cycle(
     notify_summary: bool = False,
 ) -> dict:
     started_at = datetime.now(timezone.utc)
+    # Taken before the cycle runs: the commit whose code is loaded now.
+    code_identity = source_identity()
     cycle_date = as_of or date.today()
     forward = run_daily_cycle(today=cycle_date, dry_run=dry_run, symbols=symbols)
     report = build_evidence_report()
@@ -60,6 +63,7 @@ def run_evidence_cycle(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "as_of_date": cycle_date.isoformat(),
         "dry_run": dry_run,
+        "code_identity": code_identity,
         "forward_loop": forward,
         "evidence_report": report,
         "provider_telemetry": provider_telemetry,

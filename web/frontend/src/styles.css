@@ -3016,6 +3016,14 @@ button:disabled {
 
 /* ── Footer ──────────────────────────────────────────────────────────────── */
 
+.build-stamp {
+  font-variant-numeric: tabular-nums;
+}
+
+.build-stamp-warning {
+  color: var(--warn);
+}
+
 .app-footer {
   text-align: center;
   padding: 28px 0 12px;

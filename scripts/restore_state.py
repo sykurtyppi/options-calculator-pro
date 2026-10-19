@@ -28,9 +28,20 @@ Exit codes
   1 — archive missing or unreadable, schema version mismatch, or
       target dir non-empty without --force.
   2 — extraction completed but integrity_check FAILED on at least
-      one SQLite file. The restored state is left in place so the
+      one SQLite file, or the restored files do not match the
+      archive's manifest. The restored state is left in place so the
       operator can inspect it; the archive may be corrupt or the
       backup itself may have captured a torn write.
+
+Manifest
+--------
+Archives written since manifests were added carry
+``BACKUP_MANIFEST.json``. Every restored file is checked against its
+listed SHA-256; a missing, unlisted or altered file fails the restore
+(exit 2). The manifest is kept in the target as
+``RESTORED_FROM_BACKUP_MANIFEST.json`` so the restored state records
+which archive and commit it came from. Older archives without a
+manifest still restore, with a note that hashes were not verified.
 
 Safety
 ------
@@ -46,6 +57,8 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
+import json
 import re
 import shutil
 import sqlite3
@@ -61,6 +74,10 @@ from typing import Iterable
 ARCHIVE_SCHEMA_VERSION = 1
 
 DEFAULT_TARGET_DIR = Path.home() / ".options_calculator_pro"
+
+# Must match backup_state.MANIFEST_NAME.
+MANIFEST_NAME = "BACKUP_MANIFEST.json"
+RESTORED_MANIFEST_NAME = "RESTORED_FROM_BACKUP_MANIFEST.json"
 
 # Archive filename shape:
 #   options_calculator_pro-state-YYYYMMDDTHHMMSSZ-vN.tar.gz
@@ -138,6 +155,23 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+
+    manifest_failures, manifest_note = _verify_manifest(target_dir)
+    print(f"[restore_state] {manifest_note}")
+    if manifest_failures:
+        print(
+            f"[restore_state] manifest verification FAILED on "
+            f"{len(manifest_failures)} file(s):",
+            file=sys.stderr,
+        )
+        for rel_path, message in manifest_failures:
+            print(f"  {rel_path}: {message}", file=sys.stderr)
+        print(
+            "[restore_state] Restored state is left in place at "
+            f"{target_dir} so you can inspect it.",
+            file=sys.stderr,
+        )
+        return 2
 
     integrity_failures = _verify_sqlite_integrity(target_dir)
     if integrity_failures:
@@ -345,6 +379,54 @@ def _extract(*, archive_path: Path, target_dir: Path) -> None:
             # respects the rewritten name.
             member.name = str(stripped)
             tf.extract(member, target_dir)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_manifest(target_dir: Path) -> tuple[list[tuple[str, str]], str]:
+    """Check the restored files against the archive's manifest.
+
+    Returns ``(failures, note)``. Runs before anything opens a restored
+    SQLite file, so the bytes compared are the bytes extracted. The
+    manifest is then renamed so a later backup does not mistake it for
+    its own.
+    """
+    manifest_path = target_dir / MANIFEST_NAME
+    if not manifest_path.is_file():
+        return [], "archive has no manifest (written before manifests); file hashes not verified"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        listed = {str(e["path"]): e for e in manifest["files"]}
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return [(MANIFEST_NAME, f"unreadable manifest: {type(exc).__name__}: {exc}")], "manifest unreadable"
+    failures: list[tuple[str, str]] = []
+    present = {
+        p.relative_to(target_dir).as_posix()
+        for p in target_dir.rglob("*")
+        if p.is_file() and p != manifest_path
+    }
+    for rel_path in sorted(present - set(listed)):
+        failures.append((rel_path, "in the archive but not in its manifest"))
+    for rel_path, entry in sorted(listed.items()):
+        if rel_path not in present:
+            failures.append((rel_path, "listed in the manifest but missing from the archive"))
+            continue
+        actual = _sha256_file(target_dir / rel_path)
+        if actual != entry.get("sha256"):
+            failures.append((rel_path, f"sha256 {actual} does not match manifest {entry.get('sha256')}"))
+    manifest_path.replace(target_dir / RESTORED_MANIFEST_NAME)
+    code = manifest.get("code_identity") if isinstance(manifest.get("code_identity"), dict) else {}
+    note = (
+        f"manifest: {len(listed)} file(s) checked, backup taken {manifest.get('created_at')} "
+        f"from code {code.get('git_sha') or 'unknown'}{' (dirty)' if code.get('dirty') else ''}"
+    )
+    return failures, note
 
 
 # Must match backup_state._SQLITE_PRIMARY_SUFFIXES exactly. Kept

@@ -23,6 +23,7 @@ class Category(enum.Enum):
     EARNINGS_SEC_EDGAR = "earnings_sec_edgar"
     YFINANCE = "yfinance"
     IMESSAGE = "imessage"
+    GIT_REMOTE = "git_remote"
 
 
 class ExternalIOBlocked(RuntimeError):

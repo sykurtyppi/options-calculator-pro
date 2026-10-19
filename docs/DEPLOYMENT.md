@@ -675,6 +675,34 @@ every restored `*.sqlite` file. A failure here exits with code 2
 (distinct from the exit-1 "couldn't start" errors); the restored
 state is left in place so you can inspect what survived.
 
+### Manifest
+
+Every archive carries `BACKUP_MANIFEST.json` at its root:
+
+- the commit of the checkout that took the backup, and whether it had
+  uncommitted changes;
+- each file's size and SHA-256;
+- for each SQLite snapshot, its `integrity_check` result, `user_version`
+  and a hash of its schema.
+
+The backup log line also prints the archive's own SHA-256. Restore checks
+every extracted file against the manifest before opening any database: a
+changed, missing or unlisted file exits 2. The manifest is kept in the
+restored state as `RESTORED_FROM_BACKUP_MANIFEST.json`, so the state records
+which archive and commit it came from. Archives written before manifests
+existed still restore, with a note that hashes were not verified.
+
+A snapshot that fails `integrity_check` is still archived, since it may be
+the best copy there is, but the backup exits 3 so the watchdog reports it.
+
+### Which code is running
+
+`GET /api/version` returns the commit the API process started from and the
+commit `web/frontend/dist/build-info.json` says the served bundle was built
+from, with `frontend_matches_api`. The page footer shows the bundle's
+commit and warns when the API runs a different one. After a `git pull`,
+rebuild the frontend and restart the API and launchd jobs.
+
 ### Restoring into a non-default location (verification)
 
 Before committing to a real restore, you can extract an archive
@@ -699,7 +727,8 @@ rm -rf /tmp/verify_restore/
 |---|---|
 | 0 | Backup written / restore successful, integrity_check passed |
 | 1 | Backup: state dir missing or empty. Restore: archive missing, schema-version mismatch, or non-empty target without `--force` |
-| 2 | Backup: fatal error during snapshot. Restore: extraction completed but `PRAGMA integrity_check` failed on at least one SQLite file |
+| 2 | Backup: fatal error during snapshot. Restore: extraction completed but a file did not match the manifest or `PRAGMA integrity_check` failed on at least one SQLite file |
+| 3 | Backup: archive written, but at least one SQLite snapshot failed `integrity_check` (named on stderr and in the manifest) |
 
 Exit code 2 on a restore is the "you got most of your data back but a DB is corrupt" path. The restored state is left in place; investigate which DB failed (the error message names the file), and consider falling back to an older archive.
 
