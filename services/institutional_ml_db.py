@@ -788,9 +788,13 @@ class InstitutionalMLDatabase:
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_options_data_symbol_date ON options_data (symbol, date)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_ml_features_symbol_date ON ml_features (symbol, date)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_backtest_trades_session_date ON backtest_trades (session_id, trade_date)")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_events_symbol_date ON earnings_events (symbol, event_date)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_snapshots_symbol_event_date ON earnings_option_snapshots (symbol, event_date, capture_date)")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_earnings_labels_symbol_date ON earnings_iv_decay_labels (symbol, event_date)")
+                # (symbol, event_date) is already the primary key of
+                # earnings_events and a UNIQUE constraint of
+                # earnings_iv_decay_labels, each with its own index; these
+                # copies only doubled the write cost. Dropped where present.
+                cursor.execute("DROP INDEX IF EXISTS idx_earnings_events_symbol_date")
+                cursor.execute("DROP INDEX IF EXISTS idx_earnings_labels_symbol_date")
 
                 conn.commit()
                 self.logger.info("🏗️ Institutional database schema created successfully")

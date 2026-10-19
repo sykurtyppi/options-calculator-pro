@@ -140,6 +140,14 @@ The daily watchdog checks that the evidence cycle produced today's report and
 that the launchd log contains a completion marker. It does not re-run models or
 change decisions.
 
+It also checks which code is running. Each evidence report records the commit
+the cycle ran (`code_identity`). The watchdog fetches `origin/main` and alerts
+when the checkout the jobs run from is behind it, or when today's report came
+from a different commit than that checkout (two checkouts writing the same
+state). A failed fetch, an unidentifiable checkout or uncommitted changes are
+reported as warnings without paging. Pass `--no-fetch` to compare against the
+last fetched `origin/main` instead.
+
 Manual health check:
 
 ```bash

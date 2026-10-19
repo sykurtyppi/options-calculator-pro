@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import io
+import json
 import logging
 import math
 import os
@@ -482,6 +483,7 @@ class _AuthMiddleware(BaseHTTPMiddleware):
 
 from scripts.institutional_backfill import InstitutionalDataCollector
 from services import external_io_gate
+from services.code_identity import source_identity
 from services.market_data_client import MarketDataClient
 from services.market_data_provider import build_market_data_client, get_options_provider_name
 from services.options_feature_store import OptionsFeatureStore, OptionsFeatureStoreError
@@ -1118,6 +1120,36 @@ def health() -> Dict[str, Any]:
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# Taken at startup: the commit whose code this process runs. A later `git
+# pull` does not change what is loaded, so it is not re-read per request.
+_RUNNING_CODE = source_identity(project_root)
+_STARTED_AT = datetime.now(timezone.utc).isoformat()
+
+
+def _frontend_build_info() -> Optional[Dict[str, Any]]:
+    """What the served dist/ says it was built from; None when unstamped."""
+    try:
+        payload = json.loads((project_root / "web" / "frontend" / "dist" / "build-info.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {"git_sha": payload.get("git_sha"), "dirty": payload.get("dirty"), "built_at": payload.get("built_at")}
+
+
+@app.get("/api/version")
+def version() -> Dict[str, Any]:
+    api_sha = _RUNNING_CODE.get("git_sha")
+    frontend = _frontend_build_info()
+    frontend_sha = (frontend or {}).get("git_sha")
+    return {
+        "api": {"git_sha": api_sha, "dirty": _RUNNING_CODE.get("dirty"), "started_at": _STARTED_AT},
+        "frontend": frontend,
+        # None when either side is unknown: unknown is not a match.
+        "frontend_matches_api": (frontend_sha == api_sha) if (frontend_sha and api_sha) else None,
     }
 
 
