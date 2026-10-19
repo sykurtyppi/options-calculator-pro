@@ -246,6 +246,25 @@ def test_send_imessage_default_timeout_is_30s():
     assert sig.parameters["timeout_seconds"].default == 30.0
 
 
+def test_send_imessage_does_not_retry_a_timeout_by_default(monkeypatch):
+    # A timed-out hand-off may already have reached Messages: retrying by
+    # default could send the same alert twice.
+    calls = {"n": 0}
+
+    def timeout(*_a, **_k):
+        calls["n"] += 1
+        raise subprocess.TimeoutExpired(cmd="osascript", timeout=30.0)
+
+    monkeypatch.setattr(automation_watchdog, "_run_osascript", timeout)
+    automation_watchdog.external_io_gate.enable(Category.IMESSAGE)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            automation_watchdog.send_imessage("hi", config=_imessage_config())
+    finally:
+        automation_watchdog.external_io_gate.disable(Category.IMESSAGE)
+    assert calls["n"] == 1
+
+
 def test_send_imessage_retries_once_after_timeout_then_succeeds(monkeypatch):
     calls = {"n": 0}
 
@@ -255,14 +274,14 @@ def test_send_imessage_retries_once_after_timeout_then_succeeds(monkeypatch):
             raise subprocess.TimeoutExpired(cmd="osascript", timeout=30.0)
         return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(automation_watchdog.subprocess, "run", flaky)
+    monkeypatch.setattr(automation_watchdog, "_run_osascript", flaky)
     automation_watchdog.external_io_gate.enable(Category.IMESSAGE)
     try:
-        result = automation_watchdog.send_imessage("hi", config=_imessage_config())
+        result = automation_watchdog.send_imessage("hi", config=_imessage_config(), retries=1)
     finally:
         automation_watchdog.external_io_gate.disable(Category.IMESSAGE)
     assert result["sent"] is True
-    assert calls["n"] == 2  # first attempt timed out, retry delivered
+    assert calls["n"] == 2  # first attempt timed out, the opted-in retry delivered
 
 
 def test_send_imessage_raises_after_exhausting_retries(monkeypatch):
@@ -272,7 +291,7 @@ def test_send_imessage_raises_after_exhausting_retries(monkeypatch):
         calls["n"] += 1
         raise subprocess.TimeoutExpired(cmd="osascript", timeout=30.0)
 
-    monkeypatch.setattr(automation_watchdog.subprocess, "run", always_timeout)
+    monkeypatch.setattr(automation_watchdog, "_run_osascript", always_timeout)
     automation_watchdog.external_io_gate.enable(Category.IMESSAGE)
     try:
         with pytest.raises(subprocess.TimeoutExpired):
@@ -291,7 +310,7 @@ def test_send_imessage_does_not_retry_non_timeout_errors(monkeypatch):
         calls["n"] += 1
         raise subprocess.CalledProcessError(returncode=1, cmd="osascript")
 
-    monkeypatch.setattr(automation_watchdog.subprocess, "run", hard_error)
+    monkeypatch.setattr(automation_watchdog, "_run_osascript", hard_error)
     automation_watchdog.external_io_gate.enable(Category.IMESSAGE)
     try:
         with pytest.raises(subprocess.CalledProcessError):

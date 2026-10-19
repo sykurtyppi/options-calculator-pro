@@ -76,16 +76,19 @@ from services.alert_outbox import (  # noqa: E402
     PREPARED,
     PROVIDER_SUBMITTED,
     AlertOutbox,
+    InvalidTransition,
     OutboxCorrupt,
     OutboxUnavailable,
+    QuarantineIncomplete,
     clear_tombstone,
+    outbox_lock,
     quarantine,
     quarantine_outbox,
     read_tombstone,
     tombstone_path,
 )
 from services.external_io_gate import ExternalIOBlocked  # noqa: E402
-from services.automation_watchdog import IMessageConfig, send_imessage  # noqa: E402
+from services.automation_watchdog import HandoffNotStarted, IMessageConfig, send_imessage  # noqa: E402
 from services.screener_service import build_ranked_screener, ranking_score_components  # noqa: E402
 
 logger = logging.getLogger("premarket_screener_alert")
@@ -483,8 +486,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="Durable send outbox (default: next to the state file).")
     parser.add_argument("--outbox-reconciled", action="store_true",
                         help="An operator has checked the quarantined outbox against what was actually "
-                             "sent: clear its marker and allow sending again.")
-    return parser.parse_args(argv)
+                             "sent: clear its marker and allow sending again (works on any day, "
+                             "whether or not anything qualifies).")
+    parser.add_argument("--list-unresolved", action="store_true",
+                        help="List alerts whose delivery is unknown, then exit.")
+    parser.add_argument("--resolve-delivery", nargs=2, metavar=("ALERT_KEY", "OUTCOME"),
+                        help="Record what an operator found for an alert of unknown delivery, then exit: "
+                             "OUTCOME is 'delivered' (never resent) or 'not_delivered' (the next run may "
+                             "send it).")
+    args = parser.parse_args(argv)
+    if args.resolve_delivery and args.resolve_delivery[1] not in ("delivered", "not_delivered"):
+        parser.error("--resolve-delivery OUTCOME must be 'delivered' or 'not_delivered'")
+    return args
 
 
 def _never_launched(exc: BaseException) -> bool:
@@ -495,9 +508,71 @@ def _never_launched(exc: BaseException) -> bool:
     not permitted, not executable). Everything else, a timeout, a non-zero
     exit, an error decoding its output, may follow the hand-off.
     """
-    if isinstance(exc, ExternalIOBlocked):
+    if isinstance(exc, (ExternalIOBlocked, HandoffNotStarted)):
         return True
     return isinstance(exc, OSError) and Path(str(getattr(exc, "filename", "") or "")).name == "osascript"
+
+
+def _outbox_path(args: argparse.Namespace) -> Path:
+    return args.outbox_path or args.state_path.with_name("premarket_alert_outbox.sqlite")
+
+
+def _operator_actions(args: argparse.Namespace) -> Optional[int]:
+    """Operator commands, run before screening; an exit code ends the run."""
+    outbox_path = _outbox_path(args)
+    if args.outbox_reconciled:
+        # Handled first: an operator who reconciled must not have to wait for
+        # a day on which something qualifies.
+        try:
+            with outbox_lock(outbox_path):
+                if clear_tombstone(outbox_path):
+                    logger.warning("Outbox quarantine marker cleared by the operator (%s).",
+                                   tombstone_path(outbox_path))
+                else:
+                    logger.info("No outbox quarantine marker to clear (%s).", tombstone_path(outbox_path))
+        except OutboxUnavailable as exc:
+            logger.error("Could not clear the outbox quarantine marker: %s", exc)
+            return 1
+    if not (args.list_unresolved or args.resolve_delivery):
+        return None
+    try:
+        with outbox_lock(outbox_path):
+            outbox = AlertOutbox(outbox_path)
+            if args.list_unresolved:
+                print(json.dumps(outbox.unresolved(), indent=2, sort_keys=True))
+                return 0
+            key, outcome = args.resolve_delivery
+            status = outbox.resolve_unknown(key, delivered=outcome == "delivered", note="--resolve-delivery")
+    except (OutboxCorrupt, OutboxUnavailable, InvalidTransition) as exc:
+        logger.error("Could not resolve the alert: %s", exc)
+        return 1
+    logger.warning("Alert %s resolved by the operator: %s.", key, status)
+    return 0
+
+
+def _quarantine_damaged_outbox(outbox_path: Path, exc: BaseException) -> int:
+    """Move a damaged outbox aside (holding the outbox lock); always 1: nothing is sent."""
+    try:
+        inode = outbox_path.stat().st_ino
+    except OSError:
+        inode = None
+    try:
+        moved = quarantine_outbox(outbox_path, reason=str(exc), expected_inode=inode)
+    except QuarantineIncomplete as failure:
+        logger.error("Alert outbox is damaged (%s); its quarantine marker was written but moving it aside "
+                     "failed (%s). Sends are blocked until it is reconciled. Nothing sent.", exc, failure)
+        return 1
+    except OSError:
+        logger.exception("Alert outbox is damaged (%s) and its quarantine marker could not be written; "
+                         "left in place. Nothing sent.", exc)
+        return 1
+    if moved is None:
+        logger.error("Alert outbox is damaged (%s) and already quarantined; sends are blocked until it is "
+                     "reconciled. Nothing sent.", exc)
+    else:
+        logger.error("Alert outbox is damaged (%s); moved to %s and sends are blocked until it is "
+                     "reconciled. Nothing sent.", exc, moved)
+    return 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -506,6 +581,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parse_args(argv)
     as_of = date.today()
+    early = _operator_actions(args)
+    if early is not None:
+        return early
 
     release_filter = None if args.release == "all" else args.release.upper()
     try:
@@ -578,44 +656,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import uuid
 
     event_id = uuid.uuid4().hex
-    outbox_path = args.outbox_path or args.state_path.with_name("premarket_alert_outbox.sqlite")
-    # A quarantined outbox took the record of what was sent with it: a fresh
-    # one is no send authority until an operator has reconciled.
-    if args.outbox_reconciled and clear_tombstone(outbox_path):
-        logger.warning("Outbox quarantine marker cleared by the operator (%s).", tombstone_path(outbox_path))
-    marker = read_tombstone(outbox_path)
-    if marker is not None:
-        logger.error("Alert outbox was quarantined (%s); nothing is sent until it is reconciled. "
-                     "Check the quarantined file against what was sent, then re-run with "
-                     "--outbox-reconciled.", marker)
-        return 1
+    outbox_path = _outbox_path(args)
+    # --force sends again under a fresh key; otherwise one key per digest.
+    alert_key = f"{digest}|force|{event_id}" if args.force else digest
+    # From the marker check until the reservation commits, runs (and
+    # quarantine) hold the outbox lock: no run can pass the check, lose the
+    # race to a quarantine, and then send from a fresh outbox.
     try:
-        outbox = AlertOutbox(outbox_path)
-    except OutboxCorrupt as exc:
-        try:
-            moved = quarantine_outbox(outbox_path, reason=str(exc))
-        except OSError:
-            logger.exception("Alert outbox is damaged (%s) and its quarantine marker could not be written; "
-                             "left in place. Nothing sent.", exc)
-            return 1
-        logger.error("Alert outbox is damaged (%s); moved to %s and sends are blocked until it is "
-                     "reconciled. Nothing sent.", exc, moved)
-        return 1
+        with outbox_lock(outbox_path):
+            # A quarantined outbox took the record of what was sent with it:
+            # a fresh one is no send authority until an operator has reconciled.
+            marker = read_tombstone(outbox_path)
+            if marker is not None:
+                logger.error("Alert outbox was quarantined (%s); nothing is sent until it is reconciled. "
+                             "Check the quarantined file against what was sent, then re-run with "
+                             "--outbox-reconciled.", marker)
+                return 1
+            try:
+                outbox = AlertOutbox(outbox_path)
+            except OutboxCorrupt as exc:
+                return _quarantine_damaged_outbox(outbox_path, exc)
+            reservation = outbox.reserve(alert_key, event_id=event_id)
     except OutboxUnavailable as exc:
         # Contention or I/O, not damage: leave the outbox where it is.
         logger.error("Alert outbox is unavailable right now (%s). Nothing sent.", exc)
         return 1
-    # --force sends again under a fresh key; otherwise one key per digest.
-    alert_key = f"{digest}|force|{event_id}" if args.force else digest
-    reservation = outbox.reserve(alert_key, event_id=event_id)
     if not reservation.acquired:
         # A hand-off that timed out, or one whose run died mid-send (still
         # "provider_submitted" long after any live run would have finished),
         # may have been delivered: flag it, never resend it.
         if reservation.status == DELIVERY_UNKNOWN or (
                 reservation.status == PROVIDER_SUBMITTED and outbox.is_stale(alert_key)):
-            logger.error("Alert %s: an earlier send may or may not have been delivered; "
-                         "not resending automatically.", digest)
+            logger.error("Alert %s: an earlier send may or may not have been delivered; not resending "
+                         "automatically. Once checked, record it with --resolve-delivery %s "
+                         "delivered|not_delivered.", digest, alert_key)
             return 1
         logger.info("Alert %s already %s; not sending again.", digest, reservation.status)
         return 0
@@ -673,7 +747,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # reading its output may all come after Messages took the alert.
         outbox.transition(alert_key, event_id=event_id, to=DELIVERY_UNKNOWN, error=error)
         logger.error("iMessage hand-off ended with %s after osascript started; delivery unknown, "
-                     "not retried.", error)
+                     "not retried. Once checked, record it with --resolve-delivery %s "
+                     "delivered|not_delivered.", error, alert_key)
         _audit_status(DELIVERY_UNKNOWN, error=error)
         return 1
 

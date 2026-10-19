@@ -526,3 +526,23 @@ def test_a_new_date_joins_the_most_recently_confirmed_of_two_candidate_events():
     groups = derive_event_groups(observations)
     assert groups["X|2026-02-12"]["event_id"] == "X|2026-02-10"
     assert groups["X|2026-02-14"]["current"] == "X|2026-02-14"
+
+
+def test_a_regroup_refreshes_the_event_id_stored_on_evidence(stores):
+    ledger, outcomes, baselines = stores
+    ledger.record(_rec("AAA", "2026-02-02", "2026-02-12"))
+    _trade(outcomes, "t1", "AAA", date(2026, 2, 12))
+    baselines.insert_entry(recommendation_id="r1", symbol="AAA", baseline_name="always_atm_straddle",
+                           structure="atm_straddle", entry_date=date(2026, 2, 2), earnings_date=date(2026, 2, 12),
+                           selector_structure=None, entry_mid=2.0, modeled_cost_pct=None,
+                           execution_penalty_at_entry=None, data_quality_score_at_entry=None,
+                           iv_rv_har_at_entry=None, iv_rv_yz_at_entry=None, quote_source_at_entry=None,
+                           quote_quality_at_entry=None)
+    reconcile_moved_events(ledger=ledger, outcome_store=outcomes, baseline_store=baselines)
+    assert outcomes.get_trade("t1")["event_id"] == "AAA|2026-02-12"
+    ledger.record(_rec("AAA", "2026-02-01", "2026-02-10"))       # an earlier analysis, backfilled
+    assert ledger.event_id_for("AAA|2026-02-12") == "AAA|2026-02-10"
+    summary = reconcile_moved_events(ledger=ledger, outcome_store=outcomes, baseline_store=baselines)
+    assert summary["event_ids_recorded"] == 2
+    assert outcomes.get_trade("t1")["event_id"] == "AAA|2026-02-10"
+    assert baselines.list_for_diagnostics()[0]["event_id"] == "AAA|2026-02-10"

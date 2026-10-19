@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -216,19 +217,25 @@ def _redacted_address(value: str) -> str:
     return f"***{digits[-4:]}" if len(digits) >= 4 else "***"
 
 
+class HandoffNotStarted(OSError):
+    """osascript was never started (it could not be found or executed, or the
+    process could not be created): nothing can have been sent."""
+
+
 def send_imessage(
     message: str,
     *,
     config: IMessageConfig,
     timeout_seconds: float = 30.0,
-    retries: int = 1,
+    retries: int = 0,
 ) -> dict[str, Any]:
     # osascript's hand-off to Messages.app can briefly stall when the app is
-    # cold or busy — observed in production as a run of TimeoutExpired at the
-    # old 10s ceiling (Aug 2026), which dropped that day's alert entirely. Give
-    # it 30s and one retry on timeout so a slow-to-wake Messages.app costs a few
-    # seconds, not a missed alert. Only timeouts retry; a real osascript error
-    # (bad recipient, Messages not signed in) still fails fast.
+    # cold or busy, hence the 30s ceiling. A timed-out hand-off may already
+    # have reached Messages, so it is NOT retried by default: a retry could
+    # send the same message twice. Callers that accept that risk can pass
+    # ``retries``. A failure to start osascript at all raises
+    # HandoffNotStarted (nothing went out); anything after the launch (a
+    # timeout, a non-zero exit) may follow the hand-off.
     external_io_gate.assert_allowed(external_io_gate.Category.IMESSAGE)
     script = """
 on run argv
@@ -245,13 +252,7 @@ end run
     attempts = max(1, retries + 1)
     for attempt in range(attempts):
         try:
-            subprocess.run(
-                argv,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-            )
+            _run_osascript(argv, timeout_seconds=timeout_seconds)
             break
         except subprocess.TimeoutExpired:
             if attempt + 1 >= attempts:
@@ -267,14 +268,37 @@ end run
     }
 
 
+def _run_osascript(argv: list[str], *, timeout_seconds: float) -> None:
+    try:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as exc:
+        raise HandoffNotStarted(exc.errno, f"osascript not started: {exc.strerror or exc}") from exc
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, argv, output=stdout, stderr=stderr)
+
+
 def _alert_signature(status: Mapping[str, Any]) -> str:
     errors = "|".join(str(item) for item in status.get("errors", []))
     return f"{status.get('expected_date')}::{errors}"
 
 
+class AlertStateUnreadable(RuntimeError):
+    """The dedup state exists but cannot be read: it is not 'nothing sent'."""
+
+
 def _load_alert_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
     payload = _read_json(path)
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        raise AlertStateUnreadable(f"{path} is unreadable or not a JSON object")
+    return payload
 
 
 def _write_alert_state(path: Path, payload: Mapping[str, Any]) -> None:
@@ -312,7 +336,20 @@ def maybe_send_watchdog_alert(
         return {"attempted": False, "reason": "watchdog_ok"}
 
     signature = _alert_signature(status)
-    state = _load_alert_state(state_path)
+    try:
+        state = _load_alert_state(state_path)
+    except AlertStateUnreadable as exc:
+        if not force:
+            # Read as empty, it would resend whatever it last suppressed.
+            # Moved aside, so the next tick starts clean: this alert is
+            # delayed by one tick, never lost, and never sent twice.
+            moved = None
+            with contextlib.suppress(OSError):
+                moved = state_path.with_name(f"{state_path.name}.unreadable-{_utc_now().strftime('%Y%m%dT%H%M%S')}")
+                state_path.replace(moved)
+            return {"attempted": False, "reason": "alert_state_unreadable", "error": str(exc),
+                    "moved_to": str(moved) if moved else None}
+        state = {}
     if not force and state.get("last_alert_signature") == signature:
         return {"attempted": False, "reason": "duplicate_alert_suppressed"}
 
@@ -334,7 +371,15 @@ def maybe_send_watchdog_alert(
             "to": _redacted_address(cfg.to_address),
         }
     else:
-        result = send_imessage(message, config=cfg)
+        try:
+            result = send_imessage(message, config=cfg)
+        except HandoffNotStarted as exc:
+            return {"attempted": True, "sent": False, "error": f"{type(exc).__name__}: {exc}"}
+        except Exception as exc:  # noqa: BLE001
+            # Launched, then timed out or failed: it may have gone out. The
+            # signature is recorded so the next tick does not send it again.
+            result = {"sent": None, "delivery_unknown": True, "provider": "imessage",
+                      "error": f"{type(exc).__name__}: {exc}"}
 
     try:
         _write_alert_state(
