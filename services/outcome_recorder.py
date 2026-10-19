@@ -214,6 +214,9 @@ FINALIZATION_LEASE_SECONDS = 900
 # learning (e.g. blocked on a store lock past the lease): the stores may hold
 # an observation for a row another worker now owns or that was invalidated.
 LEARNING_WRITTEN_AFTER_CLAIM_LOST = "complete_after_claim_lost"
+# Invalidation reason prefix for evidence filed under a moved earnings date
+# (services.event_reconciliation): restorable if the date moves back.
+EVENT_DATE_SUPERSEDED_REASON = "event_date_superseded"
 
 # SQL twin of is_outcome_evidence_valid(). Mutations that write outcome or
 # learning state carry it in their WHERE clause, so an invalidation made after
@@ -354,7 +357,8 @@ class OutcomeStore:
         # verdict under the current contract, never on the caller's flag alone.
         claim_allowed, withdrawn = entry_claim_status(
             claim_allowed=claim_allowed, claim_contract_version=claim_contract_version,
-            entry_execution_scenarios=entry_execution_scenarios)
+            entry_execution_scenarios=entry_execution_scenarios,
+            evidence_reasons=list(evidence_quality_reasons or []), entry_quote_source=entry_quote_source)
         if withdrawn:
             evidence_quality_reasons = sorted(set(list(evidence_quality_reasons or []) + withdrawn))
         sql = """
@@ -655,21 +659,31 @@ class OutcomeStore:
         self,
         *,
         symbol: str,
-        structure: str,
+        structure: Optional[str] = None,
         earnings_date: date,
     ) -> Optional[Dict[str, Any]]:
+        """The event's unfinalized paper trade (of ``structure``, or any).
+
+        A trade invalidated because its event date moved still counts: it is
+        restored if the date moves back. Any other invalidated trade does not.
+        """
+        structure_sql = "" if structure is None else " AND structure = ?"
+        params: list = [str(symbol).upper(), _fmt_date(earnings_date)]
+        if structure is not None:
+            params.append(str(structure))
         row = self._conn.execute(
-            """
+            f"""
             SELECT *
             FROM outcome_trades
             WHERE symbol = ?
-              AND structure = ?
-              AND earnings_date = ?
+              AND earnings_date = ?{structure_sql}
               AND status != 'finalized'
+              AND (COALESCE(evidence_valid, 1) != 0
+                   OR substr(COALESCE(invalidation_reason, ''), 1, ?) = ?)
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (str(symbol).upper(), str(structure), _fmt_date(earnings_date)),
+            (*params, len(EVENT_DATE_SUPERSEDED_REASON), EVENT_DATE_SUPERSEDED_REASON),
         ).fetchone()
         return dict(row) if row else None
 
@@ -1079,14 +1093,33 @@ class OutcomeStore:
             "invalidation_reason": reason,
         }
 
+    def revalidate(self, trade_id: str, *, reason_prefix: str) -> bool:
+        """Restore evidence invalidated with a reason starting ``reason_prefix``
+        (e.g. a superseded event date that is current again). Rows invalidated
+        for any other reason stay invalid. Returns whether it was restored."""
+        reason_prefix = str(reason_prefix or "").strip()
+        if not reason_prefix:
+            raise ValueError("revalidate: a non-empty reason prefix is required")
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    "UPDATE outcome_trades SET evidence_valid = 1, invalidated_at = NULL, invalidation_reason = NULL,"
+                    " updated_at = CURRENT_TIMESTAMP WHERE trade_id = ? AND evidence_valid = 0"
+                    " AND substr(invalidation_reason, 1, ?) = ?",
+                    (trade_id, len(reason_prefix), reason_prefix),
+                )
+                return cur.rowcount > 0
+
     def record_event_ids(self, event_ids: Dict[str, str]) -> int:
-        """Attach durable event ids (trade_id -> event_id) where none is set yet."""
+        """Attach durable event ids (trade_id -> event_id); returns rows changed."""
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
                 changed = 0
                 for trade_id, event_id in event_ids.items():
-                    cur.execute("UPDATE outcome_trades SET event_id = ? WHERE trade_id = ? AND event_id IS NULL",
-                                (event_id, trade_id))
+                    # An event's id can change when a backfilled analysis
+                    # regroups it, so a stale id is replaced too.
+                    cur.execute("UPDATE outcome_trades SET event_id = ? WHERE trade_id = ?"
+                                " AND (event_id IS NULL OR event_id != ?)", (event_id, trade_id, event_id))
                     changed += cur.rowcount
                 return changed
 

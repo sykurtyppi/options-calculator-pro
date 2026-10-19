@@ -222,7 +222,8 @@ class BaselineEvidenceStore:
         # verdict under the current contract, never on the caller's flag alone.
         claim_allowed, withdrawn = entry_claim_status(
             claim_allowed=claim_allowed, claim_contract_version=claim_contract_version,
-            entry_execution_scenarios=entry_execution_scenarios)
+            entry_execution_scenarios=entry_execution_scenarios,
+            evidence_reasons=list(evidence_quality_reasons or []), entry_quote_source=quote_source_at_entry)
         if withdrawn:
             evidence_quality_reasons = sorted(set(list(evidence_quality_reasons or []) + withdrawn))
         sql = """
@@ -449,13 +450,21 @@ class BaselineEvidenceStore:
                     " entry_execution_scenarios_json FROM baseline_trades WHERE baseline_id = ?",
                     (baseline_id,),
                 ).fetchone()
-                claim_allowed, claim_reasons = apply_exit_claim(
-                    claim_allowed=None if prior is None or prior[0] is None else bool(prior[0]),
-                    evidence_reasons=_loads_list(prior[1]) if prior is not None else [],
-                    exit_execution_scenarios=exit_execution_scenarios,
-                    entry_contract_version=prior[2] if prior is not None else None,
-                    entry_execution_scenarios=_stored_json(prior[3]) if prior is not None else None,
-                )
+                entry_claim = None if prior is None or prior[0] is None else bool(prior[0])
+                entry_reasons = _loads_list(prior[1]) if prior is not None else []
+                if status == "resolved":
+                    claim_allowed, claim_reasons = apply_exit_claim(
+                        claim_allowed=entry_claim,
+                        evidence_reasons=entry_reasons,
+                        exit_execution_scenarios=exit_execution_scenarios,
+                        entry_contract_version=prior[2] if prior is not None else None,
+                        entry_execution_scenarios=_stored_json(prior[3]) if prior is not None else None,
+                    )
+                else:
+                    # A skipped attempt has no exit to judge and may be retried
+                    # the same day: the entry claim stands until an exit is
+                    # recorded (folding here withdrew it for good).
+                    claim_allowed, claim_reasons = entry_claim, entry_reasons
                 cur.execute(sql, params + (_bool_int(claim_allowed), _json(claim_reasons)) + tail)
                 return cur.rowcount > 0
 
@@ -491,14 +500,33 @@ class BaselineEvidenceStore:
                 )
                 return cur.rowcount > 0
 
+    def revalidate(self, baseline_id: str, *, reason_prefix: str) -> bool:
+        """Restore evidence invalidated with a reason starting ``reason_prefix``
+        (e.g. a superseded event date that is current again). Rows invalidated
+        for any other reason stay invalid. Returns whether it was restored."""
+        reason_prefix = str(reason_prefix or "").strip()
+        if not reason_prefix:
+            raise ValueError("revalidate: a non-empty reason prefix is required")
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    "UPDATE baseline_trades SET evidence_valid = 1, invalidated_at = NULL, invalidation_reason = NULL,"
+                    " updated_at = CURRENT_TIMESTAMP WHERE baseline_id = ? AND evidence_valid = 0"
+                    " AND substr(invalidation_reason, 1, ?) = ?",
+                    (baseline_id, len(reason_prefix), reason_prefix),
+                )
+                return cur.rowcount > 0
+
     def record_event_ids(self, event_ids: Dict[str, str]) -> int:
-        """Attach durable event ids (baseline_id -> event_id) where none is set yet."""
+        """Attach durable event ids (baseline_id -> event_id); returns rows changed."""
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
                 changed = 0
                 for baseline_id, event_id in event_ids.items():
-                    cur.execute("UPDATE baseline_trades SET event_id = ? WHERE baseline_id = ? AND event_id IS NULL",
-                                (event_id, baseline_id))
+                    # An event's id can change when a backfilled analysis
+                    # regroups it, so a stale id is replaced too.
+                    cur.execute("UPDATE baseline_trades SET event_id = ? WHERE baseline_id = ?"
+                                " AND (event_id IS NULL OR event_id != ?)", (event_id, baseline_id, event_id))
                     changed += cur.rowcount
                 return changed
 

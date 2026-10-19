@@ -36,10 +36,12 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Literal, Optional
+from typing import Any, Dict, Generator, Iterable, List, Literal, Optional
 
 from services.candidate_shadow_provenance import (
     SAMPLE_PROVENANCE_FORWARD_POST_FREEZE,
+    SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED,
+    SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
     normalize_sample_provenance,
 )
 
@@ -205,6 +207,18 @@ _NOT_SUPERSEDED_SQL = (
     "(event_key IS NULL OR event_key NOT IN (SELECT event_key FROM event_supersessions))"
 )
 
+# SQL: the recommendation_ids that are their event's latest analysis, per
+# ``partition`` (the event, optionally with its provenance). Latest in
+# information time (as_of, then created_at), not write order: an older
+# analysis backfilled later never becomes the event's decision.
+def _latest_per_event_sql(partition: str) -> str:
+    return (
+        "SELECT recommendation_id FROM (SELECT recommendation_id, ROW_NUMBER() OVER ("
+        f"PARTITION BY {partition} ORDER BY as_of_date DESC, created_at DESC, event_sequence DESC) AS rn"
+        " FROM recommendations WHERE event_key IS NOT NULL) WHERE rn = 1"
+    )
+
+
 _MIGRATION_COLUMNS: Dict[str, str] = {
     "created_at": "TEXT",
     "symbol": "TEXT",
@@ -307,7 +321,9 @@ def _open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    from services.sqlite_helpers import enable_wal_mode
+
+    enable_wal_mode(conn)
     # PR-T: the module-level
     # _WRITE_LOCK serializes in-process writers and WAL handles concurrent
     # readers, but cross-process writers (a future worker pool or a manual
@@ -332,7 +348,7 @@ def _open_db(path: Path) -> sqlite3.Connection:
     conn.commit()
     from services.sqlite_helpers import migrate_under_lock
 
-    migrate_under_lock(conn, _backfill_event_groups)
+    migrate_under_lock(conn, _regroup_all_events)
     return conn
 
 
@@ -381,124 +397,127 @@ def _parse_day(value: Any) -> Optional[date]:
         return None
 
 
+# Replays and holdouts carry their own (historical) date source: they never
+# move a forward event's date, nor are they moved by one.
+_NON_FORWARD_PROVENANCES = (SAMPLE_PROVENANCE_HISTORICAL_REPLAY, SAMPLE_PROVENANCE_HISTORICAL_HOLDOUT_PREREGISTERED)
+
+# Bumped when the grouping rule changes: every symbol is regrouped once.
+EVENT_GROUPING_VERSION = 2
+
+
 def _supersede_moved_events(cur: sqlite3.Cursor, record: "RecommendationRecord", event_key: Optional[str]) -> None:
-    """Give ``event_key`` its durable event identity, and re-derive which of
-    the event's keys is current.
-
-    Every key belongs to one corporate event (``event_identity.event_id``,
-    the key the event was first seen under). A new key joins the event whose
-    *current* key it moved from (see ``is_moved_event_date``): later
-    information moves the date, and older information recorded late (a
-    replay, a backfill) joins too. Two dates seen on the same day are
-    ambiguous and both stand. Because a key keeps its identity, a chain of
-    moves (A -> B -> C) and a move back (C -> A) stay one event.
-
-    The event's current key is the one analyzed at the latest as_of (then the
-    latest recorded); every other key is filed in ``event_supersessions`` as
-    superseded by it.
-    """
+    """Re-derive the symbol's events after a new analysis (see ``_regroup_symbol``)."""
     as_of = _fmt_date(record.as_of_date)
     if event_key is None or not as_of:
         return
-    symbol = record.symbol.strip().upper()
-    now = datetime.now(timezone.utc).isoformat()
-    known = cur.execute("SELECT event_id FROM event_identity WHERE event_key = ?", (event_key,)).fetchone()
-    if known is not None:
-        event_id = str(known[0])
-    else:
-        groups = _symbol_event_groups(cur, symbol, exclude=event_key)
-        new_date = event_key.split("|", 1)[1]
-        joinable = []
-        for group_id, members in groups.items():
-            current = members[0]
-            current_date, current_as_of = current["event_key"].split("|", 1)[1], current["latest_as_of"]
-            if current_as_of < as_of and is_moved_event_date(current_date, new_date, as_of=as_of):
-                joinable.append((current_as_of, group_id))
-            elif current_as_of > as_of and is_moved_event_date(new_date, current_date, as_of=current_as_of):
-                joinable.append((current_as_of, group_id))
-        event_id = max(joinable)[1] if joinable else event_key
-        # A key with no identity row is its own event (its id is itself), so
-        # only the new key needs one.
-        cur.execute(
-            "INSERT OR IGNORE INTO event_identity (event_key, event_id, symbol, joined_at, joined_as_of)"
-            " VALUES (?, ?, ?, ?, ?)", (event_key, event_id, symbol, now, as_of),
-        )
-    _refresh_event_supersessions(cur, symbol, event_id, record.recommendation_id, as_of, now)
+    _regroup_symbol(cur, record.symbol.strip().upper(), recommendation_id=record.recommendation_id, as_of=as_of)
 
 
-def _symbol_event_groups(cur: sqlite3.Cursor, symbol: str, *, exclude: Optional[str] = None) -> Dict[str, list]:
-    """The symbol's events: event id -> its keys, current first.
+def derive_event_groups(observations: Iterable[tuple]) -> Dict[str, Dict[str, Any]]:
+    """Group one symbol's event keys into corporate events.
 
-    A key recorded before event identities existed is its own event.
+    ``observations`` are ``(as_of, created_at, event_key)``: the date an
+    analysis saw for the event on ``as_of``. They are replayed one as_of day
+    at a time, in information order, so the result depends only on what was
+    observed when, never on the order rows were written (a backfilled older
+    analysis lands where it belongs). A key not seen before joins the event
+    whose current date, as it stood before that day, it moved from
+    (``is_moved_event_date``: the old date had not passed); else it starts its
+    own. Two new dates first seen on the same day are ambiguous and both
+    stand. Within a day the latest analysis (by created_at) names the event's
+    current key.
+
+    Returns event_key -> {"event_id": first key of the event, "current": the
+    event's current key, "first_as_of": when the key was first seen}.
     """
+    by_day: Dict[str, list] = {}
+    for as_of, created, key in observations:
+        by_day.setdefault(str(as_of), []).append((str(created), str(key)))
+    groups: Dict[str, Dict[str, Any]] = {}
+    key_group: Dict[str, str] = {}
+    first_seen: Dict[str, str] = {}
+    for as_of in sorted(by_day):
+        before = [(g["current"], g["current_as_of"], g["event_id"]) for g in groups.values()]
+        day = sorted(set(by_day[as_of]))
+        for _created, key in day:
+            if key in key_group:
+                continue
+            new_date = key.split("|", 1)[1]
+            joinable = [(current_as_of, event_id) for current, current_as_of, event_id in before
+                        if is_moved_event_date(current.split("|", 1)[1], new_date, as_of=as_of)]
+            event_id = max(joinable)[1] if joinable else key
+            if event_id == key:
+                groups[key] = {"event_id": key}
+            key_group[key] = event_id
+            first_seen[key] = as_of
+        for _created, key in day:
+            groups[key_group[key]].update(current=key, current_as_of=as_of)
+    return {key: {"event_id": group_id, "current": groups[group_id]["current"], "first_as_of": first_seen[key]}
+            for key, group_id in key_group.items()}
+
+
+def _regroup_symbol(cur: sqlite3.Cursor, symbol: str, *, recommendation_id: Optional[str], as_of: Optional[str]) -> None:
+    """Rewrite the symbol's event identities and supersessions from all its
+    forward analyses (``derive_event_groups``)."""
+    placeholders = ",".join("?" * len(_NON_FORWARD_PROVENANCES))
     rows = cur.execute(
-        """SELECT r.event_key, MAX(r.as_of_date) AS latest_as_of, MAX(r.created_at) AS latest_created,
-                  COALESCE(i.event_id, r.event_key) AS event_id
-             FROM recommendations AS r LEFT JOIN event_identity AS i ON i.event_key = r.event_key
-            WHERE r.symbol = ? AND r.event_key IS NOT NULL AND r.event_key != ?
-            GROUP BY r.event_key""",
-        (symbol, exclude or ""),
+        f"""SELECT DISTINCT as_of_date, created_at, event_key FROM recommendations
+             WHERE symbol = ? AND event_key IS NOT NULL AND as_of_date IS NOT NULL AND as_of_date != ''
+               AND COALESCE(sample_provenance, '') NOT IN ({placeholders})""",
+        (symbol, *_NON_FORWARD_PROVENANCES),
     ).fetchall()
-    groups: Dict[str, list] = {}
-    for row in rows:
-        groups.setdefault(str(row["event_id"]), []).append({
-            "event_key": str(row["event_key"]), "latest_as_of": _fmt_date(row["latest_as_of"]) or "",
-            "latest_created": str(row["latest_created"] or ""),
-        })
-    for members in groups.values():
-        members.sort(key=lambda m: (m["latest_as_of"], m["latest_created"], m["event_key"]), reverse=True)
-    return groups
-
-
-def _refresh_event_supersessions(cur: sqlite3.Cursor, symbol: str, event_id: str,
-                                 recommendation_id: Optional[str], as_of: str, now: str) -> None:
-    members = _symbol_event_groups(cur, symbol).get(event_id, [])
-    if not members:
-        return
-    current = members[0]["event_key"]
-    keys = [m["event_key"] for m in members]
-    cur.execute(f"DELETE FROM event_supersessions WHERE event_key IN ({','.join('?' * len(keys))})", keys)
-    for key in keys[1:]:
+    derived = derive_event_groups((_fmt_date(row[0]) or "", str(row[1] or ""), str(row[2])) for row in rows)
+    now = datetime.now(timezone.utc).isoformat()
+    for key, info in derived.items():
         cur.execute(
-            "INSERT INTO event_supersessions"
+            "INSERT INTO event_identity (event_key, event_id, symbol, joined_at, joined_as_of)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(event_key) DO UPDATE SET event_id = excluded.event_id,"
+            " joined_as_of = excluded.joined_as_of",
+            (key, info["event_id"], symbol, now, info["first_as_of"]),
+        )
+    # Keys seen only in replays are their own events.
+    cur.execute(
+        "INSERT OR IGNORE INTO event_identity (event_key, event_id, symbol, joined_at, joined_as_of)"
+        " SELECT DISTINCT event_key, event_key, ?, ?, NULL FROM recommendations"
+        " WHERE symbol = ? AND event_key IS NOT NULL", (symbol, now, symbol),
+    )
+    previous = {str(row[0]): str(row[1]) for row in cur.execute(
+        "SELECT event_key, superseded_by FROM event_supersessions WHERE symbol = ?", (symbol,))}
+    superseded = {key: info["current"] for key, info in derived.items() if info["current"] != key}
+    for key in set(previous) - set(superseded):
+        cur.execute("DELETE FROM event_supersessions WHERE event_key = ?", (key,))
+    for key, current in superseded.items():
+        if previous.get(key) == current:
+            continue
+        cur.execute(
+            "INSERT OR REPLACE INTO event_supersessions"
             " (event_key, superseded_by, symbol, detected_as_of, recommendation_id, detected_at)"
             " VALUES (?, ?, ?, ?, ?, ?)",
             (key, current, symbol, as_of, recommendation_id, now),
         )
 
 
-def _backfill_event_groups(conn: sqlite3.Connection) -> None:
-    """Give keys superseded before event identities existed (PR J) one event
-    with the key that superseded them (run under the write lock)."""
-    if conn.execute("SELECT 1 FROM event_identity LIMIT 1").fetchone() is not None:
+def _regroup_all_events(conn: sqlite3.Connection) -> None:
+    """Regroup every symbol once per EVENT_GROUPING_VERSION, or when a key has
+    no identity (run under the write lock): groups written under an older
+    rule depended on write order."""
+    conn.execute("CREATE TABLE IF NOT EXISTS event_grouping_meta (version INTEGER NOT NULL)")
+    row = conn.execute("SELECT MAX(version) FROM event_grouping_meta").fetchone()
+    missing = conn.execute(
+        "SELECT 1 FROM recommendations AS r WHERE r.event_key IS NOT NULL"
+        " AND NOT EXISTS (SELECT 1 FROM event_identity AS i WHERE i.event_key = r.event_key) LIMIT 1"
+    ).fetchone()
+    if row is not None and row[0] is not None and int(row[0]) >= EVENT_GROUPING_VERSION and missing is None:
         return
-    pairs = conn.execute("SELECT event_key, superseded_by, symbol FROM event_supersessions").fetchall()
-    parent: Dict[str, str] = {}
-
-    def find(key: str) -> str:
-        while parent.get(key, key) != key:
-            key = parent[key]
-        return key
-
-    symbols: Dict[str, str] = {}
-    for old, new, symbol in pairs:
-        symbols[str(old)] = symbols[str(new)] = str(symbol)
-        root_old, root_new = find(str(old)), find(str(new))
-        if root_old != root_new:
-            parent[root_new] = root_old
-    groups: Dict[str, list] = {}
-    for key in symbols:
-        groups.setdefault(find(key), []).append(key)
-    now = datetime.now(timezone.utc).isoformat()
-    for members in groups.values():
-        dates = {key: conn.execute("SELECT MIN(created_at) FROM recommendations WHERE event_key = ?",
-                                   (key,)).fetchone()[0] or "" for key in members}
-        event_id = min(members, key=lambda key: (dates[key], key))       # first seen
-        for key in members:
-            conn.execute(
-                "INSERT OR IGNORE INTO event_identity (event_key, event_id, symbol, joined_at, joined_as_of)"
-                " VALUES (?, ?, ?, ?, NULL)", (key, event_id, symbols[key], now),
-            )
+    cur = conn.cursor()
+    symbols = [str(r[0]) for r in cur.execute(
+        "SELECT DISTINCT symbol FROM recommendations WHERE event_key IS NOT NULL")]
+    symbols += [str(r[0]) for r in cur.execute("SELECT DISTINCT symbol FROM event_supersessions")]
+    for symbol in sorted(set(symbols)):
+        _regroup_symbol(cur, symbol, recommendation_id=None, as_of=None)
+    cur.execute("DELETE FROM event_grouping_meta")
+    cur.execute("INSERT INTO event_grouping_meta (version) VALUES (?)", (EVENT_GROUPING_VERSION,))
 
 
 def _backfill_event_identity(conn: sqlite3.Connection) -> None:
@@ -1121,13 +1140,11 @@ class RecommendationLedger:
                AND earnings_date IS NOT NULL
                AND earnings_date <= ?
                AND candidate_exit_resolver_attempts < ?
-               AND (event_key IS NULL OR event_sequence = (
-                    SELECT MAX(latest.event_sequence) FROM recommendations AS latest
-                     WHERE latest.event_key = recommendations.event_key
-                       AND latest.sample_provenance = recommendations.sample_provenance))
+               AND (event_key IS NULL OR recommendation_id IN ({latest}))
                AND {not_superseded}
              ORDER BY earnings_date ASC, created_at ASC
-            """.format(not_superseded=_NOT_SUPERSEDED_SQL),
+            """.format(not_superseded=_NOT_SUPERSEDED_SQL,
+                       latest=_latest_per_event_sql("event_key, sample_provenance")),
             (
                 sample_provenance,
                 selected_structure,
@@ -1177,10 +1194,7 @@ class RecommendationLedger:
               FROM recommendations
              WHERE sample_provenance = ?{structure_sql}
                AND event_key IS NOT NULL
-               AND event_sequence = (
-                    SELECT MAX(latest.event_sequence) FROM recommendations AS latest
-                     WHERE latest.event_key = recommendations.event_key
-                       AND latest.sample_provenance = recommendations.sample_provenance)
+               AND recommendation_id IN ({_latest_per_event_sql("event_key, sample_provenance")})
                AND {_NOT_SUPERSEDED_SQL}
              ORDER BY earnings_date ASC, symbol ASC
             """,
@@ -1264,8 +1278,7 @@ class RecommendationLedger:
             SELECT COALESCE(NULLIF(recommendation, ''), 'unknown') AS key, COUNT(*) AS n
               FROM recommendations AS r
              WHERE event_key IS NOT NULL
-               AND event_sequence = (SELECT MAX(event_sequence) FROM recommendations
-                                      WHERE event_key = r.event_key)
+               AND recommendation_id IN ({_latest_per_event_sql("event_key")})
                AND {_NOT_SUPERSEDED_SQL}
              GROUP BY COALESCE(NULLIF(recommendation, ''), 'unknown')
              ORDER BY n DESC, key

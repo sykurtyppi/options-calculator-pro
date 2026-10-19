@@ -42,7 +42,9 @@ busy timeout and per-connection WAL pragma.
 """
 from __future__ import annotations
 
+import random
 import sqlite3
+import time
 from pathlib import Path
 from typing import Callable, Union
 
@@ -112,8 +114,33 @@ def open_db_conn(
     conn = sqlite3.connect(str(p), check_same_thread=check_same_thread)
     conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
     if enable_wal:
-        conn.execute("PRAGMA journal_mode=WAL")
+        enable_wal_mode(conn, timeout_ms=busy_timeout_ms)
     return conn
+
+
+def enable_wal_mode(conn: sqlite3.Connection, *, timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS) -> None:
+    """Switch the file to WAL, retrying while another connection holds it.
+
+    Converting the journal mode needs an exclusive lock, and SQLite does not
+    always wait out the busy timeout for it: processes opening a new file at
+    once failed at random with "database is locked". A file already in WAL
+    needs no lock at all.
+    """
+    deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000.0
+    delay = 0.01
+    while True:
+        try:
+            if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                return
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            if time.monotonic() >= deadline:
+                raise
+        time.sleep(delay + random.random() * delay)
+        delay = min(delay * 2, 0.25)
 
 
 def migrate_under_lock(conn: sqlite3.Connection, migrate: Callable[[sqlite3.Connection], None]) -> None:
@@ -139,6 +166,7 @@ def migrate_under_lock(conn: sqlite3.Connection, migrate: Callable[[sqlite3.Conn
 
 __all__ = [
     "DEFAULT_BUSY_TIMEOUT_MS",
+    "enable_wal_mode",
     "migrate_under_lock",
     "open_db_conn",
 ]

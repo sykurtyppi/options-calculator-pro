@@ -30,7 +30,10 @@ V = cc.CONTRACT_VERSION
 TODAY = date(2026, 4, 21)
 CAPTURED = "2026-04-21T20:30:00+00:00"
 CALL, PUT = "AAPL260424C00100000", "AAPL260424P00100000"
-PASSED = {"passed": True, "reasons": [], "contract_version": V}
+# A passing verdict bound to the booked legs (LEGS), as evaluate_quote_contract makes it.
+BOOKED = "AAPL260424C00100000"
+LEGS = {"call": {"contract": BOOKED}}
+PASSED = {"passed": True, "reasons": [], "contract_version": V, "leg_contracts": {"call": BOOKED}}
 
 
 def _quote(*, symbol="AAPL", call=CALL, put=PUT, captured=CAPTURED, day="2026-04-21"):
@@ -53,7 +56,7 @@ def test_a_passed_verdict_that_lists_a_blocking_reason_is_not_a_pass():
     verdict = {"passed": True, "reasons": ["exit_claim_quote_stale"], "contract_version": V}
     allowed, reasons = cc.apply_exit_claim(
         claim_allowed=True, evidence_reasons=[], exit_execution_scenarios={"claim": verdict},
-        entry_contract_version=V, entry_execution_scenarios={"claim": PASSED})
+        entry_contract_version=V, entry_execution_scenarios={"legs": LEGS, "claim": PASSED})
     assert allowed is False
     assert {"claim_exit_verdict_inconsistent", "exit_claim_quote_stale"} <= set(reasons)
 
@@ -72,7 +75,7 @@ def test_a_failed_verdict_with_no_reason_is_inconsistent_too():
 def test_malformed_verdicts_fail_closed_without_reading_strings_as_lists(verdict):
     allowed, reasons = cc.apply_exit_claim(
         claim_allowed=True, evidence_reasons=[], exit_execution_scenarios={"claim": verdict},
-        entry_contract_version=V, entry_execution_scenarios={"claim": PASSED})
+        entry_contract_version=V, entry_execution_scenarios={"legs": LEGS, "claim": PASSED})
     assert allowed is False and "claim_exit_verdict_malformed" in reasons
     assert all(len(reason) > 1 for reason in reasons)          # never one character per "reason"
 
@@ -80,7 +83,7 @@ def test_malformed_verdicts_fail_closed_without_reading_strings_as_lists(verdict
 def test_a_clean_round_trip_still_passes():
     allowed, reasons = cc.apply_exit_claim(
         claim_allowed=True, evidence_reasons=["kept"], exit_execution_scenarios={"claim": PASSED},
-        entry_contract_version=V, entry_execution_scenarios={"claim": PASSED})
+        entry_contract_version=V, entry_execution_scenarios={"legs": LEGS, "claim": PASSED})
     assert (allowed, reasons) == (True, ["kept"])
 
 
@@ -94,7 +97,7 @@ def test_a_clean_round_trip_still_passes():
 def test_the_exit_fold_needs_a_sound_entry_verdict_too(entry, problem):
     allowed, reasons = cc.apply_exit_claim(
         claim_allowed=True, evidence_reasons=[], exit_execution_scenarios={"claim": PASSED},
-        entry_contract_version=V, entry_execution_scenarios={"claim": entry} if entry else {})
+        entry_contract_version=V, entry_execution_scenarios={"legs": LEGS, "claim": entry} if entry else {})
     assert allowed is False and problem in reasons
 
 
@@ -122,11 +125,11 @@ def test_the_outcome_store_does_not_take_a_callers_claim_on_trust(tmp_path):
     assert {"x", "claim_quote_stale"} <= set(json.loads(failing["evidence_quality_reasons_json"]))
 
     old = _insert_outcome(store, "T_OLD", claim_allowed=True, claim_contract_version="conservative_fill_v2",
-                          entry_execution_scenarios={"claim": PASSED})
+                          entry_execution_scenarios={"legs": LEGS, "claim": PASSED})
     assert old["claim_allowed"] == 0
 
     sound = _insert_outcome(store, "T_OK", claim_allowed=True, claim_contract_version=V,
-                            entry_execution_scenarios={"claim": PASSED})
+                            entry_execution_scenarios={"legs": LEGS, "claim": PASSED})
     assert sound["claim_allowed"] == 1
 
     # Not claim-eligible stays as the caller said (False, or never classified).
@@ -136,7 +139,7 @@ def test_the_outcome_store_does_not_take_a_callers_claim_on_trust(tmp_path):
 
 def test_the_baseline_store_does_not_take_a_callers_claim_on_trust(tmp_path):
     store = BaselineEvidenceStore(tmp_path / "b.sqlite")
-    for baseline_id, scenarios in (("B_BARE", None), ("B_OK", {"claim": PASSED})):
+    for baseline_id, scenarios in (("B_BARE", None), ("B_OK", {"legs": LEGS, "claim": PASSED})):
         store.insert_entry(
             recommendation_id=baseline_id, symbol="AAPL", baseline_name="always_straddle", structure="atm_straddle",
             entry_date=TODAY, earnings_date=TODAY + timedelta(days=2), selector_structure=None, entry_mid=4.5,
@@ -154,7 +157,7 @@ def test_the_baseline_store_does_not_take_a_callers_claim_on_trust(tmp_path):
 def test_a_stored_entry_verdict_that_cannot_be_read_fails_the_exit(tmp_path):
     store = OutcomeStore(store_path=tmp_path / "o.sqlite")
     _insert_outcome(store, "T1", claim_allowed=True, claim_contract_version=V,
-                    entry_execution_scenarios={"claim": PASSED})
+                    entry_execution_scenarios={"legs": LEGS, "claim": PASSED})
     store._conn.execute("UPDATE outcome_trades SET entry_execution_scenarios_json = '{broken' WHERE trade_id = 'T1'")
     store._conn.commit()
     store.update_exit(trade_id="T1", exit_date=TODAY + timedelta(days=3), exit_mid=5.0, realized_return_pct=10.0,
@@ -172,7 +175,7 @@ def test_a_baseline_whose_stored_entry_verdict_is_unreadable_fails_its_exit(tmp_
         modeled_cost_pct=None, execution_penalty_at_entry=None, data_quality_score_at_entry=None,
         iv_rv_har_at_entry=None, iv_rv_yz_at_entry=None, quote_source_at_entry="marketdata_app",
         quote_quality_at_entry=None, claim_allowed=True, baseline_id="B1", claim_contract_version=V,
-        entry_execution_scenarios={"claim": PASSED},
+        entry_execution_scenarios={"legs": LEGS, "claim": PASSED},
     )
     store._conn.execute("UPDATE baseline_trades SET entry_execution_scenarios_json = '{broken' WHERE baseline_id = 'B1'")
     store._conn.commit()
@@ -309,7 +312,8 @@ def test_the_exit_pass_binds_the_trades_symbol(tmp_path, monkeypatch, exit_symbo
         trade_id=trade_id, symbol="AAPL", structure="atm_straddle", entry_date=TODAY - timedelta(days=4),
         setup_score=0.6, source_type="paper", earnings_date=earnings, entry_mid=4.5, execution_penalty_at_entry=0.03,
         notes=json.dumps({"pricing_context": {}}), claim_allowed=True, claim_contract_version=V,
-        entry_execution_scenarios={"legs": entry_legs, "claim": PASSED},
+        entry_execution_scenarios={"legs": entry_legs, "claim": {
+            **PASSED, "leg_contracts": {name: leg["contract"] for name, leg in entry_legs.items()}}},
     )
     exit_quote = _quote(symbol=exit_symbol, call=f"{legs_root}260424C00100000", put=f"{legs_root}260424P00100000")
     if exit_symbol is None:

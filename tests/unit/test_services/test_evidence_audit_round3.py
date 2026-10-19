@@ -38,7 +38,9 @@ def _entry(store, i, *, claim):
         entry_date=EXIT - timedelta(days=5), earnings_date=EXIT + timedelta(days=1),
         setup_score=0.6, source_type="paper", entry_mid=2.0, claim_allowed=claim,
         claim_contract_version=CONTRACT_VERSION if claim else None,
-        entry_execution_scenarios={"claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION}},
+        entry_execution_scenarios={"legs": {"call": {"contract": "AAPL260424C00100000"}},
+                                   "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION,
+                                             "leg_contracts": {"call": "AAPL260424C00100000"}}},
     )
 
 

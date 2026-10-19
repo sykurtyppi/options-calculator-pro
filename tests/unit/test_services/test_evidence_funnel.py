@@ -72,6 +72,9 @@ def test_stalled_cycles_are_counted_from_the_latest(funnel):
         cycle = f"c{day}"
         funnel.start_cycle(cycle_run_id=cycle, as_of=TODAY + timedelta(days=day), universe_size=10,
                            discovered=2, discovery_source="x")
+        # A candidate inside the entry window every day: analyzing none is a stall.
+        funnel.record(cycle_run_id=cycle, as_of=TODAY + timedelta(days=day), stage=ef.STAGE_DATA_QUALIFIED,
+                      outcome=ef.OUTCOME_ADVANCED, symbol="A")
         if day == 0:
             funnel.record(cycle_run_id=cycle, as_of=TODAY, stage=ef.STAGE_ANALYZED,
                           outcome=ef.OUTCOME_ADVANCED, symbol="A")
@@ -201,7 +204,9 @@ def _insert_trade(store, symbol, earnings, *, claim_allowed=False, marker="m"):
         execution_penalty_at_entry=0.03, notes=json.dumps({"pricing_context": {"marker": marker}}),
         claim_allowed=claim_allowed, evidence_quality_reasons=["quote_not_execution_grade"],
         claim_contract_version=CONTRACT_VERSION if claim_allowed else None,
-        entry_execution_scenarios={"claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION}},
+        entry_execution_scenarios={"legs": {"call": {"contract": "SHOP260424C00100000"}},
+                                   "claim": {"passed": True, "reasons": [], "contract_version": CONTRACT_VERSION,
+                                             "leg_contracts": {"call": "SHOP260424C00100000"}}},
     )
     return trade_id
 

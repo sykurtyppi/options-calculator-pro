@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from services.execution_scenarios import build_execution_scenarios, compare_execution_scenarios
 
 
@@ -159,11 +161,13 @@ def test_thin_credit_condor_keeps_its_adverse_scenarios() -> None:
         assert out["realized_pnl"][name] is not None, f"{name} P&L was dropped"
     # Adverse fills collected less credit, so they must show a WORSE P&L.
     assert out["realized_pnl"]["cross_50"] < out["realized_pnl"]["mid"]
-    # The RETURN is withheld where the scenario implies the structure was opened
-    # for a DEBIT: capital at risk is no longer the nominal max loss there, so
-    # dividing by it would inflate the ratio by an order of magnitude.
+    # Where the scenario fill is a DEBIT, the capital at risk is the mid-fill
+    # max loss plus the credit the fill gave up (independent audit of bfc48f5:
+    # withholding it dropped those trades from the claimable cohort).
+    # cross_50: base = 1.60 + (0.40 - -0.60) = 2.60, P&L = -0.80/share.
     assert out["realized_return_pct"]["mid"] is not None
-    assert out["realized_return_pct"]["cross_50"] is None
+    assert out["realized_return_pct"]["cross_50"] == pytest.approx(-0.80 / 2.60 * 100.0, abs=1e-5)
+    assert out["realized_return_pct"]["conservative"] == pytest.approx(-0.80 / 2.60 * 100.0, abs=1e-5)
 
 
 def test_non_positive_entry_still_guarded_without_a_risk_base() -> None:

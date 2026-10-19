@@ -375,6 +375,11 @@ class CreditBudget:
         self._now = now
         self._lock = threading.Lock()
         self._conn = open_db_conn(self.store_path)
+        # Autocommit, with explicit BEGIN IMMEDIATE wherever several writes
+        # must hold together: a single write that fails (a lock timeout) can
+        # then never leave an implicit transaction open, which would make
+        # every later BEGIN fail and the healthy ledger look unusable.
+        self._conn.isolation_level = None
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_BUDGET_DDL)
         migrate_under_lock(self._conn, _migrate_budget)
@@ -405,20 +410,29 @@ class CreditBudget:
             " WHERE provider = ? AND reported_reset_at IS NOT NULL ORDER BY reported_reset_at",
             (provider,),
         ).fetchall()
+        last_reset: Optional[datetime] = None
         for row in rows:
-            if datetime.fromisoformat(row["reported_reset_at"]) > now:
+            reset = datetime.fromisoformat(row["reported_reset_at"])
+            if reset > now:
                 return row                   # the earliest reset still ahead: the current window
-        return self._conn.execute(
+            last_reset = reset
+        day_row = self._conn.execute(
             "SELECT reported_limit, reported_remaining, reported_at, reported_reset_at FROM provider_reported_quota"
             " WHERE provider = ? AND budget_day = ? AND reported_reset_at IS NULL", (provider, day),
         ).fetchone()
+        if (day_row is not None and last_reset is not None
+                and datetime.fromisoformat(day_row["reported_at"]) < last_reset):
+            return None                      # reported before the provider's quota reset since
+        return day_row
 
     def _reserved(self, provider: str, day: str, now: datetime) -> float:
         # Every hold counts until it is settled, released or moved to
-        # unreconciled; none silently stops counting when it ages.
+        # unreconciled; none silently stops counting when it ages. A hold
+        # taken before the budget day turned is still in flight, and settles
+        # against the new day, so it counts whatever day it was taken on.
         row = self._conn.execute(
-            "SELECT COALESCE(SUM(credits), 0) FROM provider_credit_reservations"
-            " WHERE provider = ? AND budget_day = ?", (provider, day),
+            "SELECT COALESCE(SUM(credits), 0) FROM provider_credit_reservations WHERE provider = ?",
+            (provider,),
         ).fetchone()
         return float(row[0] or 0.0)
 
@@ -461,7 +475,10 @@ class CreditBudget:
         if reported is not None and reported["reported_remaining"] is not None:
             # The provider's count also includes spend from other clients.
             spent = max(local_spent, limit - float(reported["reported_remaining"]))
-        utilization = spent / limit if limit and limit != float("inf") else 0.0
+        if limit <= 0:
+            utilization = 1.0                # nothing can be admitted: exhausted, not idle
+        else:
+            utilization = spent / limit if limit != float("inf") else 0.0
         if utilization >= 1.0:
             level = "exhausted"
         elif utilization >= QUOTA_CRITICAL_UTILIZATION:
@@ -539,9 +556,16 @@ class CreditBudget:
         if not reservation_id or reservation_id == UNMETERED:
             return
         with self._lock:
-            self._conn.execute("DELETE FROM provider_credit_reservations WHERE reservation_id = ?",
-                               (reservation_id,))
-            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                # A hold that outlived the TTL was moved to unreconciled; its
+                # call has now reported, so it is no longer unknown.
+                for table in ("provider_credit_reservations", "provider_credit_unreconciled"):
+                    self._conn.execute(f"DELETE FROM {table} WHERE reservation_id = ?", (reservation_id,))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def settle(self, reservation_id: Optional[str], provider: str, priority: str, credits: float, *,
                reported_limit: Optional[float] = None, reported_remaining: Optional[float] = None,
@@ -558,8 +582,8 @@ class CreditBudget:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if reservation_id and reservation_id != UNMETERED:
-                    self._conn.execute("DELETE FROM provider_credit_reservations WHERE reservation_id = ?",
-                                       (reservation_id,))
+                    for table in ("provider_credit_reservations", "provider_credit_unreconciled"):
+                        self._conn.execute(f"DELETE FROM {table} WHERE reservation_id = ?", (reservation_id,))
                 self._bump_locked(provider, priority, now, credits=max(0.0, float(credits)), requests=1)
                 self._record_quota_locked(provider, now, reported_limit, reported_remaining, reported_reset_at)
                 self._conn.commit()
@@ -609,6 +633,17 @@ class CreditBudget:
         if reported_limit is None and reported_remaining is None:
             return
         reset_iso = reported_reset_at.astimezone(timezone.utc).isoformat() if reported_reset_at else None
+        if reset_iso is None:
+            # A response without a reset time (e.g. a quota 429 with no
+            # headers) belongs to the window the provider last told us is
+            # current, if one still is; else to the budget day.
+            active = self._conn.execute(
+                "SELECT reported_reset_at FROM provider_reported_quota"
+                " WHERE provider = ? AND reported_reset_at > ? ORDER BY reported_reset_at LIMIT 1",
+                (provider, now.astimezone(timezone.utc).isoformat()),
+            ).fetchone()
+            if active is not None:
+                reset_iso = str(active[0])
         window = f"reset:{reset_iso}" if reset_iso is not None else budget_day(now)
         prior = self._conn.execute(
             "SELECT reported_limit, reported_remaining FROM provider_reported_quota"
@@ -734,7 +769,10 @@ def unmetered_exit_calls(*, since: datetime, log_path: Optional[Path] = None) ->
         try:
             item = json.loads(line)
             when = datetime.fromisoformat(str(item.get("at")))
-        except (ValueError, TypeError):
+            if when.tzinfo is None:
+                raise ValueError("timestamp without a timezone")
+        except (ValueError, TypeError, AttributeError):
+            # Malformed, foreign or timezone-less: counted, never a crash.
             out.append({"at": None, "unreadable": True})
             continue
         if when >= since:
@@ -841,14 +879,24 @@ class ResponseCache:
             self._conn.close()
 
     def get(self, key: str) -> Optional[Any]:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT payload, expires_at FROM provider_response_cache WHERE cache_key = ?", (key,)
-            ).fetchone()
-        if row is None or float(row[1]) <= self._clock():
+        found = self.get_with_age(key)
+        return None if found is None else found[0]
+
+    def get_with_age(self, key: str) -> Optional[tuple]:
+        """(payload, seconds since it was stored), or None if absent or expired."""
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT payload, expires_at, stored_at FROM provider_response_cache WHERE cache_key = ?", (key,)
+                ).fetchone()
+        except sqlite3.Error:
+            logger.warning("provider response cache: could not read %s", key, exc_info=True)
+            return None
+        now = self._clock()
+        if row is None or float(row[1]) <= now:
             return None
         try:
-            return json.loads(row[0])
+            return json.loads(row[0]), max(0.0, now - float(row[2]))
         except (TypeError, ValueError):
             return None
 
@@ -858,12 +906,20 @@ class ResponseCache:
         except (TypeError, ValueError):
             return
         now = self._clock()
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO provider_response_cache (cache_key, stored_at, expires_at, payload) "
-                "VALUES (?, ?, ?, ?)", (key, now, now + float(ttl_seconds), text),
-            )
-            self._conn.commit()
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO provider_response_cache (cache_key, stored_at, expires_at, payload) "
+                    "VALUES (?, ?, ?, ?)", (key, now, now + float(ttl_seconds), text),
+                )
+                self._conn.commit()
+        except sqlite3.Error:
+            # An optimisation: a response already paid for is never lost to it.
+            logger.warning("provider response cache: could not store %s", key, exc_info=True)
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
 
 
 _cache: Optional[ResponseCache] = None

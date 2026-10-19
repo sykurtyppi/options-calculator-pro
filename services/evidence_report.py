@@ -24,7 +24,7 @@ from services.baseline_evidence_store import (
     is_booked_strike_exit,
 )
 from services.data_quality_diagnostics import build_data_quality_diagnostics
-from services.event_reconciliation import drop_superseded, superseded_keys
+from services.event_reconciliation import drop_superseded, one_trade_per_event, superseded_keys
 from services.evidence_maturity import build_evidence_maturity
 from services.evidence_statistics import (
     METHOD_NOTE,
@@ -83,8 +83,8 @@ def build_evidence_report(
     # Forward evidence only: seeded replay/backtest rows share the store but
     # are never forward evidence (they would otherwise fill the gate's day
     # span, resolved count and calibration buckets). Counted separately below.
-    outcomes = drop_superseded(
-        outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward"), superseded)
+    outcomes, _ = one_trade_per_event(drop_superseded(
+        outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward"), superseded))
     invalidated = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid", source="forward")
     replay_rows = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="replay")
     selected = [row for row in outcomes if _is_resolved(row)]
@@ -568,6 +568,9 @@ def _evidence_quality_summary(
     outcome_rows = list(outcomes)
     baseline_rows = list(baselines)
     all_rows = outcome_rows + baseline_rows
+    resolved_rows = [row for row in outcome_rows if _is_resolved(row)] + [
+        row for row in baseline_rows if str(row.get("status") or "") == "resolved"]
+    resolved_ids = {id(row) for row in resolved_rows}
     return {
         "selector_status_counts": _count_by(
             outcome_rows,
@@ -577,9 +580,13 @@ def _evidence_quality_summary(
             baseline_rows,
             lambda row: row.get("evidence_quality_status") or "legacy_unclassified",
         ),
-        # Claims count only under the current claim contract (see claim_contract).
-        "claim_allowed_count": sum(1 for row in all_rows if claimable_under_current_contract(row)),
-        "claim_blocked_count": sum(1 for row in all_rows if claimable_under_current_contract(row) is False),
+        # Claims count only under the current claim contract (see claim_contract),
+        # and only on resolved outcomes: an open entry is claim-eligible, not
+        # claimed evidence (counting it hid the "no claimable evidence" warning).
+        "claim_allowed_count": sum(1 for row in resolved_rows if claimable_under_current_contract(row)),
+        "claim_blocked_count": sum(1 for row in resolved_rows if claimable_under_current_contract(row) is False),
+        "claim_eligible_unresolved_count": sum(
+            1 for row in all_rows if claimable_under_current_contract(row) and id(row) not in resolved_ids),
         "execution_grade_count": sum(1 for row in all_rows if _truthy(row.get("execution_grade"))),
         "record_only_count": sum(1 for row in all_rows if row.get("evidence_quality_status") == "record_only"),
         "degraded_count": sum(1 for row in all_rows if row.get("evidence_quality_status") == "degraded_evidence"),
@@ -615,6 +622,9 @@ def _surface_quality_summary(
     outcome_rows = list(outcomes)
     baseline_rows = list(baselines)
     all_rows = outcome_rows + baseline_rows
+    resolved_rows = [row for row in outcome_rows if _is_resolved(row)] + [
+        row for row in baseline_rows if str(row.get("status") or "") == "resolved"]
+    resolved_ids = {id(row) for row in resolved_rows}
     return {
         "selector_status_counts": _count_by(outcome_rows, lambda row: row.get("surface_quality_status") or "legacy_unclassified"),
         "baseline_status_counts": _count_by(baseline_rows, lambda row: row.get("surface_quality_status") or "legacy_unclassified"),

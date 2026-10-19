@@ -175,7 +175,10 @@ def test_the_dropped_count_survives_a_store_that_stays_unwritable(tmp_path, funn
     funnel.note_dropped_write(cycle_run_id="c1", as_of=TODAY)
     monkeypatch.setattr(funnel, "finish_cycle", _locked)
     status = ef.safe_finish_cycle(funnel, cycle_run_id="c1", as_of=TODAY)
-    assert status == {"status": "degraded", "dropped_writes": 1, "dropped_writes_persisted": False}
+    # Kept beside the store (which is what failed) and absorbed once it is writable.
+    assert status == {"status": "degraded", "dropped_writes": 1, "dropped_writes_persisted": True}
+    monkeypatch.undo()
+    assert ef.build_evidence_funnel_health(store=funnel, as_of=TODAY)["summary"]["dropped_writes_7d"] == 1
 
 
 # ── cohort-valid conversion ─────────────────────────────────────────────────
