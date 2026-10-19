@@ -866,7 +866,7 @@ class ResponseCache:
             self._conn.commit()
 
 
-_cache: Optional[ResponseCache] = None
+_caches: Dict[Path, ResponseCache] = {}
 _cache_lock = threading.Lock()
 
 
@@ -875,24 +875,35 @@ def disk_cache_enabled() -> bool:
 
 
 def get_response_cache(store_path: Optional[Path] = None) -> Optional[ResponseCache]:
-    global _cache
     if store_path is None and not disk_cache_enabled():
         return None
-    if _cache is None or store_path is not None:
-        with _cache_lock:
-            if _cache is None or store_path is not None:
-                try:
-                    _cache = ResponseCache(store_path or _DEFAULT_CACHE_STORE)
-                except Exception:  # noqa: BLE001 - the cache is an optimisation
-                    logger.debug("provider response cache unavailable", exc_info=True)
-                    return None
-    return _cache
+    path = Path(store_path or _DEFAULT_CACHE_STORE).expanduser().resolve()
+    with _cache_lock:
+        if path not in _caches:
+            try:
+                _caches[path] = ResponseCache(path)
+            except Exception:  # noqa: BLE001 - the cache is an optimisation
+                logger.debug("provider response cache unavailable", exc_info=True)
+                return None
+        return _caches[path]
+
+
+def reset_response_caches() -> None:
+    """Close and forget process-local cache handles (primarily test cleanup)."""
+    with _cache_lock:
+        caches = list(_caches.values())
+        _caches.clear()
+    for cache in caches:
+        try:
+            cache.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            logger.debug("provider response cache close failed", exc_info=True)
 
 
 __all__ = [
     "PRIORITIES", "PRIORITY_CEILINGS", "PRIORITY_DISCOVERY", "PRIORITY_ENTRY", "PRIORITY_EXIT",
     "SKIP_BUDGET", "SKIP_BUDGET_UNAVAILABLE", "SKIP_CIRCUIT_OPEN", "CircuitBreaker", "CreditBudget", "ResponseCache",
     "blocked_reason", "build_provider_budget_health", "current_priority", "current_skips", "get_breaker", "get_credit_budget",
-    "get_response_cache", "note_skip", "reliability_status", "request_priority", "reset_breakers",
+    "get_response_cache", "note_skip", "reliability_status", "request_priority", "reset_breakers", "reset_response_caches",
     "retry_delay", "skip_log_scope", "start_skip_log", "unmetered_exit_allowed", "unmetered_exit_calls",
 ]

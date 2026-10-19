@@ -328,6 +328,21 @@ def test_disk_cache_entries_expire():
         cache.close()
 
 
+def test_custom_response_cache_does_not_replace_default_singleton(tmp_path, monkeypatch):
+    default_path = tmp_path / "default.sqlite"
+    custom_path = tmp_path / "custom.sqlite"
+    monkeypatch.setattr(pr, "_DEFAULT_CACHE_STORE", default_path)
+    pr.reset_response_caches()
+    try:
+        custom = pr.get_response_cache(custom_path)
+        default = pr.get_response_cache()
+        assert custom is pr.get_response_cache(custom_path)
+        assert default is pr.get_response_cache()
+        assert custom is not default
+    finally:
+        pr.reset_response_caches()
+
+
 # ── the forward loop: priorities and funnel dispositions ────────────────────
 
 TODAY = date(2026, 4, 21)

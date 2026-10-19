@@ -69,6 +69,39 @@ def test_a_sent_alert_moves_through_the_outbox_and_is_not_resent(tmp_path):
     assert code == 0 and calls == []
 
 
+def test_main_closes_outbox_on_success(tmp_path, monkeypatch):
+    real = ob.AlertOutbox(tmp_path / "premarket_alert_outbox.sqlite")
+    closed = []
+    original_close = real.close
+
+    def close():
+        closed.append(True)
+        original_close()
+
+    real.close = close
+    monkeypatch.setattr(alert, "AlertOutbox", lambda _path: real)
+    code, _ = _run(tmp_path)
+    assert code == 0
+    assert closed == [True]
+
+
+def test_main_closes_outbox_when_reservation_raises(tmp_path, monkeypatch):
+    real = ob.AlertOutbox(tmp_path / "premarket_alert_outbox.sqlite")
+    closed = []
+    original_close = real.close
+    real.reserve = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+
+    def close():
+        closed.append(True)
+        original_close()
+
+    real.close = close
+    monkeypatch.setattr(alert, "AlertOutbox", lambda _path: real)
+    with pytest.raises(RuntimeError, match="boom"):
+        _run(tmp_path)
+    assert closed == [True]
+
+
 def test_a_state_write_failure_after_the_send_does_not_resend(tmp_path):
     with patch.object(alert, "_save_state", side_effect=OSError("disk full")):
         code, calls = _run(tmp_path)

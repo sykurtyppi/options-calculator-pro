@@ -308,6 +308,13 @@ def test_drop_superseded_keeps_rows_without_a_key():
     assert drop_superseded(rows, {"B|2026-04-28": "B|2026-05-05"}) == [rows[0]]
 
 
+def test_same_as_of_date_correction_supersedes_the_old_event_key(ledger):
+    ledger.record(_record("AAPL", "2026-10-25", "2026-10-19"))
+    ledger.record(_record("AAPL", "2026-10-27", "2026-10-19"))
+    assert ledger.superseded_event_keys()["AAPL|2026-10-25"] == "AAPL|2026-10-27"
+    assert ledger.event_id_for("AAPL|2026-10-27") == "AAPL|2026-10-25"
+
+
 def test_the_evidence_report_counts_only_current_date_evidence(moved):
     from services.evidence_report import build_evidence_report
 

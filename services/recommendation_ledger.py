@@ -199,6 +199,9 @@ CREATE INDEX IF NOT EXISTS idx_event_identity_event ON event_identity (event_id)
 # Two dates for one symbol this close together are one event that moved
 # (earnings are quarterly, so distinct events sit ~90 days apart).
 EVENT_MOVE_WINDOW_DAYS = 30
+# Same-cycle corrections are only inferred close to the event. This avoids
+# collapsing synthetic/backfilled rows that happen to share an as-of date.
+SAME_AS_OF_MOVE_MAX_DTE = 14
 
 # SQL fragment: keep rows whose event has not been superseded.
 _NOT_SUPERSEDED_SQL = (
@@ -389,8 +392,8 @@ def _supersede_moved_events(cur: sqlite3.Cursor, record: "RecommendationRecord",
     the key the event was first seen under). A new key joins the event whose
     *current* key it moved from (see ``is_moved_event_date``): later
     information moves the date, and older information recorded late (a
-    replay, a backfill) joins too. Two dates seen on the same day are
-    ambiguous and both stand. Because a key keeps its identity, a chain of
+    replay, a backfill) joins too. A correction seen on the same as-of day
+    joins the prior key, with the later recorded key current. Because a key keeps its identity, a chain of
     moves (A -> B -> C) and a move back (C -> A) stay one event.
 
     The event's current key is the one analyzed at the latest as_of (then the
@@ -412,7 +415,13 @@ def _supersede_moved_events(cur: sqlite3.Cursor, record: "RecommendationRecord",
         for group_id, members in groups.items():
             current = members[0]
             current_date, current_as_of = current["event_key"].split("|", 1)[1], current["latest_as_of"]
-            if current_as_of < as_of and is_moved_event_date(current_date, new_date, as_of=as_of):
+            as_of_day = _parse_day(as_of)
+            new_day = _parse_day(new_date)
+            same_as_of_correction = (
+                current_as_of == as_of and as_of_day is not None and new_day is not None
+                and 0 <= (new_day - as_of_day).days <= SAME_AS_OF_MOVE_MAX_DTE
+            )
+            if (current_as_of < as_of or same_as_of_correction) and is_moved_event_date(current_date, new_date, as_of=as_of):
                 joinable.append((current_as_of, group_id))
             elif current_as_of > as_of and is_moved_event_date(new_date, current_date, as_of=current_as_of):
                 joinable.append((current_as_of, group_id))

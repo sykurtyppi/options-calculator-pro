@@ -260,6 +260,23 @@ def _verdict_reasons(verdict: Any) -> list[str]:
     return [reason for reason in reasons if isinstance(reason, str)] if isinstance(reasons, list) else []
 
 
+def _claim_flag(value: Any) -> Optional[bool]:
+    """Normalize only explicit, historically accepted boolean representations."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return False
+
+
 def entry_claim_status(
     *, claim_allowed: Any, claim_contract_version: Any, entry_execution_scenarios: Any,
 ) -> tuple[Optional[bool], list[str]]:
@@ -269,8 +286,9 @@ def entry_claim_status(
     entry verdict (``entry_execution_scenarios["claim"]``) made under this
     CONTRACT_VERSION, recorded under that same version.
     """
-    if claim_allowed is None or not bool(claim_allowed):
-        return (None if claim_allowed is None else False), []
+    normalized = _claim_flag(claim_allowed)
+    if normalized is not True:
+        return normalized, []
     verdict = entry_execution_scenarios.get("claim") if isinstance(entry_execution_scenarios, Mapping) else None
     problems = verdict_problems(verdict, side="entry")
     if not problems and not verdict["passed"]:
@@ -318,8 +336,9 @@ def apply_exit_claim(
     that was never claim-eligible is left as it was.
     """
     reasons = [str(reason) for reason in evidence_reasons if isinstance(reason, str)]
-    if claim_allowed is None or not bool(claim_allowed):
-        return (None if claim_allowed is None else False), reasons
+    normalized = _claim_flag(claim_allowed)
+    if normalized is not True:
+        return normalized, reasons
     entry_allowed, entry_problems = entry_claim_status(
         claim_allowed=claim_allowed, claim_contract_version=entry_contract_version,
         entry_execution_scenarios=entry_execution_scenarios)
@@ -335,9 +354,9 @@ def claimable_under_current_contract(row: Mapping[str, Any]) -> Optional[bool]:
     CONTRACT_VERSION, so claims made under different rules are never pooled.
     None when the row never had a claim status."""
     raw = row.get("claim_allowed")
-    if raw is None:
+    allowed = _claim_flag(raw)
+    if allowed is None:
         return None
-    allowed = str(raw).strip().lower() in {"1", "true", "yes"} if isinstance(raw, str) else bool(raw)
     return allowed and row.get("claim_contract_version") == CONTRACT_VERSION
 
 
@@ -354,7 +373,10 @@ def _parse_time(value: Any) -> Optional[datetime]:
     if value is None or value == "" or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc) if math.isfinite(float(value)) else None
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc) if math.isfinite(float(value)) else None
+        except (OverflowError, OSError, ValueError):
+            return None
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:

@@ -190,6 +190,35 @@ def test_a_dry_run_records_nothing(tmp_path, funnel):
     assert funnel.events() == []
 
 
+def test_same_symbol_different_event_dates_keep_distinct_discovery_rows(tmp_path, funnel):
+    rows = [
+        {"symbol": "AAPL", "status": "ranked", "dte": 30, "earnings_date": "2026-05-21"},
+        {"symbol": "AAPL", "status": "ranked", "dte": 31, "earnings_date": "2026-05-22"},
+    ]
+    _run_entries(tmp_path, funnel, rows, {}, {})
+    discovered = [e for e in funnel.events("cycle-1") if e["stage"] == ef.STAGE_DISCOVERED]
+    assert [(e["symbol"], e["earnings_date"]) for e in discovered] == [
+        ("AAPL", "2026-05-21"), ("AAPL", "2026-05-22")]
+
+
+def test_same_symbol_different_event_dates_stay_distinct_in_conversion_metrics(funnel):
+    subjects = ("AAPL|2026-05-21", "AAPL|2026-05-22")
+    for subject in subjects:
+        funnel.record(cycle_run_id="c1", as_of=TODAY, stage=ef.STAGE_DISCOVERED,
+                      outcome=ef.OUTCOME_ADVANCED, symbol="AAPL", subject=subject)
+    funnel.record(cycle_run_id="c1", as_of=TODAY, stage=ef.STAGE_DATA_QUALIFIED,
+                  outcome=ef.OUTCOME_ADVANCED, symbol="AAPL", subject=subjects[0])
+    funnel.record(cycle_run_id="c1", as_of=TODAY, stage=ef.STAGE_DATA_QUALIFIED,
+                  outcome=ef.OUTCOME_DROPPED, symbol="AAPL", subject=subjects[1],
+                  reason=ef.REASON_TOO_LATE)
+
+    transition = funnel.summarize()["transitions"]["discovered->data_qualified"]
+    assert transition == {
+        "basis": "candidate_pass", "cohort": 2, "advanced": 1, "stopped": 1,
+        "deferred": 0, "open": 0, "rate": 0.5,
+    }
+
+
 # ── exit stages and claimability ────────────────────────────────────────────
 
 
