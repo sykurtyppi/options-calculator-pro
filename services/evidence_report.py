@@ -24,7 +24,7 @@ from services.baseline_evidence_store import (
     is_booked_strike_exit,
 )
 from services.data_quality_diagnostics import build_data_quality_diagnostics
-from services.event_reconciliation import drop_superseded, superseded_keys
+from services.event_reconciliation import drop_superseded, one_trade_per_event, superseded_keys
 from services.evidence_maturity import build_evidence_maturity
 from services.evidence_statistics import (
     METHOD_NOTE,
@@ -83,8 +83,8 @@ def build_evidence_report(
     # Forward evidence only: seeded replay/backtest rows share the store but
     # are never forward evidence (they would otherwise fill the gate's day
     # span, resolved count and calibration buckets). Counted separately below.
-    outcomes = drop_superseded(
-        outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward"), superseded)
+    outcomes, _ = one_trade_per_event(drop_superseded(
+        outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="forward"), superseded))
     invalidated = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="invalid", source="forward")
     replay_rows = outcome_obj.list_for_diagnostics(limit=max_rows, evidence="valid", source="replay")
     selected = [row for row in outcomes if _is_resolved(row)]

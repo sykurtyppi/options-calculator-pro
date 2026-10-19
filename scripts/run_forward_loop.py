@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -156,11 +156,14 @@ def _provider_skip_reason() -> Optional[str]:
 
 
 def _recheck_rows(funnel_store: Optional[EvidenceFunnelStore], *, as_of: date, cycle_id: str,
-                  discovered_rows: list[Dict[str, Any]], summary: Dict[str, Any]) -> list[Dict[str, Any]]:
+                  discovered_rows: list[Dict[str, Any]], summary: Dict[str, Any],
+                  trade_store: Any = None) -> list[Dict[str, Any]]:
     """Re-checks due today that discovery did not surface, as discovery rows.
 
     Pending re-checks whose entry window has already closed expire here with a
-    funnel drop, so every deferred event ends with a recorded outcome.
+    funnel drop, so every deferred event ends with a recorded outcome. One
+    whose event was entered (its close was lost to a failed write) is closed
+    as done instead.
     """
     if funnel_store is None:
         return []
@@ -176,6 +179,14 @@ def _recheck_rows(funnel_store: Optional[EvidenceFunnelStore], *, as_of: date, c
         if item["symbol"] in surfaced:
             continue  # discovery listed it today: the entry pass decides (and closes) it
         earnings = _parse_date(item.get("earnings_date"))
+        finder = getattr(trade_store, "find_active_trade_for_event", None)
+        if earnings is not None and callable(finder) and finder(symbol=item["symbol"], earnings_date=earnings):
+            try:
+                funnel_store.close_recheck(symbol=item["symbol"], earnings_date=item["earnings_date"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("forward_loop: could not close re-check for %s: %s", item["symbol"], exc)
+                funnel_mod.note_dropped_write(funnel_store, cycle_run_id=cycle_id, as_of=as_of)
+            continue
         dte = (earnings - as_of).days if earnings is not None else None
         if dte is None or dte < DTE_MIN_DEFAULT:
             try:
@@ -186,8 +197,7 @@ def _recheck_rows(funnel_store: Optional[EvidenceFunnelStore], *, as_of: date, c
                 funnel_mod.note_dropped_write(funnel_store, cycle_run_id=cycle_id, as_of=as_of)
                 continue
             summary["rechecks_expired"] += 1
-            stage = (funnel_mod.STAGE_DATA_QUALIFIED if item.get("reason") == funnel_mod.REASON_TOO_EARLY
-                     else funnel_mod.STAGE_RECORDED)
+            stage = _recheck_stage(item.get("reason"))
             funnel_mod.safe_record(
                 funnel_store, cycle_run_id=cycle_id, as_of=as_of, stage=stage,
                 outcome=funnel_mod.OUTCOME_DROPPED, symbol=item["symbol"], earnings_date=item["earnings_date"],
@@ -209,8 +219,12 @@ def _recheck_rows(funnel_store: Optional[EvidenceFunnelStore], *, as_of: date, c
 
 
 def _schedule_recheck(funnel_store: Optional[EvidenceFunnelStore], *, symbol: str, earnings_date: Optional[date],
-                      recheck_on: date, reason: str, as_of: date) -> bool:
-    """Defer an event to ``recheck_on`` if that is still inside its entry window."""
+                      recheck_on: date, reason: str, as_of: date, cycle_run_id: Optional[str] = None) -> bool:
+    """Defer an event to ``recheck_on`` if that is still inside its entry window.
+
+    False when it was not scheduled; a failed write also counts as a dropped
+    funnel write, so the cycle reports degraded instead of passing silently.
+    """
     if funnel_store is None or earnings_date is None:
         return False
     if (earnings_date - recheck_on).days < DTE_MIN_DEFAULT:
@@ -220,11 +234,23 @@ def _schedule_recheck(funnel_store: Optional[EvidenceFunnelStore], *, symbol: st
                                       reason=reason, as_of=as_of)
     except Exception as exc:  # noqa: BLE001
         logger.warning("forward_loop: could not schedule re-check for %s: %s", symbol, exc)
+        funnel_mod.note_dropped_write(funnel_store, cycle_run_id=cycle_run_id, as_of=as_of)
         return False
     return True
 
 
-def _close_rechecks(funnel_store: Optional[EvidenceFunnelStore], symbol: str, *earnings_dates: Any) -> list:
+def _recheck_stage(reason: Any) -> str:
+    """The funnel stage an expired re-check was deferred at (its drop lands there)."""
+    text = str(reason or "")
+    if text == funnel_mod.REASON_TOO_EARLY:
+        return funnel_mod.STAGE_DATA_QUALIFIED
+    if text.startswith(funnel_mod.REASON_ANALYZER_ERROR):
+        return funnel_mod.STAGE_ANALYZED
+    return funnel_mod.STAGE_RECORDED
+
+
+def _close_rechecks(funnel_store: Optional[EvidenceFunnelStore], symbol: str, *earnings_dates: Any,
+                    cycle_run_id: Optional[str] = None, as_of: Optional[date] = None) -> list:
     """Close the event's pending re-check (it was analyzed); returns its earlier attempts."""
     if funnel_store is None:
         return []
@@ -233,7 +259,9 @@ def _close_rechecks(funnel_store: Optional[EvidenceFunnelStore], symbol: str, *e
         try:
             closed = funnel_store.close_recheck(symbol=symbol, earnings_date=earnings)
         except Exception as exc:  # noqa: BLE001
+            # Left pending, it would later expire as a drop: say so now.
             logger.warning("forward_loop: could not close re-check for %s: %s", symbol, exc)
+            funnel_mod.note_dropped_write(funnel_store, cycle_run_id=cycle_run_id, as_of=as_of)
             continue
         if closed:
             attempts.extend(closed.get("attempts", []))
@@ -1943,11 +1971,14 @@ def _finalize_baseline_exits(
     log_path: Path,
     dry_run: bool,
     mda_client: Any,
+    current_event: Callable[[Mapping[str, Any]], bool] = lambda row: True,
 ) -> Dict[str, int]:
     summary = {"baseline_exits": 0, "baseline_skipped": 0, "baseline_exit_missing": 0}
     if not dry_run:
         summary["baseline_exit_missing"] = len(baseline_store.mark_missing_exits(as_of))
     for row in baseline_store.baselines_due_for_exit(as_of):
+        if not current_event(row):
+            continue
         entry_mid = _safe_float(row.get("entry_mid"))
         earnings_date = _parse_date(row.get("earnings_date"))
         if entry_mid is None or entry_mid <= 0 or earnings_date is None:
@@ -2160,7 +2191,7 @@ def _run_forward_screener(
     # Deferred events due today are analyzed even if discovery missed them.
     candidate_rows = list(screener_payload.get("rows", []))
     candidate_rows += _recheck_rows(funnel_store, as_of=as_of, cycle_id=cycle_id,
-                                    discovered_rows=candidate_rows, summary=summary)
+                                    discovered_rows=candidate_rows, summary=summary, trade_store=trade_store)
     funnel_mod.safe_start_cycle(
         funnel_store,
         cycle_run_id=cycle_id,
@@ -2216,12 +2247,12 @@ def _run_forward_screener(
             summary["outside_dte_window"] += 1
             row_earnings = _parse_date(row.get("earnings_date"))
             recheck_on = row_earnings - timedelta(days=DTE_MAX_DEFAULT) if row_earnings is not None else None
-            if recheck_on is not None and _schedule_recheck(
-                    funnel_store, symbol=symbol, earnings_date=row_earnings, recheck_on=recheck_on,
-                    reason=funnel_mod.REASON_TOO_EARLY, as_of=as_of):
-                summary["rechecks_scheduled"] += 1
+            scheduled = recheck_on is not None and _schedule_recheck(
+                funnel_store, symbol=symbol, earnings_date=row_earnings, recheck_on=recheck_on,
+                reason=funnel_mod.REASON_TOO_EARLY, as_of=as_of, cycle_run_id=cycle_id)
+            summary["rechecks_scheduled"] += int(scheduled)
             _funnel(funnel_mod.STAGE_DATA_QUALIFIED, funnel_mod.OUTCOME_DEFERRED, funnel_mod.REASON_TOO_EARLY,
-                    detail={"dte": int(dte), "recheck_on": recheck_on.isoformat() if recheck_on else None})
+                    detail={"dte": int(dte), "recheck_on": recheck_on.isoformat() if scheduled else None})
             continue
         if int(dte) < DTE_MIN_DEFAULT:
             summary["outside_dte_window"] += 1
@@ -2262,7 +2293,7 @@ def _run_forward_screener(
             # next cycle while the event is still in its entry window.
             retry_on = as_of + timedelta(days=1)
             retried = _schedule_recheck(funnel_store, symbol=symbol, earnings_date=_parse_date(row.get("earnings_date")),
-                                        recheck_on=retry_on, reason=reason, as_of=as_of)
+                                        recheck_on=retry_on, reason=reason, as_of=as_of, cycle_run_id=cycle_id)
             summary["rechecks_scheduled"] += int(retried)
             _funnel(funnel_mod.STAGE_ANALYZED, funnel_mod.OUTCOME_ERROR, reason,
                     detail=_with_provider_skips({"error": str(exc)[:300],
@@ -2289,7 +2320,8 @@ def _run_forward_screener(
             selected_structure=structure,
         )
         # Analyzed: any re-check that brought it here is done.
-        prior_attempts = _close_rechecks(funnel_store, symbol, row.get("earnings_date"), earnings_date)
+        prior_attempts = _close_rechecks(funnel_store, symbol, row.get("earnings_date"), earnings_date,
+                                         cycle_run_id=cycle_id, as_of=as_of)
         if earnings_date is not None and _iso_or_none(row.get("earnings_date")) != earnings_date.isoformat():
             # Analysis found a different date than discovery: the event moved.
             _supersede_rechecks(funnel_store, symbol, earnings_date, as_of=as_of, summary=summary)
@@ -2386,9 +2418,10 @@ def _run_forward_screener(
         _funnel(funnel_mod.STAGE_ELIGIBLE, funnel_mod.OUTCOME_ADVANCED, recommendation_id=recommendation_id,
                 earnings_date=earnings_date, detail={"recommendation": recommendation, "structure": structure})
 
+        # One paper trade per event, whatever structure a later analysis
+        # prefers: a second one is not independent evidence.
         existing = trade_store.find_active_trade_for_event(
             symbol=symbol,
-            structure=structure,
             earnings_date=earnings_date,
         )
         if existing is not None:
@@ -2462,7 +2495,8 @@ def _run_forward_screener(
             retry_on = as_of + timedelta(days=1)
             retried = _schedule_recheck(funnel_store, symbol=symbol,
                                         earnings_date=earnings_date or _parse_date(row.get("earnings_date")),
-                                        recheck_on=retry_on, reason=missing_reason, as_of=as_of)
+                                        recheck_on=retry_on, reason=missing_reason, as_of=as_of,
+                                        cycle_run_id=cycle_id)
             summary["rechecks_scheduled"] += int(retried)
             _funnel(funnel_mod.STAGE_RECORDED,
                     funnel_mod.OUTCOME_DEFERRED if retried else funnel_mod.OUTCOME_DROPPED,
@@ -2701,6 +2735,33 @@ def _realized_trade_math(
     return gross_return_pct, pnl_per_share * 100.0, expansion_pct
 
 
+def _current_event_filter(ledger: Any, summary: Dict[str, Any]) -> Callable[[Mapping[str, Any]], bool]:
+    """A row predicate: is the row's event key current (not superseded)?
+
+    Counts refusals in ``summary["superseded_skipped"]``. When the ledger's
+    superseded keys cannot be read, every row is refused and the error is
+    recorded in ``summary["event_identity_error"]``.
+    """
+    from services.event_reconciliation import superseded_keys
+    from services.recommendation_ledger import get_recommendation_ledger, make_event_key
+
+    try:
+        superseded: Optional[Dict[str, str]] = superseded_keys(ledger or get_recommendation_ledger())
+    except Exception as exc:  # noqa: BLE001
+        logger.error("forward_loop: superseded event keys unreadable; no exits this cycle: %s", exc)
+        summary["event_identity_error"] = f"{type(exc).__name__}: {exc}"
+        superseded = None
+
+    def current(row: Mapping[str, Any]) -> bool:
+        key = make_event_key(row.get("symbol"), row.get("earnings_date"))
+        if superseded is None or (key is not None and key in superseded):
+            summary["superseded_skipped"] = int(summary.get("superseded_skipped") or 0) + 1
+            return False
+        return True
+
+    return current
+
+
 def run_exit_detection(*, cycle_run_id: Optional[str] = None, today: Optional[date] = None,
                        **kwargs: Any) -> Dict[str, int]:
     """Exit pass; telemetry carries the run id and the trade being exited."""
@@ -2723,11 +2784,18 @@ def _run_exit_detection(
     mda_client: Any = None,
     funnel: Optional[EvidenceFunnelStore] = None,
     cycle_run_id: Optional[str] = None,
+    ledger: Any = None,
 ) -> Dict[str, int]:
     as_of = today or date.today()
     trade_store = store or OutcomeStore()
     summary = {"exits": 0, "skipped": 0, "exit_missing": 0, "refinalized": 0, "learning_retried": 0,
-               "baseline_exits": 0, "baseline_skipped": 0}
+               "baseline_exits": 0, "baseline_skipped": 0, "superseded_skipped": 0}
+    # Evidence filed under a superseded earnings date is never exited or
+    # learned, whether or not this cycle's reconciliation managed to
+    # invalidate it. If the superseded keys cannot be read, no exit runs
+    # (fail closed: an unexited trade becomes visible attrition, a wrongly
+    # exited one would reach the learning stores).
+    current_event = _current_event_filter(ledger, summary)
     funnel_store = None if dry_run else funnel_mod.open_evidence_funnel(funnel)
     cycle_id = cycle_run_id or funnel_mod.new_cycle_run_id(as_of)
 
@@ -2787,6 +2855,8 @@ def _run_exit_detection(
         # lost its claim after the exit write) are completed from the stored
         # facts; no quote is re-fetched and the exit day is not moved.
         for pending in trade_store.trades_pending_finalization(as_of):
+            if not current_event(pending):
+                continue
             pending_id = str(pending["trade_id"])
             stored = (_safe_float(pending.get("realized_return_pct")), _safe_float(pending.get("realized_expansion_pct")))
             if not all(value is not None and math.isfinite(value) for value in stored):
@@ -2874,6 +2944,8 @@ def _run_exit_detection(
 
     due_rows: Dict[str, Dict[str, Any]] = {}
     for row in trade_store.trades_due_for_exit(as_of):
+        if not current_event(row):
+            continue
         trade_id = str(row["trade_id"])
         _start_candidate(trade_id)
         due_rows[trade_id] = dict(row)
@@ -3077,6 +3149,7 @@ def _run_exit_detection(
         log_path=log_path,
         dry_run=dry_run,
         mda_client=mda_client,
+        current_event=current_event,
     )
     summary.update(baseline_summary)
     summary["evidence_funnel"] = _finish_funnel(funnel_store, cycle_id=cycle_id, as_of=as_of, dry_run=dry_run)
@@ -3141,6 +3214,7 @@ def run_daily_cycle(
         mda_client=resolved_mda_client,
         funnel=funnel,
         cycle_run_id=cycle_run_id,
+        ledger=ledger,
     )
     diagnostics = build_learning_diagnostics()
     _append_learning_log(

@@ -139,6 +139,8 @@ def build_evidence_watchdog_status(
             evidence_report = report.get("evidence_report")
             if not isinstance(forward_loop, dict):
                 errors.append("Evidence report is missing forward_loop output.")
+            else:
+                _check_forward_loop(forward_loop, errors, warnings)
             if not isinstance(evidence_report, dict):
                 errors.append("Evidence report is missing evidence_report output.")
 
@@ -164,6 +166,28 @@ def build_evidence_watchdog_status(
         "errors": errors,
         "warnings": warnings,
     }
+
+
+def _check_forward_loop(forward_loop: Mapping[str, Any], errors: list[str], warnings: list[str]) -> None:
+    """Problems the cycle recorded but survived: they must not pass silently."""
+    reconciliation = forward_loop.get("event_reconciliation")
+    if isinstance(reconciliation, Mapping):
+        if reconciliation.get("error"):
+            errors.append(f"Moved-earnings-date reconciliation failed: {reconciliation['error']}.")
+        failed = reconciliation.get("errors") or []
+        if failed:
+            warnings.append(f"Moved-earnings-date reconciliation could not write {len(failed)} row(s); "
+                            f"retried next cycle (first: {failed[0]}).")
+    exits = forward_loop.get("exits") if isinstance(forward_loop.get("exits"), Mapping) else {}
+    if exits.get("event_identity_error"):
+        errors.append(f"No exits ran: superseded event dates were unreadable ({exits['event_identity_error']}).")
+    entries = forward_loop.get("entries") if isinstance(forward_loop.get("entries"), Mapping) else {}
+    for label, part in (("entry", entries), ("exit", exits)):
+        funnel = part.get("evidence_funnel") if isinstance(part.get("evidence_funnel"), Mapping) else {}
+        status = str(funnel.get("status") or "")
+        if status in {"unavailable", "degraded"}:
+            warnings.append(f"Evidence funnel {status} during the {label} pass "
+                            f"({int(funnel.get('dropped_writes') or 0)} dropped write(s)).")
 
 
 @dataclass(frozen=True)

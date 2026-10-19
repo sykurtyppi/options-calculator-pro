@@ -228,8 +228,8 @@ def test_reports_ignore_claims_resolved_under_an_older_contract(tmp_path):
     from services.outcome_recorder import OutcomeStore
 
     store = OutcomeStore(store_path=tmp_path / "o.sqlite")
-    for trade_id in ("T_OLD", "T_V2"):
-        store.insert_entry(trade_id=trade_id, symbol="AAPL", structure="atm_straddle", entry_date=date(2026, 4, 20),
+    for trade_id, symbol in (("T_OLD", "AAPL"), ("T_V2", "MSFT")):      # two events
+        store.insert_entry(trade_id=trade_id, symbol=symbol, structure="atm_straddle", entry_date=date(2026, 4, 20),
                            setup_score=0.6, source_type="paper", earnings_date=date(2026, 4, 24), entry_mid=4.0,
                            claim_allowed=True, claim_contract_version=V, entry_execution_scenarios=PASSED)
         store.update_exit(trade_id=trade_id, exit_date=date(2026, 4, 23), exit_mid=4.4, realized_return_pct=10.0,

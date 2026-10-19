@@ -14,7 +14,7 @@ import os
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -211,10 +211,18 @@ def _run_log_payload(
         "evidence_funnel_dropped_writes": max(
             int((part.get("evidence_funnel") or {}).get("dropped_writes") or 0) for part in (entries, exits)
         ),
+        "event_reconciliation_errors": _reconciliation_error_count(forward.get("event_reconciliation")),
+        "exits_refused_event_identity": exits.get("event_identity_error"),
         "weekly_report_path": payload.get("weekly_report_path"),
         "warnings": report.get("warning_flags") or [],
         "error": error,
     }
+
+
+def _reconciliation_error_count(reconciliation: Any) -> int:
+    if not isinstance(reconciliation, dict):
+        return 0
+    return len(reconciliation.get("errors") or []) + (1 if reconciliation.get("error") else 0)
 
 
 def _funnel_status(*passes: dict) -> Optional[str]:

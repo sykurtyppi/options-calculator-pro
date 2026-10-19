@@ -72,6 +72,9 @@ def test_stalled_cycles_are_counted_from_the_latest(funnel):
         cycle = f"c{day}"
         funnel.start_cycle(cycle_run_id=cycle, as_of=TODAY + timedelta(days=day), universe_size=10,
                            discovered=2, discovery_source="x")
+        # A candidate inside the entry window every day: analyzing none is a stall.
+        funnel.record(cycle_run_id=cycle, as_of=TODAY + timedelta(days=day), stage=ef.STAGE_DATA_QUALIFIED,
+                      outcome=ef.OUTCOME_ADVANCED, symbol="A")
         if day == 0:
             funnel.record(cycle_run_id=cycle, as_of=TODAY, stage=ef.STAGE_ANALYZED,
                           outcome=ef.OUTCOME_ADVANCED, symbol="A")

@@ -351,7 +351,9 @@ def _dedupe_records(records: Iterable[EarningsRecord]) -> list[EarningsRecord]:
 def _ensure_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(path)) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
+        from services.sqlite_helpers import enable_wal_mode
+
+        enable_wal_mode(conn)
         conn.execute(EVENTS_DDL)
         conn.execute(SOURCES_DDL)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hee_symbol_date ON historical_earnings_events(symbol, event_date)")

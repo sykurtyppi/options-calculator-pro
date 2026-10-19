@@ -384,7 +384,9 @@ def _ensure_schema(db_path: Path, logger: logging.Logger) -> None:
     # leaked connection's file handle drops this process's SQLite locks when
     # it is finally closed (e.g. a forked worker), undoing the lock below.
     with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
+        from services.sqlite_helpers import enable_wal_mode
+
+        enable_wal_mode(conn)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(_EARNINGS_EVENTS_DDL)
         conn.execute(_EARNINGS_LABELS_DDL)
@@ -1116,7 +1118,9 @@ def _write_labels(
     params = [_label_row_params(r) for r in rows]
 
     with sqlite3.connect(str(db_path)) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
+        from services.sqlite_helpers import enable_wal_mode
+
+        enable_wal_mode(conn)
         before = conn.execute(
             "SELECT COUNT(*) FROM earnings_iv_decay_labels"
         ).fetchone()[0]

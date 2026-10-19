@@ -500,14 +500,33 @@ class BaselineEvidenceStore:
                 )
                 return cur.rowcount > 0
 
+    def revalidate(self, baseline_id: str, *, reason_prefix: str) -> bool:
+        """Restore evidence invalidated with a reason starting ``reason_prefix``
+        (e.g. a superseded event date that is current again). Rows invalidated
+        for any other reason stay invalid. Returns whether it was restored."""
+        reason_prefix = str(reason_prefix or "").strip()
+        if not reason_prefix:
+            raise ValueError("revalidate: a non-empty reason prefix is required")
+        with _WRITE_LOCK:
+            with _tx(self._conn) as cur:
+                cur.execute(
+                    "UPDATE baseline_trades SET evidence_valid = 1, invalidated_at = NULL, invalidation_reason = NULL,"
+                    " updated_at = CURRENT_TIMESTAMP WHERE baseline_id = ? AND evidence_valid = 0"
+                    " AND substr(invalidation_reason, 1, ?) = ?",
+                    (baseline_id, len(reason_prefix), reason_prefix),
+                )
+                return cur.rowcount > 0
+
     def record_event_ids(self, event_ids: Dict[str, str]) -> int:
-        """Attach durable event ids (baseline_id -> event_id) where none is set yet."""
+        """Attach durable event ids (baseline_id -> event_id); returns rows changed."""
         with _WRITE_LOCK:
             with _tx(self._conn) as cur:
                 changed = 0
                 for baseline_id, event_id in event_ids.items():
-                    cur.execute("UPDATE baseline_trades SET event_id = ? WHERE baseline_id = ? AND event_id IS NULL",
-                                (event_id, baseline_id))
+                    # An event's id can change when a backfilled analysis
+                    # regroups it, so a stale id is replaced too.
+                    cur.execute("UPDATE baseline_trades SET event_id = ? WHERE baseline_id = ?"
+                                " AND (event_id IS NULL OR event_id != ?)", (event_id, baseline_id, event_id))
                     changed += cur.rowcount
                 return changed
 

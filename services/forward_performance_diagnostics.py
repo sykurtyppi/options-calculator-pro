@@ -23,7 +23,7 @@ from services.baseline_evidence_store import (
 )
 from services.claim_contract import CONTRACT_VERSION, claimable_under_current_contract
 from services.outcome_recorder import OutcomeStore, get_outcome_store
-from services.event_reconciliation import drop_superseded, superseded_keys
+from services.event_reconciliation import drop_superseded, one_trade_per_event, superseded_keys
 from services.recommendation_ledger import RecommendationLedger, get_recommendation_ledger
 
 LOW_QUALITY_THRESHOLD = 0.60
@@ -66,6 +66,8 @@ def build_forward_performance_diagnostics(
     superseded = superseded_keys(ledger_obj)
     outcomes = drop_superseded(outcomes, superseded)
     baseline_rows = drop_superseded(baseline_rows, superseded)
+    # One observation per event: its first paper trade.
+    outcomes, same_event_extra_trades = one_trade_per_event(outcomes)
     ledger_by_id = {
         str(row.get("recommendation_id")): row
         for row in ledger_rows
@@ -90,10 +92,16 @@ def build_forward_performance_diagnostics(
     no_trade_count = sum(1 for row in ledger_rows if str(row.get("recommendation") or "") == "No Trade")
     # An event analyzed on several days is one decision: its latest analysis.
     # An event whose earnings date moved counts once, under its current date.
+    # Latest in information time (as_of, then created_at), not write order.
     latest_by_event: Dict[str, Dict[str, Any]] = {}
+
+    def _analysis_rank(row: Dict[str, Any]) -> tuple:
+        return (str(row.get("as_of_date") or ""), str(row.get("created_at") or ""), int(row.get("event_sequence") or 0))
+
     for row in ledger_rows:
         key = row.get("event_key")
-        if key and key not in superseded and int(row.get("event_sequence") or 0) >= int(latest_by_event.get(key, {}).get("event_sequence") or 0):
+        if key and key not in superseded and (
+                str(key) not in latest_by_event or _analysis_rank(row) >= _analysis_rank(latest_by_event[str(key)])):
             latest_by_event[str(key)] = row
     no_trade_event_count = sum(
         1 for row in latest_by_event.values() if str(row.get("recommendation") or "") == "No Trade"
@@ -125,6 +133,8 @@ def build_forward_performance_diagnostics(
         "no_trade_event_count": no_trade_event_count,
         "open_outcome_count": open_count,
         "resolved_outcome_count": len(resolved),
+        # Later paper trades on an event already counted (not in any figure).
+        "same_event_extra_trades": same_event_extra_trades,
         "invalidated_outcome_count": invalidated_count,
         "performance_summary": _group_stats(resolved),
         "by_structure": _group_by(resolved, lambda item: item["structure"] or "unknown"),

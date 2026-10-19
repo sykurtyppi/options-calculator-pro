@@ -43,6 +43,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from services.sqlite_helpers import enable_wal_mode
+
 PREPARED = "prepared"
 PROVIDER_SUBMITTED = "provider_submitted"
 ACCEPTED = "accepted"
@@ -133,7 +135,7 @@ class AlertOutbox:
             check = conn.execute("PRAGMA quick_check").fetchone()
             if check is None or str(check[0]).lower() != "ok":
                 raise OutboxCorrupt(f"integrity check failed: {check[0] if check else 'no result'}")
-            conn.execute("PRAGMA journal_mode=WAL")
+            enable_wal_mode(conn)
             conn.executescript(_DDL)
             columns = {row[1] for row in conn.execute("PRAGMA table_info(alert_outbox)")}
             if not {"alert_key", "status", "event_id", "updated_at"} <= columns:

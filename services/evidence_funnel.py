@@ -331,7 +331,9 @@ class EvidenceFunnelStore:
         trade stages pair rows of the same trade, whenever (up to ``until``)
         the trade reached the next stage. A member's downstream outcome is its
         best one: advanced, else dropped/error, else deferred; members with
-        none yet are open (an exit still in the future, say).
+        none yet are open (an exit still in the future, say). A trade that
+        skipped the downstream stage takes its outcome from the stage it
+        reached instead.
         """
         until_iso = _iso(until)
         clauses, params = [], []
@@ -372,6 +374,20 @@ class EvidenceFunnelStore:
                     continue
                 if rank[row["outcome"]] > rank.get(reached.get(member), 0):
                     reached[member] = row["outcome"]
+            if trade_transition:
+                # A trade can skip a stage (no exit attempt on T-1 goes
+                # straight to resolved/dropped as exit_missing): where it
+                # ended up later settles this transition too, so it never
+                # stays open forever.
+                later = set(STAGES[STAGES.index(downstream) + 1:])
+                for row in rows:
+                    if row["stage"] not in later or row["outcome"] == OUTCOME_DEFERRED:
+                        continue
+                    member = _member(row, trade_transition)
+                    if member not in cohort or member in reached or str(row["as_of_date"]) < cohort[member]:
+                        continue
+                    reached[member] = (OUTCOME_ADVANCED if row["outcome"] == OUTCOME_ADVANCED
+                                       else OUTCOME_DROPPED)
             advanced = sum(1 for outcome in reached.values() if outcome == OUTCOME_ADVANCED)
             stopped = sum(1 for outcome in reached.values() if outcome in (OUTCOME_DROPPED, OUTCOME_ERROR))
             deferred = sum(1 for outcome in reached.values() if outcome == OUTCOME_DEFERRED)
@@ -537,24 +553,69 @@ class EvidenceFunnelStore:
         return counts
 
     def cycles_without_analysis(self, *, lookback: int = 10) -> int:
-        """How many of the most recent cycles in a row discovered candidates but
-        analyzed none (a stalled entry pipeline)."""
+        """How many of the most recent cycles in a row had candidates inside
+        the entry window but analyzed none (a stalled entry pipeline).
+
+        A cycle whose candidates were all outside the window (a quiet stretch)
+        is not a stall."""
         with self._lock:
             cycles = self._conn.execute(
-                "SELECT cycle_run_id, discovered FROM funnel_cycles ORDER BY as_of_date DESC, started_at DESC LIMIT ?",
+                "SELECT cycle_run_id FROM funnel_cycles ORDER BY as_of_date DESC, started_at DESC LIMIT ?",
                 (int(lookback),),
             ).fetchall()
             streak = 0
             for cycle in cycles:
-                analyzed = self._conn.execute(
-                    "SELECT COUNT(*) FROM funnel_events WHERE cycle_run_id = ? AND stage = ? AND outcome = ?",
-                    (cycle["cycle_run_id"], STAGE_ANALYZED, OUTCOME_ADVANCED),
-                ).fetchone()[0]
-                if int(cycle["discovered"] or 0) > 0 and int(analyzed) == 0:
+                counts = dict(self._conn.execute(
+                    "SELECT stage, COUNT(*) FROM funnel_events WHERE cycle_run_id = ? AND outcome = ?"
+                    " AND stage IN (?, ?) GROUP BY stage",
+                    (cycle["cycle_run_id"], OUTCOME_ADVANCED, STAGE_DATA_QUALIFIED, STAGE_ANALYZED),
+                ).fetchall())
+                if int(counts.get(STAGE_DATA_QUALIFIED, 0)) > 0 and int(counts.get(STAGE_ANALYZED, 0)) == 0:
                     streak += 1
                 else:
                     break
             return streak
+
+    def cycles_without_discovery(self, *, lookback: int = 10) -> int:
+        """How many of the most recent cycles in a row discovered nothing at
+        all (a discovery outage looks like a quiet market otherwise)."""
+        with self._lock:
+            cycles = self._conn.execute(
+                "SELECT discovered FROM funnel_cycles ORDER BY as_of_date DESC, started_at DESC LIMIT ?",
+                (int(lookback),),
+            ).fetchall()
+        streak = 0
+        for cycle in cycles:
+            if int(cycle["discovered"] or 0) != 0:
+                break
+            streak += 1
+        return streak
+
+    def absorb_lost_write_counts(self) -> int:
+        """Persist dropped-write counts a cycle could not store itself (kept in
+        a sidecar file by ``safe_finish_cycle``); returns how many cycles."""
+        marker = _lost_writes_marker(self.path)
+        try:
+            pending = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {}
+        except (OSError, ValueError):
+            pending = {}
+        if not isinstance(pending, dict) or not pending:
+            return 0
+        with self._lock:
+            for cycle_run_id, entry in pending.items():
+                entry = entry if isinstance(entry, dict) else {}
+                self._conn.execute(
+                    """INSERT INTO funnel_write_health (cycle_run_id, as_of_date, dropped_writes, updated_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(cycle_run_id) DO UPDATE SET
+                           dropped_writes = MAX(funnel_write_health.dropped_writes, excluded.dropped_writes),
+                           updated_at = excluded.updated_at""",
+                    (str(cycle_run_id), entry.get("as_of") or str(cycle_run_id)[:10],
+                     int(entry.get("dropped") or 0), datetime.now(timezone.utc).isoformat()),
+                )
+            self._conn.commit()
+        marker.unlink(missing_ok=True)
+        return len(pending)
 
 
 def _linked_dates(start: str, links: List[tuple]) -> set:
@@ -630,8 +691,42 @@ def safe_finish_cycle(store: Optional[EvidenceFunnelStore], *, cycle_run_id: str
     except Exception as exc:  # noqa: BLE001
         persisted = False
         logger.warning("evidence funnel: could not persist %d dropped writes for %s: %s", dropped, cycle_run_id, exc)
+    if dropped and not persisted:
+        # The store is what failed: keep the count beside it so the health
+        # check still sees this cycle's losses once the lock is gone.
+        persisted = _note_lost_writes(store, cycle_run_id=cycle_run_id, as_of=as_of, dropped=dropped)
+    else:
+        try:
+            store.absorb_lost_write_counts()
+        except Exception:  # noqa: BLE001
+            logger.warning("evidence funnel: could not absorb earlier lost-write counts", exc_info=True)
     status = "degraded" if dropped else "ok"
     return {"status": status, "dropped_writes": dropped, "dropped_writes_persisted": persisted if dropped else None}
+
+
+def _lost_writes_marker(store_path: Optional[Path] = None) -> Path:
+    path = Path(store_path or _DEFAULT_STORE)
+    return path.with_name(path.name + ".lost_writes.json")
+
+
+def _note_lost_writes(store: Any, *, cycle_run_id: str, as_of: date, dropped: int) -> bool:
+    """Keep a cycle's dropped-write count in a sidecar file; whether it was kept."""
+    marker = _lost_writes_marker(getattr(store, "path", None))
+    try:
+        pending = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {}
+    except (OSError, ValueError):
+        pending = {}
+    pending = pending if isinstance(pending, dict) else {}
+    pending[str(cycle_run_id)] = {"as_of": _iso(as_of), "dropped": int(dropped)}
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_name(marker.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(pending, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, marker)
+    except OSError:
+        logger.warning("evidence funnel: could not keep the lost-write count", exc_info=True)
+        return False
+    return True
 
 
 # A funnel unreadable for one cycle is a warning; unreadable for longer than
@@ -756,7 +851,12 @@ def build_evidence_funnel_health(
     moment = now or datetime.now(timezone.utc)
     try:
         funnel = store or get_evidence_funnel()
+        try:
+            funnel.absorb_lost_write_counts()
+        except AttributeError:
+            pass
         stalled = funnel.cycles_without_analysis()
+        undiscovering = int(getattr(funnel, "cycles_without_discovery", lambda: 0)())
         dropped = funnel.recent_dropped_writes(since=(as_of or date.today()) - timedelta(days=6))
     except Exception as exc:  # noqa: BLE001
         record = note_funnel_unavailable(exc, store_path=store_path, now=moment)
@@ -786,8 +886,17 @@ def build_evidence_funnel_health(
             "severity": "WARN",
             "alertable": True,
             "message": (
-                f"Entry pipeline stalled: the last {stalled} cycles discovered candidates "
+                f"Entry pipeline stalled: the last {stalled} cycles had candidates in the entry window "
                 "but analyzed none (see the evidence funnel drop reasons)."
+            ),
+        })
+    if undiscovering >= int(stalled_threshold):
+        issues.append({
+            "severity": "WARN",
+            "alertable": True,
+            "message": (
+                f"Discovery returned no candidates for the last {undiscovering} cycles: "
+                "a screener or earnings-calendar outage looks like a quiet market."
             ),
         })
     if dropped:
@@ -799,8 +908,8 @@ def build_evidence_funnel_health(
                 "(locked or unwritable store); funnel counts for those cycles are a floor."
             ),
         })
-    return {"summary": {"cycles_without_analysis": stalled, "stalled_threshold": int(stalled_threshold),
-                        "dropped_writes_7d": dropped},
+    return {"summary": {"cycles_without_analysis": stalled, "cycles_without_discovery": undiscovering,
+                        "stalled_threshold": int(stalled_threshold), "dropped_writes_7d": dropped},
             "issues": issues}
 
 
