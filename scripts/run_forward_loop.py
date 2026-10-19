@@ -2194,6 +2194,7 @@ def _run_forward_screener(
                 stage=stage,
                 outcome=outcome,
                 symbol=symbol,
+                subject=f"{symbol}|{row.get('earnings_date') or ''}",
                 reason=reason,
                 earnings_date=extra.pop("earnings_date", row.get("earnings_date")),
                 **extra,

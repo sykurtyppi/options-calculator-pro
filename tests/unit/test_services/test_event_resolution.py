@@ -207,6 +207,60 @@ def test_an_edited_cohort_is_refused(tmp_path):
         ec.load_cohort("absent", directory=tmp_path)
 
 
+@pytest.mark.parametrize("field,value", [
+    ("name", "other"),
+    ("claim_contract_version", "tampered"),
+    ("window", {"since": "2026-04-02", "until": "2026-04-30"}),
+    ("frozen_as_of", "2026-04-01"),
+    ("frozen_at", "2026-01-01T00:00:00+00:00"),
+    ("member_count", 999),
+])
+def test_cohort_integrity_binds_interpretation_metadata(tmp_path, field, value):
+    manifest = ec.build_cohort_manifest(name="c", since=date(2026, 4, 1), until=EARNINGS,
+                                        as_of=EARNINGS + timedelta(days=3), events=_events())
+    path = ec.write_cohort(manifest, directory=tmp_path)
+    edited = json.loads(path.read_text())
+    edited[field] = value
+    path.write_text(json.dumps(edited))
+    with pytest.raises(ec.CohortError, match="integrity"):
+        ec.load_cohort("c", directory=tmp_path)
+
+
+def test_cohort_loader_does_not_trust_stored_verification_label(tmp_path):
+    manifest = ec.build_cohort_manifest(name="c", since=date(2026, 4, 1), until=EARNINGS,
+                                        as_of=EARNINGS + timedelta(days=3), events=_events())
+    path = ec.write_cohort(manifest, directory=tmp_path)
+    edited = json.loads(path.read_text())
+    edited["integrity_verification"] = "legacy_members_only"
+    path.write_text(json.dumps(edited))
+    loaded = ec.load_cohort("c", directory=tmp_path)
+    assert loaded["integrity_verification"] == "metadata_and_members"
+
+
+def test_v2_cohort_cannot_downgrade_itself_to_legacy_verification(tmp_path):
+    manifest = ec.build_cohort_manifest(name="c", since=date(2026, 4, 1), until=EARNINGS,
+                                        as_of=EARNINGS + timedelta(days=3), events=_events())
+    path = ec.write_cohort(manifest, directory=tmp_path)
+    edited = json.loads(path.read_text())
+    edited["manifest_version"] = 1
+    edited["window"] = {"since": "2026-01-01", "until": "2026-12-31"}
+    edited["member_count"] = 999
+    path.write_text(json.dumps(edited))
+    with pytest.raises(ec.CohortError, match="downgrade|version"):
+        ec.load_cohort("c", directory=tmp_path)
+
+
+def test_legacy_cohort_is_read_but_marked_members_only_verified(tmp_path):
+    manifest = ec.build_cohort_manifest(name="legacy", since=date(2026, 4, 1), until=EARNINGS,
+                                        as_of=EARNINGS + timedelta(days=3), events=_events())
+    manifest["manifest_version"] = 1
+    manifest.pop("integrity_sha256")
+    manifest.pop("integrity_verification")
+    ec.write_cohort(manifest, directory=tmp_path)
+    loaded = ec.load_cohort("legacy", directory=tmp_path)
+    assert loaded["integrity_verification"] == "legacy_members_only"
+
+
 def test_a_cohort_report_counts_frozen_members_only():
     manifest = ec.build_cohort_manifest(name="c", since=date(2026, 4, 1), until=EARNINGS,
                                         as_of=EARNINGS + timedelta(days=3), events=_events())

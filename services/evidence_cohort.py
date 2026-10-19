@@ -27,7 +27,7 @@ from services.event_resolution import (
     summarize_event_resolutions,
 )
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 _DEFAULT_DIR = Path.home() / ".options_calculator_pro" / "evidence" / "cohorts"
 _NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -38,6 +38,18 @@ class CohortError(ValueError):
 
 def _members_hash(members: list[Dict[str, Any]]) -> str:
     return hashlib.sha256(json.dumps(members, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+_INTEGRITY_FIELDS = (
+    "name", "manifest_version", "claim_contract_version", "window",
+    "frozen_as_of", "frozen_at", "member_count", "members",
+)
+
+
+def _integrity_hash(manifest: Dict[str, Any]) -> str:
+    """Bind every authoritative field used to interpret or report a cohort."""
+    bound = {field: manifest.get(field) for field in _INTEGRITY_FIELDS}
+    return hashlib.sha256(json.dumps(bound, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def build_cohort_manifest(
@@ -59,17 +71,21 @@ def build_cohort_manifest(
                 "tracks": {track: sorted(item["id"] for item in items)
                            for track, items in sorted(event["tracks"].items())},
             })
-    return {
+    window = {"since": since.isoformat(), "until": until.isoformat()}
+    manifest = {
         "name": name,
         "manifest_version": MANIFEST_VERSION,
         "claim_contract_version": CONTRACT_VERSION,
-        "window": {"since": since.isoformat(), "until": until.isoformat()},
+        "window": window,
         "frozen_as_of": as_of.isoformat(),
         "frozen_at": datetime.now(timezone.utc).isoformat(),
         "member_count": len(members),
         "members": members,
         "members_sha256": _members_hash(members),
+        "integrity_verification": "metadata_and_members",
     }
+    manifest["integrity_sha256"] = _integrity_hash(manifest)
+    return manifest
 
 
 def write_cohort(manifest: Dict[str, Any], *, directory: Optional[Path] = None) -> Path:
@@ -94,8 +110,28 @@ def load_cohort(name: str, *, directory: Optional[Path] = None) -> Dict[str, Any
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise CohortError(f"no frozen cohort {name!r} at {path}") from exc
-    if _members_hash(manifest.get("members") or []) != manifest.get("members_sha256"):
+    members = manifest.get("members") or []
+    if _members_hash(members) != manifest.get("members_sha256"):
         raise CohortError(f"cohort {name!r} does not match its frozen hash; its membership was edited")
+    version = manifest.get("manifest_version", 1)
+    if version == MANIFEST_VERSION:
+        actual = _integrity_hash(manifest)
+        if actual != manifest.get("integrity_sha256"):
+            raise CohortError(f"cohort {name!r} failed integrity verification; interpretation metadata was edited")
+        if manifest.get("name") != name:
+            raise CohortError(f"cohort {name!r} failed integrity verification; embedded name does not match")
+        if manifest.get("member_count") != len(members):
+            raise CohortError(f"cohort {name!r} failed integrity verification; member count does not match")
+        # This label describes verification performed by this reader; never
+        # trust an editable value stored in the manifest itself.
+        manifest["integrity_verification"] = "metadata_and_members"
+    elif version == 1 and "integrity_sha256" not in manifest and "integrity_verification" not in manifest:
+        # Genuine v1 files predate both v2 integrity fields.  A v2 file cannot
+        # opt itself out of metadata verification merely by editing its
+        # manifest_version value while retaining the v2 envelope.
+        manifest["integrity_verification"] = "legacy_members_only"
+    else:
+        raise CohortError(f"cohort {name!r} has an unsupported version or attempted integrity downgrade")
     return manifest
 
 

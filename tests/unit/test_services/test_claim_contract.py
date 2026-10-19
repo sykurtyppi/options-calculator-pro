@@ -53,6 +53,32 @@ def _with_leg(quote, leg, **changes):
     return out
 
 
+@pytest.mark.parametrize("raw", ["false", "0", "no", "off", "unknown", {}, []])
+def test_entry_claim_status_does_not_treat_nonaffirmative_values_as_true(raw):
+    allowed, _ = cc.entry_claim_status(
+        claim_allowed=raw, claim_contract_version=cc.CONTRACT_VERSION,
+        entry_execution_scenarios={"claim": {"passed": True, "reasons": [],
+                                               "contract_version": cc.CONTRACT_VERSION}},
+    )
+    assert allowed is False
+
+
+def test_apply_exit_claim_does_not_treat_string_false_as_true():
+    verdict = {"claim": {"passed": True, "reasons": [], "contract_version": cc.CONTRACT_VERSION}}
+    allowed, _ = cc.apply_exit_claim(
+        claim_allowed="false", evidence_reasons=[], entry_contract_version=cc.CONTRACT_VERSION,
+        entry_execution_scenarios=verdict, exit_execution_scenarios=verdict,
+    )
+    assert allowed is False
+
+
+def test_oversized_finite_unix_timestamp_fails_closed():
+    quote = _quote(captured=1e300)
+    result = cc.evaluate_quote_contract(quote)
+    assert result.passed is False
+    assert "claim_missing_capture_time" in result.reasons
+
+
 # ── the quote contract ──────────────────────────────────────────────────────
 
 

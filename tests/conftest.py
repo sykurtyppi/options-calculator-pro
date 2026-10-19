@@ -124,7 +124,8 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
 
     def _reset_singletons():
         pr.reset_breakers()
-        for module, attr in ((bes, "_store"), (rl, "_ledger"), (ef, "_store"), (pr, "_budget"), (pr, "_cache"),
+        pr.reset_response_caches()
+        for module, attr in ((bes, "_store"), (rl, "_ledger"), (ef, "_store"), (pr, "_budget"),
                                (orec, "_store")):
             existing = getattr(module, attr, None)
             if existing is not None:

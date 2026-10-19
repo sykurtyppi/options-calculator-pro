@@ -349,7 +349,10 @@ class EvidenceFunnelStore:
         def _member(row: sqlite3.Row, trade_transition: bool) -> Any:
             if trade_transition:
                 return str(row["trade_id"] or row["subject"])
-            return (row["cycle_run_id"], str(row["symbol"]) or str(row["subject"]))
+            # Candidate identity is event-aware.  ``symbol`` alone collapses
+            # two dated earnings events for the same ticker into one
+            # conversion denominator even though they are separate rows.
+            return (row["cycle_run_id"], str(row["subject"] or row["symbol"]))
 
         rank = {OUTCOME_ADVANCED: 3, OUTCOME_DROPPED: 2, OUTCOME_ERROR: 2, OUTCOME_DEFERRED: 1}
         out: Dict[str, Dict[str, Any]] = {}

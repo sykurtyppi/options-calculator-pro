@@ -34,9 +34,10 @@ Design notes
   spread no wider than ``MAX_ATM_SPREAD_PCT``, an ATM IV inside
   [``MIN_PLAUSIBLE_ATM_IV``, ``MAX_PLAUSIBLE_ATM_IV``], and a non-stale
   earnings date. An unconfirmed earnings date is labelled, not dropped.
-* **Audit trail.** Every sent alert appends its full rows, score components
+* **Operational audit log.** Every sent alert best-effort appends its full rows, score components
   (including the IV/RV actually scored) and drop counts to
-  ``DEFAULT_AUDIT_PATH``.
+  ``DEFAULT_AUDIT_PATH``. This JSONL is append-only by convention, not
+  immutable or tamper-evident.
 * **Timing.** launchd runs it at 15:00 machine-local time (Reykjavik = UTC):
   11:00 ET in daylight time, 10:00 ET in standard time, always after the
   09:30 ET open. The message states the New York time it was built.
@@ -605,97 +606,101 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Contention or I/O, not damage: leave the outbox where it is.
         logger.error("Alert outbox is unavailable right now (%s). Nothing sent.", exc)
         return 1
-    # --force sends again under a fresh key; otherwise one key per digest.
-    alert_key = f"{digest}|force|{event_id}" if args.force else digest
-    reservation = outbox.reserve(alert_key, event_id=event_id)
-    if not reservation.acquired:
-        # A hand-off that timed out, or one whose run died mid-send (still
-        # "provider_submitted" long after any live run would have finished),
-        # may have been delivered: flag it, never resend it.
-        if reservation.status == DELIVERY_UNKNOWN or (
-                reservation.status == PROVIDER_SUBMITTED and outbox.is_stale(alert_key)):
-            logger.error("Alert %s: an earlier send may or may not have been delivered; "
-                         "not resending automatically.", digest)
+    try:
+        # --force sends again under a fresh key; otherwise one key per digest.
+        alert_key = f"{digest}|force|{event_id}" if args.force else digest
+        reservation = outbox.reserve(alert_key, event_id=event_id)
+        if not reservation.acquired:
+            # A hand-off that timed out, or one whose run died mid-send (still
+            # "provider_submitted" long after any live run would have finished),
+            # may have been delivered: flag it, never resend it.
+            if reservation.status == DELIVERY_UNKNOWN or (
+                    reservation.status == PROVIDER_SUBMITTED and outbox.is_stale(alert_key)):
+                logger.error("Alert %s: an earlier send may or may not have been delivered; "
+                             "not resending automatically.", digest)
+                return 1
+            logger.info("Alert %s already %s; not sending again.", digest, reservation.status)
+            return 0
+
+        def _audit_status(status: str, **extra: Any) -> bool:
+            return _try_append_audit(args.audit_path, {
+                "event_type": "premarket_alert", "event_id": event_id, "alert_key": alert_key,
+                "status": status, "at_utc": datetime.now(timezone.utc).isoformat(), **extra,
+            })
+
+        # The best-effort append-only operational log is written as "prepared"
+        # BEFORE the send. It is not an immutable or tamper-evident ledger; if
+        # this pre-send append cannot be written, nothing is sent.
+        try:
+            record = {
+                "event_type": "premarket_alert",
+                "event_id": event_id,
+                "alert_key": alert_key,
+                "status": PREPARED,
+                "attempt": reservation.attempts,
+                "as_of_date": as_of.isoformat(),
+                "built_at_utc": built_at.isoformat(),
+                "built_at_new_york": _new_york_time(built_at),
+                "min_score": args.min_score,
+                "gates": {
+                    "dte_min": args.dte_min, "dte_max": args.dte_max,
+                    "max_atm_spread_pct": MAX_ATM_SPREAD_PCT,
+                    "atm_iv_range": [MIN_PLAUSIBLE_ATM_IV, MAX_PLAUSIBLE_ATM_IV],
+                },
+                "screened": {"universe_size": table.get("universe_size"), "rows": len(rows),
+                             "in_entry_window": table.get("in_entry_window")},
+                "dropped": dropped,
+                "message": message,
+                "setups": [{"row": row, "score_breakdown": score_breakdown(row)} for row in qualifying],
+            }
+            _append_audit(args.audit_path, record)
+        except Exception as exc:
+            logger.exception("Could not record the alert audit before sending; nothing sent.")
+            outbox.transition(alert_key, event_id=event_id, to=FAILED, error=f"audit: {type(exc).__name__}")
             return 1
-        logger.info("Alert %s already %s; not sending again.", digest, reservation.status)
-        return 0
 
-    def _audit_status(status: str, **extra: Any) -> bool:
-        return _try_append_audit(args.audit_path, {
-            "event_type": "premarket_alert", "event_id": event_id, "alert_key": alert_key,
-            "status": status, "at_utc": datetime.now(timezone.utc).isoformat(), **extra,
-        })
-
-    # The full audit record is written as "prepared" BEFORE the send, so every
-    # sent alert has a durable record. If it cannot be written, nothing is sent.
-    try:
-        record = {
-            "event_type": "premarket_alert",
-            "event_id": event_id,
-            "alert_key": alert_key,
-            "status": PREPARED,
-            "attempt": reservation.attempts,
-            "as_of_date": as_of.isoformat(),
-            "built_at_utc": built_at.isoformat(),
-            "built_at_new_york": _new_york_time(built_at),
-            "min_score": args.min_score,
-            "gates": {
-                "dte_min": args.dte_min, "dte_max": args.dte_max,
-                "max_atm_spread_pct": MAX_ATM_SPREAD_PCT,
-                "atm_iv_range": [MIN_PLAUSIBLE_ATM_IV, MAX_PLAUSIBLE_ATM_IV],
-            },
-            "screened": {"universe_size": table.get("universe_size"), "rows": len(rows),
-                         "in_entry_window": table.get("in_entry_window")},
-            "dropped": dropped,
-            "message": message,
-            "setups": [{"row": row, "score_breakdown": score_breakdown(row)} for row in qualifying],
-        }
-        _append_audit(args.audit_path, record)
-    except Exception as exc:
-        logger.exception("Could not record the alert audit before sending; nothing sent.")
-        outbox.transition(alert_key, event_id=event_id, to=FAILED, error=f"audit: {type(exc).__name__}")
-        return 1
-
-    # Committed before the hand-off: if this run dies mid-send, the alert is
-    # treated as possibly delivered and never resent automatically.
-    outbox.transition(alert_key, event_id=event_id, to=PROVIDER_SUBMITTED)
-    try:
-        # No automatic retry: a timed-out hand-off may already have gone out.
-        result = send_imessage(message, config=config, retries=0)
-    except Exception as exc:  # noqa: BLE001
-        error = f"{type(exc).__name__}: {exc}"
-        if _never_launched(exc):
-            outbox.transition(alert_key, event_id=event_id, to=FAILED, error=error)
-            logger.exception("iMessage hand-off never started; nothing was sent.")
-            _audit_status(FAILED, error=error)
+        # Committed before the hand-off: if this run dies mid-send, the alert is
+        # treated as possibly delivered and never resent automatically.
+        outbox.transition(alert_key, event_id=event_id, to=PROVIDER_SUBMITTED)
+        try:
+            # No automatic retry: a timed-out hand-off may already have gone out.
+            result = send_imessage(message, config=config, retries=0)
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+            if _never_launched(exc):
+                outbox.transition(alert_key, event_id=event_id, to=FAILED, error=error)
+                logger.exception("iMessage hand-off never started; nothing was sent.")
+                _audit_status(FAILED, error=error)
+                return 1
+            # osascript was launched: a timeout, a non-zero exit or an error
+            # reading its output may all come after Messages took the alert.
+            outbox.transition(alert_key, event_id=event_id, to=DELIVERY_UNKNOWN, error=error)
+            logger.error("iMessage hand-off ended with %s after osascript started; delivery unknown, "
+                         "not retried.", error)
+            _audit_status(DELIVERY_UNKNOWN, error=error)
             return 1
-        # osascript was launched: a timeout, a non-zero exit or an error
-        # reading its output may all come after Messages took the alert.
-        outbox.transition(alert_key, event_id=event_id, to=DELIVERY_UNKNOWN, error=error)
-        logger.error("iMessage hand-off ended with %s after osascript started; delivery unknown, "
-                     "not retried.", error)
-        _audit_status(DELIVERY_UNKNOWN, error=error)
-        return 1
 
-    outbox.transition(alert_key, event_id=event_id, to=ACCEPTED, detail={"to": result.get("to")})
-    # Accepted: the outbox already prevents a resend, so a failure to update
-    # the state file or the closing audit line is reported but never resends.
-    code = 0
-    try:
-        _save_state(args.state_path, {
-            "last_digest": digest,
-            "last_sent_at": datetime.now(timezone.utc).isoformat(),
-            "symbols": [str(r.get("symbol")) for r in qualifying],
-            "audit_event_id": event_id,
-        })
-    except Exception:
-        logger.exception("Alert %s was accepted but the state file could not be updated.", event_id)
-        code = 1
-    if not _audit_status(ACCEPTED):
-        logger.error("Alert %s was accepted but its closing audit line could not be written.", event_id)
-        code = 1
-    logger.info("Alert accepted for %s (%s setups).", result.get("to"), len(qualifying))
-    return code
+        outbox.transition(alert_key, event_id=event_id, to=ACCEPTED, detail={"to": result.get("to")})
+        # Accepted: the outbox already prevents a resend, so a failure to update
+        # the state file or the closing audit line is reported but never resends.
+        code = 0
+        try:
+            _save_state(args.state_path, {
+                "last_digest": digest,
+                "last_sent_at": datetime.now(timezone.utc).isoformat(),
+                "symbols": [str(r.get("symbol")) for r in qualifying],
+                "audit_event_id": event_id,
+            })
+        except Exception:
+            logger.exception("Alert %s was accepted but the state file could not be updated.", event_id)
+            code = 1
+        if not _audit_status(ACCEPTED):
+            logger.error("Alert %s was accepted but its closing audit line could not be written.", event_id)
+            code = 1
+        logger.info("Alert accepted for %s (%s setups).", result.get("to"), len(qualifying))
+        return code
+    finally:
+        outbox.close()
 
 
 if __name__ == "__main__":
