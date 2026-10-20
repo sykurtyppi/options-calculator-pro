@@ -1145,11 +1145,21 @@ def version() -> Dict[str, Any]:
     api_sha = _RUNNING_CODE.get("git_sha")
     frontend = _frontend_build_info()
     frontend_sha = (frontend or {}).get("git_sha")
+    if not (frontend_sha and api_sha):
+        matches = None  # unknown is not a match
+    elif frontend_sha != api_sha:
+        matches = False
+    elif _RUNNING_CODE.get("dirty") is False and (frontend or {}).get("dirty") is False:
+        matches = True
+    else:
+        # Same commit, but either side was built from modified (or
+        # unknown-state) sources: the code can still differ.
+        matches = None
     return {
         "api": {"git_sha": api_sha, "dirty": _RUNNING_CODE.get("dirty"), "started_at": _STARTED_AT},
         "frontend": frontend,
-        # None when either side is unknown: unknown is not a match.
-        "frontend_matches_api": (frontend_sha == api_sha) if (frontend_sha and api_sha) else None,
+        # True only for the same commit with both sides unmodified.
+        "frontend_matches_api": matches,
     }
 
 

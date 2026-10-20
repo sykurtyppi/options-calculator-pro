@@ -699,8 +699,10 @@ the best copy there is, but the backup exits 3 so the watchdog reports it.
 
 `GET /api/version` returns the commit the API process started from and the
 commit `web/frontend/dist/build-info.json` says the served bundle was built
-from, with `frontend_matches_api`. The page footer shows the bundle's
-commit and warns when the API runs a different one. After a `git pull`,
+from, with `frontend_matches_api`. That is `true` only for the same commit
+with neither side built from modified sources, `false` for different
+commits, and `null` when either side is unknown or modified. The page footer
+shows the bundle's commit and warns in both of the last two cases. After a `git pull`,
 rebuild the frontend and restart the API and launchd jobs.
 
 ### Restoring into a non-default location (verification)
