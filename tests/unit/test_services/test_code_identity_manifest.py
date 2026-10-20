@@ -336,8 +336,16 @@ def test_version_endpoint_compares_the_served_bundle_with_the_running_api(monkey
     out = app_module.version()
     assert out["api"]["git_sha"] == SHA_A and out["frontend"]["git_sha"] == SHA_B
     assert out["frontend_matches_api"] is False
-    (dist / "build-info.json").write_text(json.dumps({"git_sha": SHA_A}))
+    (dist / "build-info.json").write_text(json.dumps({"git_sha": SHA_A, "dirty": False}))
     assert app_module.version()["frontend_matches_api"] is True
+    # Same commit, but modified or unknown sources on either side: not a match.
+    for ui_dirty, api_dirty in [(True, False), (False, True), (None, False), (False, None)]:
+        (dist / "build-info.json").write_text(json.dumps({"git_sha": SHA_A, "dirty": ui_dirty}))
+        monkeypatch.setattr(app_module, "_RUNNING_CODE", {"git_sha": SHA_A, "dirty": api_dirty})
+        assert app_module.version()["frontend_matches_api"] is None, (ui_dirty, api_dirty)
+    # A different commit is a known mismatch even when modified.
+    (dist / "build-info.json").write_text(json.dumps({"git_sha": SHA_B, "dirty": True}))
+    assert app_module.version()["frontend_matches_api"] is False
     monkeypatch.setattr(app_module, "_RUNNING_CODE", {"git_sha": None})
     assert app_module.version()["frontend_matches_api"] is None
 
