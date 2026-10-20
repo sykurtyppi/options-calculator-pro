@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { describeBuild } from './buildStamp.js'
+import { describeBuild } from './buildIdentity.js'
 
 const A = 'aaaaaaa1111111111111111111111111111111111'
 const B = 'bbbbbbb2222222222222222222222222222222222'

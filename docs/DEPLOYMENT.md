@@ -223,12 +223,15 @@ cd web/frontend && npm install && npm run build && cd ../..
 # 4. Install all launchd jobs. The script template-renders each
 #    plist (substituting __PROJECT_ROOT__ and __HOME__), drops the
 #    rendered version into ~/Library/LaunchAgents/, and launchctl-loads
-#    it.
+#    it. This includes com.optionscalculator.api, which starts the API
+#    server at once and keeps it running: stop any API you started by
+#    hand first, or the job retries every 30s against the held port.
 scripts/automation/install_launchd_jobs.sh
 
 # 5. Confirm the jobs are loaded.
 launchctl list | grep optionscalculator
-# Expected: 5 lines, each ending with "0" (last exit status).
+# Expected: one line per job in install_launchd_jobs.sh, the scheduled
+# ones ending with "0" (last exit status) and the API with its PID.
 
 # 6. Re-run preflight to confirm the launchagents check now passes too.
 .venv311/bin/python scripts/preflight_check.py
@@ -524,7 +527,7 @@ Access to fetch at '<...>' has been blocked by CORS policy
 
 | Likely cause | Check |
 |---|---|
-| Job not installed | `launchctl list \| grep optionscalculator` — must show every job listed in `install_launchd_jobs.sh` (8 today); `scripts/preflight_check.py` derives the expected set from the installer. Re-run `scripts/automation/install_launchd_jobs.sh`. |
+| Job not installed | `launchctl list \| grep optionscalculator` — must show every job listed in `install_launchd_jobs.sh` (9 today, including the API server); `scripts/preflight_check.py` derives the expected set from the installer. Re-run `scripts/automation/install_launchd_jobs.sh`. |
 | Plist points at a venv path that no longer exists | Wrappers hardcode `${PROJECT_ROOT}/.venv311/bin/python`. If you renamed or moved `.venv311`, reinstall the jobs. |
 | Repo moved after install | Same: plists capture absolute paths at install time. Reinstall. |
 | launchd exit non-zero last run | `launchctl list \| grep optionscalculator` — second column is last exit code. Inspect the wrapper log (`*_launchd.log`) for the matching `===== … failed exit_code=N =====` line. |
@@ -703,7 +706,8 @@ from, with `frontend_matches_api`. That is `true` only for the same commit
 with neither side built from modified sources, `false` for different
 commits, and `null` when either side is unknown or modified. The page footer
 shows the bundle's commit and warns in both of the last two cases. After a `git pull`,
-rebuild the frontend and restart the API and launchd jobs.
+rebuild the frontend and restart the API with
+`launchctl kickstart -k gui/$(id -u)/com.optionscalculator.api`.
 
 ### Restoring into a non-default location (verification)
 
