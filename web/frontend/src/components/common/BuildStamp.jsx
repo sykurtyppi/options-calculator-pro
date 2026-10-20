@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { apiFetch } from '../../lib/api'
-import { describeBuild } from './buildStamp'
+import { describeBuild } from './buildStamp.js'
 
 /* global __OCP_BUILD__ */
 const FRONTEND_BUILD = typeof __OCP_BUILD__ !== 'undefined' ? __OCP_BUILD__ : null

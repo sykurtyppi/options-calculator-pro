@@ -2,7 +2,7 @@ import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'rea
 import ScreenerConsole from './components/screener/ScreenerConsole'
 import SelectorDecisionCard from './components/edge/SelectorDecisionCard'
 import ForwardEvidenceStrip from './components/edge/ForwardEvidenceStrip'
-import BuildStamp from './components/common/BuildStamp'
+import BuildStamp from './components/common/BuildStamp.jsx'
 import DecisionEvidenceStrip from './components/edge/DecisionEvidenceStrip'
 import CalibrationInsightPanel from './components/edge/CalibrationInsightPanel'
 import RegimeNarrativePanel from './components/edge/RegimeNarrativePanel'

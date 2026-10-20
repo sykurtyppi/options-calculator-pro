@@ -5,7 +5,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 const apiFetch = vi.fn()
 vi.mock('../../lib/api', () => ({ apiFetch: (...a) => apiFetch(...a) }))
 
-import BuildStamp from './BuildStamp'
+import BuildStamp from './BuildStamp.jsx'
 
 const A = 'aaaaaaa1111111111111111111111111111111111'
 const B = 'bbbbbbb2222222222222222222222222222222222'
