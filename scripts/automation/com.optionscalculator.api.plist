@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optionscalculator.api</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/scripts/automation/run_api_server.sh</string>
+  </array>
+  <!--
+    The API server: started at load and restarted whenever it exits with a
+    failure (a crash, or the port still held by another process). A clean
+    exit (launchctl stop) stays stopped. ThrottleInterval spaces restarts so
+    a port collision retries every 30s instead of spinning.
+  -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <!--
+    Not *_launchd*.log: these stay open for the server's whole life, so the
+    log rotation job must not rename them (it matches only *_launchd*.log).
+  -->
+  <key>StandardOutPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/api_server_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/api_server_stderr.log</string>
+</dict>
+</plist>

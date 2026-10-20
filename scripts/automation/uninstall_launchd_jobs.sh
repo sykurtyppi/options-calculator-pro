@@ -12,7 +12,8 @@ for plist in \
   com.optionscalculator.log-rotation.plist \
   com.optionscalculator.forward-paper-collector.plist \
   com.optionscalculator.premarket-screener-alert.plist \
-  com.optionscalculator.state-backup.plist
+  com.optionscalculator.state-backup.plist \
+  com.optionscalculator.api.plist
 do
   dst="${LAUNCH_AGENTS_DIR}/${plist}"
   if [ -e "${dst}" ]; then
