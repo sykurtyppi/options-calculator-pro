@@ -11,7 +11,7 @@ anyio==4.14.2
     #   watchfiles
 beautifulsoup4==4.14.3
     # via yfinance
-certifi==2026.4.22
+certifi==2026.10.19
     # via
     #   curl-cffi
     #   httpcore

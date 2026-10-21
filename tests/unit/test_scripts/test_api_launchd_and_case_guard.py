@@ -110,28 +110,43 @@ def test_wrapper_host_and_port_can_be_overridden(tmp_path: Path) -> None:
 _SKIP_DIRS = {".git", "node_modules", "dist", "__pycache__", ".pytest_cache"}
 
 
-def case_collisions(root: Path) -> list[list[str]]:
-    """Paths under *root* that are distinct here but one path on macOS."""
+def case_collisions(paths: list[str]) -> list[list[str]]:
+    """Paths that are distinct here but one path on macOS.
+
+    Takes paths rather than reading a directory, so it can be tested on
+    names a case-insensitive disk could never hold side by side.
+    """
     seen: dict[str, list[str]] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".venv")]
-        for name in dirnames + filenames:
-            rel = os.path.relpath(os.path.join(dirpath, name), root)
-            seen.setdefault(rel.lower(), []).append(rel)
+    for rel in paths:
+        seen.setdefault(rel.lower(), []).append(rel)
     return sorted(sorted(group) for group in seen.values() if len(group) > 1)
 
 
-def test_case_collision_finder_sees_files_and_directories(tmp_path: Path) -> None:
-    (tmp_path / "a").mkdir()
-    (tmp_path / "a" / "Readme.md").write_text("")
-    (tmp_path / "a" / "README.md").write_text("")
-    (tmp_path / "Docs").mkdir()
-    (tmp_path / "docs").mkdir()
-    (tmp_path / "node_modules").mkdir()
-    (tmp_path / "node_modules" / "X").write_text("")
-    (tmp_path / "node_modules" / "x").write_text("")
-    assert case_collisions(tmp_path) == [["Docs", "docs"], ["a/README.md", "a/Readme.md"]]
+def repo_paths(root: Path) -> list[str]:
+    """Every file and directory under *root*, relative and '/'-separated."""
+    paths: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".venv")]
+        for name in dirnames + filenames:
+            paths.append(Path(dirpath, name).relative_to(root).as_posix())
+    return paths
+
+
+def test_case_collisions_finds_files_and_directories_differing_only_by_case() -> None:
+    paths = ["Docs", "docs", "docs/x.md", "a", "a/Readme.md", "a/README.md", "a/readme.txt", "b/c.py"]
+    assert case_collisions(paths) == [["Docs", "docs"], ["a/README.md", "a/Readme.md"]]
+    assert case_collisions(["a/b.js", "a/c.js", "A"]) == []
+
+
+def test_repo_paths_lists_files_and_directories_and_skips_generated_trees(tmp_path: Path) -> None:
+    # Only names that can coexist on a case-insensitive disk (macOS).
+    (tmp_path / "src" / "deep").mkdir(parents=True)
+    (tmp_path / "src" / "deep" / "m.py").write_text("")
+    for skipped in ("node_modules", ".git", "dist", ".venv311"):
+        (tmp_path / skipped).mkdir()
+        (tmp_path / skipped / "inside.txt").write_text("")
+    assert sorted(repo_paths(tmp_path)) == ["src", "src/deep", "src/deep/m.py"]
 
 
 def test_no_two_repo_paths_differ_only_by_case() -> None:
-    assert case_collisions(REPO) == []
+    assert case_collisions(repo_paths(REPO)) == []
