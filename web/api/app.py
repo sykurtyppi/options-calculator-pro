@@ -1218,7 +1218,11 @@ def export_options_edge_evidence(
     http_request: Request = None,
 ) -> WorkstationEvidenceEnvelope:
     native_payload = _run_edge_analysis(request, http_request)
-    return build_workstation_evidence_envelope(native_payload, producer_version=app.version)
+    return build_workstation_evidence_envelope(
+        request,
+        native_payload,
+        producer_version=app.version,
+    )
 
 
 @app.get("/api/edge/screener", response_model=EdgeScreenerResponse)
