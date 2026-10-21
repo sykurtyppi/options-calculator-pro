@@ -812,7 +812,9 @@ class TestApiEndpoints(unittest.TestCase):
         first = build_workstation_evidence_envelope(request, native, producer_version="0.1.0")
         second = build_workstation_evidence_envelope(request, native, producer_version="0.1.0")
         changed_input = build_workstation_evidence_envelope(
-            EdgeAnalyzeRequest(symbol="MSFT"), native, producer_version="0.1.0"
+            EdgeAnalyzeRequest(symbol="MSFT"),
+            native.model_copy(update={"symbol": "MSFT"}),
+            producer_version="0.1.0",
         )
         changed_native = build_workstation_evidence_envelope(
             request,
@@ -863,7 +865,7 @@ class TestApiEndpoints(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "evidence_id does not match"):
             WorkstationEvidenceEnvelope.model_validate(tampered)
 
-    def test_workstation_evidence_requires_aware_generated_at_and_normalizes_utc(self):
+    def test_workstation_evidence_requires_aware_utc_generated_at(self):
         from pydantic import ValidationError
         from web.api.schemas import EdgeAnalyzeRequest
         from web.api.workstation_evidence import build_workstation_evidence_envelope
@@ -872,30 +874,23 @@ class TestApiEndpoints(unittest.TestCase):
         naive = app_module._edge_analyze_response(
             _workstation_edge_snapshot(), generated_at=datetime(2026, 4, 17, 12, 0)
         )
-        with self.assertRaisesRegex(ValidationError, "timezone-aware"):
+        with self.assertRaisesRegex(ValidationError, "timezone-aware UTC"):
             build_workstation_evidence_envelope(request, naive, producer_version="0.1.0")
 
         eastern = timezone(timedelta(hours=-4))
-        aware = app_module._edge_analyze_response(
+        non_utc = app_module._edge_analyze_response(
             _workstation_edge_snapshot(),
             generated_at=datetime(2026, 4, 17, 8, 0, tzinfo=eastern),
         )
-        envelope = build_workstation_evidence_envelope(request, aware, producer_version="0.1.0")
-        self.assertEqual(envelope.temporal.generated_at, datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc))
+        with self.assertRaisesRegex(ValidationError, "timezone-aware UTC"):
+            build_workstation_evidence_envelope(request, non_utc, producer_version="0.1.0")
 
-        utc_rollover = aware.model_copy(
-            update={
-                "generated_at": datetime(2026, 4, 17, 20, 30, tzinfo=eastern),
-                "metrics": {},
-                "selector_output": {},
-                "vol_snapshot": {},
-            }
-        )
-        fallback = build_workstation_evidence_envelope(
-            request, utc_rollover, producer_version="0.1.0"
-        )
-        self.assertEqual(fallback.temporal.generated_at.date().isoformat(), "2026-04-18")
-        self.assertEqual(fallback.temporal.as_of.isoformat(), "2026-04-18")
+        mismatched = app_module._edge_analyze_response(
+            _workstation_edge_snapshot(),
+            generated_at=datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc),
+        ).model_copy(update={"symbol": "MSFT"})
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            build_workstation_evidence_envelope(request, mismatched, producer_version="0.1.0")
 
     def test_workstation_evidence_models_are_strict_frozen_and_reject_nonfinite_values(self):
         from pydantic import ValidationError

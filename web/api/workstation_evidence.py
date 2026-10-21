@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta
 from typing import Annotated, Any, Literal, Optional
 
 from pydantic import (
@@ -64,10 +64,10 @@ class EvidenceTemporalContext(_FrozenStrictModel):
 
     @field_validator("generated_at")
     @classmethod
-    def normalize_generated_at_utc(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("generated_at must be timezone-aware")
-        return value.astimezone(timezone.utc)
+    def generated_at_must_be_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ValueError("generated_at must be timezone-aware UTC")
+        return value
 
 
 class EvidenceMethodology(_FrozenStrictModel):
@@ -97,7 +97,7 @@ class WorkstationEvidenceEnvelope(_FrozenStrictModel):
     subject: EvidenceSubject
     temporal: EvidenceTemporalContext
     epistemic: EvidenceEpistemicContext
-    native_payload_schema: Literal["options-calculator-pro.edge-analyze.v1"]
+    native_payload_schema: str
     native_payload: dict[str, JsonValue]
     human_decision: None = None
 
@@ -170,12 +170,12 @@ def build_workstation_evidence_envelope(
     producer_version: str,
 ) -> WorkstationEvidenceEnvelope:
     """Bind one non-secret analysis request to its complete native response."""
+    if native_payload.symbol.upper() != request.symbol.upper():
+        raise ValueError("Native response symbol does not match the analysis request")
     metrics = native_payload.metrics or {}
     selector = native_payload.selector_output or {}
     vol = native_payload.vol_snapshot or {}
     generated_at = native_payload.generated_at
-    if generated_at.tzinfo is not None and generated_at.utcoffset() is not None:
-        generated_at = generated_at.astimezone(timezone.utc)
 
     as_of, as_of_basis = _first_date([
         ("native_payload.vol_snapshot.as_of_date", vol.get("as_of_date")),
