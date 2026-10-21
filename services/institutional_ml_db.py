@@ -12,6 +12,7 @@ Enhanced database system for institutional-grade options trading:
 Part of Professional Options Calculator v10.0 - Institutional Edition
 """
 
+import contextlib
 import sqlite3
 import logging
 import os
@@ -20,7 +21,7 @@ import itertools
 import math
 import threading
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, List, Optional, Any, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -417,10 +418,29 @@ class InstitutionalMLDatabase:
         from services.sqlite_helpers import open_db_conn
         return open_db_conn(self.db_path)
 
+    @contextlib.contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """A connection that commits on success, rolls back on error, and closes.
+
+        ``with sqlite3.connect(...) as conn`` only ends the transaction; the
+        connection stays open until the garbage collector frees it, which
+        for these connections happened only on a cycle collection. A forked
+        child that inherited one closed it at an arbitrary moment, and SQLite
+        in that child, holding no locks of its own, could then checkpoint and
+        remove the shared WAL and shm files under processes still using them
+        ("disk I/O error" when several processes opened the store at once).
+        """
+        conn = self._open_conn()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_institutional_schema(self):
         """Create institutional-grade database schema"""
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
 
                 # Enable foreign keys
@@ -806,7 +826,7 @@ class InstitutionalMLDatabase:
     def _populate_ticker_universe(self):
         """Populate initial ticker universe with institutional stocks"""
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
 
                 # Check if already populated
@@ -941,7 +961,7 @@ class InstitutionalMLDatabase:
             if "RSI_14" not in hist_data.columns or "RealizedVol_30" not in hist_data.columns:
                 hist_data = self._add_technical_indicators(hist_data)
 
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
 
                 for date, row in hist_data.iterrows():
@@ -1030,7 +1050,7 @@ class InstitutionalMLDatabase:
             vix_proxy = (12.0 + 70.0 * rv30).clip(lower=10.0, upper=45.0)
             forward_vol_21d = (data['Returns'].rolling(window=21).std() * np.sqrt(252)).shift(-21)
 
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
 
                 for i, (date, row) in enumerate(data.iterrows()):
@@ -1481,7 +1501,7 @@ class InstitutionalMLDatabase:
             end_date.strftime('%Y-%m-%d'),
         ]
 
-        with self._open_conn() as conn:
+        with self._connection() as conn:
             df = pd.read_sql_query(query, conn, params=params)
 
         if df.empty:
@@ -1650,7 +1670,7 @@ class InstitutionalMLDatabase:
                                  window_end: datetime) -> List[Tuple[datetime, str, str]]:
         """Read cached earnings dates for the given symbol and time window."""
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 query = """
                     SELECT event_date, source, release_timing
                     FROM earnings_events
@@ -1688,7 +1708,7 @@ class InstitutionalMLDatabase:
         if not event_dates:
             return
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO earnings_events (symbol, event_date, source, release_timing)
@@ -1942,7 +1962,7 @@ class InstitutionalMLDatabase:
         events_outside_window = 0
 
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
 
                 for symbol in symbols:
@@ -2184,7 +2204,7 @@ class InstitutionalMLDatabase:
         no_point_in_time_inputs = 0
         no_iv_values = 0
 
-        with self._open_conn() as conn:
+        with self._connection() as conn:
             cursor = conn.cursor()
 
             for symbol in symbols:
@@ -2828,7 +2848,7 @@ class InstitutionalMLDatabase:
             ORDER BY capture_date
         """
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 df = pd.read_sql_query(query, conn, params=[str(symbol).upper(), event_date_str])
         except Exception as exc:
             self.logger.debug("Failed to load replay snapshot pair for %s @ %s: %s", symbol, event_date_str, exc)
@@ -3172,7 +3192,7 @@ class InstitutionalMLDatabase:
             ORDER BY symbol, event_date, capture_date
         """
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 snapshots = pd.read_sql_query(query, conn)
         except Exception as e:
             self.logger.error(f"❌ Failed to read snapshots for calibration: {e}")
@@ -3289,7 +3309,7 @@ class InstitutionalMLDatabase:
             for symbol, event_date in all_snapshot_events.itertuples(index=False)
         ]
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 conn.executemany(
                     "DELETE FROM earnings_iv_decay_labels WHERE symbol = ? AND event_date = ? AND source = 'snapshot_pair'",
                     rebuilt_events,
@@ -3312,7 +3332,7 @@ class InstitutionalMLDatabase:
 
         labels_df = pd.DataFrame(label_rows)
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO earnings_iv_decay_labels
@@ -3374,7 +3394,7 @@ class InstitutionalMLDatabase:
             ORDER BY symbol, event_date, capture_date
         """
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 snapshots = pd.read_sql_query(query, conn)
         except Exception as e:
             self.logger.error(f"❌ Failed to summarize snapshot pairing progress: {e}")
@@ -3813,7 +3833,7 @@ class InstitutionalMLDatabase:
     def _store_backtest_session(self, session: BacktestSession):
         """Store backtest session metadata"""
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
 
                 cursor.execute("""
@@ -3847,7 +3867,7 @@ class InstitutionalMLDatabase:
             return
 
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM backtest_trades WHERE session_id = ?", (session_id,))
                 cursor.executemany("""
@@ -3907,7 +3927,7 @@ class InstitutionalMLDatabase:
             accidental leakage in downstream modeling code.
         """
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 feature_columns = [
                     "symbol",
                     "date",
@@ -3970,7 +3990,7 @@ class InstitutionalMLDatabase:
     def get_backtest_results(self, session_id: str = None) -> pd.DataFrame:
         """Get backtest results summary"""
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 if session_id:
                     query = "SELECT * FROM backtest_sessions WHERE session_id = ?"
                     df = pd.read_sql_query(query, conn, params=[session_id])
@@ -3987,7 +4007,7 @@ class InstitutionalMLDatabase:
     def get_backtest_trades(self, session_id: str, limit: Optional[int] = None) -> pd.DataFrame:
         """Get trade-level records for a backtest session."""
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 query = """
                     SELECT *
                     FROM backtest_trades
@@ -4065,7 +4085,7 @@ class InstitutionalMLDatabase:
             ))
 
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 rows = conn.execute(query, symbol_params).fetchall()
                 global_query = """
                     SELECT COUNT(*) as sample_size,
@@ -4159,7 +4179,7 @@ class InstitutionalMLDatabase:
             WHERE t.session_id = ?
         """
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 row = conn.execute(query, [session_id]).fetchone()
             if not row:
                 return {
@@ -4232,7 +4252,7 @@ class InstitutionalMLDatabase:
         query += " ORDER BY t.trade_date, t.symbol"
 
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 df = pd.read_sql_query(query, conn, params=params)
         except Exception as e:
             self.logger.error(f"❌ Failed to build crush scorecard: {e}")
@@ -4387,7 +4407,7 @@ class InstitutionalMLDatabase:
         query += " ORDER BY t.trade_date, t.symbol"
 
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 df = pd.read_sql_query(query, conn, params=params)
         except Exception as e:
             self.logger.error(f"❌ Failed to load trade diagnostics frame: {e}")
@@ -4931,7 +4951,7 @@ class InstitutionalMLDatabase:
             WHERE symbol IN ({placeholders})
         """
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 row = conn.execute(query, universe).fetchone()
             if not row or not row[0] or not row[1]:
                 return None
@@ -5502,7 +5522,7 @@ class InstitutionalMLDatabase:
             WHERE realized_vol_30d IS NOT NULL AND realized_vol_30d > 0
         """
         try:
-            with self._open_conn() as conn:
+            with self._connection() as conn:
                 df_labels = pd.read_sql_query(labels_query, conn)
                 df_prices = pd.read_sql_query(prices_query, conn)
         except Exception as exc:
