@@ -487,7 +487,7 @@ from services.code_identity import source_identity
 from services.market_data_client import MarketDataClient
 from services.market_data_provider import build_market_data_client, get_options_provider_name
 from services.options_feature_store import OptionsFeatureStore, OptionsFeatureStoreError
-from web.api.edge_engine import analyze_single_ticker
+from web.api.edge_engine import EdgeSnapshot, analyze_single_ticker
 from web.api.screener_engine import build_edge_screener
 from web.api.schemas import (
     CalibrationBucket,
@@ -502,6 +502,10 @@ from web.api.schemas import (
     RankedScreenerResponse,
     RankedSetupRow,
     LearningDiagnosticsResponse,
+)
+from web.api.workstation_evidence import (
+    WorkstationEvidenceEnvelope,
+    build_workstation_evidence_envelope,
 )
 
 # Module-level MarketDataClient singleton — shared across requests so the
@@ -540,7 +544,7 @@ def _get_feature_store() -> OptionsFeatureStore:
 
 app = FastAPI(
     title="Options Calculator Pro API",
-    version="0.1.0",
+    version="0.2.0",
     description="Event-volatility structure selection, evidence diagnostics, and OOS robustness reports.",
 )
 
@@ -1163,8 +1167,27 @@ def version() -> Dict[str, Any]:
     }
 
 
-@app.post("/api/edge/analyze", response_model=EdgeAnalyzeResponse)
-def analyze_edge(request: EdgeAnalyzeRequest, http_request: Request = None) -> EdgeAnalyzeResponse:
+def _edge_analyze_response(
+    snapshot: EdgeSnapshot,
+    *,
+    generated_at: Optional[datetime] = None,
+) -> EdgeAnalyzeResponse:
+    """Serialize one native analysis result at the API boundary."""
+    return EdgeAnalyzeResponse(
+        generated_at=generated_at or datetime.now(timezone.utc),
+        symbol=snapshot.symbol,
+        recommendation=snapshot.recommendation,
+        confidence_pct=snapshot.confidence_pct,
+        setup_score=snapshot.setup_score,
+        metrics=_json_safe(snapshot.metrics),
+        rationale=snapshot.rationale,
+        selector_output=_json_safe(snapshot.selector_output),
+        structure_scorecards=_json_safe(snapshot.structure_scorecards),
+        vol_snapshot=_json_safe(snapshot.vol_snapshot),
+    )
+
+
+def _run_edge_analysis(request: EdgeAnalyzeRequest, http_request: Request = None) -> EdgeAnalyzeResponse:
     if not _check_rate_limit(
         "analyze", _client_ip(http_request),
         _ANALYZE_RATE_LIMIT_PER_MIN, _ANALYZE_RATE_LIMIT_PER_HOUR,
@@ -1179,20 +1202,23 @@ def analyze_edge(request: EdgeAnalyzeRequest, http_request: Request = None) -> E
         # scalars from data-dependent branches (np.bool_/np.float64), which
         # pydantic refuses to serialize ("Unable to serialize unknown type").
         # Sanitize at the boundary so a rare branch can never 500 the endpoint.
-        return EdgeAnalyzeResponse(
-            generated_at=datetime.now(timezone.utc),
-            symbol=snapshot.symbol,
-            recommendation=snapshot.recommendation,
-            confidence_pct=snapshot.confidence_pct,
-            setup_score=snapshot.setup_score,
-            metrics=_json_safe(snapshot.metrics),
-            rationale=snapshot.rationale,
-            selector_output=_json_safe(snapshot.selector_output),
-            structure_scorecards=_json_safe(snapshot.structure_scorecards),
-            vol_snapshot=_json_safe(snapshot.vol_snapshot),
-        )
+        return _edge_analyze_response(snapshot)
     except Exception as exc:
         _raise_public_error(400, "Analysis failed. Check the ticker, data availability, and provider configuration.", exc)
+
+
+@app.post("/api/edge/analyze", response_model=EdgeAnalyzeResponse)
+def analyze_edge(request: EdgeAnalyzeRequest, http_request: Request = None) -> EdgeAnalyzeResponse:
+    return _run_edge_analysis(request, http_request)
+
+
+@app.post("/api/workstation/evidence/options-edge", response_model=WorkstationEvidenceEnvelope)
+def export_options_edge_evidence(
+    request: EdgeAnalyzeRequest,
+    http_request: Request = None,
+) -> WorkstationEvidenceEnvelope:
+    native_payload = _run_edge_analysis(request, http_request)
+    return build_workstation_evidence_envelope(native_payload, producer_version=app.version)
 
 
 @app.get("/api/edge/screener", response_model=EdgeScreenerResponse)

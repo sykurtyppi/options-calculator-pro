@@ -1,3 +1,5 @@
+import hashlib
+import json
 import tempfile
 import time
 import unittest
@@ -20,6 +22,43 @@ def _make_mock_mda_client():
     m = MagicMock()
     m.is_available.return_value = False
     return m
+
+
+def _workstation_edge_snapshot(*, confidence_pct=67.5):
+    return EdgeSnapshot(
+        symbol="AAPL",
+        recommendation="CALENDAR",
+        confidence_pct=confidence_pct,
+        setup_score=0.72,
+        metrics={
+            "generated_at": "2026-04-17T11:59:00+00:00",
+            "data_source": "marketdata_app",
+            "data_sources": {
+                "options_source": "marketdata_app",
+                "price_rv_source": "yfinance",
+            },
+            "move_uncertainty_pct": 1.4,
+            "sample_confidence": "medium",
+            "hard_no_trade": True,
+            "hard_gate_reasons": ["earnings timing is unconfirmed"],
+            "data_quality": "degraded",
+        },
+        rationale=["Research signal only."],
+        selector_output={
+            "as_of": "2026-04-17",
+            "earnings_date": "2026-04-23",
+            "methodology": "event_volatility_structure_selector",
+            "binding_gate": "data_quality_below_floor",
+            "binding_gates": ["data_quality_below_floor"],
+        },
+        structure_scorecards=[{"structure": "calendar", "score": 0.72}],
+        vol_snapshot={
+            "as_of_date": "2026-04-17",
+            "earnings_date": "2026-04-23",
+            "data_quality": "degraded",
+            "surface_quality_reasons": ["crossed quote detected"],
+        },
+    )
 
 
 class _StubFeatureStore:
@@ -673,6 +712,105 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(payload["recommendation"], "Watchlist")
         self.assertAlmostEqual(payload["confidence_pct"], 77.7, places=3)
         self.assertEqual(payload["metrics"]["iv_rv30"], 1.31)
+
+    def test_workstation_evidence_export_preserves_native_payload_and_governance(self):
+        snapshot = _workstation_edge_snapshot()
+        with patch.object(app_module, "analyze_single_ticker", return_value=snapshot) as analyze, \
+             patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()):
+            response = self.client.post(
+                "/api/workstation/evidence/options-edge", json={"symbol": "aapl"}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        analyze.assert_called_once()
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "workstation.evidence.v1")
+        self.assertRegex(payload["evidence_id"], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(payload["producer"]["system"], "options-calculator-pro")
+        self.assertEqual(payload["producer"]["version"], "0.2.0")
+        self.assertEqual(payload["producer"]["native_output_schema"], "options-calculator-pro.edge-analyze.v1")
+        self.assertEqual(
+            payload["subject"],
+            {
+                "entity_type": "security",
+                "local_identifier": "AAPL",
+                "scheme": "ticker",
+                "canonical_identifier": None,
+                "mapping_status": "unresolved",
+            },
+        )
+        self.assertEqual(payload["temporal"]["as_of"], "2026-04-17")
+        self.assertEqual(payload["temporal"]["as_of_basis"], "native_payload.vol_snapshot.as_of_date")
+        self.assertEqual(payload["temporal"]["horizon"], "earnings_event")
+        self.assertEqual(payload["temporal"]["event_date"], "2026-04-23")
+        self.assertEqual(payload["epistemic"]["evidence_class"], "analytical_signal")
+        self.assertEqual(payload["epistemic"]["confidence"]["confidence_pct"], 67.5)
+        self.assertEqual(payload["epistemic"]["uncertainty"]["move_uncertainty_pct"], 1.4)
+        self.assertEqual(payload["epistemic"]["provenance"]["data_source"], "marketdata_app")
+        self.assertEqual(
+            payload["epistemic"]["invalidation_conditions"],
+            ["earnings timing is unconfirmed", "data_quality_below_floor"],
+        )
+        self.assertEqual(
+            payload["epistemic"]["blocking_quality_reasons"],
+            ["crossed quote detected", "earnings timing is unconfirmed"],
+        )
+        self.assertEqual(payload["native_payload_schema"], "options-calculator-pro.edge-analyze.v1")
+        self.assertEqual(payload["native_payload"]["symbol"], "AAPL")
+        self.assertEqual(payload["native_payload"]["recommendation"], "CALENDAR")
+        self.assertIsNone(payload["human_decision"])
+
+        unhashed = {key: value for key, value in payload.items() if key != "evidence_id"}
+        canonical = json.dumps(unhashed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        expected_id = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        self.assertEqual(payload["evidence_id"], expected_id)
+
+    def test_workstation_evidence_id_is_deterministic_and_content_addressed(self):
+        from web.api.workstation_evidence import build_workstation_evidence_envelope
+
+        native = app_module._edge_analyze_response(
+            _workstation_edge_snapshot(),
+            generated_at=datetime(2026, 4, 17, 12, 0, tzinfo=timezone.utc),
+        )
+        first = build_workstation_evidence_envelope(native, producer_version="0.1.0")
+        second = build_workstation_evidence_envelope(native, producer_version="0.1.0")
+        changed_native = native.model_copy(update={"confidence_pct": 68.0})
+        changed = build_workstation_evidence_envelope(changed_native, producer_version="0.1.0")
+        changed_metadata = build_workstation_evidence_envelope(native, producer_version="0.1.1")
+
+        self.assertEqual(first.evidence_id, second.evidence_id)
+        self.assertNotEqual(first.evidence_id, changed.evidence_id)
+        self.assertNotEqual(first.evidence_id, changed_metadata.evidence_id)
+        self.assertIsNone(first.human_decision)
+        with self.assertRaises(Exception):
+            first.model_copy(update={"human_decision": "BUY"}).model_validate(
+                {**first.model_dump(mode="json"), "human_decision": "BUY"}
+            )
+
+    def test_workstation_evidence_endpoint_is_auth_protected(self):
+        with patch.object(app_module, "_SHARE_AUTH_ENABLED", True), \
+             patch.object(app_module, "_SHARE_PASSWORD", "secret"):
+            response = self.client.post(
+                "/api/workstation/evidence/options-edge", json={"symbol": "AAPL"}
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Unauthorized", response.text)
+
+    def test_workstation_evidence_shares_analyze_rate_limit_bucket(self):
+        snapshot = _workstation_edge_snapshot()
+        with patch.object(app_module, "_ANALYZE_RATE_LIMIT_PER_MIN", 1), \
+             patch.object(app_module, "_ANALYZE_RATE_LIMIT_PER_HOUR", 100), \
+             patch.object(app_module, "analyze_single_ticker", return_value=snapshot) as analyze, \
+             patch.object(app_module, "_get_mda_client", return_value=_make_mock_mda_client()):
+            exported = self.client.post(
+                "/api/workstation/evidence/options-edge", json={"symbol": "AAPL"}
+            )
+            native = self.client.post("/api/edge/analyze", json={"symbol": "AAPL"})
+
+        self.assertEqual(exported.status_code, 200)
+        self.assertEqual(native.status_code, 429)
+        analyze.assert_called_once()
 
     def test_historical_options_symbols_endpoint(self):
         with patch.object(app_module, "_get_feature_store", return_value=_StubFeatureStore()):
