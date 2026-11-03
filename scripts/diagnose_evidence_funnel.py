@@ -24,13 +24,19 @@ from services.funnel_diagnosis import (  # noqa: E402
     DEFAULT_TRAILING_WEEKS,
     diagnose_funnel,
     read_funnel_rows,
+    read_recommendation_rows,
     render_text,
 )
+
+DEFAULT_RECOMMENDATION_LEDGER = (Path.home() / ".options_calculator_pro" / "recommendations"
+                                 / "recommendation_ledger.sqlite")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--store", type=Path, default=_DEFAULT_STORE, help=f"Funnel store (default {_DEFAULT_STORE}).")
+    parser.add_argument("--recommendations", type=Path, default=DEFAULT_RECOMMENDATION_LEDGER,
+                        help=f"Recommendation ledger for stop details (default {DEFAULT_RECOMMENDATION_LEDGER}).")
     parser.add_argument("--as-of", type=date.fromisoformat, default=None, help="Evaluate as of this date (default today).")
     parser.add_argument("--since", type=date.fromisoformat, default=None,
                         help="Only events first seen on or after this date (default: all history).")
@@ -44,8 +50,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[diagnose_evidence_funnel] no funnel store at {args.store}", file=sys.stderr)
         return 1
     rows = read_funnel_rows(args.store)
+    recommendation_status: dict = {}
+    recommendations = read_recommendation_rows(args.recommendations, status=recommendation_status)
+    if recommendation_status.get("status") == "missing":
+        print(f"warning: recommendation enrichment missing: {args.recommendations}", file=sys.stderr)
+    elif recommendation_status.get("status") == "unavailable":
+        print(f"warning: recommendation enrichment unavailable: {recommendation_status['error']}",
+              file=sys.stderr)
     result = diagnose_funnel(rows["events"], rows["cycles"], as_of=args.as_of or date.today(),
-                             since=args.since, trailing_weeks=args.trailing_weeks)
+                             since=args.since, trailing_weeks=args.trailing_weeks,
+                             recommendations=recommendations,
+                             recommendation_status=recommendation_status)
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else render_text(result))
     return 0
 
