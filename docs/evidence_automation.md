@@ -226,6 +226,29 @@ Useful flags:
 ./.venv311/bin/python scripts/check_evidence_health.py --date 2026-04-27
 ```
 
+## Funnel Diagnosis
+
+The daily report's funnel section counts candidate passes over at most 30
+days. To see where forward evidence actually stops, run:
+
+```bash
+./.venv311/bin/python scripts/diagnose_evidence_funnel.py          # text summary
+./.venv311/bin/python scripts/diagnose_evidence_funnel.py --json   # full detail
+./.venv311/bin/python scripts/diagnose_evidence_funnel.py --since 2026-09-01
+```
+
+It reads the funnel store read-only and reports, over all history:
+
+- every earnings event's furthest stage and how it ended there: claimable,
+  in flight, stopped (with the reason), deferred, or deferred and never
+  picked up again before the event passed;
+- the binding constraint: the stage that ends the most events, and its
+  leading reasons (`no_trade:<gate>` names the selector gate that said no);
+- claimable trades per week over the last 8 weeks, and at that rate how many
+  weeks until the paid-beta gate's 30-outcome sample.
+
+An event whose earnings date moved is counted once per date.
+
 ## Troubleshooting
 
 If the daily report is missing:
