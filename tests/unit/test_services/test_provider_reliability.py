@@ -27,6 +27,7 @@ from services.baseline_evidence_store import BaselineEvidenceStore
 from services.outcome_recorder import OutcomeStore, make_trade_id
 from services.recommendation_ledger import RecommendationLedger
 from services.yfinance_market_data_client import YFinanceMarketDataClient
+from tests.unit.quote_fixtures import IN_SESSION_QUOTES
 
 
 @pytest.fixture
@@ -336,7 +337,7 @@ TODAY = date(2026, 4, 21)
 def _analysis(symbol):
     earnings = TODAY + timedelta(days=6)
     return SimpleNamespace(
-        symbol=symbol, recommendation="Candidate", confidence_pct=70.0, setup_score=0.6, metrics={},
+        symbol=symbol, recommendation="Candidate", confidence_pct=70.0, setup_score=0.6, metrics={"quote_provenance": IN_SESSION_QUOTES},
         rationale=["ok"],
         selector_output={"recommendation": "Candidate", "best_structure": "atm_straddle",
                          "earnings_date": earnings.isoformat(), "binding_gate": None},

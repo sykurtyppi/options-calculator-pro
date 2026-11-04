@@ -33,6 +33,7 @@ from services.recommendation_ledger import (
     build_record_from_analysis,
     is_moved_event_date,
 )
+from tests.unit.quote_fixtures import IN_SESSION_QUOTES
 
 TODAY = date(2026, 4, 21)
 
@@ -46,7 +47,7 @@ def funnel(tmp_path):
 
 def _analysis(symbol, earnings, as_of=TODAY):
     return SimpleNamespace(
-        symbol=symbol, recommendation="Candidate", confidence_pct=70.0, setup_score=0.6, metrics={},
+        symbol=symbol, recommendation="Candidate", confidence_pct=70.0, setup_score=0.6, metrics={"quote_provenance": IN_SESSION_QUOTES},
         rationale=["ok"],
         selector_output={"recommendation": "Candidate", "best_structure": "atm_straddle",
                          "earnings_date": earnings.isoformat(), "binding_gate": None},
@@ -346,7 +347,7 @@ def test_a_recheck_for_a_distinct_event_is_not_superseded(tmp_path, funnel):
 
 def _record(symbol, earnings, as_of, provenance="forward_post_freeze"):
     analysis = SimpleNamespace(
-        symbol=symbol, recommendation="Candidate", metrics={},
+        symbol=symbol, recommendation="Candidate", metrics={"quote_provenance": IN_SESSION_QUOTES},
         selector_output={"recommendation": "Candidate", "best_structure": "call_calendar",
                          "earnings_date": earnings},
         structure_scorecards=[], rationale=[], sample_provenance=provenance,

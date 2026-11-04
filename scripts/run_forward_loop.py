@@ -66,6 +66,7 @@ from services.provider_telemetry import (
     record_provider_telemetry,
     telemetry_context,
 )
+from services.quote_provenance import quote_provenance_problem
 from services.recommendation_ledger import (
     RecommendationLedger,
     make_recommendation_id,
@@ -2358,6 +2359,26 @@ def _run_forward_screener(
                     },
                     dry_run=dry_run,
                 )
+
+        # Quotes fetched outside the regular session, or provider quotes too
+        # old at the fetch, must not price forward evidence: not this
+        # candidate's trade, nor its shadow baseline. The analysis is already
+        # in the ledger with its provenance, so the stop is auditable.
+        quote_problem = quote_provenance_problem(
+            _get(_get(snapshot, "metrics", {}) or {}, "quote_provenance"))
+        if quote_problem is not None:
+            _funnel(funnel_mod.STAGE_ELIGIBLE, funnel_mod.OUTCOME_DROPPED,
+                    f"{funnel_mod.REASON_UNTRUSTED_QUOTES}:{quote_problem}",
+                    recommendation_id=recommendation_id, earnings_date=earnings_date or row.get("earnings_date"))
+            _record_skip(summary, "untrusted_quotes")
+            _append_learning_log(
+                log_path,
+                {"event_type": "skip", "symbol": symbol, "structure": structure,
+                 "setup_score": _get(snapshot, "setup_score"), "source": "paper",
+                 "reason": f"untrusted_quotes:{quote_problem}", "recommendation_id": recommendation_id},
+                dry_run=dry_run,
+            )
+            continue
 
         # Universe shadow cohort: price every eligible event BEFORE the
         # actionable gate so No Trade calls get a counterfactual. Best-effort -

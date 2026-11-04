@@ -16,6 +16,7 @@ from services.outcome_recorder import OutcomeStore, make_trade_id
 from services.recommendation_ledger import RecommendationLedger
 from services.structure_prior_store import StructurePriorStore
 from scripts.run_forward_loop import run_daily_cycle
+from tests.unit.quote_fixtures import IN_SESSION_QUOTES
 
 
 def _analysis(symbol: str, earnings_date: date, structure: str, recommendation: str = "Candidate") -> SimpleNamespace:
@@ -24,7 +25,7 @@ def _analysis(symbol: str, earnings_date: date, structure: str, recommendation: 
         recommendation=recommendation,
         confidence_pct=72.0,
         setup_score=0.66,
-        metrics={"calibration_phase": "bootstrap_prior"},
+        metrics={"calibration_phase": "bootstrap_prior", "quote_provenance": IN_SESSION_QUOTES},
         rationale=["ok"],
         selector_output={
             "recommendation": recommendation,

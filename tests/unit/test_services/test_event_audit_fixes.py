@@ -40,6 +40,7 @@ from services.event_reconciliation import (
 from services.forward_performance_diagnostics import build_forward_performance_diagnostics
 from services.outcome_recorder import OutcomeStore
 from services.recommendation_ledger import RecommendationLedger, RecommendationRecord, derive_event_groups
+from tests.unit.quote_fixtures import IN_SESSION_QUOTES
 
 T = date(2026, 4, 21)
 
@@ -285,7 +286,7 @@ def test_the_run_log_counts_reconciliation_errors():
 def _analysis(day, structure, earnings):
     def analyze(sym, mda_client=None):
         return SimpleNamespace(
-            symbol=sym, recommendation="Candidate", setup_score=0.6, metrics={}, rationale=[],
+            symbol=sym, recommendation="Candidate", setup_score=0.6, metrics={"quote_provenance": IN_SESSION_QUOTES}, rationale=[],
             selector_output={"recommendation": "Candidate", "best_structure": structure,
                              "earnings_date": earnings.isoformat()},
             structure_scorecards=[{"structure": structure, "execution_penalty": 0.0}],

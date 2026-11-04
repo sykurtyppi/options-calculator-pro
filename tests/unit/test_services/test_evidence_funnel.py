@@ -22,6 +22,7 @@ from services.claim_contract import CONTRACT_VERSION
 from services.baseline_evidence_store import BaselineEvidenceStore
 from services.outcome_recorder import OutcomeStore, make_trade_id
 from services.recommendation_ledger import RecommendationLedger
+from tests.unit.quote_fixtures import IN_SESSION_QUOTES
 
 TODAY = date(2026, 4, 21)
 
@@ -111,7 +112,7 @@ def _analysis(symbol, recommendation="Candidate", structure="atm_straddle", gate
     earnings = TODAY + timedelta(days=6)
     return SimpleNamespace(
         symbol=symbol, recommendation=recommendation, confidence_pct=70.0, setup_score=0.6,
-        metrics={}, rationale=["ok"],
+        metrics={"quote_provenance": IN_SESSION_QUOTES}, rationale=["ok"],
         selector_output={"recommendation": recommendation, "best_structure": structure,
                          "earnings_date": earnings.isoformat(), "binding_gate": gate},
         structure_scorecards=[{"structure": structure, "execution_penalty": 0.03}],

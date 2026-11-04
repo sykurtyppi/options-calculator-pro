@@ -21,6 +21,7 @@ from services.baseline_evidence_store import (
 from services.evidence_report import build_evidence_report
 from services.outcome_recorder import OutcomeStore
 from services.recommendation_ledger import RecommendationLedger
+from tests.unit.quote_fixtures import IN_SESSION_QUOTES
 
 TODAY = date(2026, 4, 21)
 EARNINGS = TODAY + timedelta(days=6)
@@ -32,7 +33,7 @@ def _analysis(symbol: str, recommendation: str, structure, as_of: date = TODAY) 
         recommendation=recommendation,
         confidence_pct=55.0,
         setup_score=0.4,
-        metrics={"calibration_phase": "bootstrap_prior"},
+        metrics={"calibration_phase": "bootstrap_prior", "quote_provenance": IN_SESSION_QUOTES},
         rationale=["ok"],
         selector_output={
             "recommendation": recommendation,

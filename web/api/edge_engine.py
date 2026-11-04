@@ -27,6 +27,7 @@ from services.dividend_yields import get_dividend_yield
 from services.iv_term_structure import bounded_interp, select_tenor_spanning_expiries
 from services.earnings_event_service import resolve_upcoming_earnings_event
 from services.earnings_vol_snapshot import build_vol_snapshot
+from services.quote_provenance import chain_quote_provenance
 from services.provider_telemetry import classify_error, record_provider_telemetry
 from services.pricing_rates import (
     _rf_rate_cache,
@@ -2452,6 +2453,8 @@ class AnalysisInputs:
     vol_snapshot: Any
     structure_scorecards: Any
     selector_output: Any
+    # services.quote_provenance record of the chain vol_snapshot read.
+    quote_provenance: Optional[Dict[str, Any]] = None
 
 
 def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs:
@@ -2562,6 +2565,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     # Yang-Zhang 30-day RV (primary — ~5x more efficient than close-to-close)
     # ── 2. Option chain: MDApp (one call, reused for term structure + curvature) ──
     chain_df: Optional[pd.DataFrame] = None
+    chain_fetched_at: Optional[datetime] = None
     if use_provider:
         try:
             chain_df = client.get_option_chain(
@@ -2569,6 +2573,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
                 expiration="all",
                 strike_limit=10,
             )
+            chain_fetched_at = datetime.now(timezone.utc)
             if chain_df is None or chain_df.empty:
                 logger.info("Provider chain empty for %s, falling back to yfinance", clean_symbol)
                 chain_df = None
@@ -2689,14 +2694,22 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
             "Volume": "volume",
         }
     )
-    option_snapshot_frame = chain_df if chain_df is not None else _collect_yf_option_chain_frame(
-        ticker, as_of_date=_market_today_date()
-    )
+    if chain_df is not None:
+        option_snapshot_frame = chain_df
+    else:
+        option_snapshot_frame = _collect_yf_option_chain_frame(ticker, as_of_date=_market_today_date())
+        chain_fetched_at = datetime.now(timezone.utc)
     # V2: same honest provenance the term-structure path reports (see options_source
     # below) — when the provider supplied the chain, use its name; otherwise the
     # raw-yfinance fallback was used. Threaded so data_quality_score can penalize a
     # delayed/greek-less surface instead of scoring it like real-time MarketData.
     snapshot_options_provider = data_source if chain_df is not None else "yfinance"
+    # When and from whom these quotes came: the ledger records it, and the
+    # forward loop refuses to price evidence from stale or off-session quotes.
+    quote_provenance = chain_quote_provenance(
+        option_snapshot_frame, provider=snapshot_options_provider,
+        fetched_at=chain_fetched_at or datetime.now(timezone.utc),
+    )
     vol_snapshot = build_vol_snapshot(
         clean_symbol,
         _market_today_date(),
@@ -2747,6 +2760,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
         vol_snapshot=vol_snapshot,
         structure_scorecards=structure_scorecards,
         selector_output=selector_output,
+        quote_provenance=quote_provenance,
     )
 
 
@@ -2773,6 +2787,7 @@ def analyze_single_ticker(
     current_price = inputs.current_price
     close_for_profile = inputs.close_for_profile
     chain_df = inputs.chain_df
+    quote_provenance = inputs.quote_provenance
     data_source = inputs.data_source
     dte = inputs.dte
     earnings_release_time = inputs.earnings_release_time
@@ -3506,6 +3521,7 @@ def analyze_single_ticker(
 
     # ── 10. Metrics dict ──────────────────────────────────────────────────────
     metrics = {
+        "quote_provenance": quote_provenance,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "data_source": data_source,
         # FIX 4: granular source provenance — options and price/RV may differ

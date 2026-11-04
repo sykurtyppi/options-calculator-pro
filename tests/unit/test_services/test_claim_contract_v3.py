@@ -25,6 +25,7 @@ from services.baseline_evidence_store import BaselineEvidenceStore
 from services.evidence_quality import evaluate_evidence_quality
 from services.outcome_recorder import OutcomeStore
 from services.recommendation_ledger import RecommendationLedger
+from tests.unit.quote_fixtures import IN_SESSION_QUOTES
 
 V = cc.CONTRACT_VERSION
 TODAY = date(2026, 4, 21)
@@ -259,7 +260,7 @@ def test_the_forward_loop_stores_the_entry_verdict_with_the_trade(tmp_path, monk
     monkeypatch.setattr(forward_loop, "_today", lambda: TODAY)
     earnings = TODAY + timedelta(days=6)
     analysis = SimpleNamespace(
-        symbol="AAPL", recommendation="Candidate", confidence_pct=70.0, setup_score=0.6, metrics={},
+        symbol="AAPL", recommendation="Candidate", confidence_pct=70.0, setup_score=0.6, metrics={"quote_provenance": IN_SESSION_QUOTES},
         rationale=["ok"],
         selector_output={"recommendation": "Candidate", "best_structure": "atm_straddle",
                          "earnings_date": earnings.isoformat(), "binding_gate": None},

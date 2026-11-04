@@ -44,6 +44,7 @@ from services.candidate_shadow_provenance import (
     SAMPLE_PROVENANCE_HISTORICAL_REPLAY,
     normalize_sample_provenance,
 )
+from services.quote_provenance import ledger_quote_payload
 
 logger = logging.getLogger(__name__)
 
@@ -1364,7 +1365,9 @@ def build_record_from_analysis(
     selector_output = _as_dict(_get(analysis, "selector_output", {}) or {})
     scorecards = [_as_dict(card) for card in (_get(analysis, "structure_scorecards", []) or [])]
     metrics = _as_dict(_get(analysis, "metrics", {}) or {})
-    quote = quote_payload or {}
+    # The analysis's own chain provenance fills the quote columns when the
+    # caller passes no explicit quote (every forward and UI analysis).
+    quote = quote_payload or ledger_quote_payload(metrics.get("quote_provenance"))
     surface_quality = quote.get("surface_quality") or vol_snapshot.get("surface_quality") or {}
     created_at = datetime.now(timezone.utc).isoformat()
 
@@ -1472,6 +1475,7 @@ def build_record_from_analysis(
         explanation=explanation,
         metadata={
             "schema_source": "build_record_from_analysis",
+            **({"quote_provenance": metrics["quote_provenance"]} if metrics.get("quote_provenance") else {}),
             **(metadata or {}),
         },
         picker_provenance=picker_provenance,

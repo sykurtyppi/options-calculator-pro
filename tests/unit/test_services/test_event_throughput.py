@@ -24,6 +24,7 @@ from services.baseline_evidence_store import BaselineEvidenceStore
 from services.forward_performance_diagnostics import build_forward_performance_diagnostics
 from services.outcome_recorder import OutcomeStore
 from services.recommendation_ledger import RecommendationLedger, build_record_from_analysis, make_event_key
+from tests.unit.quote_fixtures import IN_SESSION_QUOTES
 
 TODAY = date(2026, 4, 21)
 
@@ -34,7 +35,7 @@ TODAY = date(2026, 4, 21)
 def _record(symbol, earnings, as_of, *, recommendation="Candidate", structure="call_calendar",
             provenance="forward_post_freeze"):
     analysis = SimpleNamespace(
-        symbol=symbol, recommendation=recommendation, metrics={},
+        symbol=symbol, recommendation=recommendation, metrics={"quote_provenance": IN_SESSION_QUOTES},
         selector_output={"recommendation": recommendation, "best_structure": structure,
                          "earnings_date": earnings},
         structure_scorecards=[], rationale=[], sample_provenance=provenance,
@@ -130,7 +131,7 @@ def funnel(tmp_path):
 
 def _analysis(symbol, earnings):
     return SimpleNamespace(
-        symbol=symbol, recommendation="Candidate", confidence_pct=70.0, setup_score=0.6, metrics={},
+        symbol=symbol, recommendation="Candidate", confidence_pct=70.0, setup_score=0.6, metrics={"quote_provenance": IN_SESSION_QUOTES},
         rationale=["ok"],
         selector_output={"recommendation": "Candidate", "best_structure": "atm_straddle",
                          "earnings_date": earnings.isoformat(), "binding_gate": None},
