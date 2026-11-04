@@ -25,7 +25,7 @@
     pre-earnings), so the time is chosen for quote quality, not urgency.
     Weekends are omitted (Weekday 1-5): a Saturday alert would duplicate
     Friday's. Clear of every other job: exit resolver (12:30), forward
-    collector (19:30), evidence cycle (21:30), watchdog (22:15), rotation
+    collector (19:30), evidence cycle (16:45), watchdog (22:15), rotation
     (03:00), backup (04:00). This job only reads provider data and writes its
     own state file, so it cannot contend with the SQLite writers.
   -->

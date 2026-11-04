@@ -12,7 +12,7 @@
   <!--
     Daily at 04:00 LOCAL. Offset from the 03:00 log rotation so the two
     jobs don't contend for the SQLite files, and clear of the evidence
-    cycle (~21:30) / watchdog (~22:15) / forward collector (19:30).
+    cycle (16:45) / watchdog (~22:15) / forward collector (19:30).
     The SQLite Online Backup API holds only a shared read lock, so a
     concurrent writer would see brief BUSY retries rather than deadlock —
     but keeping the schedule quiet avoids even that.

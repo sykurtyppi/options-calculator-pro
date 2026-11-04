@@ -60,7 +60,25 @@ scripts/automation/install_launchd_jobs.sh
 
 Installed jobs:
 
-- `com.optionscalculator.evidence-cycle`: daily at 21:30 local time.
+- `com.optionscalculator.evidence-cycle`: daily at 16:45 local time.
+
+  The cycle prices entries and T-1 exits from live option quotes, so it runs
+  only while the NYSE regular session is open. 16:45 on a GMT Mac is 11:45 ET
+  in EST and 12:45 ET in EDT, before the 13:00 early closes; on a Mac in
+  another time zone, set the plist to the local time of about 12:00 ET. A
+  scheduled run on a day NYSE is closed (weekends, exchange holidays) logs
+  `skipped` and writes no report; the watchdog and health check expect none
+  that day, and allow for the gap afterwards. A scheduled run on a trading
+  day outside the session (the Mac was asleep at 16:45 and launchd fired it
+  on wake) refuses to price, exits 3, and logs a failure, so the missed day
+  is visible rather than filled from stale quotes. Manual runs with `--date`
+  or `--dry-run` are not held to the session; `--allow-outside-session`
+  forces a live run.
+
+  Before this schedule (until early November 2026) the cycle ran at 21:30
+  local, after the close and on weekends, so entries and exits up to then
+  were priced from after-hours yfinance quotes. Treat that as a break in the
+  evidence: compare cohorts on the same side of it.
 - `com.optionscalculator.evidence-watchdog`: daily at 22:15 local time.
 - `com.optionscalculator.weekly-evidence-report`: weekly Monday at 22:45 local time.
 

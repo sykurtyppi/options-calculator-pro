@@ -82,12 +82,16 @@ def _short(sha: Any) -> str:
 def build_code_identity_health(
     drift: Mapping[str, Any],
     report_identity: Mapping[str, Any] | None,
+    *,
+    report_expected: bool = True,
 ) -> dict[str, Any]:
     """Watchdog issues for code drift, in the evidence_health issue shape.
 
     ``drift`` is :func:`deployment_drift` for the checkout the jobs run from;
     ``report_identity`` is the ``code_identity`` the evidence cycle stamped
     into today's report (``None`` when the report predates the stamp).
+    ``report_expected`` is False on a day the cycle does not run (NYSE
+    closed): then only the running code is checked.
     """
     issues: list[dict[str, Any]] = []
     head = drift.get("git_sha")
@@ -112,10 +116,10 @@ def build_code_identity_health(
         if drift.get("dirty"):
             issues.append({"severity": "WARN", "alertable": False,
                            "message": f"Running checkout {_short(head)} has uncommitted changes to tracked files."})
-    if report_identity is None:
+    if report_expected and report_identity is None:
         issues.append({"severity": "WARN", "alertable": False,
                        "message": "Today's evidence report does not record which code produced it."})
-    else:
+    elif report_expected:
         report_sha = report_identity.get("git_sha")
         if report_sha is None:
             issues.append({"severity": "WARN", "alertable": False,

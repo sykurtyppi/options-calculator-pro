@@ -38,7 +38,7 @@ launchctl list | grep optionscalculator
 | Job | When |
 |---|---|
 | `com.optionscalculator.candidate-exit-resolver` | Daily at 12:30 |
-| `com.optionscalculator.evidence-cycle` | Daily at 21:30 |
+| `com.optionscalculator.evidence-cycle` | Daily at 16:45 (runs only during the NYSE session; skips closed days) |
 | `com.optionscalculator.evidence-watchdog` | Daily at 22:15 |
 | `com.optionscalculator.weekly-evidence-report` | Mondays at 22:45 |
 | `com.optionscalculator.log-rotation` | Daily at 03:00 |
