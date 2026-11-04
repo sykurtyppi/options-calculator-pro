@@ -9,12 +9,21 @@
   <array>
     <string>__PROJECT_ROOT__/scripts/automation/run_daily_evidence_cycle.sh</string>
   </array>
+  <!--
+    Daily at 16:45 LOCAL, while NYSE is open: the cycle prices entries and
+    T-1 exits from live option quotes, and after the close those are stale
+    or zero-bid. On a GMT (Atlantic/Reykjavik) Mac that is 11:45 ET in EST
+    and 12:45 ET in EDT, inside the session in both regimes and before the
+    13:00 early closes. Elsewhere, pick the local time of roughly 12:00 ET.
+    The cycle itself refuses to run outside the regular session and skips
+    days NYSE is closed (services/market_calendar.py).
+  -->
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>
-    <integer>21</integer>
+    <integer>16</integer>
     <key>Minute</key>
-    <integer>30</integer>
+    <integer>45</integer>
   </dict>
   <key>StandardOutPath</key>
   <string>__HOME__/.options_calculator_pro/logs/evidence_cycle_launchd_stdout.log</string>

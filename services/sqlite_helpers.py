@@ -17,7 +17,7 @@ silent-data-loss failure mode under concurrent writers:
 
 For the launchd jobs sharing ``telemetry.sqlite`` and
 ``institutional_ml.db``, the overlap windows on the 12:30 /
-21:30 / 22:15 cycle make this concrete: rows go missing whenever
+16:45 / 22:15 cycle make this concrete: rows go missing whenever
 two jobs land in the same write window.
 
 Note on busy_timeout: Python's ``sqlite3.connect()`` already

@@ -40,6 +40,7 @@ from services.outcome_recorder import FORWARD_SOURCE_SQL, _VALID_EVIDENCE_SQL
 from services.structure_prior_store import _DEFAULT_STORE as DEFAULT_PRIOR_STORE
 from services.provider_telemetry import _DEFAULT_STORE as DEFAULT_TELEMETRY_STORE
 from services.recommendation_ledger import _DEFAULT_LEDGER as DEFAULT_LEDGER_STORE
+from services.market_calendar import days_since_previous_session, is_trading_day
 
 DEFAULT_HOME = Path.home() / ".options_calculator_pro"
 DEFAULT_STRUCTURED_RUN_LOG = DEFAULT_HOME / "logs" / "evidence_cycle_runs.jsonl"
@@ -351,6 +352,13 @@ def _check_daily_report(cfg: EvidenceHealthConfig, now: datetime) -> dict[str, A
     path = cfg.report_dir / f"evidence_report_{cfg.expected_date.isoformat()}.json"
     latest = cfg.report_dir / "latest.json"
     issues: list[dict[str, str]] = []
+    if not is_trading_day(cfg.expected_date):
+        # No cycle runs while NYSE is closed, so no report is due today.
+        return {
+            "summary": {"path": str(path), "exists": path.exists(), "latest_path": str(latest),
+                        "generated_at": None, "market_closed": True},
+            "issues": issues,
+        }
     payload = _read_json(path)
     generated_at = _parse_datetime((payload or {}).get("generated_at"))
     if payload is None:
@@ -490,7 +498,9 @@ def _check_structured_run_log(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                 "Run scripts/run_evidence_cycle.py once after this deployment; it now writes structured JSONL run summaries.",
             )
         )
-    elif latest_success_end and _age_hours(latest_success_end, now) > cfg.max_run_log_age_hours:
+    elif latest_success_end and _age_hours(latest_success_end, now) > (
+        cfg.max_run_log_age_hours + _closed_market_allowance_hours(cfg.expected_date)
+    ):
         issues.append(
             _issue(
                 "WARN",
@@ -558,7 +568,9 @@ def _check_provider_telemetry(cfg: EvidenceHealthConfig, now: datetime) -> dict[
                 "Run scripts/run_evidence_cycle.py and confirm provider calls are being instrumented.",
             )
         )
-    elif latest_ts and _age_hours(latest_ts, now) > cfg.max_telemetry_age_hours:
+    elif latest_ts and _age_hours(latest_ts, now) > (
+        cfg.max_telemetry_age_hours + _closed_market_allowance_hours(cfg.expected_date)
+    ):
         issues.append(
             _issue(
                 "WARN",
@@ -1354,6 +1366,15 @@ def _ensure_utc(value: datetime) -> datetime:
 
 def _age_hours(ts: datetime, now: datetime) -> float:
     return max(0.0, (now - _ensure_utc(ts)).total_seconds() / 3600.0)
+
+
+def _closed_market_allowance_hours(day: date) -> float:
+    """Extra age allowed because the cycle did not run on closed-market days.
+
+    The cycle runs only on NYSE sessions, so on a Monday its last run was
+    Friday's: 48 extra hours, 72 after a Monday holiday, none mid-week.
+    """
+    return 24.0 * (days_since_previous_session(day) - 1)
 
 
 def _daily_due_deadline(cfg: EvidenceHealthConfig) -> datetime:

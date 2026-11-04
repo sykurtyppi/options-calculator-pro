@@ -366,7 +366,7 @@ rm /tmp/cookies.txt
 | Job | When | Purpose |
 |---|---|---|
 | `candidate-exit-resolver` | Daily 12:30 | Resolve pending candidate-shadow-outcome rows (PR-AE). |
-| `evidence-cycle` | Daily 21:30 | Run the daily forward loop + write evidence-report snapshot. |
+| `evidence-cycle` | Daily 16:45 | Run the daily forward loop + write evidence-report snapshot, during the NYSE session only (see below). |
 | `evidence-watchdog` | Daily 22:15 | Check that today's evidence report is present + fresh; iMessage on failure. |
 | `weekly-evidence-report` | Mondays 22:45 | Write the weekly evidence export. |
 | `log-rotation` | Daily 03:00 | Size-based gzip + 7-archive retention for launchd logs (skips self-logs). |
@@ -417,7 +417,7 @@ A healthy long-running deployment shows `"summary": "OK"`. If it shows
 
 ```sh
 # Tail the daily cycle log (no rotation race — 03:00 rotation is far
-# from 21:30 cycle fire).
+# from the 16:45 cycle fire).
 tail -200 ~/.options_calculator_pro/logs/daily_evidence_cycle_launchd.log
 
 # Last 5 resolver outcomes from JSONL telemetry.

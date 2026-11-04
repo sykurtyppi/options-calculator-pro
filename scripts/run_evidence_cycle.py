@@ -30,6 +30,7 @@ except ImportError:
 from scripts.run_forward_loop import _parse_date, run_daily_cycle
 from services.automation_watchdog import IMessageConfig, send_imessage
 from services.code_identity import source_identity
+from services.market_calendar import EXCHANGE_TZ, in_regular_session, is_trading_day
 from services.evidence_report import build_evidence_report, build_weekly_evidence_report
 from services.evidence_funnel import build_evidence_funnel_report
 from services.provider_telemetry import build_provider_telemetry_diagnostics
@@ -130,7 +131,26 @@ def _send_local_summary(report: dict, *, weekly_report: dict | None = None, dry_
     return {"attempted": True, **sent}
 
 
-def main() -> int:
+EXIT_OUTSIDE_SESSION = 3
+
+
+def session_skip_reason(now: datetime) -> Optional[tuple[str, str]]:
+    """Why a scheduled run at ``now`` must not price quotes, or None.
+
+    ("skipped", ...) on a day NYSE is closed; ("fail", ...) on a trading day
+    outside its regular session, so the missed run shows up in the run log
+    and, with no report written, in the watchdog.
+    """
+    session_day = now.astimezone(EXCHANGE_TZ).date()
+    if not is_trading_day(session_day):
+        return "skipped", f"market closed on {session_day.isoformat()}"
+    if not in_regular_session(now):
+        return "fail", (f"outside the NYSE regular session at {now.astimezone(EXCHANGE_TZ):%H:%M} ET; "
+                        "quotes then are stale. Rerun during the session, or pass --allow-outside-session.")
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the automated daily evidence cycle.")
     parser.add_argument("--dry-run", action="store_true", help="Run without writing trades, logs, baselines, or report files.")
     parser.add_argument("--date", type=str, default=None, help="Override as-of date (YYYY-MM-DD).")
@@ -141,11 +161,35 @@ def main() -> int:
     parser.add_argument("--write-weekly", action="store_true", help="Force writing a weekly evidence export even if today is not Monday.")
     parser.add_argument("--no-weekly", action="store_true", help="Disable weekly evidence export for this run.")
     parser.add_argument("--notify-summary", action="store_true", help="Send a short iMessage system/evidence summary if configured.")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--allow-outside-session",
+        action="store_true",
+        help="Run even when the NYSE regular session is closed (manual runs only: quotes are stale then).",
+    )
+    args = parser.parse_args(argv)
+
+    started_at = datetime.now(timezone.utc)
+    # A live scheduled run prices entries and exits from current quotes, so it
+    # runs only while the regular session is open. A --date override or a dry
+    # run is an operator's choice and is not held to the session.
+    if not (args.date or args.dry_run or args.allow_outside_session):
+        skip = session_skip_reason(started_at)
+        if skip is not None:
+            status, reason = skip
+            cycle_date = started_at.astimezone(EXCHANGE_TZ).date()
+            _append_structured_run_log(
+                args.structured_run_log,
+                _run_log_payload(started_at=started_at, status=status, cycle_date=cycle_date,
+                                 dry_run=False, payload={}, error=reason),
+            )
+            print(json.dumps({"status": status, "as_of_date": cycle_date.isoformat(), "reason": reason},
+                             indent=2, sort_keys=True))
+            # A closed market is not a missed run; a trading day whose session
+            # the run missed (the Mac was asleep at the scheduled time) is.
+            return 0 if status == "skipped" else EXIT_OUTSIDE_SESSION
 
     symbols = [token.strip().upper() for token in args.symbols.split(",") if token.strip()] if args.symbols else None
     weekly_override = True if args.write_weekly else False if args.no_weekly else None
-    started_at = datetime.now(timezone.utc)
     try:
         payload = run_evidence_cycle(
             as_of=_parse_date(args.date) if args.date else date.today(),

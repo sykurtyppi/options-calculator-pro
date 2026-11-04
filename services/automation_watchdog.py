@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from services import external_io_gate
+from services.market_calendar import is_trading_day
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,22 @@ def build_evidence_watchdog_status(
 
     report_path = cfg.report_dir / f"evidence_report_{cfg.expected_date.isoformat()}.json"
     latest_path = cfg.report_dir / "latest.json"
+    if not is_trading_day(cfg.expected_date):
+        # The evidence cycle prices live quotes, so it does not run when NYSE
+        # is closed: no report is expected and none missing is a failure.
+        return {
+            "ok": True,
+            "status": "market_closed",
+            "checked_at": now_utc.isoformat(),
+            "expected_date": cfg.expected_date.isoformat(),
+            "report_path": str(report_path),
+            "latest_path": str(latest_path),
+            "log_path": str(cfg.log_path),
+            "generated_at": None,
+            "completion_logged": None,
+            "errors": [],
+            "warnings": [],
+        }
     errors: list[str] = []
     warnings: list[str] = []
     report: dict[str, Any] | None = None

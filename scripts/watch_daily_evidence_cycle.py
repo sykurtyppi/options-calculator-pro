@@ -260,6 +260,7 @@ def main() -> int:
         code_health=build_code_identity_health(
             deployment_drift(fetch=not args.no_fetch),
             _report_code_identity(Path(status["report_path"])),
+            report_expected=status.get("status") != "market_closed",
         ),
     )
     alert = maybe_send_watchdog_alert(

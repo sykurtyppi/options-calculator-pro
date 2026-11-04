@@ -150,6 +150,32 @@ def add_sessions(day: date, sessions: int) -> date:
     return day
 
 
+def in_regular_session(moment: datetime) -> bool:
+    """True while NYSE's regular session is open at ``moment`` (aware).
+
+    Open from 09:30 New York time to the day's close (13:00 on early-close
+    days). Outside it, option quotes are the last session's close at best
+    and stale or zero-bid at worst.
+    """
+    if moment.tzinfo is None:
+        raise ValueError("in_regular_session needs a timezone-aware datetime")
+    local = moment.astimezone(EXCHANGE_TZ)
+    day = local.date()
+    return is_trading_day(day) and SESSION_OPEN <= local.time() < session_close(day)
+
+
+def days_since_previous_session(day: date) -> int:
+    """Calendar days from the latest NYSE session strictly before ``day``.
+
+    1 on a Tuesday, 3 on a Monday, 4 on the Tuesday after a Monday holiday,
+    2 on a Sunday.
+    """
+    prior = day - timedelta(days=1)
+    while not is_trading_day(prior):
+        prior -= timedelta(days=1)
+    return (day - prior).days
+
+
 def quote_session(moment: datetime) -> date:
     """The NYSE session whose quotes are current at ``moment``.
 
@@ -182,4 +208,6 @@ __all__ = [
     "next_session_on_or_after",
     "nyse_holidays",
     "quote_session",
+    "in_regular_session",
+    "days_since_previous_session",
 ]
