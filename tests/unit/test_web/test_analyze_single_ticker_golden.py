@@ -33,7 +33,8 @@ from services.structure_selector import SelectorOutput
 import web.api.edge_engine as edge_engine
 
 _FIXTURE = pathlib.Path(__file__).parent / "golden" / "analyze_watch.json"
-VOLATILE = {"generated_at", "pricing_dividend_yield_source"}
+# quote_provenance carries the fetch time; tested in test_quote_provenance.py.
+VOLATILE = {"generated_at", "pricing_dividend_yield_source", "quote_provenance"}
 
 
 def _canon(o):

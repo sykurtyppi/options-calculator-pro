@@ -78,6 +78,7 @@ REASON_TOO_EARLY = "outside_dte_window:too_early"
 REASON_TOO_LATE = "outside_dte_window:too_late"
 REASON_ANALYZER_ERROR = "analyzer_error"          # :<ExceptionType>
 REASON_NO_TRADE = "no_trade"                      # :<binding_gate>
+REASON_UNTRUSTED_QUOTES = "untrusted_quotes"      # :<services.quote_provenance problem>
 REASON_NOT_ACTIONABLE = "not_actionable"          # :<recommendation>
 REASON_NO_STRUCTURE = "no_structure"
 REASON_NO_EARNINGS_DATE = "no_earnings_date"

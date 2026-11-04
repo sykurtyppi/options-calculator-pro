@@ -244,6 +244,33 @@ Useful flags:
 ./.venv311/bin/python scripts/check_evidence_health.py --date 2026-04-27
 ```
 
+## Quote Provenance
+
+Every analysis records where and when its option quotes came from
+(`services/quote_provenance.py`). The recommendation ledger's `quote_source`,
+`quote_timestamp` and `quote_quality` columns are filled from it, and the full
+record is kept in the row's `metadata_json.quote_provenance`:
+
+- `quote_source`: the provider that supplied the chain (`marketdata`,
+  `yfinance`, ...);
+- `fetched_at`: when the chain was fetched (UTC);
+- `quote_timestamp`: the provider's own quote time when it has one (the median
+  of MarketData's per-contract `updated`), otherwise the fetch time;
+  `quote_quality` says which (`provider_quote_time` or `fetch_time_only`).
+  yfinance has no quote time, so for it only the fetch time is known, and no
+  quote time is invented;
+- `in_regular_session` and `quote_session`: whether NYSE was open at the fetch,
+  and which session's quotes were current.
+
+The forward loop refuses to price forward evidence from an analysis whose
+quotes were fetched outside the regular session, whose provider quotes were
+more than 30 minutes old at the fetch, or that has no provenance at all. Such
+a candidate stops at the `eligible` stage with
+`untrusted_quotes:<outside_session|stale_quotes:<n>m|missing_quote_provenance>`
+before any trade or universe-shadow baseline is priced. The analysis itself is
+still written to the ledger, so the stop is auditable. The funnel diagnosis
+lists these stops with the other eligibility stops.
+
 ## Funnel Diagnosis
 
 The daily report's funnel section counts candidate passes over at most 30
