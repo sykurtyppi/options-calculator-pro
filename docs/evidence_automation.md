@@ -244,6 +244,13 @@ Useful flags:
 ./.venv311/bin/python scripts/check_evidence_health.py --date 2026-04-27
 ```
 
+## Pre-registration
+
+What the forward evidence is meant to show, which events count, the fixed
+analysis, and the kill criteria are set in [PREREGISTRATION.md](PREREGISTRATION.md)
+before the cohort starts. Note its first precondition: the claim contract only
+admits MarketData.app quotes, so with yfinance alone nothing becomes claimable.
+
 ## Quote Provenance
 
 Every analysis records where and when its option quotes came from
