@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -10,7 +12,13 @@ import pytest
 from scripts import diagnose_evidence_funnel as cli
 from services import evidence_funnel as ef
 from services.evidence_report import MIN_RESOLVED_SAMPLE
-from services.funnel_diagnosis import GATE_SAMPLE, diagnose_funnel, read_funnel_rows, render_text
+from services.funnel_diagnosis import (
+    GATE_SAMPLE,
+    diagnose_funnel,
+    read_funnel_rows,
+    read_recommendation_rows,
+    render_text,
+)
 
 AS_OF = date(2026, 11, 3)
 A, D, X = ef.OUTCOME_ADVANCED, ef.OUTCOME_DEFERRED, ef.OUTCOME_DROPPED
@@ -190,6 +198,17 @@ def test_a_later_duplicate_drop_does_not_undo_an_entered_trade(tmp_path: Path) -
     assert ev["by_final"]["in_flight"] == 1 and ev["by_final"]["stopped"] == 0
 
 
+def test_follow_up_uses_the_actual_last_recorded_date(tmp_path: Path) -> None:
+    f = _Funnel(tmp_path / "f.sqlite")
+    f.entry("2026-10-01", "A", "2026-10-20", upto=ef.STAGE_RECORDED, trade_id="T-A")
+    f.row("2026-10-02", ef.STAGE_RECORDED, X, "A", "2026-10-20",
+          ef.REASON_DUPLICATE_ACTIVE_TRADE)
+    f.store.close()
+
+    event = _diag(tmp_path / "f.sqlite")["events"]["no_further_record_events"][0]
+    assert event["last_recorded_as_of"] == "2026-10-02"
+
+
 def test_a_trade_counts_once_in_the_week_it_first_became_claimable(store_path: Path) -> None:
     f = _Funnel(store_path)
     f.cycles.update({"c-2026-11-02"})
@@ -215,3 +234,290 @@ def test_reading_a_missing_store_creates_nothing(tmp_path: Path) -> None:
     with pytest.raises(Exception):
         read_funnel_rows(missing)
     assert not missing.exists()
+
+
+def test_no_eligible_structure_reports_underlying_eligibility_causes(tmp_path: Path) -> None:
+    f = _Funnel(tmp_path / "f.sqlite")
+    for symbol in ("A", "B"):
+        f.entry("2026-10-20", symbol, "2026-10-28", upto=ef.STAGE_ANALYZED)
+        f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, symbol, "2026-10-28", "no_eligible_structure")
+    f.store.close()
+
+    recommendations = [
+        {
+            "symbol": "A", "earnings_date": "2026-10-28", "as_of_date": "2026-10-20",
+            "created_at": "2026-10-20T21:00:00+00:00", "binding_gate": "no_eligible_structure",
+            "structure_scorecards_json": [
+                {"structure": "atm_straddle", "eligible": False,
+                 "eligibility_flags": ["spread_exceeds_absolute_threshold"], "expected_edge_pct": -3.0},
+                {"structure": "call_calendar", "eligible": False,
+                 "eligibility_flags": ["missing_structure_leg_spread", "surface_quality_record_only"],
+                 "expected_edge_pct": -2.0},
+            ],
+        },
+        {
+            "symbol": "B", "earnings_date": "2026-10-28", "as_of_date": "2026-10-20",
+            "created_at": "2026-10-20T21:01:00+00:00", "binding_gate": "no_eligible_structure",
+            "structure_scorecards_json": [
+                {"structure": "atm_straddle", "eligible": False,
+                 "eligibility_flags": ["cannot_form_atm_straddle"], "expected_edge_pct": -1.0},
+            ],
+        },
+    ]
+    rows = read_funnel_rows(tmp_path / "f.sqlite")
+    d = diagnose_funnel(rows["events"], rows["cycles"], as_of=AS_OF, recommendations=recommendations)
+
+    detail = d["events"]["stop_reason_details"]["no_eligible_structure"]
+    assert detail["events"] == 2 and detail["matched_recommendations"] == 2
+    assert detail["eligibility_categories"] == [
+        {"category": "missing_legs", "events": 2},
+        {"category": "spread_or_liquidity", "events": 1},
+        {"category": "surface_quality", "events": 1},
+    ]
+    assert detail["eligibility_flags"] == [
+        {"flag": "cannot_form_atm_straddle", "events": 1},
+        {"flag": "missing_structure_leg_spread", "events": 1},
+        {"flag": "spread_exceeds_absolute_threshold", "events": 1},
+        {"flag": "surface_quality_record_only", "events": 1},
+    ]
+    assert "Eligibility causes (2/2 usable; 2 ledger matches): missing_legs (2), spread_or_liquidity (1), surface_quality (1)" in render_text(d)
+
+
+def test_stop_diagnostics_match_production_no_trade_reason_prefix(tmp_path: Path) -> None:
+    f = _Funnel(tmp_path / "funnel.sqlite")
+    f.entry("2026-10-20", "A", "2026-10-28", upto=ef.STAGE_ANALYZED)
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28",
+          "no_trade:no_eligible_structure")
+    f.store.close()
+    recommendations = [{
+        "symbol": "A", "earnings_date": "2026-10-28", "as_of_date": "2026-10-20",
+        "created_at": "2026-10-20T21:00:00Z", "binding_gate": "no_eligible_structure",
+        "structure_scorecards_json": '[{"structure":"atm_straddle","eligible":false,'
+                                      '"eligibility_flags":["spread_exceeds_absolute_threshold"]}]',
+    }]
+
+    details = diagnose_funnel(read_funnel_rows(tmp_path / "funnel.sqlite")["events"], [],
+                              as_of=date(2026, 11, 3), recommendations=recommendations)["events"]["stop_reason_details"]
+
+    assert details["no_eligible_structure"]["matched_recommendations"] == 1
+
+
+def test_non_positive_edge_reports_best_eligible_candidate(tmp_path: Path) -> None:
+    f = _Funnel(tmp_path / "f.sqlite")
+    f.entry("2026-10-20", "A", "2026-10-28", upto=ef.STAGE_ANALYZED)
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28", "non_positive_edge")
+    f.store.close()
+
+    recommendations = [{
+        "symbol": "A", "earnings_date": "2026-10-28", "as_of_date": "2026-10-20",
+        "created_at": "2026-10-20T21:00:00+00:00", "binding_gate": "non_positive_edge",
+        "structure_scorecards_json": [
+            {"structure": "atm_straddle", "eligible": True, "eligibility_flags": [],
+             "composite_structure_score": 85.0, "expected_edge_pct": -2.25},
+            {"structure": "iron_condor", "eligible": True, "eligibility_flags": [],
+             "composite_structure_score": 70.0, "expected_edge_pct": -0.15},
+            {"structure": "bad_quotes", "eligible": False, "eligibility_flags": ["spread_too_wide"],
+             "expected_edge_pct": 9.0},
+        ],
+        "selected_structure": "atm_straddle",
+    }]
+    rows = read_funnel_rows(tmp_path / "f.sqlite")
+    d = diagnose_funnel(rows["events"], rows["cycles"], as_of=AS_OF, recommendations=recommendations)
+
+    detail = d["events"]["stop_reason_details"]["non_positive_edge"]
+    assert detail["events"] == 1 and detail["matched_recommendations"] == 1
+    assert detail["best_eligible_edge_pct"] == {"events": 1, "min": -2.25, "median": -2.25, "max": -2.25}
+    assert detail["event_details"] == [{
+        "symbol": "A", "earnings_date": "2026-10-28", "as_of_date": "2026-10-20",
+        "match_status": "usable",
+        "best_structure": "atm_straddle", "best_eligible_edge_pct": -2.25,
+    }]
+    assert "Selected eligible edge at non-positive stops (1/1 usable): median -2.25%, range -2.25% to -2.25%" in render_text(d)
+
+
+def test_eligibility_categories_do_not_mislabel_event_metadata(tmp_path: Path) -> None:
+    f = _Funnel(tmp_path / "f.sqlite")
+    f.entry("2026-10-20", "A", "2026-10-28", upto=ef.STAGE_ANALYZED)
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28", "no_eligible_structure")
+    f.store.close()
+    recommendations = [{
+        "symbol": "A", "earnings_date": "2026-10-28", "as_of_date": "2026-10-20",
+        "created_at": "2026-10-20T21:00:00Z", "binding_gate": "no_eligible_structure",
+        "structure_scorecards_json": [{
+            "structure": "atm_straddle", "eligible": False,
+            "eligibility_flags": ["missing_earnings_date", "missing_option_chain", "invalid_near_term_dte",
+                                  "structure_spread_exceeds_absolute_threshold",
+                                  "cannot_form_otm_strangle", "cannot_form_calendar"],
+        }],
+    }]
+
+    detail = diagnose_funnel(
+        read_funnel_rows(tmp_path / "f.sqlite")["events"], [], as_of=AS_OF,
+        recommendations=recommendations,
+    )["events"]["stop_reason_details"]["no_eligible_structure"]
+    assert detail["eligibility_categories"] == [
+        {"category": "dte", "events": 1},
+        {"category": "event_metadata", "events": 1},
+        {"category": "missing_legs", "events": 1},
+        {"category": "option_chain", "events": 1},
+        {"category": "spread_or_liquidity", "events": 1},
+    ]
+    assert detail["events_with_eligibility_causes"] == 1
+    assert detail["event_details"][0]["match_status"] == "usable"
+
+
+def test_lost_and_orphaned_events_are_identified_for_follow_up(store_path: Path) -> None:
+    ev = _diag(store_path)["events"]
+
+    assert ev["deferred_then_lost_events"] == [{
+        "symbol": "AMD", "earnings_date": "2026-10-15", "stage": "data_qualified",
+        "reason": ef.REASON_TOO_EARLY, "last_recorded_as_of": "2026-10-01", "analysis_passes": 0,
+    }]
+    assert ev["no_further_record_events"] == [{
+        "symbol": "SHOP", "earnings_date": "2026-10-10", "stage": "recorded",
+        "reason": None, "last_recorded_as_of": "2026-10-05", "analysis_passes": 1,
+    }]
+    text = render_text(_diag(store_path))
+    assert (f"Deferred/lost event: AMD 2026-10-15 at data_qualified "
+            f"({ef.REASON_TOO_EARLY}; last 2026-10-01)") in text
+    assert "No-further-record event: SHOP 2026-10-10 after recorded (last 2026-10-05)" in text
+
+
+def test_recommendation_rows_are_read_only_and_missing_ledger_is_optional(tmp_path: Path) -> None:
+    ledger = tmp_path / "recommendations.sqlite"
+    conn = sqlite3.connect(ledger)
+    conn.execute("CREATE TABLE recommendations (symbol TEXT, earnings_date TEXT, as_of_date TEXT, "
+                 "created_at TEXT, binding_gate TEXT, structure_scorecards_json TEXT)")
+    conn.execute("INSERT INTO recommendations VALUES (?, ?, ?, ?, ?, ?)",
+                 ("A", "2026-10-28", "2026-10-20", "2026-10-20T21:00:00Z", "non_positive_edge", "[]"))
+    conn.commit()
+    conn.close()
+    before = hashlib.sha256(ledger.read_bytes()).hexdigest()
+
+    assert read_recommendation_rows(ledger) == [{
+        "symbol": "A", "earnings_date": "2026-10-28", "as_of_date": "2026-10-20",
+        "created_at": "2026-10-20T21:00:00Z", "binding_gate": "non_positive_edge",
+        "structure_scorecards_json": "[]",
+    }]
+    assert hashlib.sha256(ledger.read_bytes()).hexdigest() == before
+    missing = tmp_path / "missing.sqlite"
+    assert read_recommendation_rows(missing) == [] and not missing.exists()
+
+
+def test_incompatible_recommendation_ledger_is_optional(tmp_path: Path) -> None:
+    ledger = tmp_path / "legacy.sqlite"
+    sqlite3.connect(ledger).close()
+    status: dict = {}
+
+    assert read_recommendation_rows(ledger, status=status) == []
+    assert status["status"] == "unavailable"
+    assert "recommendations table" in status["error"]
+
+
+def test_cli_discloses_missing_optional_recommendation_ledger(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    f = _Funnel(tmp_path / "funnel.sqlite")
+    f.entry("2026-10-20", "A", "2026-10-28", upto=ef.STAGE_ANALYZED)
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28", "non_positive_edge")
+    f.store.close()
+    ledger = tmp_path / "missing.sqlite"
+
+    assert cli.main(["--store", str(tmp_path / "funnel.sqlite"),
+                     "--recommendations", str(ledger), "--as-of", "2026-11-03"]) == 0
+    captured = capsys.readouterr()
+    assert "Recommendation enrichment missing:" in captured.out
+    assert "recommendation enrichment missing:" in captured.err
+    assert not ledger.exists()
+
+
+def test_cli_continues_when_optional_recommendation_ledger_is_incompatible(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    f = _Funnel(tmp_path / "funnel.sqlite")
+    f.entry("2026-10-20", "A", "2026-10-28", upto=ef.STAGE_ANALYZED)
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28", "non_positive_edge")
+    f.store.close()
+    ledger = tmp_path / "legacy.sqlite"
+    sqlite3.connect(ledger).close()
+
+    assert cli.main(["--store", str(tmp_path / "funnel.sqlite"),
+                     "--recommendations", str(ledger), "--as-of", "2026-11-03",
+                     "--json"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["recommendation_ledger"]["status"] == "unavailable"
+    assert payload["events"]["stop_reason_details"]["non_positive_edge"][
+        "events_with_selected_edge"] == 0
+    assert "recommendation enrichment unavailable" in captured.err
+
+
+def test_latest_recommendation_revision_is_used(tmp_path: Path) -> None:
+    ledger = tmp_path / "recommendations.sqlite"
+    conn = sqlite3.connect(ledger)
+    conn.execute("CREATE TABLE recommendations (recommendation_id TEXT, symbol TEXT, earnings_date TEXT, "
+                 "as_of_date TEXT, created_at TEXT, binding_gate TEXT, selected_structure TEXT, "
+                 "structure_scorecards_json TEXT, selector_output_json TEXT)")
+    conn.execute("CREATE TABLE recommendation_revisions (revision_id INTEGER PRIMARY KEY, "
+                 "recommendation_id TEXT, revised_at TEXT, content_hash TEXT, record_json TEXT)")
+    conn.execute("INSERT INTO recommendations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+        "r1", "A", "2026-10-28", "2026-10-20", "2026-10-20T20:00:00Z", "non_positive_edge",
+        "atm_straddle", '[{"structure":"atm_straddle","eligible":true,"expected_edge_pct":-3.0}]', "{}"))
+    conn.execute("INSERT INTO recommendation_revisions VALUES (?, ?, ?, ?, ?)", (
+        1, "r1", "2026-10-20T21:00:00Z", "hash", '{"recommendation_id":"r1","symbol":"A",'
+        '"earnings_date":"2026-10-28","as_of_date":"2026-10-20",'
+        '"created_at":"2026-10-20T20:00:00Z","binding_gate":"non_positive_edge",'
+        '"selected_structure":"iron_condor","structure_scorecards":['
+        '{"structure":"iron_condor","eligible":true,"expected_edge_pct":-0.5}]}'))
+    conn.commit()
+    conn.close()
+
+    row = read_recommendation_rows(ledger)[0]
+    assert row["selected_structure"] == "iron_condor"
+    assert row["structure_scorecards_json"][0]["expected_edge_pct"] == -0.5
+
+
+def test_latest_revision_effective_gate_controls_inclusion(tmp_path: Path) -> None:
+    ledger = tmp_path / "recommendations.sqlite"
+    conn = sqlite3.connect(ledger)
+    conn.execute("CREATE TABLE recommendations (recommendation_id TEXT, symbol TEXT, earnings_date TEXT, "
+                 "as_of_date TEXT, created_at TEXT, binding_gate TEXT, selected_structure TEXT, "
+                 "structure_scorecards_json TEXT, selector_output_json TEXT)")
+    conn.execute("CREATE TABLE recommendation_revisions (revision_id INTEGER PRIMARY KEY, "
+                 "recommendation_id TEXT, revised_at TEXT, content_hash TEXT, record_json TEXT)")
+    conn.execute("INSERT INTO recommendations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+        "r1", "A", "2026-10-28", "2026-10-20", "2026-10-20T20:00:00Z", "iv_rv_gate",
+        None, "[]", "{}"))
+    conn.execute("INSERT INTO recommendation_revisions VALUES (?, ?, ?, ?, ?)", (
+        1, "r1", "2026-10-20T21:00:00Z", "hash", '{"recommendation_id":"r1","symbol":"A",'
+        '"earnings_date":"2026-10-28","as_of_date":"2026-10-20",'
+        '"created_at":"2026-10-20T20:00:00Z","binding_gate":"non_positive_edge",'
+        '"selected_structure":"iron_condor","structure_scorecards":['
+        '{"structure":"iron_condor","eligible":true,"expected_edge_pct":-0.5}]}'))
+    conn.commit()
+    conn.close()
+
+    rows = read_recommendation_rows(ledger)
+    assert len(rows) == 1
+    assert rows[0]["binding_gate"] == "non_positive_edge"
+
+
+def test_cli_enriches_stops_from_recommendation_ledger(tmp_path: Path, capsys) -> None:
+    f = _Funnel(tmp_path / "funnel.sqlite")
+    f.entry("2026-10-20", "A", "2026-10-28", upto=ef.STAGE_ANALYZED)
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28", "no_eligible_structure")
+    f.store.close()
+    ledger = tmp_path / "recommendations.sqlite"
+    conn = sqlite3.connect(ledger)
+    conn.execute("CREATE TABLE recommendations (symbol TEXT, earnings_date TEXT, as_of_date TEXT, "
+                 "created_at TEXT, binding_gate TEXT, structure_scorecards_json TEXT)")
+    conn.execute("INSERT INTO recommendations VALUES (?, ?, ?, ?, ?, ?)", (
+        "A", "2026-10-28", "2026-10-20", "2026-10-20T21:00:00Z", "no_eligible_structure",
+        '[{"structure":"atm_straddle","eligible":false,'
+        '"eligibility_flags":["spread_exceeds_absolute_threshold"]}]'))
+    conn.commit()
+    conn.close()
+
+    assert cli.main(["--store", str(tmp_path / "funnel.sqlite"), "--recommendations", str(ledger),
+                     "--as-of", "2026-11-03"]) == 0
+    assert "Eligibility causes (1/1 usable; 1 ledger matches): spread_or_liquidity (1)" in capsys.readouterr().out

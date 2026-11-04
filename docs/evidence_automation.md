@@ -235,17 +235,37 @@ days. To see where forward evidence actually stops, run:
 ./.venv311/bin/python scripts/diagnose_evidence_funnel.py          # text summary
 ./.venv311/bin/python scripts/diagnose_evidence_funnel.py --json   # full detail
 ./.venv311/bin/python scripts/diagnose_evidence_funnel.py --since 2026-09-01
+./.venv311/bin/python scripts/diagnose_evidence_funnel.py \
+  --recommendations /path/to/recommendation_ledger.sqlite
 ```
 
-It reads the funnel store read-only and reports, over all history:
+It reads both the funnel store and the optional recommendation ledger read-only
+and reports, over all history:
 
 - every earnings event's furthest stage and how it ended there: claimable,
   in flight, stopped (with the reason), deferred, or deferred and never
   picked up again before the event passed;
 - the binding constraint: the stage that ends the most events, and its
   leading reasons (`no_trade:<gate>` names the selector gate that said no);
+- underlying scorecard eligibility causes for `no_eligible_structure`, such as
+  spread/liquidity, surface quality, and missing legs;
+- the selector-ranked eligible structure and its modeled edge for each
+  `non_positive_edge` stop, using the persisted selection when available and
+  never substituting an ineligible or merely higher-edge scorecard;
+- event-level match status plus aggregate usable/matched counts, so missing,
+  malformed, or unclassified recommendation evidence is visible rather than
+  overstated;
+- event identities and last-recorded dates for deferred events that passed
+  without being revisited and for events with no downstream record;
 - claimable trades per week over the last 8 weeks, and at that rate how many
   weeks until the paid-beta gate's 30-outcome sample.
+
+If the recommendation ledger does not exist or cannot be read with the expected
+schema, the core funnel diagnosis still runs, reports the enrichment status in
+JSON/text, and warns on stderr. When recommendation revisions exist, the newest
+complete revision is used rather than the immutable first-write payload. The
+default ledger is
+`~/.options_calculator_pro/recommendations/recommendation_ledger.sqlite`.
 
 An event whose earnings date moved is counted once per date.
 
