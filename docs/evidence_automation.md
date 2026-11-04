@@ -254,7 +254,11 @@ and reports, over all history:
   never substituting an ineligible or merely higher-edge scorecard;
 - event-level match status plus aggregate usable/matched counts, so missing,
   malformed, or unclassified recommendation evidence is visible rather than
-  overstated;
+  overstated. A stop is matched to the ledger row by the `recommendation_id`
+  the funnel recorded with it (`match_method: recommendation_id`), so a UI
+  analysis of the same symbol that day never stands in for the forward loop's
+  own; only stops recorded without an id fall back to the newest row for the
+  event and gate (`match_method: event_key`);
 - event identities and last-recorded dates for deferred events that passed
   without being revisited and for events with no downstream record;
 - claimable trades per week over the last 8 weeks, and at that rate how many

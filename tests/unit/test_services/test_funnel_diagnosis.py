@@ -35,14 +35,16 @@ class _Funnel:
         self.cycles: set[str] = set()
 
     def row(self, day: str, stage: str, outcome: str, symbol: str, earnings: str,
-            reason: str | None = None, trade_id: str | None = None) -> None:
+            reason: str | None = None, trade_id: str | None = None,
+            recommendation_id: str | None = None) -> None:
         cycle = f"c-{day}"
         if cycle not in self.cycles:
             self.store.start_cycle(cycle_run_id=cycle, as_of=_d(day), universe_size=500, discovered=10,
                                    discovery_source="test")
             self.cycles.add(cycle)
         self.store.record(cycle_run_id=cycle, as_of=_d(day), stage=stage, outcome=outcome, symbol=symbol,
-                          earnings_date=_d(earnings), reason=reason, trade_id=trade_id)
+                          earnings_date=_d(earnings), reason=reason, trade_id=trade_id,
+                          recommendation_id=recommendation_id)
 
     def entry(self, day: str, symbol: str, earnings: str, *, upto: str, trade_id: str | None = None) -> None:
         for stage in ENTRY[: ENTRY.index(upto) + 1]:
@@ -329,7 +331,7 @@ def test_non_positive_edge_reports_best_eligible_candidate(tmp_path: Path) -> No
     assert detail["best_eligible_edge_pct"] == {"events": 1, "min": -2.25, "median": -2.25, "max": -2.25}
     assert detail["event_details"] == [{
         "symbol": "A", "earnings_date": "2026-10-28", "as_of_date": "2026-10-20",
-        "match_status": "usable",
+        "match_status": "usable", "match_method": "event_key",
         "best_structure": "atm_straddle", "best_eligible_edge_pct": -2.25,
     }]
     assert "Selected eligible edge at non-positive stops (1/1 usable): median -2.25%, range -2.25% to -2.25%" in render_text(d)
@@ -521,3 +523,83 @@ def test_cli_enriches_stops_from_recommendation_ledger(tmp_path: Path, capsys) -
     assert cli.main(["--store", str(tmp_path / "funnel.sqlite"), "--recommendations", str(ledger),
                      "--as-of", "2026-11-03"]) == 0
     assert "Eligibility causes (1/1 usable; 1 ledger matches): spread_or_liquidity (1)" in capsys.readouterr().out
+
+
+# ── matching a stop to its ledger row ───────────────────────────────────────
+
+
+def _card(structure: str, edge: float, composite: float = 80.0) -> dict:
+    return {"structure": structure, "eligible": True, "eligibility_flags": [],
+            "composite_structure_score": composite, "expected_edge_pct": edge}
+
+
+def _ledger_row(recommendation_id: str, created_at: str, gate: str, cards: list) -> dict:
+    return {"recommendation_id": recommendation_id, "symbol": "A", "earnings_date": "2026-10-28",
+            "as_of_date": "2026-10-20", "created_at": created_at, "binding_gate": gate,
+            "structure_scorecards_json": cards}
+
+
+def _edge_detail(tmp_path: Path, recommendation_id: str | None, recommendations: list) -> dict:
+    f = _Funnel(tmp_path / "f.sqlite")
+    f.entry("2026-10-20", "A", "2026-10-28", upto=ef.STAGE_ANALYZED)
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28", "no_trade:non_positive_edge",
+          recommendation_id=recommendation_id)
+    f.store.close()
+    rows = read_funnel_rows(tmp_path / "f.sqlite")
+    return diagnose_funnel(rows["events"], rows["cycles"], as_of=AS_OF,
+                           recommendations=recommendations)["events"]["stop_reason_details"]["non_positive_edge"]
+
+
+def test_funnel_rows_carry_the_recommendation_id(tmp_path: Path) -> None:
+    f = _Funnel(tmp_path / "f.sqlite")
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28", "no_trade:x", recommendation_id="rec-1")
+    f.store.close()
+    assert read_funnel_rows(tmp_path / "f.sqlite")["events"][0]["recommendation_id"] == "rec-1"
+
+
+def test_a_stop_is_explained_by_its_own_ledger_row_not_a_later_ui_analysis(tmp_path: Path) -> None:
+    # The forward loop's row, then a UI analysis of the same symbol and day
+    # with the same gate but different numbers, written later.
+    loop = _ledger_row("rec-loop", "2026-10-20T21:30:00+00:00", "non_positive_edge", [_card("atm_straddle", -2.0)])
+    ui = _ledger_row("rec-ui", "2026-10-20T23:00:00+00:00", "non_positive_edge", [_card("iron_condor", -0.1)])
+    detail = _edge_detail(tmp_path, "rec-loop", [loop, ui])
+    [event] = detail["event_details"]
+    assert (event["match_method"], event["best_structure"], event["best_eligible_edge_pct"]) == \
+        ("recommendation_id", "atm_straddle", -2.0)
+
+
+def test_a_missing_or_mismatched_ledger_row_is_not_borrowed_from_another_analysis(tmp_path: Path) -> None:
+    ui = _ledger_row("rec-ui", "2026-10-20T23:00:00+00:00", "non_positive_edge", [_card("iron_condor", -0.1)])
+    [event] = _edge_detail(tmp_path, "rec-loop", [ui])["event_details"]
+    assert (event["match_status"], event["match_method"], event["best_structure"]) == \
+        ("unmatched", "recommendation_id", None)
+    # Its own row exists but records another gate: still not this stop's evidence.
+    loop = _ledger_row("rec-loop", "2026-10-20T21:30:00+00:00", "execution_penalty_high", [_card("x", -1.0)])
+    [event] = _edge_detail(tmp_path / "b", "rec-loop", [loop, ui])["event_details"]
+    assert event["match_status"] == "unmatched"
+
+
+def test_a_stop_recorded_without_an_id_falls_back_to_the_event_key(tmp_path: Path) -> None:
+    older = _ledger_row("rec-1", "2026-10-20T21:30:00+00:00", "non_positive_edge", [_card("atm_straddle", -2.0)])
+    newer = _ledger_row("rec-2", "2026-10-20T23:00:00+00:00", "non_positive_edge", [_card("iron_condor", -0.1)])
+    [event] = _edge_detail(tmp_path, None, [older, newer])["event_details"]
+    assert (event["match_method"], event["best_structure"]) == ("event_key", "iron_condor")
+
+
+def test_no_eligible_stops_match_by_id_too(tmp_path: Path) -> None:
+    f = _Funnel(tmp_path / "f.sqlite")
+    f.entry("2026-10-20", "A", "2026-10-28", upto=ef.STAGE_ANALYZED)
+    f.row("2026-10-20", ef.STAGE_ELIGIBLE, X, "A", "2026-10-28", "no_trade:no_eligible_structure",
+          recommendation_id="rec-loop")
+    f.store.close()
+    bad = {"structure": "atm_straddle", "eligible": False}
+    loop = _ledger_row("rec-loop", "2026-10-20T21:30:00+00:00", "no_eligible_structure",
+                       [{**bad, "eligibility_flags": ["spread_exceeds_absolute_threshold"]}])
+    ui = _ledger_row("rec-ui", "2026-10-20T23:00:00+00:00", "no_eligible_structure",
+                     [{**bad, "eligibility_flags": ["missing_option_chain"]}])
+    rows = read_funnel_rows(tmp_path / "f.sqlite")
+    detail = diagnose_funnel(rows["events"], rows["cycles"], as_of=AS_OF,
+                             recommendations=[loop, ui])["events"]["stop_reason_details"]["no_eligible_structure"]
+    [event] = detail["event_details"]
+    assert event["match_method"] == "recommendation_id"
+    assert event["eligibility_flags"] == ["spread_exceeds_absolute_threshold"]

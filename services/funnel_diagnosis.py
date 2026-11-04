@@ -57,7 +57,7 @@ def read_funnel_rows(store_path: Path) -> Dict[str, List[Dict[str, Any]]]:
     conn.row_factory = sqlite3.Row
     try:
         events = [dict(row) for row in conn.execute(
-            "SELECT as_of_date, stage, outcome, subject, symbol, earnings_date, reason, trade_id"
+            "SELECT as_of_date, stage, outcome, subject, symbol, earnings_date, reason, trade_id, recommendation_id"
             " FROM funnel_events")]
         cycles = [dict(row) for row in conn.execute(
             "SELECT cycle_run_id, as_of_date, universe_size, discovered FROM funnel_cycles")]
@@ -177,7 +177,8 @@ def _event_final(rows: List[Mapping[str, Any]], earnings_date: Optional[str], as
     passes = len({r["as_of_date"] for r in rows if r["stage"] == STAGE_ANALYZED})
     last_recorded = max(str(row["as_of_date"]) for row in rows)
     return {"stage": stage, "final": final, "reason": reason, "passes": passes,
-            "as_of_date": str(final_row["as_of_date"]), "last_recorded_as_of": last_recorded}
+            "as_of_date": str(final_row["as_of_date"]), "last_recorded_as_of": last_recorded,
+            "recommendation_id": final_row.get("recommendation_id")}
 
 
 def _top(counter: Counter, n: int = 5) -> List[Dict[str, Any]]:
@@ -205,11 +206,12 @@ _ELIGIBILITY_FLAG_CATEGORIES = {
     "invalid_near_term_dte": {"dte"},
     "spread_exceeds_absolute_threshold": {"spread_or_liquidity"},
     "structure_spread_exceeds_absolute_threshold": {"spread_or_liquidity"},
+    "surface_quality_record_only": {"surface_quality"},
+    "missing_structure_leg_spread": {"missing_legs"},
+    # Not emitted by services/structure_scorecard.py today; kept so older or
+    # synthetic scorecards classify instead of landing in "unclassified".
     "insufficient_open_interest": {"spread_or_liquidity"},
     "insufficient_volume": {"spread_or_liquidity"},
-    "surface_quality_record_only": {"surface_quality"},
-    # Older/synthetic scorecards used by historical ledgers and tests.
-    "missing_structure_leg_spread": {"missing_legs"},
     "spread_too_wide": {"spread_or_liquidity"},
 }
 
@@ -275,11 +277,41 @@ def _selected_eligible_card(row: Mapping[str, Any]) -> Optional[Mapping[str, Any
     return min(ranked)[-1] if ranked else None
 
 
+MATCH_BY_ID = "recommendation_id"
+MATCH_BY_EVENT_KEY = "event_key"
+
+
+def _matcher(recommendations: Iterable[Mapping[str, Any]]):
+    """Find the ledger row behind a funnel stop.
+
+    The stopping funnel row carries the recommendation_id the forward loop
+    wrote to the ledger, so that is matched exactly. The UI's analysis writes
+    ledger rows for the same symbol and day too, and a key match would take
+    the newest of them. Only a funnel row without an id (written before ids
+    were recorded) falls back to the newest row for the event key and gate.
+    An id with no ledger row stays unmatched rather than borrowing another.
+    """
+    rows = list(recommendations)
+    by_id = {str(row["recommendation_id"]): row for row in rows if row.get("recommendation_id")}
+    by_key = _recommendation_index(rows)
+
+    def match(symbol: str, earnings_date: Optional[str], final: Mapping[str, Any], gate: str):
+        recommendation_id = final.get("recommendation_id")
+        if recommendation_id:
+            row = by_id.get(str(recommendation_id))
+            if row is None or str(row.get("binding_gate") or "") != gate:
+                return None, MATCH_BY_ID
+            return row, MATCH_BY_ID
+        return by_key.get((symbol, earnings_date or "", final["as_of_date"], gate)), MATCH_BY_EVENT_KEY
+
+    return match
+
+
 def _stop_reason_details(
     finals: Mapping[tuple, Mapping[str, Any]],
     recommendations: Iterable[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    index = _recommendation_index(recommendations)
+    match = _matcher(recommendations)
     stopped = [(key, final) for key, final in finals.items() if final["final"] == FINAL_STOPPED]
     no_eligible = [(key, final) for key, final in stopped
                    if _binding_gate(final["reason"]) == "no_eligible_structure"]
@@ -288,11 +320,12 @@ def _stop_reason_details(
     matched = parsed = usable = 0
     no_eligible_events = []
     for (symbol, earnings_date), final in no_eligible:
-        row = index.get((symbol, earnings_date or "", final["as_of_date"], "no_eligible_structure"))
+        row, method = match(symbol, earnings_date, final, "no_eligible_structure")
         if row is None:
             no_eligible_events.append({
                 "symbol": symbol, "earnings_date": earnings_date, "as_of_date": final["as_of_date"],
-                "match_status": "unmatched", "eligibility_flags": [], "eligibility_categories": [],
+                "match_status": "unmatched", "match_method": method,
+                "eligibility_flags": [], "eligibility_categories": [],
             })
             continue
         matched += 1
@@ -309,6 +342,7 @@ def _stop_reason_details(
         no_eligible_events.append({
             "symbol": symbol, "earnings_date": earnings_date, "as_of_date": final["as_of_date"],
             "match_status": "usable" if flags else ("no_flags" if scorecards else "no_scorecards"),
+            "match_method": method,
             "eligibility_flags": sorted(flags), "eligibility_categories": sorted(categories),
         })
 
@@ -316,11 +350,12 @@ def _stop_reason_details(
                     if _binding_gate(final["reason"]) == "non_positive_edge"]
     edge_events = []
     for (symbol, earnings_date), final in non_positive:
-        row = index.get((symbol, earnings_date or "", final["as_of_date"], "non_positive_edge"))
+        row, method = match(symbol, earnings_date, final, "non_positive_edge")
         if row is None:
             edge_events.append({
                 "symbol": symbol, "earnings_date": earnings_date, "as_of_date": final["as_of_date"],
-                "match_status": "unmatched", "best_structure": None, "best_eligible_edge_pct": None,
+                "match_status": "unmatched", "match_method": method,
+                "best_structure": None, "best_eligible_edge_pct": None,
             })
             continue
         card = _selected_eligible_card(row)
@@ -330,6 +365,7 @@ def _stop_reason_details(
             "earnings_date": earnings_date,
             "as_of_date": final["as_of_date"],
             "match_status": "usable" if edge_value is not None else "no_selected_edge",
+            "match_method": method,
             "best_structure": str(card.get("structure") or "unknown") if card is not None else None,
             "best_eligible_edge_pct": edge_value,
         })
