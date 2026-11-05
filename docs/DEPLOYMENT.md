@@ -83,6 +83,29 @@ evidence reports, resolve candidate exits, and rotate logs.
   capture absolute paths at install time).
 - A **non-empty `.env`** in the repo root with at minimum the
   data-provider keys; see [README.md](../README.md#marketdata-app-setup-recommended).
+- An **always-on Mac**. launchd jobs and IB Gateway stop while the machine
+  sleeps, and a Mac that stays down after a power cut stops them until
+  someone notices. Both are administrator settings, so set them yourself
+  (`scripts/preflight_check.py` only reports them):
+
+  ```sh
+  sudo pmset -c sleep 0          # never sleep on AC power (display sleep is fine)
+  sudo pmset -a autorestart 1    # power back on after a power failure
+  ```
+
+  With FileVault on, a cold start stops at the unlock screen and no
+  LaunchAgent (nor IB Gateway) runs until someone unlocks and logs in.
+  Either accept that a power loss needs a visit, or weigh turning
+  FileVault off on a machine that lives in a locked room. If the Mac is
+  reachable over the network, enable Screen Sharing so the visit can be
+  remote.
+- **IB Gateway** when `OPTIONS_CALCULATOR_OPTIONS_PROVIDER=ib_gateway`: the
+  `com.optionscalculator.ib-gateway` job starts it at login and restarts it
+  after a crash or IB's daily logoff, but **a person must sign in** each
+  time; the API port opens only then. In the gateway, Configure → Settings →
+  API → Settings: enable socket clients, keep *Read-Only API* on, and tick
+  *Allow connections from localhost only* so the port is not reachable
+  from other machines (`TrustedIPs` filters at the application layer only).
 
 ```sh
 # One-time Python env setup
@@ -146,6 +169,8 @@ import.
 | `IB_GATEWAY_HOST` / `IB_GATEWAY_PORT` | 127.0.0.1 / 4002 | Where the IB Gateway socket API listens (4002 paper gateway, 4001 live gateway, 7497/7496 TWS). Read only when the provider is `ib_gateway`. The gateway must be running and logged in; the app connects read-only. |
 | `IB_GATEWAY_CLIENT_ID` | 17 | API client id; must differ from any other API client on the same gateway. |
 | `IB_GATEWAY_MARKET_DATA_TYPE` | 3 | 1 live, 2 frozen, 3 delayed (free, ~15 min, no provider quote timestamps), 4 delayed-frozen. Chains are tagged with the resulting feed type. |
+| `IB_GATEWAY_APP` | newest `IB Gateway *.app` | The .app bundle the `com.optionscalculator.ib-gateway` job starts, when the default search of `~/Applications` and `/Applications` is wrong. Read from `.env` (parsed, never sourced). |
+| `OPTIONS_CALCULATOR_BACKUP_DIR` / `OPTIONS_CALCULATOR_BACKUP_RETENTION` | in-tree `backups/` / 14 | Where the nightly state backup writes, and how many archives it keeps. Unset, archives land on the same disk as the state (no disaster recovery). Point it at an external drive or sync folder; preflight FAILs when the path is missing (drive not mounted) and WARNs when it is unset or on the state's own disk. |
 | `IB_GATEWAY_TIMEOUT_SECONDS` / `IB_GATEWAY_QUOTE_SETTLE_SECONDS` | 10 / 15 | Socket connect timeout; maximum wait per batch of contracts for streamed option quotes and greeks (delayed feeds need ~10 s; the wait ends early once every contract has data). |
 | `LOG_ROTATION_TIMEOUT_SECONDS` | 300 | Hard cap for log rotation. |
 
@@ -218,11 +243,15 @@ cd web/frontend && npm install && npm run build && cd ../..
 
 # 3. Run the preflight check. Verifies .env, Python venv, frontend
 #    build, wrapper/plist files, startup validators (PR #59), SQLite
-#    quick_check, and the log-rotation dry-run. Exit codes match the
-#    watchdog convention: 0=clean, 1=warnings, 2=failures.
+#    quick_check, the log-rotation dry-run, and the operations posture:
+#    IB Gateway reachable and bound to localhost (when it is the provider),
+#    the Mac never sleeping and restarting after power loss, and a backup
+#    destination off the system disk. Exit codes match the watchdog
+#    convention: 0=clean, 1=warnings, 2=failures.
 .venv311/bin/python scripts/preflight_check.py
-# Expected on a clean install: 9 PASS, 1 SKIP (launchagents not yet
-# installed), 0 FAIL. If you see any FAIL, fix it before step 4.
+# Expected on a clean install: every row PASS or SKIP (launchagents not yet
+# installed), 0 FAIL. Each WARN names the setting to fix and how; fix any
+# FAIL before step 4.
 
 # 4. Install all launchd jobs. The script template-renders each
 #    plist (substituting __PROJECT_ROOT__ and __HOME__), drops the
@@ -239,7 +268,7 @@ launchctl list | grep optionscalculator
 
 # 6. Re-run preflight to confirm the launchagents check now passes too.
 .venv311/bin/python scripts/preflight_check.py
-# Expected: 10 PASS, 0 WARN, 0 FAIL.
+# Expected: every row PASS (ib_gateway SKIP unless it is the provider), 0 WARN, 0 FAIL.
 ```
 
 Expected `launchctl list` output:
@@ -374,6 +403,11 @@ rm /tmp/cookies.txt
 | `evidence-watchdog` | Daily 22:15 | Check that today's evidence report is present + fresh; iMessage on failure. |
 | `weekly-evidence-report` | Mondays 22:45 | Write the weekly evidence export. |
 | `log-rotation` | Daily 03:00 | Size-based gzip + 7-archive retention for launchd logs (skips self-logs). |
+| `forward-paper-collector` | Daily 19:30 | Entry/exit pass for the AMC OTM-strangle paper-trade pocket. |
+| `premarket-screener-alert` | Weekdays 15:00 | iMessage when a ranked-screener setup clears the threshold. |
+| `state-backup` | Daily 04:00 | Hot snapshot of `~/.options_calculator_pro` to `OPTIONS_CALCULATOR_BACKUP_DIR`. |
+| `api` | Always on | uvicorn on 127.0.0.1:8000; restarted on failure. |
+| `ib-gateway` | Always on | IB Gateway started at login, restarted on failure or IB's daily logoff; **sign-in is manual**. |
 
 All times are **local**. If your machine is not in UTC, see
 [`scripts/automation/README.md`](../scripts/automation/README.md#resolver-due-window-check--timezone-mapping)

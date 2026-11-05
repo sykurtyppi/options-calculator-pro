@@ -16,7 +16,8 @@ for plist in \
   com.optionscalculator.forward-paper-collector.plist \
   com.optionscalculator.premarket-screener-alert.plist \
   com.optionscalculator.state-backup.plist \
-  com.optionscalculator.api.plist
+  com.optionscalculator.api.plist \
+  com.optionscalculator.ib-gateway.plist
 do
   src="${TEMPLATE_DIR}/${plist}"
   dst="${LAUNCH_AGENTS_DIR}/${plist}"

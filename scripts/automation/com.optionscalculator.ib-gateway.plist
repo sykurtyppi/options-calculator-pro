@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.optionscalculator.ib-gateway</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_ROOT__/scripts/automation/run_ib_gateway.sh</string>
+  </array>
+  <!--
+    IB Gateway, the ib_gateway options provider's data source: started at
+    login and restarted whenever it exits with a failure (a crash, the daily
+    IB auto-logoff, a wrapper that found no app). A clean exit (launchctl
+    stop, or Quit in the gateway) stays stopped. ThrottleInterval spaces
+    restarts so a missing app retries every 30s instead of spinning.
+
+    Login is still a person's job: the gateway comes back to its login
+    window and the API port opens only after someone signs in. Unattended
+    sign-in needs a third-party controller (IBC) holding the credentials,
+    which this job deliberately does not do.
+
+    A GUI application: Aqua-only so launchd never tries to start it in a
+    headless session, and Interactive so the window server treats it like
+    an app the user opened.
+  -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <!--
+    Not *_launchd*.log: these stay open for the gateway's whole life, so the
+    log rotation job must not rename them (it matches only *_launchd*.log).
+  -->
+  <key>StandardOutPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/ib_gateway_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.options_calculator_pro/logs/ib_gateway_stderr.log</string>
+</dict>
+</plist>
