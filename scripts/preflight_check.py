@@ -35,6 +35,17 @@ Checks (all read-only, none mutate state):
  10. Optional ``GET /api/health`` if a backend is already running —
      SKIP if connection refused (we never start uvicorn here; it's
      the operator's job).
+ 11. IB Gateway, when ``OPTIONS_CALCULATOR_OPTIONS_PROVIDER=ib_gateway``:
+     its API port accepts connections (WARN if not — start it and log
+     in) and is not bound on every interface (WARN — restrict it to
+     localhost in the gateway's API settings). SKIP for other providers.
+ 12. Power management on this Mac: WARN when the system sleeps on AC
+     power (scheduled jobs and IB Gateway stop while asleep) or when
+     automatic restart after a power failure is off. SKIP off macOS.
+ 13. Backup destination: WARN when ``OPTIONS_CALCULATOR_BACKUP_DIR`` is
+     unset (nightly archives land on the state's own disk) or on the
+     same disk as the state; FAIL when it is set but missing or
+     unwritable (an unmounted external drive).
 
 Exit codes (match the watchdog convention so this can drop into
 existing CI):
@@ -55,6 +66,8 @@ import json
 import os
 import plistlib
 import re
+import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -632,6 +645,271 @@ def check_backend_health(
         )
 
 
+# ── Operations checks (IB Gateway, power, backups) ───────────────────────
+
+
+_IB_PROVIDER_ALIASES = frozenset({"ib_gateway", "ib", "ibkr", "ibgateway", "interactive_brokers", "tws"})
+_ALL_INTERFACES_PREFIXES = ("*:", "0.0.0.0:", "[::]:")
+
+
+def env_file_values(project_root: Path = _PROJECT_ROOT) -> dict[str, str]:
+    """``KEY=VALUE`` pairs from the repo ``.env``, parsed and never sourced.
+
+    Comments and blank lines are skipped; surrounding quotes are stripped; the
+    last assignment of a key wins, as python-dotenv would read it.
+    """
+    env_path = project_root / ".env"
+    values: dict[str, str] = {}
+    if not env_path.exists():
+        return values
+    for raw in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def _tcp_reachable(host: str, port: int, timeout_seconds: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds):
+            return True
+    except OSError:
+        return False
+
+
+def _listening_addresses(port: int) -> list[str] | None:
+    """``addr:port`` of every LISTEN socket on ``port`` per ``lsof``; None when
+    that cannot be determined (no ``lsof``, or it failed)."""
+    if shutil.which("lsof") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode not in (0, 1):  # 1 = nothing listening
+        return None
+    addresses: list[str] = []
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 9:
+            addresses.append(parts[8])
+    return addresses
+
+
+def check_ib_gateway(
+    project_root: Path = _PROJECT_ROOT,
+    env: dict[str, str] | None = None,
+    reachable: Callable[[str, int], bool] = _tcp_reachable,
+    listeners: Callable[[int], list[str] | None] = _listening_addresses,
+) -> CheckResult:
+    """The ``ib_gateway`` provider's data source is a GUI app someone must
+    have started and logged into. A gateway that is down makes every
+    analysis fall back to yfinance (no greeks) without failing anything, so
+    preflight says so. Its API port should also be reachable from this Mac
+    only: ``TrustedIPs`` in the gateway is an application-layer filter, and
+    the socket itself can be bound to localhost in its API settings."""
+    env = env_file_values(project_root) if env is None else env
+    provider = (env.get("OPTIONS_CALCULATOR_OPTIONS_PROVIDER") or "yfinance").strip().lower()
+    if provider not in _IB_PROVIDER_ALIASES:
+        return CheckResult(
+            name="ib_gateway",
+            status=Status.SKIP,
+            message=f"Options provider is {provider!r}; IB Gateway is not in use.",
+            details={"provider": provider},
+        )
+    host = (env.get("IB_GATEWAY_HOST") or "127.0.0.1").strip()
+    try:
+        port = int((env.get("IB_GATEWAY_PORT") or "4002").strip())
+    except ValueError:
+        return CheckResult(
+            name="ib_gateway",
+            status=Status.FAIL,
+            message=f"IB_GATEWAY_PORT={env.get('IB_GATEWAY_PORT')!r} is not a port number.",
+            details={"host": host, "port": env.get("IB_GATEWAY_PORT")},
+        )
+    up = bool(reachable(host, port))
+    bound = listeners(port)
+    exposed = [a for a in (bound or []) if a.startswith(_ALL_INTERFACES_PREFIXES)]
+    details = {"host": host, "port": port, "reachable": up,
+               "listening": bound if bound is not None else "unknown", "all_interfaces": exposed}
+    if not up:
+        return CheckResult(
+            name="ib_gateway",
+            status=Status.WARN,
+            message=(
+                f"IB Gateway is not accepting API connections at {host}:{port}. Start it and "
+                "log in (the com.optionscalculator.ib-gateway job starts it at login but cannot "
+                "sign in); until then analyses fall back to yfinance, which has no greeks."
+            ),
+            details=details,
+        )
+    if exposed:
+        return CheckResult(
+            name="ib_gateway",
+            status=Status.WARN,
+            message=(
+                f"IB Gateway API port {port} is listening on every interface ({', '.join(exposed)}), "
+                "so other machines on the network can reach it. In IB Gateway: Configure → Settings "
+                "→ API → Settings, tick 'Allow connections from localhost only'."
+            ),
+            details=details,
+        )
+    return CheckResult(
+        name="ib_gateway",
+        status=Status.PASS,
+        message=(
+            f"IB Gateway accepting API connections at {host}:{port}"
+            + (" (socket bound to localhost only)." if bound else " (socket binding not determinable).")
+        ),
+        details=details,
+    )
+
+
+def _pmset_custom() -> str | None:
+    if shutil.which("pmset") is None:
+        return None
+    try:
+        result = subprocess.run(["pmset", "-g", "custom"], capture_output=True, text=True,
+                                timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def parse_pmset_ac_settings(output: str) -> dict[str, str]:
+    """``setting -> value`` from ``pmset -g custom``, from the ``AC Power:``
+    section when the output has sections (a laptop), else from the whole
+    output (a desktop reports one unlabelled set)."""
+    settings: dict[str, str] = {}
+    section = None
+    has_sections = any(line.strip().endswith("Power:") for line in output.splitlines())
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.endswith("Power:"):
+            section = stripped[:-len("Power:")].strip().lower()
+            continue
+        if has_sections and section != "ac":
+            continue
+        parts = stripped.split()
+        if len(parts) >= 2:
+            # "Sleep On Power Button 1" has a multi-word key; keep the last token as value.
+            settings[" ".join(parts[:-1]).lower()] = parts[-1]
+    return settings
+
+
+def check_power_management(pmset_output: str | None = None, *, on_macos: bool | None = None) -> CheckResult:
+    """Scheduled jobs and IB Gateway stop while the Mac sleeps, and a Mac
+    that stays down after a power failure stops them until someone notices.
+    Both are system settings only an administrator can change, so this
+    check reports and names the command rather than changing anything."""
+    if on_macos is None:
+        on_macos = sys.platform == "darwin"
+    if not on_macos:
+        return CheckResult(name="power_management", status=Status.SKIP,
+                           message="Not macOS; pmset not applicable.", details={})
+    output = _pmset_custom() if pmset_output is None else pmset_output
+    if output is None:
+        return CheckResult(name="power_management", status=Status.SKIP,
+                           message="pmset unavailable; power settings not checked.", details={})
+    settings = parse_pmset_ac_settings(output)
+    issues: list[str] = []
+    sleep = settings.get("sleep")
+    if sleep is not None and sleep != "0":
+        issues.append(
+            f"system sleeps after {sleep} min on AC power, stopping scheduled jobs and IB Gateway "
+            "(fix: `sudo pmset -c sleep 0`)"
+        )
+    autorestart = settings.get("autorestart")
+    if autorestart is not None and autorestart != "1":
+        issues.append("automatic restart after a power failure is off (fix: `sudo pmset -a autorestart 1`)")
+    details = {"sleep": sleep, "autorestart": autorestart, "displaysleep": settings.get("displaysleep")}
+    if issues:
+        return CheckResult(name="power_management", status=Status.WARN,
+                           message="; ".join(issues) + ".", details=details)
+    return CheckResult(
+        name="power_management",
+        status=Status.PASS,
+        message="Mac stays awake on AC power and restarts itself after a power failure.",
+        details=details,
+    )
+
+
+def check_backup_destination(
+    project_root: Path = _PROJECT_ROOT,
+    env: dict[str, str] | None = None,
+    state_dir: Path = _OPTIONS_HOME,
+    device_of: Callable[[Path], int] = lambda path: path.stat().st_dev,
+) -> CheckResult:
+    """The nightly backup job writes where ``OPTIONS_CALCULATOR_BACKUP_DIR``
+    says. Unset, it writes next to the state it is protecting, which
+    survives a typo but not the disk. An external destination that is
+    missing is most likely an unmounted drive: the job would then create a
+    plain folder on the system disk at that path and look healthy."""
+    env = env_file_values(project_root) if env is None else env
+    raw = (env.get("OPTIONS_CALCULATOR_BACKUP_DIR") or "").strip()
+    if not raw:
+        return CheckResult(
+            name="backup_destination",
+            status=Status.WARN,
+            message=(
+                "OPTIONS_CALCULATOR_BACKUP_DIR is unset: nightly backups land in "
+                f"{state_dir / 'backups'}, on the same disk as the state. Set it to an "
+                "external drive or sync folder for disaster recovery."
+            ),
+            details={"configured": None},
+        )
+    dest = Path(raw).expanduser()
+    if not dest.is_dir():
+        return CheckResult(
+            name="backup_destination",
+            status=Status.FAIL,
+            message=(
+                f"Backup destination {dest} does not exist (an external drive not mounted?). "
+                "The nightly job would create a folder at that path on the system disk instead."
+            ),
+            details={"configured": str(dest), "exists": False},
+        )
+    if not os.access(dest, os.W_OK):
+        return CheckResult(
+            name="backup_destination",
+            status=Status.FAIL,
+            message=f"Backup destination {dest} is not writable.",
+            details={"configured": str(dest), "exists": True, "writable": False},
+        )
+    same_disk = None
+    if state_dir.exists():
+        try:
+            same_disk = device_of(dest) == device_of(state_dir)
+        except OSError:
+            same_disk = None
+    details = {"configured": str(dest), "exists": True, "writable": True, "same_disk_as_state": same_disk}
+    if same_disk:
+        return CheckResult(
+            name="backup_destination",
+            status=Status.WARN,
+            message=(
+                f"Backup destination {dest} is on the same disk as {state_dir}; a disk failure "
+                "takes the backups with the state."
+            ),
+            details=details,
+        )
+    return CheckResult(
+        name="backup_destination",
+        status=Status.PASS,
+        message=f"Backup destination {dest} is writable"
+                + (" and on a different disk from the state." if same_disk is False else "."),
+        details=details,
+    )
+
+
 # ── Aggregation + output ─────────────────────────────────────────────────
 
 
@@ -646,6 +924,9 @@ _CHECKS: tuple[Callable[[], CheckResult], ...] = (
     check_sqlite_stores,
     check_log_rotation_dryrun,
     check_backend_health,
+    check_ib_gateway,
+    check_power_management,
+    check_backup_destination,
 )
 
 
