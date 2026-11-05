@@ -104,8 +104,14 @@ evidence reports, resolve candidate exits, and rotate logs.
   after a crash or IB's daily logoff, but **a person must sign in** each
   time; the API port opens only then. In the gateway, Configure → Settings →
   API → Settings: enable socket clients, keep *Read-Only API* on, and tick
-  *Allow connections from localhost only* so the port is not reachable
-  from other machines (`TrustedIPs` filters at the application layer only).
+  *Allow connections from localhost only*, then quit the gateway from its
+  File menu and start it again (the setting is read at startup). Note that
+  the gateway still binds its socket on every interface (`lsof` keeps
+  showing `*:4002`): the option drops non-local clients after they connect,
+  and `TrustedIPs` prompts for the rest. `scripts/preflight_check.py`
+  therefore judges exposure by sending an API handshake to this Mac's own
+  LAN address: refused is PASS, answered is FAIL, no answer is WARN (a
+  trusted-IP prompt is probably waiting in the gateway; click Reject).
 
 ```sh
 # One-time Python env setup

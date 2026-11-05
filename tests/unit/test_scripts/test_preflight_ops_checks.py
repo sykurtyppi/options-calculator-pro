@@ -7,19 +7,38 @@ tested without a gateway, a Mac, or an external drive.
 """
 from __future__ import annotations
 
+import socket
+import threading
 from pathlib import Path
 
 from scripts.preflight_check import (
+    PROBE_ACCEPTED,
+    PROBE_NO_ADDRESS,
+    PROBE_REJECTED,
+    PROBE_TIMEOUT,
+    PROBE_UNREACHABLE,
     Status,
     check_backup_destination,
     check_ib_gateway,
     check_power_management,
     env_file_values,
+    lan_api_probe,
     parse_pmset_ac_settings,
+    primary_lan_address,
 )
 
 IB_ENV = {"OPTIONS_CALCULATOR_OPTIONS_PROVIDER": "ib_gateway", "IB_GATEWAY_HOST": "127.0.0.1",
           "IB_GATEWAY_PORT": "4002"}
+UP = lambda h, p: True  # noqa: E731
+ON_ALL = lambda p: ["*:4002"]  # noqa: E731
+
+
+def _probe(verdict):
+    return lambda port: (verdict, "192.168.1.20" if verdict != PROBE_NO_ADDRESS else None)
+
+
+def _never_probed(port):
+    raise AssertionError("the LAN probe must not run when the binding already answers the question")
 
 
 # ── .env parsing ────────────────────────────────────────────────────────────
@@ -57,28 +76,140 @@ def test_ib_gateway_down_is_warn_with_instructions() -> None:
     assert result.details["reachable"] is False
 
 
-def test_ib_gateway_bound_on_all_interfaces_is_warn() -> None:
-    result = check_ib_gateway(env=IB_ENV, reachable=lambda h, p: True, listeners=lambda p: ["*:4002"])
-    assert result.status is Status.WARN
-    assert "every interface" in result.message and "localhost only" in result.message
+# The gateway binds on every interface even with 'localhost only' ticked, so
+# the binding alone decides nothing: the LAN-side handshake does.
+
+
+def test_ib_gateway_on_all_interfaces_but_refusing_lan_clients_is_pass() -> None:
+    result = check_ib_gateway(env=IB_ENV, reachable=UP, listeners=ON_ALL, probe=_probe(PROBE_REJECTED))
+    assert result.status is Status.PASS
+    assert "refused" in result.message and "192.168.1.20:4002" in result.message
     assert result.details["all_interfaces"] == ["*:4002"]
+    assert result.details["lan_probe"] == {"verdict": PROBE_REJECTED, "address": "192.168.1.20"}
+
+
+def test_ib_gateway_answering_lan_clients_is_fail_with_the_fix() -> None:
+    result = check_ib_gateway(env=IB_ENV, reachable=UP, listeners=ON_ALL, probe=_probe(PROBE_ACCEPTED))
+    assert result.status is Status.FAIL
+    assert "any machine on the network" in result.message
+    assert "localhost only" in result.message and "File menu" in result.message  # restart is part of the fix
+
+
+def test_ib_gateway_silent_on_lan_probe_is_warn_naming_the_prompt() -> None:
+    result = check_ib_gateway(env=IB_ENV, reachable=UP, listeners=ON_ALL, probe=_probe(PROBE_TIMEOUT))
+    assert result.status is Status.WARN
+    assert "prompt" in result.message and "Reject" in result.message and "localhost only" in result.message
+
+
+def test_ib_gateway_probe_that_cannot_run_keeps_the_binding_warning() -> None:
+    for verdict in (PROBE_NO_ADDRESS, PROBE_UNREACHABLE):
+        result = check_ib_gateway(env=IB_ENV, reachable=UP, listeners=ON_ALL, probe=_probe(verdict))
+        assert result.status is Status.WARN, verdict
+        assert "every interface" in result.message and verdict in result.message
     for addr in ("0.0.0.0:4002", "[::]:4002"):
-        assert check_ib_gateway(env=IB_ENV, reachable=lambda h, p: True,
-                                listeners=lambda p, a=addr: [a]).status is Status.WARN
+        assert check_ib_gateway(env=IB_ENV, reachable=UP, listeners=lambda p, a=addr: [a],
+                                probe=_probe(PROBE_NO_ADDRESS)).status is Status.WARN
 
 
-def test_ib_gateway_localhost_only_is_pass() -> None:
-    result = check_ib_gateway(env=IB_ENV, reachable=lambda h, p: True,
-                              listeners=lambda p: ["127.0.0.1:4002", "[::1]:4002"])
+def test_ib_gateway_localhost_only_binding_is_pass_without_probing() -> None:
+    result = check_ib_gateway(env=IB_ENV, reachable=UP,
+                              listeners=lambda p: ["127.0.0.1:4002", "[::1]:4002"], probe=_never_probed)
     assert result.status is Status.PASS
     assert "localhost only" in result.message
 
 
 def test_ib_gateway_unknown_binding_still_passes_when_reachable() -> None:
     # No lsof (CI on Linux): reachability is known, exposure is not claimed either way.
-    result = check_ib_gateway(env=IB_ENV, reachable=lambda h, p: True, listeners=lambda p: None)
+    result = check_ib_gateway(env=IB_ENV, reachable=UP, listeners=lambda p: None, probe=_never_probed)
     assert result.status is Status.PASS
     assert result.details["listening"] == "unknown"
+
+
+def test_ib_gateway_down_is_warn_before_any_probe() -> None:
+    result = check_ib_gateway(env=IB_ENV, reachable=lambda h, p: False, listeners=ON_ALL, probe=_never_probed)
+    assert result.status is Status.WARN
+
+
+# ── the probe itself, against fake gateways on loopback ─────────────────────
+
+
+def _fake_gateway(behaviour):
+    """A one-connection server on an ephemeral loopback port. ``behaviour`` is
+    'reset' (close right after reading the handshake), 'answer' (reply with a
+    server-version frame) or 'hang' (read and never reply)."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    server.settimeout(5)
+    seen = {}
+
+    def serve():
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return
+        with conn:
+            conn.settimeout(5)
+            try:
+                seen["handshake"] = conn.recv(64)
+            except OSError:
+                return
+            if behaviour == "answer":
+                conn.sendall(b"\x00\x00\x00\x0c178\x0020260101 00\x00")
+            elif behaviour == "hang":
+                try:
+                    conn.recv(1)  # until the probe gives up and closes
+                except OSError:
+                    pass
+        # 'reset': falls out of the with-block and closes at once
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return server, server.getsockname()[1], seen, thread
+
+
+def test_probe_sends_the_ib_handshake_and_reads_a_reset_as_rejected() -> None:
+    server, port, seen, thread = _fake_gateway("reset")
+    try:
+        assert lan_api_probe(port, address="127.0.0.1", timeout_seconds=3) == (PROBE_REJECTED, "127.0.0.1")
+    finally:
+        server.close()
+    thread.join(5)
+    assert seen["handshake"].startswith(b"API\0")
+    assert b"v100..178" in seen["handshake"]
+
+
+def test_probe_reads_a_server_version_as_accepted() -> None:
+    server, port, _, thread = _fake_gateway("answer")
+    try:
+        assert lan_api_probe(port, address="127.0.0.1", timeout_seconds=3) == (PROBE_ACCEPTED, "127.0.0.1")
+    finally:
+        server.close()
+    thread.join(5)
+
+
+def test_probe_reads_silence_as_timeout() -> None:
+    server, port, _, thread = _fake_gateway("hang")
+    try:
+        assert lan_api_probe(port, address="127.0.0.1", timeout_seconds=0.5) == (PROBE_TIMEOUT, "127.0.0.1")
+    finally:
+        server.close()
+    thread.join(5)
+
+
+def test_probe_with_nothing_listening_is_unreachable() -> None:
+    spare = socket.socket(); spare.bind(("127.0.0.1", 0)); port = spare.getsockname()[1]; spare.close()
+    assert lan_api_probe(port, address="127.0.0.1", timeout_seconds=1) == (PROBE_UNREACHABLE, "127.0.0.1")
+
+
+def test_probe_without_a_lan_address_does_not_connect(monkeypatch) -> None:
+    monkeypatch.setattr("scripts.preflight_check.primary_lan_address", lambda: None)
+    assert lan_api_probe(4002) == (PROBE_NO_ADDRESS, None)
+
+
+def test_primary_lan_address_is_never_loopback() -> None:
+    address = primary_lan_address()
+    assert address is None or (not address.startswith("127.") and address != "0.0.0.0")
 
 
 def test_ib_gateway_honours_configured_host_and_port() -> None:

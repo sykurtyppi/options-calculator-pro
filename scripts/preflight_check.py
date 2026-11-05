@@ -37,8 +37,14 @@ Checks (all read-only, none mutate state):
      the operator's job).
  11. IB Gateway, when ``OPTIONS_CALCULATOR_OPTIONS_PROVIDER=ib_gateway``:
      its API port accepts connections (WARN if not — start it and log
-     in) and is not bound on every interface (WARN — restrict it to
-     localhost in the gateway's API settings). SKIP for other providers.
+     in) and refuses clients from other machines. The gateway binds its
+     socket on every interface even with *Allow connections from
+     localhost only* ticked (that option is a filter, not a bind), so
+     when ``lsof`` shows ``*:4002`` preflight opens an API handshake to
+     this Mac's own LAN address: refused → PASS (the filter is on),
+     answered → FAIL (any machine on the network can drive the API),
+     no answer → WARN (a TrustedIPs prompt is probably waiting in the
+     gateway). SKIP for other providers.
  12. Power management on this Mac: WARN when the system sleeps on AC
      power (scheduled jobs and IB Gateway stop while asleep) or when
      automatic restart after a power failure is off. SKIP off macOS.
@@ -67,6 +73,7 @@ import os
 import plistlib
 import re
 import shutil
+import struct
 import socket
 import sqlite3
 import subprocess
@@ -704,18 +711,78 @@ def _listening_addresses(port: int) -> list[str] | None:
     return addresses
 
 
+# What the LAN-side handshake found. The gateway's *Allow connections from
+# localhost only* does not change the socket binding (lsof keeps showing
+# ``*:4002``); it drops non-local clients after accept. So the only honest
+# test of exposure is to connect from a non-loopback address and see whether
+# the gateway talks back.
+PROBE_REJECTED = "rejected"      # connected, then the gateway closed/reset: filter is on
+PROBE_ACCEPTED = "accepted"      # the gateway answered the handshake: anyone on the LAN can
+PROBE_TIMEOUT = "timeout"        # connected, no answer: a TrustedIPs prompt is likely waiting
+PROBE_UNREACHABLE = "unreachable"  # nothing accepted the connection on that address
+PROBE_NO_ADDRESS = "no_address"  # this Mac has no non-loopback IPv4 address to probe from
+
+# ib_async's opening message (client.py Client.connect): "API\0" then a
+# length-prefixed version range. We only care whether the peer answers.
+_API_HANDSHAKE = b"API\0" + struct.pack(">I", len(b"v100..178")) + b"v100..178"
+
+
+def primary_lan_address() -> str | None:
+    """This host's primary non-loopback IPv4 address, or None when it has
+    none (no network). A connected UDP socket to a routable address reveals
+    the outbound interface's address; no packet is sent."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            address = s.getsockname()[0]
+    except OSError:
+        return None
+    if not address or address.startswith("127.") or address == "0.0.0.0":
+        return None
+    return address
+
+
+def lan_api_probe(port: int, address: str | None = None,
+                  timeout_seconds: float = 5.0) -> tuple[str, str | None]:
+    """Open an IB API handshake to ``address:port`` (default: this Mac's own
+    LAN address, so the gateway sees a non-localhost client) and report one
+    of the ``PROBE_*`` verdicts with the address used."""
+    address = primary_lan_address() if address is None else address
+    if not address:
+        return PROBE_NO_ADDRESS, None
+    try:
+        with socket.create_connection((address, port), timeout=timeout_seconds) as conn:
+            conn.settimeout(timeout_seconds)
+            conn.sendall(_API_HANDSHAKE)
+            try:
+                answer = conn.recv(64)
+            except socket.timeout:
+                return PROBE_TIMEOUT, address
+            except OSError:
+                return PROBE_REJECTED, address  # reset by peer after the handshake
+    except socket.timeout:
+        return PROBE_UNREACHABLE, address
+    except OSError:
+        return PROBE_UNREACHABLE, address
+    return (PROBE_ACCEPTED if answer else PROBE_REJECTED), address
+
+
 def check_ib_gateway(
     project_root: Path = _PROJECT_ROOT,
     env: dict[str, str] | None = None,
     reachable: Callable[[str, int], bool] = _tcp_reachable,
     listeners: Callable[[int], list[str] | None] = _listening_addresses,
+    probe: Callable[[int], tuple[str, str | None]] = lan_api_probe,
 ) -> CheckResult:
     """The ``ib_gateway`` provider's data source is a GUI app someone must
     have started and logged into. A gateway that is down makes every
     analysis fall back to yfinance (no greeks) without failing anything, so
-    preflight says so. Its API port should also be reachable from this Mac
-    only: ``TrustedIPs`` in the gateway is an application-layer filter, and
-    the socket itself can be bound to localhost in its API settings."""
+    preflight says so. Its API should also take clients from this Mac only.
+    The gateway cannot bind to localhost: *Allow connections from localhost
+    only* leaves the socket on every interface and drops non-local clients
+    after accept, and ``TrustedIPs`` prompts for the rest. So when ``lsof``
+    shows the port on every interface the check sends a real API handshake
+    to this Mac's own LAN address and judges the gateway by its answer."""
     env = env_file_values(project_root) if env is None else env
     provider = (env.get("OPTIONS_CALCULATOR_OPTIONS_PROVIDER") or "yfinance").strip().lower()
     if provider not in _IB_PROVIDER_ALIASES:
@@ -752,13 +819,50 @@ def check_ib_gateway(
             details=details,
         )
     if exposed:
+        verdict, lan = probe(port)
+        details["lan_probe"] = {"verdict": verdict, "address": lan}
+        where = f"{lan}:{port}" if lan else f"port {port}"
+        fix = ("In IB Gateway: Configure → Settings → API → Settings, tick 'Allow connections "
+               "from localhost only', then quit the gateway from its File menu and start it again.")
+        if verdict == PROBE_REJECTED:
+            return CheckResult(
+                name="ib_gateway",
+                status=Status.PASS,
+                message=(
+                    f"IB Gateway accepting API connections at {host}:{port}; the socket is on every "
+                    f"interface ({', '.join(exposed)}) but the gateway refused an API client arriving "
+                    f"on this Mac's LAN address ({where}), so 'localhost only' is in effect."
+                ),
+                details=details,
+            )
+        if verdict == PROBE_ACCEPTED:
+            return CheckResult(
+                name="ib_gateway",
+                status=Status.FAIL,
+                message=(
+                    f"IB Gateway answered an API handshake from this Mac's LAN address ({where}): "
+                    "any machine on the network can drive the API. " + fix
+                ),
+                details=details,
+            )
+        if verdict == PROBE_TIMEOUT:
+            return CheckResult(
+                name="ib_gateway",
+                status=Status.WARN,
+                message=(
+                    f"IB Gateway took an API connection from this Mac's LAN address ({where}) and did "
+                    "not answer within the probe timeout; it is probably showing a 'trusted IP' prompt "
+                    "for that connection (click Reject). " + fix
+                ),
+                details=details,
+            )
         return CheckResult(
             name="ib_gateway",
             status=Status.WARN,
             message=(
-                f"IB Gateway API port {port} is listening on every interface ({', '.join(exposed)}), "
-                "so other machines on the network can reach it. In IB Gateway: Configure → Settings "
-                "→ API → Settings, tick 'Allow connections from localhost only'."
+                f"IB Gateway API port {port} is listening on every interface ({', '.join(exposed)}) "
+                f"and the LAN-side probe could not run ({verdict}), so whether other machines can "
+                "reach it is unknown. " + fix
             ),
             details=details,
         )
