@@ -127,7 +127,7 @@ import.
 | `OPTIONS_CALCULATOR_HOSTED_MODE=true` | Implies `OPTIONS_CALCULATOR_SECURE_COOKIES=true`, `OPTIONS_CALCULATOR_PROTECT_API_DOCS=true`, and `OPTIONS_CALCULATOR_TRUST_PROXY_HEADERS=true`. |
 | `OPTIONS_CALCULATOR_TRUST_PROXY_HEADERS=true` | Honour leftmost `X-Forwarded-For` for per-IP rate-limiting on `/login`, `/api/ml/train`, `/api/oos/submit`. Without this, behind a tunnel ALL login attempts share one global bucket. Spoof-safe only when a real proxy is enforced in front. |
 | `WATCHDOG_IMESSAGE_TO` | Address (phone or email) that receives daily watchdog iMessage alerts. If unset, the watchdog logs but does not page. |
-| `OPTIONS_CALCULATOR_OPTIONS_PROVIDER` | Options/earnings data provider for the live web API + evidence cycle: `yfinance` (default, free) or `marketdata_app` (paid, requires `MARKETDATA_TOKEN`). Default is `yfinance` so the system runs on free data; switch to `marketdata_app` once a paid plan is in place — no code change. Caveat: yfinance has no greeks and flakier IV (degrades honestly via the evidence-quality gate). The forward paper collector always uses yfinance regardless of this flag. |
+| `OPTIONS_CALCULATOR_OPTIONS_PROVIDER` | Options/earnings data provider for the live web API + evidence cycle: `yfinance` (default, free), `marketdata_app` (paid, requires `MARKETDATA_TOKEN`) or `ib_gateway` (a locally running IB Gateway/TWS; see the `IB_GATEWAY_*` variables below; earnings still come from yfinance). Default is `yfinance` so the system runs on free data; switch to `marketdata_app` once a paid plan is in place — no code change. Caveat: yfinance has no greeks and flakier IV (degrades honestly via the evidence-quality gate). The forward paper collector always uses yfinance regardless of this flag. |
 
 ### C. Optional tuning
 
@@ -143,6 +143,10 @@ import.
 | `OPTIONS_CALCULATOR_MARKETDATA_DAILY_CREDITS` | 100000 | MarketData.app daily credit limit for the budget (`services/provider_reliability.py`). The limit the API reports in its rate-limit headers takes precedence once seen. Discovery stops at 60% of the day's credits, entries at 85%; exits may use the rest. |
 | `OPTIONS_CALCULATOR_MARKETDATA_RESET_ET` | 00:00 | When the MarketData.app daily credits reset, as `HH:MM` New York time. This sets the budget window boundary; a reset time the API reports in `X-Api-Ratelimit-Reset` takes precedence. The default is not verified against the provider. |
 | `OPTIONS_CALCULATOR_PROVIDER_DISK_CACHE` | 1 | Set `0` to turn off the shared on-disk cache for MarketData.app earnings, expirations and historical chains (`~/.options_calculator_pro/cache/`). Live chains and quotes are never cached on disk. |
+| `IB_GATEWAY_HOST` / `IB_GATEWAY_PORT` | 127.0.0.1 / 4002 | Where the IB Gateway socket API listens (4002 paper gateway, 4001 live gateway, 7497/7496 TWS). Read only when the provider is `ib_gateway`. The gateway must be running and logged in; the app connects read-only. |
+| `IB_GATEWAY_CLIENT_ID` | 17 | API client id; must differ from any other API client on the same gateway. |
+| `IB_GATEWAY_MARKET_DATA_TYPE` | 3 | 1 live, 2 frozen, 3 delayed (free, ~15 min, no provider quote timestamps), 4 delayed-frozen. Chains are tagged with the resulting feed type. |
+| `IB_GATEWAY_TIMEOUT_SECONDS` / `IB_GATEWAY_QUOTE_SETTLE_SECONDS` | 10 / 15 | Socket connect timeout; maximum wait per batch of contracts for streamed option quotes and greeks (delayed feeds need ~10 s; the wait ends early once every contract has data). |
 | `LOG_ROTATION_TIMEOUT_SECONDS` | 300 | Hard cap for log rotation. |
 
 **MarketData.app credit ledger** (`~/.options_calculator_pro/telemetry/provider_budget.sqlite`):

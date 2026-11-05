@@ -1606,8 +1606,8 @@ class InstitutionalMLDatabase:
         window_end = end_date + timedelta(days=30)
 
         cached = self._get_cached_earnings_dates(symbol, window_start, window_end)
-        # Accept both 'yfinance' and 'marketdata_app' as true (non-proxy) sources.
-        _TRUE_SOURCES = {'yfinance', 'marketdata_app'}
+        # Accept yfinance, marketdata_app and ib_gateway as true (non-proxy) sources.
+        _TRUE_SOURCES = {'yfinance', 'marketdata_app', 'ib_gateway'}
         true_dates = sorted(
             {(event_date, release_timing, source) for event_date, source, release_timing in cached
              if source in _TRUE_SOURCES},
@@ -1738,6 +1738,14 @@ class InstitutionalMLDatabase:
         """
         # ── Primary: MarketData.app (accurate reportTime = BMO/AMC) ──────────
         if self.mda_client is not None:
+            # Label rows with the provider that actually served them: the
+            # injected client may be yfinance, MarketData.app or IB Gateway
+            # (which itself sources earnings from yfinance).
+            earnings_source = str(
+                getattr(self.mda_client, "earnings_provider_name", None)
+                or getattr(self.mda_client, "provider_name", None)
+                or "marketdata_app"
+            )
             try:
                 mda_df = self.mda_client.get_earnings(symbol, countback=60)
                 if mda_df is not None and not mda_df.empty:
@@ -1767,7 +1775,7 @@ class InstitutionalMLDatabase:
                         event_rows.append({
                             "event_date": dt,
                             "release_timing": release_timing,
-                            "source": "marketdata_app",
+                            "source": earnings_source,
                         })
 
                     dedup = {}
@@ -1776,7 +1784,7 @@ class InstitutionalMLDatabase:
                         dedup[key] = ev
                     event_rows = [dedup[k] for k in sorted(dedup.keys())]
                     if event_rows:
-                        self._cache_earnings_dates(symbol, event_rows, source="marketdata_app")
+                        self._cache_earnings_dates(symbol, event_rows, source=earnings_source)
                     return event_rows
             except Exception as e:
                 self.logger.debug("MDApp earnings fetch failed for %s, falling back to yfinance: %s", symbol, e)

@@ -22,6 +22,7 @@ class Category(enum.Enum):
     EARNINGS_ALPHA_VANTAGE = "earnings_alpha_vantage"
     EARNINGS_SEC_EDGAR = "earnings_sec_edgar"
     YFINANCE = "yfinance"
+    IB_GATEWAY = "ib_gateway"
     IMESSAGE = "imessage"
     GIT_REMOTE = "git_remote"
 

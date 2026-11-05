@@ -51,7 +51,7 @@ from services.execution_scenarios import (
 )
 from services import external_io_gate
 from services.market_data_client import MarketDataClient
-from services.market_data_provider import build_market_data_client, get_options_provider_name
+from services.market_data_provider import build_market_data_client, get_options_provider_name, provider_io_category
 from services.option_surface_quality import diagnose_option_surface_quality
 from services.outcome_recorder import (
     OutcomeStore,
@@ -395,11 +395,7 @@ def _get_marketdata_client(candidate: Any = None) -> Optional[Any]:
     # Provider-selected (default: yfinance). Gate on the active provider's
     # category so the IO guard stays accurate for whichever feed is live.
     provider = get_options_provider_name()
-    category = (
-        external_io_gate.Category.YFINANCE
-        if provider in {"yfinance", "yahoo", "yf"}
-        else external_io_gate.Category.MARKETDATA
-    )
+    category = provider_io_category(provider)
     if not external_io_gate.is_allowed(category):
         return None
     try:

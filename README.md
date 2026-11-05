@@ -67,6 +67,28 @@ Multi-source earnings discovery notes:
 - `SEC EDGAR` is used as a confirmation layer, not a future-calendar source. The API requires no key, but a descriptive `User-Agent` is strongly recommended for compliant automated access.
 - `yfinance` remains the last-resort research fallback when stronger sources are unavailable.
 
+## Interactive Brokers Gateway Setup (Optional)
+Set `OPTIONS_CALCULATOR_OPTIONS_PROVIDER=ib_gateway` in `.env` to read option chains,
+model greeks, implied volatility and quotes from a locally running IB Gateway or TWS.
+
+1. Start IB Gateway and log in (paper or live). The app never enters credentials.
+2. In the gateway: **Configure → Settings → API → Settings**, tick *Enable ActiveX and
+   Socket Clients*, note the *Socket port* (4002 paper / 4001 live by default), keep
+   *Read-Only API* ticked, and make sure `127.0.0.1` is a trusted IP.
+3. Match the port in `.env` (`IB_GATEWAY_PORT`) and start the backend.
+
+What the IB provider does and does not supply:
+- Chains, bid/ask, volume, open interest, model IV and delta/gamma/theta/vega — from IB.
+- Earnings dates — still from yfinance (IB's socket API has no free earnings feed);
+  rows are labelled `yfinance`, not IB.
+- Historical chains — none; `date=` requests return empty, as with yfinance.
+- Without a live OPRA subscription quotes are **delayed ~15 min**
+  (`IB_GATEWAY_MARKET_DATA_TYPE=3`). Delayed rows carry no provider quote time and the
+  chain is tagged `attrs["market_data_type"]="delayed"`; set `1` once a live
+  subscription is active.
+- If the gateway is not running the provider reports unavailable and callers degrade
+  to the yfinance fallback, exactly as with a missing MarketData.app token.
+
 ## Optional Share-Code Auth
 Auth is disabled by default. To enable login protection for shared deployments, set:
 

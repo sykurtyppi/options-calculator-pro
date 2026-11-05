@@ -485,7 +485,7 @@ from scripts.institutional_backfill import InstitutionalDataCollector
 from services import external_io_gate
 from services.code_identity import source_identity
 from services.market_data_client import MarketDataClient
-from services.market_data_provider import build_market_data_client, get_options_provider_name
+from services.market_data_provider import build_market_data_client, get_options_provider_name, provider_io_category
 from services.options_feature_store import OptionsFeatureStore, OptionsFeatureStoreError
 from web.api.edge_engine import EdgeSnapshot, analyze_single_ticker
 from web.api.screener_engine import build_edge_screener
@@ -525,11 +525,7 @@ def _get_mda_client():
     global _mda_client
     if _mda_client is None:
         provider = get_options_provider_name()
-        category = (
-            external_io_gate.Category.YFINANCE
-            if provider in {"yfinance", "yahoo", "yf"}
-            else external_io_gate.Category.MARKETDATA
-        )
+        category = provider_io_category(provider)
         external_io_gate.assert_allowed(category)
         _mda_client = build_market_data_client(provider=provider)
     return _mda_client
