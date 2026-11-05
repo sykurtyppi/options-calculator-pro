@@ -8,8 +8,10 @@ changes what "claimable" means, so it must come with a new CONTRACT_VERSION.
 
 A quote passes (entry or exit) when every one of these holds:
 
-1. Source: a live, quote-level feed (MarketData.app). yfinance chains are
-   delayed and indicative and never pass.
+1. Source: a live, quote-level feed (MarketData.app, or IB Gateway on a live
+   market-data subscription). yfinance chains are delayed and indicative and
+   never pass. A delayed IB feed stamps no per-leg quote time, so it fails
+   rule 4 rather than passing as live.
 2. Contract identity: each leg names a standard OCC option symbol on the
    recommendation's own underlying, with a real expiration that had not passed
    on the quote's session day. An adjusted contract (after a split or special
@@ -51,9 +53,11 @@ from services.market_calendar import EXCHANGE_TZ, SESSION_OPEN, is_trading_day, 
 # other-version exit verdicts all fail (v1 let each of them through).
 # v3: legs must be on the recommendation's underlying and unexpired at the
 # quote's session; entry and exit verdicts are typed, consistent and mandatory.
-CONTRACT_VERSION = "conservative_fill_v3"
+# v4: IB Gateway (ib_gateway) is a claim source; its legs must still carry a
+# provider quote time, which only its live feed stamps. Fill rules unchanged.
+CONTRACT_VERSION = "conservative_fill_v4"
 
-CLAIM_SOURCES = frozenset({"marketdata_app"})
+CLAIM_SOURCES = frozenset({"marketdata_app", "ib_gateway"})
 MIN_LEG_BID = 0.05
 MAX_LEG_SPREAD_PCT = 25.0
 MAX_LEG_SKEW_SECONDS = 60.0

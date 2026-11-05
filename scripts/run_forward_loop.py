@@ -801,10 +801,12 @@ def _normalize_forward_chain_frame(frame: Optional[pd.DataFrame]) -> pd.DataFram
     once converted a -95% loss into a +267% win. That split is only safe while
     providers really do emit 0.0 for worthless legs.
 
-    Both current providers satisfy it: yfinance
+    All three providers satisfy it: yfinance
     (yfinance_market_data_client.py:207) and MarketData
     (market_data_client.py:563) each run bid through
-    ``pd.to_numeric(..., errors="coerce")``, so a real zero stays 0.0 and only an
+    ``pd.to_numeric(..., errors="coerce")``, and IB Gateway
+    (ib_gateway_market_data_client.py, ``_quote_value``) keeps a real 0.0 bid and
+    maps IB's -1 / NaN "no quote" to NaN, so a real zero stays 0.0 and only an
     absent/unparseable quote becomes NaN. This function deliberately does NOT
     fill or drop NaN bid/ask — it coerces ``strike`` only — so that distinction
     survives intact down to the pricing layer.
@@ -1168,11 +1170,16 @@ def fetch_structure_quote(
         if not mda_calls.empty and not mda_puts.empty:
             chain_from_client = True
             quote_source = client_provider
+            # Label the quote with the provider that served it; a non-live feed
+            # (IB Gateway delayed/frozen) is named so the record shows it.
+            feed_type = str(getattr(mda_chain, "attrs", {}).get("market_data_type") or "").lower()
             quote_quality = (
-                "marketdata_app_paper_research_mid_not_execution_grade"
-                if client_provider == "marketdata_app"
-                else "paper_research_mid_not_execution_grade"
+                "paper_research_mid_not_execution_grade"
+                if client_provider == "yfinance"
+                else f"{client_provider}_paper_research_mid_not_execution_grade"
             )
+            if feed_type and feed_type != "live":
+                quote_quality += f"_{feed_type}_feed"
             front_calls, front_puts = mda_calls, mda_puts
             chain_spot = _spot_from_marketdata_chain(mda_chain)
             if chain_spot is not None:

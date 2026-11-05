@@ -86,6 +86,9 @@ What the IB provider does and does not supply:
   (`IB_GATEWAY_MARKET_DATA_TYPE=3`). Delayed rows carry no provider quote time and the
   chain is tagged `attrs["market_data_type"]="delayed"`; set `1` once a live
   subscription is active.
+- Claim-grade evidence: live IB quotes (type `1`) can pass the claim contract
+  (`docs/CLAIM_CONTRACT.md`, `conservative_fill_v4`) like MarketData.app quotes.
+  Delayed and frozen feeds cannot, because their legs carry no quote time.
 - If the gateway is not running the provider reports unavailable and callers degrade
   to the yfinance fallback, exactly as with a missing MarketData.app token.
 

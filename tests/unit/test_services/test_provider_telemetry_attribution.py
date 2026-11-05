@@ -185,14 +185,20 @@ def _strangle_chain():
     ])
 
 
-@pytest.mark.parametrize("provider, expected_source, expected_quality", [
-    ("yfinance", "yfinance", "paper_research_mid_not_execution_grade"),
-    ("marketdata_app", "marketdata_app", "marketdata_app_paper_research_mid_not_execution_grade"),
+@pytest.mark.parametrize("provider, feed_type, expected_source, expected_quality", [
+    ("yfinance", None, "yfinance", "paper_research_mid_not_execution_grade"),
+    ("marketdata_app", None, "marketdata_app", "marketdata_app_paper_research_mid_not_execution_grade"),
+    # IB Gateway names its feed: a live feed is plain, a delayed one says so.
+    ("ib_gateway", "live", "ib_gateway", "ib_gateway_paper_research_mid_not_execution_grade"),
+    ("ib_gateway", "delayed", "ib_gateway", "ib_gateway_paper_research_mid_not_execution_grade_delayed_feed"),
 ])
-def test_quote_source_is_the_clients_provider(monkeypatch, store, provider, expected_source, expected_quality):
+def test_quote_source_is_the_clients_provider(monkeypatch, store, provider, feed_type, expected_source, expected_quality):
     monkeypatch.setattr(forward_loop.yf, "Ticker",
                         lambda _symbol: (_ for _ in ()).throw(AssertionError("raw yfinance not expected")))
-    client = _FakeMarketDataClient(_strangle_chain())
+    chain = _strangle_chain()
+    if feed_type is not None:
+        chain.attrs["market_data_type"] = feed_type
+    client = _FakeMarketDataClient(chain)
     client.provider_name = provider
     quote = forward_loop.fetch_structure_quote(symbol="AAPL", structure="otm_strangle",
                                                earnings_date=date(2026, 4, 30), as_of_date=date(2026, 4, 24),

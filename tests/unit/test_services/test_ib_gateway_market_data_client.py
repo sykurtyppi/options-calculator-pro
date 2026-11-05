@@ -104,7 +104,8 @@ class _FakeIB:
             elif isinstance(c, Option):
                 if c.strike in _LISTED_STRIKES and c.strike != _UNLISTED_STRIKE:
                     c.conId = int(c.strike * 10) + (1 if c.right == "C" else 2)
-                    c.localSymbol = f"ACME {c.lastTradeDateOrContractMonth}{c.right}{int(c.strike):05d}000"
+                    # IB pads the root to six characters, as the real gateway does.
+                    c.localSymbol = f"ACME  {c.lastTradeDateOrContractMonth[2:]}{c.right}{int(c.strike * 1000):08d}"
                     out.append(c)
         return out
 
@@ -153,7 +154,8 @@ def test_chain_is_normalized_with_greeks_from_ib():
     assert (chain.loc[chain["side"] == "put", "delta"] < 0).all()
     assert chain["impliedVolatility"].between(0.29, 0.32).all()
     assert (chain["underlyingPrice"] == 100.0).all()
-    assert chain["optionSymbol"].str.startswith("ACME ").all()
+    # Compact OCC symbols (no IB padding), as the claim contract and ledger expect.
+    assert chain["optionSymbol"].str.fullmatch(r"ACME260717[CP]\d{8}").all()
     call_100 = chain[(chain["side"] == "call") & (chain["strike"] == 100.0)].iloc[0]
     assert call_100["openInterest"] == 800
     assert call_100["mid"] == pytest.approx(2.2)
@@ -186,6 +188,13 @@ def test_live_feed_stamps_provider_quote_time():
     assert "updated" in chain.columns
     assert (chain["updated"] == _QUOTE_TIME.timestamp()).all()
     assert chain.attrs["market_data_type"] == "live"
+
+
+def test_frozen_feed_stamps_no_quote_time():
+    # Frozen replays the last close while the tick arrives now: no stamp.
+    chain = _client(_FakeIB(), market_data_type=2).get_option_chain("ACME", expiration="2026-07-17")
+    assert "updated" not in chain.columns
+    assert chain.attrs["market_data_type"] == "frozen"
 
 
 def test_default_expiration_is_the_front_month_and_all_is_capped():

@@ -249,7 +249,8 @@ Useful flags:
 What the forward evidence is meant to show, which events count, the fixed
 analysis, and the kill criteria are set in [PREREGISTRATION.md](PREREGISTRATION.md)
 before the cohort starts. Note its first precondition: the claim contract only
-admits MarketData.app quotes, so with yfinance alone nothing becomes claimable.
+admits MarketData.app quotes or live IB Gateway quotes, so with yfinance alone
+(or a delayed IB feed) nothing becomes claimable.
 
 ## Quote Provenance
 

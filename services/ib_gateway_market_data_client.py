@@ -9,7 +9,8 @@ What IB gives that yfinance cannot:
   - Model greeks (delta/gamma/theta/vega) and model implied volatility per
     contract, straight from IB's option computation ticks.
   - Exchange bid/ask with a quote time, so quote provenance can carry a real
-    provider timestamp when the feed is live.
+    provider timestamp when the feed is live, and live IB quotes can pass the
+    claim contract (services.claim_contract) like MarketData.app quotes.
 
 Data-fidelity caveats, stated rather than hidden:
   - No earnings calendar. IB's socket API has no free earnings-date feed, so
@@ -76,9 +77,11 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_SETTLE_SECONDS = 15.0
 
 MARKET_DATA_TYPE_LABELS = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}
-# Only a live or frozen feed stamps quotes the gateway itself timed; a delayed
-# feed's ticks arrive ~15 minutes after the fact with no original time.
-_REAL_TIME_MARKET_DATA_TYPES = {1, 2}
+# Only the live feed stamps quotes with the time the gateway delivered them. A
+# delayed feed's ticks arrive ~15 minutes after the fact with no original time,
+# and a frozen feed replays the last close while the tick arrives now, so a
+# stamp on either would be an invented quote time.
+_REAL_TIME_MARKET_DATA_TYPES = {1}
 
 # IB's default market-data line cap is 100 concurrent subscriptions per account;
 # stay under it with headroom for anything else the user runs against the gateway.
@@ -564,7 +567,7 @@ class IBGatewayMarketDataClient:
         if strike is not None and und is not None:
             intrinsic = max(0.0, und - strike) if side == "call" else max(0.0, strike - und)
         row = {
-            "optionSymbol": getattr(contract, "localSymbol", None) or None,
+            "optionSymbol": _occ_symbol(getattr(contract, "localSymbol", None)),
             "underlying": symbol,
             "side": side,
             "strike": strike,
@@ -685,6 +688,13 @@ def _ticker_price(ticker: Any) -> Optional[float]:
         if _finite(candidate) and float(candidate) > 0:
             return float(candidate)
     return None
+
+
+def _occ_symbol(local_symbol: Any) -> Optional[str]:
+    """IB pads its option local symbol (``AAPL  261120C00345000``); the rest of
+    the system, and the claim contract's OCC check, use the compact form."""
+    text = str(local_symbol or "").replace(" ", "").upper()
+    return text or None
 
 
 def _iso_date(value: Any) -> str:
