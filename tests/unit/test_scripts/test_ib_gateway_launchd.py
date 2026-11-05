@@ -125,6 +125,26 @@ def test_wrapper_finds_the_newest_gateway_under_applications(tmp_path: Path) -> 
     assert "IB Gateway 10.51.app" in result.stdout
 
 
+def test_wrapper_finds_the_installer_layout_with_a_version_folder(tmp_path: Path) -> None:
+    # IB's installer: ~/Applications/IB Gateway 10.51/IB Gateway 10.51.app
+    root, app = _fake_project(tmp_path)
+    home = tmp_path / "home"
+    nested = home / "Applications" / "IB Gateway 10.51" / "IB Gateway 10.51.app"
+    nested.parent.mkdir(parents=True)
+    shutil.copytree(app, nested)
+    # The installer also leaves an uninstaller beside it, which sorts LAST under
+    # version sort and once got launched instead of the gateway. Never again.
+    uninstaller = nested.parent / "IB Gateway 10.51 Uninstaller.app"
+    shutil.copytree(app, uninstaller)
+    (uninstaller / "Contents" / "MacOS" / "JavaApplicationStub").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "UNINSTALLER-RAN" > "$CALLS"\n')
+    result = _run(root, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert result.calls[:1] == ["stub-ran"]
+    assert str(nested) in result.stdout
+    assert "Uninstaller" not in result.stdout
+
+
 def test_wrapper_without_an_app_exits_with_config_error(tmp_path: Path) -> None:
     root, _ = _fake_project(tmp_path)
     result = _run(root, tmp_path, IB_GATEWAY_APP=str(tmp_path / "missing.app"))

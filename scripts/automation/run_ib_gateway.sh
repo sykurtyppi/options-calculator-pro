@@ -41,8 +41,17 @@ _env_file_value() {
 APP="${IB_GATEWAY_APP:-$(_env_file_value IB_GATEWAY_APP)}"
 APP="${APP/#\~/${HOME}}"
 if [ -z "${APP}" ]; then
-  # Newest version wins: `sort -V` orders "IB Gateway 10.51" after "IB Gateway 10.9".
-  APP="$( { ls -d "${HOME}/Applications/IB Gateway"*.app /Applications/IB\ Gateway*.app 2>/dev/null || true; } | sort -V | tail -1)"
+  # IB's installer puts the bundle in a version folder ("IB Gateway 10.51/IB
+  # Gateway 10.51.app") next to "IB Gateway 10.51 Uninstaller.app"; a
+  # drag-install puts it directly in Applications. Look in both layouts under
+  # ~/Applications and /Applications, never pick an uninstaller, and let the
+  # newest version win: `sort -V` orders "IB Gateway 10.51" after "IB Gateway 10.9".
+  APP="$( { ls -d \
+      "${HOME}/Applications/IB Gateway"*.app \
+      "${HOME}/Applications/IB Gateway"*/"IB Gateway"*.app \
+      "/Applications/IB Gateway"*.app \
+      "/Applications/IB Gateway"*/"IB Gateway"*.app 2>/dev/null || true; } \
+    | grep -viE 'uninstall' | sort -V | tail -1 || true)"
 fi
 STUB="${APP%/}/Contents/MacOS/JavaApplicationStub"
 
