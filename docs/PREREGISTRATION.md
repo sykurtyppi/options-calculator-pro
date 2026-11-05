@@ -12,11 +12,14 @@ sign-off; the proposed value is filled in.
 ## 1. Preconditions: the cohort cannot start until all hold
 
 1. **Claim-grade quotes.** The claim contract
-   ([CLAIM_CONTRACT.md](CLAIM_CONTRACT.md), `conservative_fill_v3`) accepts only
-   live quote-level MarketData.app quotes; yfinance quotes never pass. Every
-   forward analysis so far has been priced from yfinance, so no outcome can be
-   claimable until MarketData.app supplies the chains the loop prices.
-   **DECIDE:** subscribe to MarketData.app (or stop here: without it this
+   ([CLAIM_CONTRACT.md](CLAIM_CONTRACT.md), `conservative_fill_v4`) accepts only
+   live quote-level quotes: MarketData.app, or IB Gateway on a live market-data
+   subscription (`IB_GATEWAY_MARKET_DATA_TYPE=1`); yfinance quotes never pass,
+   and an IB delayed feed fails on missing leg quote times. Every forward
+   analysis so far has been priced from yfinance, so no outcome can be
+   claimable until one of those feeds supplies the chains the loop prices.
+   **DECIDE:** subscribe to MarketData.app, or add a live OPRA subscription to
+   the IB account used by the gateway (or stop here: without one of them this
    pre-registration can never be tested).
 2. **In-session pricing.** The evidence cycle runs during the NYSE regular
    session on trading days (#193), and every analysis carries quote provenance
@@ -39,7 +42,7 @@ earnings (T-1), make money, and does it beat simply always buying the same
 structure on the same events?
 
 All returns are `realized_return_pct` of **claimable** outcomes under
-`conservative_fill_v3`, one per event (the claim contract and the
+`conservative_fill_v4`, one per event (the claim contract and the
 one-trade-per-event rule define both). The unit of analysis is the event.
 
 - **H1 (primary): the selector beats no trade.** The mean selector return per

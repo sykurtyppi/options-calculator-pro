@@ -56,6 +56,21 @@ def _with_leg(quote, leg, **changes):
 # ── the quote contract ──────────────────────────────────────────────────────
 
 
+def test_a_clean_closing_ib_gateway_live_quote_passes():
+    check = cc.evaluate_quote_contract(_quote(source="ib_gateway", quality="ib_gateway_paper_research_mid_not_execution_grade"))
+    assert check.passed and check.reasons == []
+
+
+def test_an_ib_gateway_delayed_quote_fails_on_missing_leg_times_not_source():
+    quote = _quote(source="ib_gateway", quality="ib_gateway_paper_research_mid_not_execution_grade_delayed_feed")
+    for leg in quote["bid_ask_mid"]["legs"].values():
+        leg.pop("quote_time")   # a delayed IB feed stamps no per-leg quote time
+    check = cc.evaluate_quote_contract(quote)
+    assert not check.passed
+    assert {"claim_call_missing_quote_time", "claim_put_missing_quote_time"} <= set(check.reasons)
+    assert not any(reason.startswith("claim_source_not_live") for reason in check.reasons)
+
+
 def test_a_clean_closing_marketdata_quote_passes():
     check = cc.evaluate_quote_contract(_quote())
     assert check.passed, check.reasons

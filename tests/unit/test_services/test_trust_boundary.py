@@ -117,7 +117,7 @@ def test_entries_carry_the_contract_version():
     quote = {**_quote(captured="2026-04-21T20:30:00+00:00", call_time="2026-04-21T19:59:40+00:00"),
              "surface_quality": {"status": "clean_surface"}}
     result = evaluate_evidence_quality(quote_payload=quote)
-    assert result.claim_allowed and result.claim_contract_version == V == "conservative_fill_v3"
+    assert result.claim_allowed and result.claim_contract_version == V == "conservative_fill_v4"
 
 
 # ── event identity under concurrency ────────────────────────────────────────
