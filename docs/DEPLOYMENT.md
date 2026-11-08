@@ -105,7 +105,8 @@ evidence reports, resolve candidate exits, and rotate logs.
   time; the API port opens only then. In the gateway, Configure → Settings →
   API → Settings: enable socket clients, keep *Read-Only API* on, and tick
   *Allow connections from localhost only*, then quit the gateway from its
-  File menu and start it again (the setting is read at startup). Note that
+  File menu. Launchd restarts it automatically; sign in again so the startup
+  setting takes effect. Note that
   the gateway still binds its socket on every interface (`lsof` keeps
   showing `*:4002`): the option drops non-local clients after they connect,
   and `TrustedIPs` prompts for the rest. `scripts/preflight_check.py`

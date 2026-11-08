@@ -24,8 +24,10 @@ def test_plist_keeps_the_gateway_running_in_the_gui_session() -> None:
     assert data["Label"] == "com.optionscalculator.ib-gateway"
     assert data["ProgramArguments"] == ["__PROJECT_ROOT__/scripts/automation/run_ib_gateway.sh"]
     assert data["RunAtLoad"] is True
-    # Restart on failure only: Quit in the gateway or `launchctl stop` must stick.
-    assert data["KeepAlive"] == {"SuccessfulExit": False}
+    # IB's daily auto-logoff can exit cleanly, so production supervision must
+    # restart the gateway after both successful and failed exits. Operators use
+    # launchctl bootout/unload when they intentionally need it stopped.
+    assert data["KeepAlive"] is True
     assert data["ThrottleInterval"] >= 30
     # A GUI app: never started in a headless session.
     assert data["LimitLoadToSessionType"] == "Aqua"

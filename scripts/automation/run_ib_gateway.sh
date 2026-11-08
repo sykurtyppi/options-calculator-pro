@@ -3,7 +3,7 @@ set -euo pipefail
 
 # IB Gateway wrapper, kept alive by launchd (com.optionscalculator.ib-gateway).
 # Like run_api_server.sh it takes no lock and no timeout: launchd runs a single
-# instance and restarts it if it exits with a failure. `exec` hands the process
+# instance and restarts it whenever it exits. `exec` hands the process
 # to the gateway's own launcher so launchd supervises the gateway itself.
 #
 # What this does and does not do:

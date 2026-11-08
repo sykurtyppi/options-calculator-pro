@@ -11,10 +11,11 @@
   </array>
   <!--
     IB Gateway, the ib_gateway options provider's data source: started at
-    login and restarted whenever it exits with a failure (a crash, the daily
-    IB auto-logoff, a wrapper that found no app). A clean exit (launchctl
-    stop, or Quit in the gateway) stays stopped. ThrottleInterval spaces
-    restarts so a missing app retries every 30s instead of spinning.
+    login and restarted whenever it exits. IB's daily auto-logoff may exit
+    cleanly, so failure-only supervision can silently leave the production
+    provider down. To stop it intentionally, unload/bootout the job rather than
+    merely quitting the app. ThrottleInterval spaces restarts so a missing app
+    retries every 30s instead of spinning.
 
     Login is still a person's job: the gateway comes back to its login
     window and the API port opens only after someone signs in. Unattended
@@ -28,10 +29,7 @@
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
+  <true/>
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>LimitLoadToSessionType</key>
