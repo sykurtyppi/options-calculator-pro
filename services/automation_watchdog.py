@@ -91,6 +91,7 @@ class EvidenceWatchdogConfig:
     log_path: Path = DEFAULT_LOG_PATH
     max_report_age_hours: float = DEFAULT_MAX_REPORT_AGE_HOURS
     require_completion_log: bool = True
+    freshness_reference_time: datetime | None = None
 
 
 def build_evidence_watchdog_status(
@@ -148,7 +149,10 @@ def build_evidence_watchdog_status(
             if generated_at is None:
                 errors.append("Evidence report is missing a valid generated_at timestamp.")
             else:
-                age_hours = (now_utc - generated_at).total_seconds() / 3600.0
+                freshness_reference = cfg.freshness_reference_time or now_utc
+                if freshness_reference.tzinfo is None:
+                    freshness_reference = freshness_reference.replace(tzinfo=timezone.utc)
+                age_hours = (freshness_reference - generated_at).total_seconds() / 3600.0
                 if age_hours > cfg.max_report_age_hours:
                     errors.append(
                         f"Evidence report is stale: {age_hours:.1f}h old, max {cfg.max_report_age_hours:.1f}h."

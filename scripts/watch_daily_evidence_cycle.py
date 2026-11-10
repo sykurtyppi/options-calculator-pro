@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -21,6 +21,7 @@ except ImportError:
 
 from services.code_identity import build_code_identity_health, deployment_drift
 from services.evidence_funnel import build_evidence_funnel_health
+from services.market_calendar import is_trading_day
 from services.provider_reliability import build_provider_budget_health
 from services.evidence_health import (
     EvidenceHealthConfig,
@@ -41,6 +42,50 @@ from scripts.run_forward_loop import _parse_date
 
 def _default_expected_date() -> date:
     return date.today()
+
+
+def _latest_due_trading_date(
+    *,
+    now: datetime,
+    due_hour: int,
+    due_minute: int,
+) -> date:
+    """Return the latest NYSE session whose watchdog deadline has passed."""
+    candidate = now.date()
+    due_at = datetime.combine(
+        candidate,
+        time(hour=due_hour, minute=due_minute),
+        tzinfo=now.tzinfo,
+    )
+    if now < due_at or not is_trading_day(candidate):
+        candidate -= timedelta(days=1)
+    while not is_trading_day(candidate):
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _watchdog_freshness_reference(
+    *,
+    expected_date: date,
+    now: datetime,
+    due_hour: int,
+    due_minute: int,
+    explicit_date: bool,
+) -> datetime | None:
+    """Anchor automatic report freshness to the selected session deadline.
+
+    This keeps a valid Friday report healthy through a weekend or holiday.
+    Once the next trading session reaches its deadline, expected_date advances
+    and the missing newer report is detected by its date instead. Explicit
+    historical checks retain the existing wall-clock age behavior.
+    """
+    if explicit_date:
+        return None
+    return datetime.combine(
+        expected_date,
+        time(hour=due_hour, minute=due_minute),
+        tzinfo=now.tzinfo,
+    )
 
 
 def _build_combined_watchdog_status(
@@ -193,31 +238,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    expected = _parse_date(args.date) if args.date else _default_expected_date()
+    now = datetime.now().astimezone()
+    expected = (
+        _parse_date(args.date)
+        if args.date
+        else _latest_due_trading_date(
+            now=now,
+            due_hour=args.not_due_before_hour,
+            due_minute=args.not_due_before_minute,
+        )
+    )
     if expected is None:
         raise SystemExit(f"Invalid --date value: {args.date}")
-    now = datetime.now().astimezone()
-    if args.date is None and expected == now.date():
-        due_at = datetime.combine(
-            expected,
-            time(hour=args.not_due_before_hour, minute=args.not_due_before_minute),
-            tzinfo=now.tzinfo,
-        )
-        if now < due_at:
-            payload = {
-                "generated_at": now.isoformat(),
-                "watchdog": {
-                    "ok": True,
-                    "status": "not_due_yet",
-                    "expected_date": expected.isoformat(),
-                    "due_at": due_at.isoformat(),
-                    "errors": [],
-                    "warnings": ["Daily evidence watchdog is not due yet."],
-                },
-                "alert": {"attempted": False, "reason": "not_due_yet"},
-            }
-            print(json.dumps(payload, indent=2, sort_keys=True, default=str))
-            return 0
 
     config = EvidenceWatchdogConfig(
         expected_date=expected,
@@ -225,6 +257,13 @@ def main() -> int:
         log_path=args.log_path,
         max_report_age_hours=args.max_report_age_hours,
         require_completion_log=not args.no_completion_log_required,
+        freshness_reference_time=_watchdog_freshness_reference(
+            expected_date=expected,
+            now=now,
+            due_hour=args.not_due_before_hour,
+            due_minute=args.not_due_before_minute,
+            explicit_date=args.date is not None,
+        ),
     )
     status = build_evidence_watchdog_status(config=config)
     resolver_base = EvidenceHealthConfig(expected_date=expected)

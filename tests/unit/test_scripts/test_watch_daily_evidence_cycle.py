@@ -16,6 +16,9 @@ Plus a regression that daily-cycle warnings remain observation-only
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from scripts import watch_daily_evidence_cycle
 from scripts.watch_daily_evidence_cycle import _build_combined_watchdog_status
 
 
@@ -343,3 +346,45 @@ def test_combined_status_aggregates_multiple_resolver_issues() -> None:
     assert any("simulator_error" in e for e in combined["errors"])
     assert any("Awaiting chain data" in e for e in combined["errors"])
     assert any("stale" in e for e in combined["errors"])
+
+
+def test_latest_due_trading_date_checks_yesterday_before_todays_deadline() -> None:
+    """A delayed watchdog must not hide a missed prior trading-day cycle.
+
+    This reproduces the November 5/6 failure: at 00:45 UTC on November 6,
+    the old CLI returned ``not_due_yet`` because the November 6 deadline was
+    still in the future, even though November 5 was already overdue.
+    """
+    now = datetime(2026, 11, 6, 0, 45, tzinfo=timezone.utc)
+
+    expected = watch_daily_evidence_cycle._latest_due_trading_date(
+        now=now,
+        due_hour=22,
+        due_minute=15,
+    )
+
+    assert expected.isoformat() == "2026-11-05"
+
+
+def test_freshness_reference_uses_selected_session_deadline() -> None:
+    expected = watch_daily_evidence_cycle._watchdog_freshness_reference(
+        expected_date=datetime(2026, 11, 6, tzinfo=timezone.utc).date(),
+        now=datetime(2026, 11, 8, 22, 15, tzinfo=timezone.utc),
+        due_hour=22,
+        due_minute=15,
+        explicit_date=False,
+    )
+
+    assert expected == datetime(2026, 11, 6, 22, 15, tzinfo=timezone.utc)
+
+
+def test_freshness_reference_preserves_explicit_date_wall_clock_behavior() -> None:
+    expected = watch_daily_evidence_cycle._watchdog_freshness_reference(
+        expected_date=datetime(2026, 11, 6, tzinfo=timezone.utc).date(),
+        now=datetime(2026, 11, 8, 22, 15, tzinfo=timezone.utc),
+        due_hour=22,
+        due_minute=15,
+        explicit_date=True,
+    )
+
+    assert expected is None
