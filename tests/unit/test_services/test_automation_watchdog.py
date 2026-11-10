@@ -86,6 +86,34 @@ def test_watchdog_flags_stale_or_malformed_report(tmp_path):
     assert any("stale" in err for err in status["errors"])
 
 
+def test_watchdog_keeps_prior_session_report_fresh_until_next_session_is_due(tmp_path):
+    report_dir = tmp_path / "reports"
+    report_dir.mkdir()
+    log_path = tmp_path / "watchdog.log"
+    report_path = report_dir / "evidence_report_2026-11-06.json"
+    _write_report(
+        report_path,
+        as_of_date="2026-11-06",
+        generated_at=datetime(2026, 11, 6, 16, 45, tzinfo=timezone.utc).isoformat(),
+    )
+    (report_dir / "latest.json").write_text(report_path.read_text(encoding="utf-8"), encoding="utf-8")
+    log_path.write_text("===== 2026-11-06T16:46:00Z daily evidence cycle complete =====\n", encoding="utf-8")
+
+    status = build_evidence_watchdog_status(
+        config=EvidenceWatchdogConfig(
+            expected_date=date(2026, 11, 6),
+            report_dir=report_dir,
+            log_path=log_path,
+            freshness_reference_time=datetime(2026, 11, 6, 22, 15, tzinfo=timezone.utc),
+        ),
+        now=datetime(2026, 11, 8, 22, 15, tzinfo=timezone.utc),
+    )
+
+    assert status["ok"] is True
+    assert status["checked_at"] == "2026-11-08T22:15:00+00:00"
+    assert status["errors"] == []
+
+
 def test_watchdog_imessage_dedupes_failure_signature(tmp_path, monkeypatch):
     sent = []
 
