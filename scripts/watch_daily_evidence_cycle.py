@@ -88,6 +88,13 @@ def _watchdog_freshness_reference(
     )
 
 
+def _has_cycle_history(report_dir: Path, log_path: Path) -> bool:
+    """Distinguish a fresh install from an established job missing a run."""
+    return (log_path.is_file() and log_path.stat().st_size > 0) or any(
+        report_dir.glob("evidence_report_*.json")
+    )
+
+
 def _build_combined_watchdog_status(
     *,
     watchdog_status: Mapping[str, Any],
@@ -250,6 +257,30 @@ def main() -> int:
     )
     if expected is None:
         raise SystemExit(f"Invalid --date value: {args.date}")
+
+    # A newly installed watchdog has no earlier cycle to hold accountable.
+    # Established installations retain the prior-session check even before
+    # today's deadline; explicit --date always requests a real health check.
+    if args.date is None and expected != now.date() and not _has_cycle_history(args.report_dir, args.log_path):
+        closed = not is_trading_day(now.date())
+        due_at = datetime.combine(
+            now.date(), time(hour=args.not_due_before_hour, minute=args.not_due_before_minute),
+            tzinfo=now.tzinfo,
+        )
+        payload = {
+            "generated_at": now.isoformat(),
+            "watchdog": {
+                "ok": True,
+                "status": "market_closed" if closed else "not_due_yet",
+                "expected_date": now.date().isoformat(),
+                "due_at": due_at.isoformat(),
+                "errors": [],
+                "warnings": [] if closed else ["Daily evidence watchdog is not due yet."],
+            },
+            "alert": {"attempted": False, "reason": "market_closed" if closed else "not_due_yet"},
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return 0
 
     config = EvidenceWatchdogConfig(
         expected_date=expected,
