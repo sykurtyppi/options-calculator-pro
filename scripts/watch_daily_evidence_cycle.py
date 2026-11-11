@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -38,6 +40,11 @@ from services.automation_watchdog import (
     maybe_send_watchdog_alert,
 )
 from scripts.run_forward_loop import _parse_date
+
+
+DEFAULT_ACTIVATION_PATH = Path.home() / ".options_calculator_pro" / "state" / "watchdog_activated_at"
+DEFAULT_CYCLE_HOUR = 16
+DEFAULT_CYCLE_MINUTE = 45
 
 
 def _default_expected_date() -> date:
@@ -88,11 +95,68 @@ def _watchdog_freshness_reference(
     )
 
 
-def _has_cycle_history(report_dir: Path, log_path: Path) -> bool:
-    """Distinguish a fresh install from an established job missing a run."""
-    return (log_path.is_file() and log_path.stat().st_size > 0) or any(
-        report_dir.glob("evidence_report_*.json")
+def _read_activation_time(path: Path, *, now: datetime) -> datetime | None:
+    """Read a trustworthy activation marker, failing closed on bad state."""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        activated_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (OSError, ValueError):
+        return None
+    if activated_at.tzinfo is None or activated_at > now:
+        return None
+    return activated_at
+
+
+def _scheduler_timezone(configured: str | None = None) -> ZoneInfo | None:
+    """Resolve launchd's local timezone without reducing it to a fixed offset."""
+    if configured:
+        try:
+            return ZoneInfo(configured)
+        except (ZoneInfoNotFoundError, ValueError):
+            return None
+
+    candidates: list[str] = []
+    if os.environ.get("TZ"):
+        candidates.append(os.environ["TZ"].removeprefix(":"))
+
+    try:
+        localtime = Path("/etc/localtime").resolve()
+        parts = localtime.parts
+        zoneinfo_index = parts.index("zoneinfo")
+        candidates.append("/".join(parts[zoneinfo_index + 1 :]))
+    except (OSError, ValueError):
+        pass
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return ZoneInfo(candidate)
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+    return None
+
+
+def _activation_defers_session(
+    *,
+    activated_at: datetime | None,
+    expected_date: date,
+    now: datetime,
+    scheduler_tz: ZoneInfo | None,
+    cycle_hour: int,
+    cycle_minute: int,
+) -> bool:
+    """Whether this install was activated after the selected cycle fired."""
+    if activated_at is None or scheduler_tz is None:
+        return False
+    cycle_at = datetime.combine(
+        expected_date,
+        time(hour=cycle_hour, minute=cycle_minute),
+        tzinfo=scheduler_tz,
     )
+    # Fresh-install activation is stamped immediately before launchctl load.
+    # Equality therefore means the job was not active when that cycle fired.
+    return activated_at >= cycle_at
 
 
 def _build_combined_watchdog_status(
@@ -209,6 +273,7 @@ def main() -> int:
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    parser.add_argument("--activation-path", type=Path, default=DEFAULT_ACTIVATION_PATH)
     parser.add_argument("--max-report-age-hours", type=float, default=DEFAULT_MAX_REPORT_AGE_HOURS)
     parser.add_argument("--no-completion-log-required", action="store_true")
     parser.add_argument("--candidate-resolver-jsonl", type=Path, default=None)
@@ -234,6 +299,12 @@ def main() -> int:
     )
     parser.add_argument("--not-due-before-hour", type=int, default=22)
     parser.add_argument("--not-due-before-minute", type=int, default=15)
+    parser.add_argument("--cycle-hour", type=int, default=DEFAULT_CYCLE_HOUR)
+    parser.add_argument("--cycle-minute", type=int, default=DEFAULT_CYCLE_MINUTE)
+    parser.add_argument(
+        "--scheduler-timezone",
+        help="IANA timezone used by launchd; defaults to the host's /etc/localtime zone.",
+    )
     parser.add_argument("--no-fetch", action="store_true",
                         help="Compare the checkout with the last fetched origin/main instead of fetching.")
     parser.add_argument("--force-alert", action="store_true", help="Send even if this failure was already alerted.")
@@ -258,45 +329,57 @@ def main() -> int:
     if expected is None:
         raise SystemExit(f"Invalid --date value: {args.date}")
 
-    # A newly installed watchdog has no earlier cycle to hold accountable.
-    # Established installations retain the prior-session check even before
-    # today's deadline; explicit --date always requests a real health check.
-    if args.date is None and expected != now.date() and not _has_cycle_history(args.report_dir, args.log_path):
-        closed = not is_trading_day(now.date())
-        due_at = datetime.combine(
-            now.date(), time(hour=args.not_due_before_hour, minute=args.not_due_before_minute),
-            tzinfo=now.tzinfo,
-        )
-        payload = {
-            "generated_at": now.isoformat(),
-            "watchdog": {
-                "ok": True,
-                "status": "market_closed" if closed else "not_due_yet",
-                "expected_date": now.date().isoformat(),
-                "due_at": due_at.isoformat(),
-                "errors": [],
-                "warnings": [] if closed else ["Daily evidence watchdog is not due yet."],
-            },
-            "alert": {"attempted": False, "reason": "market_closed" if closed else "not_due_yet"},
-        }
-        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
-        return 0
-
-    config = EvidenceWatchdogConfig(
+    # A durable activation marker establishes which scheduled cycles this
+    # installation actually owned. Missing/corrupt/future markers fail closed:
+    # they cannot suppress an alert. Explicit --date always performs the check.
+    activated_at = _read_activation_time(args.activation_path, now=now)
+    scheduler_tz = _scheduler_timezone(args.scheduler_timezone)
+    if args.scheduler_timezone and scheduler_tz is None:
+        raise SystemExit(f"Invalid --scheduler-timezone value: {args.scheduler_timezone}")
+    if args.date is None and _activation_defers_session(
+        activated_at=activated_at,
         expected_date=expected,
-        report_dir=args.report_dir,
-        log_path=args.log_path,
-        max_report_age_hours=args.max_report_age_hours,
-        require_completion_log=not args.no_completion_log_required,
-        freshness_reference_time=_watchdog_freshness_reference(
+        now=now,
+        scheduler_tz=scheduler_tz,
+        cycle_hour=args.cycle_hour,
+        cycle_minute=args.cycle_minute,
+    ):
+        assert activated_at is not None
+        assert scheduler_tz is not None
+        cycle_at = datetime.combine(
+            expected, time(hour=args.cycle_hour, minute=args.cycle_minute),
+            tzinfo=scheduler_tz,
+        )
+        status = {
+            "ok": True,
+            "status": "activation_deferred",
+            "expected_date": expected.isoformat(),
+            "report_path": str(args.report_dir / f"evidence_report_{expected.isoformat()}.json"),
+            "latest_path": str(args.report_dir / "latest.json"),
+            "log_path": str(args.log_path),
+            "cycle_at": cycle_at.isoformat(),
+            "activation_at": activated_at.isoformat(),
+            "errors": [],
+            "warnings": [
+                "Evidence cycle predates watchdog activation; no alert is due for this session."
+            ],
+        }
+    else:
+        config = EvidenceWatchdogConfig(
             expected_date=expected,
-            now=now,
-            due_hour=args.not_due_before_hour,
-            due_minute=args.not_due_before_minute,
-            explicit_date=args.date is not None,
-        ),
-    )
-    status = build_evidence_watchdog_status(config=config)
+            report_dir=args.report_dir,
+            log_path=args.log_path,
+            max_report_age_hours=args.max_report_age_hours,
+            require_completion_log=not args.no_completion_log_required,
+            freshness_reference_time=_watchdog_freshness_reference(
+                expected_date=expected,
+                now=now,
+                due_hour=args.not_due_before_hour,
+                due_minute=args.not_due_before_minute,
+                explicit_date=args.date is not None,
+            ),
+        )
+        status = build_evidence_watchdog_status(config=config)
     resolver_base = EvidenceHealthConfig(expected_date=expected)
     resolver_health = build_candidate_exit_resolver_health(
         config=EvidenceHealthConfig(
@@ -330,7 +413,7 @@ def main() -> int:
         code_health=build_code_identity_health(
             deployment_drift(fetch=not args.no_fetch),
             _report_code_identity(Path(status["report_path"])),
-            report_expected=status.get("status") != "market_closed",
+            report_expected=status.get("status") not in {"market_closed", "activation_deferred"},
         ),
     )
     alert = maybe_send_watchdog_alert(
