@@ -2,7 +2,7 @@
 name = "options-calculator-pro"
 version = "0.2.0"
 description = "Single-ticker IV crush edge analysis and OOS robustness reports"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11.5,<3.13"
 dependencies = [
     "fastapi>=0.110.0,<1.0",
     "uvicorn[standard]>=0.27.0,<1.0",
