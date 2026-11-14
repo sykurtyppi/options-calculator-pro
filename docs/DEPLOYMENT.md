@@ -102,7 +102,15 @@ evidence reports, resolve candidate exits, and rotate logs.
 - **IB Gateway** when `OPTIONS_CALCULATOR_OPTIONS_PROVIDER=ib_gateway`: the
   `com.optionscalculator.ib-gateway` job starts it at login and restarts it
   after a crash or IB's daily logoff, but **a person must sign in** each
-  time; the API port opens only then. In the gateway, Configure → Settings →
+  time; the API port opens only then. To cut that to one sign-in a week, set
+  Configure → Settings → Lock and Exit to *Auto restart* instead of *Auto
+  logoff*: the gateway then relaunches itself each night still signed in
+  (IB forces a fresh login after its Sunday reset regardless). The job is
+  built for that: it leaves the relaunched gateway alive
+  (`AbandonProcessGroup`) and the wrapper adopts it rather than starting a
+  new one at the login window. With *Auto logoff* every trading day needs a
+  login before the evidence cycle or the cycle silently runs on yfinance.
+  In the gateway, Configure → Settings →
   API → Settings: enable socket clients, keep *Read-Only API* on, and tick
   *Allow connections from localhost only*, then quit the gateway from its
   File menu. Launchd restarts it automatically; sign in again so the startup
@@ -177,6 +185,7 @@ import.
 | `IB_GATEWAY_CLIENT_ID` | 17 | API client id; must differ from any other API client on the same gateway. |
 | `IB_GATEWAY_MARKET_DATA_TYPE` | 3 | 1 live, 2 frozen, 3 delayed (free, ~15 min, no provider quote timestamps), 4 delayed-frozen. Chains are tagged with the resulting feed type. |
 | `IB_GATEWAY_APP` | newest `IB Gateway *.app` | The .app bundle the `com.optionscalculator.ib-gateway` job starts, when the default search of `~/Applications` and `/Applications` is wrong. Read from `.env` (parsed, never sourced). |
+| `IB_GATEWAY_ADOPT_GRACE_SECONDS` | 20 | How long the gateway wrapper looks for an already-running gateway (one relaunched by IB's auto-restart) before starting a new one. Read from `.env` (parsed, never sourced). |
 | `OPTIONS_CALCULATOR_BACKUP_DIR` / `OPTIONS_CALCULATOR_BACKUP_RETENTION` | in-tree `backups/` / 14 | Where the nightly state backup writes, and how many archives it keeps. Unset, archives land on the same disk as the state (no disaster recovery). Point it at an external drive or sync folder; preflight FAILs when the path is missing (drive not mounted) and WARNs when it is unset or on the state's own disk. |
 | `IB_GATEWAY_TIMEOUT_SECONDS` / `IB_GATEWAY_QUOTE_SETTLE_SECONDS` | 10 / 15 | Socket connect timeout; maximum wait per batch of contracts for streamed option quotes and greeks (delayed feeds need ~10 s; the wait ends early once every contract has data). |
 | `LOG_ROTATION_TIMEOUT_SECONDS` | 300 | Hard cap for log rotation. |

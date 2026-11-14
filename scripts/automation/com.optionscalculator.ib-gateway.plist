@@ -32,6 +32,17 @@
   <true/>
   <key>ThrottleInterval</key>
   <integer>30</integer>
+  <!--
+    With IB's daily auto-restart on, the gateway relaunches itself as a child
+    of the old process, still signed in, and the old process exits. By
+    default launchd then kills everything left in the job's process group,
+    which is that relaunched gateway. Abandon the group so it survives; the
+    wrapper finds it on its next run and adopts it instead of starting a new
+    one at the login window. Consequence: unloading the job stops the wrapper
+    but leaves an adopted gateway running; quit that one from its own menu.
+  -->
+  <key>AbandonProcessGroup</key>
+  <true/>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
   <key>ProcessType</key>
