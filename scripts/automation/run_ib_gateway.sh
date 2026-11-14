@@ -14,8 +14,9 @@ set -euo pipefail
 #     port (IB_GATEWAY_PORT) opens only after a person signs in. Unattended
 #     sign-in needs a third-party controller (IBC) holding the credentials.
 #   - Never starts a second gateway. If one is already running (started by
-#     hand), this waits for it to exit and then exits non-zero so launchd
-#     starts a supervised one in its place.
+#     hand, or relaunched by IB's own daily auto-restart and still signed
+#     in), this adopts it: waits for it to exit, then exits so launchd runs
+#     the wrapper again.
 #
 # Which app: IB_GATEWAY_APP (process env, else the project .env) names the
 # .app bundle; otherwise the newest "IB Gateway <version>.app" under
@@ -61,15 +62,41 @@ if [ -z "${APP}" ] || [ ! -x "${STUB}" ]; then
   exit 78  # EX_CONFIG; launchd retries after ThrottleInterval
 fi
 
-# A gateway started by hand is left alone; a second instance would fight over
-# the API port and the IB session. Wait for it, then hand over to launchd.
-if pgrep -f "${STUB}" >/dev/null 2>&1; then
-  echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') ib gateway already running (not started by launchd); waiting for it to exit ====="
-  while pgrep -f "${STUB}" >/dev/null 2>&1; do
-    sleep 30
+# Never start a second gateway: it would fight the first over the API port and
+# the IB session. Two ways one can already be running when we get here:
+#   - someone started it by hand;
+#   - IB's own daily auto-restart (Configure -> Settings -> Lock and Exit ->
+#     Auto restart). The gateway then relaunches ITSELF, still signed in, and
+#     the old process exits. launchd sees its job exit and runs this wrapper
+#     again, while the relaunched gateway is alive (the plist sets
+#     AbandonProcessGroup so launchd does not kill it). Starting a fresh one
+#     here would replace a signed-in gateway with a login window, which is
+#     exactly what auto-restart exists to avoid.
+# So: adopt whatever is running and wait for it. The relaunch can trail the
+# old process's exit by a moment, so look for it for a short grace period
+# before concluding nothing is running.
+_gateway_running() { pgrep -f "${STUB}" >/dev/null 2>&1; }
+
+_whole_seconds() {
+  # $1 = candidate, $2 = default. Prints $1 when it is a whole number, else $2.
+  case "${1}" in ''|*[!0-9]*) printf '%s' "${2}" ;; *) printf '%s' "${1}" ;; esac
+}
+ADOPT_GRACE="$(_whole_seconds "${IB_GATEWAY_ADOPT_GRACE_SECONDS:-$(_env_file_value IB_GATEWAY_ADOPT_GRACE_SECONDS)}" 20)"
+POLL_SECONDS="$(_whole_seconds "${IB_GATEWAY_POLL_SECONDS:-}" 30)"
+
+waited=0
+while ! _gateway_running && [ "${waited}" -lt "${ADOPT_GRACE}" ]; do
+  sleep 1
+  waited=$((waited + 1))
+done
+
+if _gateway_running; then
+  echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') ib gateway already running (started by hand or relaunched by IB's auto-restart); adopting it ====="
+  while _gateway_running; do
+    sleep "${POLL_SECONDS}"
   done
-  echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') hand-started ib gateway exited; launchd will start a supervised one ====="
-  exit 75  # EX_TEMPFAIL; a failure exit, so KeepAlive restarts us
+  echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') adopted ib gateway exited; launchd will run this wrapper again ====="
+  exit 75  # EX_TEMPFAIL; the next run adopts a relaunched gateway or starts one
 fi
 
 cd "${PROJECT_ROOT}"

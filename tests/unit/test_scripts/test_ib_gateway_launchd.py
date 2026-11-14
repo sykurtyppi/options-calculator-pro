@@ -9,6 +9,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from scripts.rotate_launchd_logs import _LAUNCHD_LOG_GLOBS
@@ -29,6 +30,10 @@ def test_plist_keeps_the_gateway_running_in_the_gui_session() -> None:
     # launchctl bootout/unload when they intentionally need it stopped.
     assert data["KeepAlive"] is True
     assert data["ThrottleInterval"] >= 30
+    # IB's auto-restart relaunches the gateway as a child of the old process;
+    # without this launchd kills that relaunched, signed-in gateway when the
+    # old one exits.
+    assert data["AbandonProcessGroup"] is True
     # A GUI app: never started in a headless session.
     assert data["LimitLoadToSessionType"] == "Aqua"
     assert data["ProcessType"] == "Interactive"
@@ -75,8 +80,13 @@ def _fake_project(tmp_path: Path) -> tuple[Path, Path]:
     app = tmp_path / "IB Gateway 10.51.app"
     stub = app / "Contents" / "MacOS" / "JavaApplicationStub"
     stub.parent.mkdir(parents=True)
-    # Records that it was exec'd (and from where), then exits cleanly.
-    stub.write_text('#!/bin/sh\nprintf "%s\\n" "stub-ran" "$PWD" > "$CALLS"\nexit 0\n')
+    # Records that it was exec'd (and from where), then exits cleanly. With
+    # FAKE_GATEWAY_SECONDS set it instead plays a running gateway: it stays
+    # alive that long and records nothing.
+    stub.write_text(
+        '#!/bin/sh\n'
+        'if [ -n "$FAKE_GATEWAY_SECONDS" ]; then sleep "$FAKE_GATEWAY_SECONDS"; exit 0; fi\n'
+        'printf "%s\\n" "stub-ran" "$PWD" > "$CALLS"\nexit 0\n')
     stub.chmod(0o755)
     return root, app
 
@@ -85,8 +95,9 @@ def _run(root: Path, tmp_path: Path, **env: str) -> subprocess.CompletedProcess:
     calls = tmp_path / "calls.txt"
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    base = {k: v for k, v in os.environ.items() if not k.startswith("IB_GATEWAY_")}
-    base.update({"HOME": str(home), "CALLS": str(calls), **env})
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("IB_GATEWAY_", "FAKE_GATEWAY_"))}
+    base.update({"HOME": str(home), "CALLS": str(calls),
+                 "IB_GATEWAY_ADOPT_GRACE_SECONDS": "0", "IB_GATEWAY_POLL_SECONDS": "1", **env})
     result = subprocess.run(["bash", str(root / "scripts" / "automation" / WRAPPER.name)],
                             env=base, capture_output=True, text=True, timeout=60)
     result.calls = calls.read_text().splitlines() if calls.exists() else []  # type: ignore[attr-defined]
@@ -162,3 +173,72 @@ def test_wrapper_never_sources_the_env_file(tmp_path: Path) -> None:
     result = _run(root, tmp_path)
     assert result.returncode == 0, result.stderr
     assert not marker.exists()
+
+
+# ── adopting a gateway that is already running ──────────────────────────────
+
+
+def _running_gateway(app: Path, seconds: int, delay: float = 0.0) -> subprocess.Popen:
+    """Start the fake stub as a long-running gateway (optionally after a delay),
+    the way IB's auto-restart relaunches the real one: same launcher path."""
+    stub = app / "Contents" / "MacOS" / "JavaApplicationStub"
+    env = {**os.environ, "FAKE_GATEWAY_SECONDS": str(seconds)}
+    if delay:
+        return subprocess.Popen(["/bin/sh", "-c", f'sleep {delay}; exec "$0"', str(stub)], env=env)
+    return subprocess.Popen([str(stub)], env=env)
+
+
+def test_wrapper_adopts_a_running_gateway_instead_of_starting_a_second(tmp_path: Path) -> None:
+    root, app = _fake_project(tmp_path)
+    gateway = _running_gateway(app, seconds=3)
+    try:
+        time.sleep(0.3)
+        result = _run(root, tmp_path, IB_GATEWAY_APP=str(app))
+    finally:
+        gateway.wait(10)
+    assert result.returncode == 75                   # hands back to launchd once it is gone
+    assert result.calls == []                        # the stub was never exec'd a second time
+    assert "already running" in result.stdout and "adopting it" in result.stdout
+    assert "adopted ib gateway exited" in result.stdout
+    assert "ib gateway start app=" not in result.stdout
+
+
+def test_wrapper_waits_out_the_grace_for_a_gateway_relaunching_itself(tmp_path: Path) -> None:
+    # IB's auto-restart: the old process is gone (launchd reran the wrapper)
+    # and the relaunched gateway shows up a moment later. The wrapper must
+    # find it within the grace period, not start a fresh one at a login window.
+    root, app = _fake_project(tmp_path)
+    gateway = _running_gateway(app, seconds=3, delay=1.5)
+    try:
+        result = _run(root, tmp_path, IB_GATEWAY_APP=str(app), IB_GATEWAY_ADOPT_GRACE_SECONDS="8")
+    finally:
+        gateway.wait(15)
+    assert result.returncode == 75
+    assert result.calls == []
+    assert "adopting it" in result.stdout
+
+
+def test_wrapper_starts_a_gateway_when_the_grace_passes_with_none_running(tmp_path: Path) -> None:
+    root, app = _fake_project(tmp_path)
+    started = time.monotonic()
+    result = _run(root, tmp_path, IB_GATEWAY_APP=str(app), IB_GATEWAY_ADOPT_GRACE_SECONDS="2")
+    assert result.returncode == 0, result.stderr
+    assert result.calls[:1] == ["stub-ran"]
+    assert time.monotonic() - started >= 2          # it did wait before starting
+
+
+def test_wrapper_reads_the_grace_from_the_env_file_and_ignores_garbage(tmp_path: Path) -> None:
+    root, app = _fake_project(tmp_path)
+    (root / ".env").write_text(f'IB_GATEWAY_APP="{app}"\nIB_GATEWAY_ADOPT_GRACE_SECONDS=2\n')
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("IB_GATEWAY_", "FAKE_GATEWAY_"))}
+    home = tmp_path / "home"; home.mkdir(exist_ok=True)
+    calls = tmp_path / "calls.txt"
+    started = time.monotonic()
+    done = subprocess.run(["bash", str(root / "scripts" / "automation" / WRAPPER.name)],
+                          env={**base, "HOME": str(home), "CALLS": str(calls)},
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert 2 <= time.monotonic() - started < 15      # the .env value, not the 20s default
+    # A non-numeric value falls back to the default instead of breaking the wrapper.
+    result = _run(root, tmp_path, IB_GATEWAY_APP=str(app), IB_GATEWAY_POLL_SECONDS="soon")
+    assert result.returncode == 0, result.stderr
