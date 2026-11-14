@@ -5,7 +5,7 @@ These rules apply to the entire repository.
 ## Environment and installation
 
 - Work in an isolated checkout or worktree; do not modify a user's active checkout.
-- Python must satisfy `>=3.11,<3.13`. Create a disposable environment and install with `uv pip sync requirements.lock`; `requirements.lock` is authoritative for tests.
+- Python must satisfy `>=3.11.5,<3.13`. Create a disposable environment and install with `uv pip sync requirements.lock`; `requirements.lock` is authoritative for tests.
 - Frontend dependencies are installed with `npm ci` in `web/frontend/`; its `package-lock.json` is authoritative.
 - Never persist API keys, cookies, tokens, account data, or raw credential-bearing responses in tests, logs, fixtures, commits, or audit ledgers.
 
