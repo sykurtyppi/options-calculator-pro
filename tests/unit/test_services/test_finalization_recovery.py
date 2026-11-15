@@ -32,6 +32,7 @@ from services.outcome_recorder import (
     make_trade_id,
 )
 from services.structure_prior_store import StructurePriorStore
+from tests.unit.outcome_fixtures import claimed_exit_scenarios
 
 T_MINUS_1 = date(2026, 4, 27)
 EARNINGS = T_MINUS_1 + timedelta(days=1)
@@ -156,7 +157,8 @@ def test_claim_lost_after_learning_write_is_released_and_refinalized(tmp_path, s
 
     cal.update = slow_write
     result = finalize_trade_and_update_learning(trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=5.0,
-                                                realized_expansion_pct=5.0, store=store)
+                                                realized_expansion_pct=5.0, store=store,
+                                                exit_execution_scenarios=claimed_exit_scenarios(5.0))
     cal.update = real
     assert result["status"] == "claim_lost"
     row = store.get_trade("AAA")
@@ -182,7 +184,8 @@ def test_failed_claim_renewal_releases_the_row(tmp_path, stores):
     store.renew_finalization_claim = locked
     with pytest.raises(sqlite3.OperationalError):
         finalize_trade_and_update_learning(trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=5.0,
-                                           realized_expansion_pct=5.0, store=store)
+                                           realized_expansion_pct=5.0, store=store,
+                                           exit_execution_scenarios=claimed_exit_scenarios(5.0))
     del store.renew_finalization_claim
     row = store.get_trade("AAA")
     assert row["status"] == "exited" and row["finalizing_owner"] is None
@@ -263,7 +266,8 @@ def test_backfill_and_retry_agree_on_a_crashed_attempts_exit(tmp_path, stores):
     _open(store, "AAA")
     assert store.claim_for_finalization("AAA", owner="crashed")
     store.update_exit(trade_id="AAA", exit_date=T_MINUS_1, exit_mid=3.8, realized_return_pct=90.0,
-                      realized_expansion_pct=90.0, owner="crashed")
+                      realized_expansion_pct=90.0, owner="crashed",
+                      exit_execution_scenarios=claimed_exit_scenarios(90.0, conservative=81.0))
     _expire(store, "AAA")
 
     # A backfill while the row is in flight and unlearned adds nothing ...
@@ -273,11 +277,13 @@ def test_backfill_and_retry_agree_on_a_crashed_attempts_exit(tmp_path, stores):
     # ... and a retry carrying other numbers learns the RECORDED exit, so the
     # row, calibration and priors all agree.
     result = finalize_trade_and_update_learning(trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=-30.0,
-                                                realized_expansion_pct=-30.0, store=store)
+                                                realized_expansion_pct=-30.0, store=store,
+                                                exit_execution_scenarios=claimed_exit_scenarios(-30.0))
     assert result["learning_update_status"] == "complete"
     row = store.get_trade("AAA")
     assert row["realized_return_pct"] == 90.0 and row["exit_mid"] == 3.8
-    assert _prior_returns(tmp_path / "priors.json", "AAA") == [90.0]
+    # Priors learn the recorded exit's conservative fill, not the modeled 90.
+    assert _prior_returns(tmp_path / "priors.json", "AAA") == [81.0]
     assert json.loads((tmp_path / "cal.json").read_text())["expansions"] == [90.0]
 
 

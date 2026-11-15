@@ -145,6 +145,15 @@ export function buildBenchmarkComparisonRows(payload = {}) {
   })
 }
 
+const RETURN_BASIS_LABELS = {
+  conservative_fill: 'Conservative fill (claimed)',
+  modeled_net: 'Modeled net (observational)',
+}
+
+export function returnBasisLabel(basis) {
+  return RETURN_BASIS_LABELS[basis] || 'Basis not stated'
+}
+
 export function buildClaimablePerformanceRows(payload = {}) {
   const groups = payload.claimable_performance || {}
   const labels = {
@@ -161,6 +170,8 @@ export function buildClaimablePerformanceRows(payload = {}) {
       winRateLabel: formatRate(item.win_rate),
       avgRealizedLabel: formatReturnPct(item.avg_realized_return_pct),
       medianRealizedLabel: formatReturnPct(item.median_realized_return_pct),
+      basisLabel: returnBasisLabel(item.return_basis),
+      withheldCount: Number(item.withheld_count || 0),
       warningLabel: item.small_sample_warning ? 'Small sample' : 'Observed',
       paperResearchLabel: item.paper_research_warning || item.paper_research_label || 'Paper/research only',
     }

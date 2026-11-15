@@ -41,9 +41,14 @@ earnings event priced at conservative fills and exited on the session before
 earnings (T-1), make money, and does it beat simply always buying the same
 structure on the same events?
 
-All returns are `realized_return_pct` of **claimable** outcomes under
-`conservative_fill_v4`, one per event (the claim contract and the
-one-trade-per-event rule define both). The unit of analysis is the event.
+All returns are the **conservative-fill return** (return basis
+`conservative_fill`, `services/outcome_returns.py`) of **claimable** outcomes
+under `conservative_fill_v4`, one per event (the claim contract and the
+one-trade-per-event rule define both). The unit of analysis is the event. The
+`realized_return_pct` column is *not* this return: it is the mid return minus
+the cost the selector modeled at entry (`modeled_net`), an observational
+diagnostic only. A claimable outcome with no conservative-fill return is
+withheld and counted, never valued on another basis.
 
 - **H1 (primary): the selector beats no trade.** The mean selector return per
   claimable event is greater than zero: the 95% interval's lower bound is above
@@ -100,8 +105,13 @@ The analysis is the existing evidence report code, unchanged
 
 - 95% percentile bootstrap, 2000 resamples, fixed seed 20260927; no interval
   below n = 10.
-- H1: `mean_with_ci` over claimable selector returns.
-- H2: `paired_difference` of selector and baseline returns keyed by event.
+- The report section is `claimed_evidence` (return basis `conservative_fill`);
+  every other return figure in the report is `modeled_net` and observational.
+- H1: `claimed_evidence.selector`, `mean_with_ci` over claimable selector
+  conservative-fill returns.
+- H2: `claimed_evidence.selector_minus_baseline`, `paired_difference` of
+  selector and baseline conservative-fill returns keyed by event, both sides
+  claimable.
 - Robustness: `outlier_dependence` with k = 5. A result that is positive only
   because of its 5 best events (`fragile`) does not count as edge.
 - Exit attrition and quote integrity as the health check reports them.

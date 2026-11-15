@@ -21,6 +21,7 @@ from typing import List, Optional
 
 import pytest
 
+from tests.unit.outcome_fixtures import claimed_exit_scenarios
 from services.outcome_recorder import (
     OutcomeStore,
     finalize_trade_and_update_learning,
@@ -999,6 +1000,7 @@ def _finalize_with_patched_services(
                 exit_date=exit_date,
                 realized_return_pct=realized_return_pct,
                 realized_expansion_pct=realized_expansion_pct,
+                exit_execution_scenarios=claimed_exit_scenarios(realized_return_pct),
             )
     finally:
         _or._store = orig_store

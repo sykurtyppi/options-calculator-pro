@@ -33,6 +33,7 @@ from services.outcome_recorder import (
     finalize_trade_and_update_learning,
 )
 from services.structure_prior_store import StructurePriorStore
+from tests.unit.outcome_fixtures import claimed_exit_scenarios
 
 T_MINUS_1 = date(2026, 4, 27)
 EARNINGS = T_MINUS_1 + timedelta(days=1)
@@ -124,6 +125,7 @@ def test_failed_exit_write_releases_the_claim_and_the_row_is_swept(tmp_path, sto
     with pytest.raises(sqlite3.OperationalError):
         finalize_trade_and_update_learning(
             trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=5.0, realized_expansion_pct=5.0, store=store,
+            exit_execution_scenarios=claimed_exit_scenarios(5.0),
         )
 
     row = store.get_trade("AAA")
@@ -152,9 +154,11 @@ def _finalize_bbb(db: str, started, finished) -> None:
     from services.outcome_recorder import OutcomeStore as Store
     from services.outcome_recorder import finalize_trade_and_update_learning as finalize
 
+    from tests.unit.outcome_fixtures import claimed_exit_scenarios as claimed
+
     started.set()
     finalize(trade_id="BBB", exit_date=T_MINUS_1, realized_return_pct=7.0, realized_expansion_pct=7.0,
-             store=Store(Path(db)))
+             store=Store(Path(db)), exit_execution_scenarios=claimed(7.0))
     finished.set()
 
 
@@ -218,12 +222,14 @@ def test_refinalize_learns_the_stored_values_not_the_callers(tmp_path, stores, m
     monkeypatch.setattr(cal, "update", lambda *a, **k: (_ for _ in ()).throw(PersistenceError("disk full")))
     first = finalize_trade_and_update_learning(
         trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=50.0, realized_expansion_pct=50.0, store=store,
+        exit_execution_scenarios=claimed_exit_scenarios(50.0),
     )
     assert first["learning_update_status"] == "calibration_failed"
     monkeypatch.setattr(cal, "update", real_update)
 
     retry = finalize_trade_and_update_learning(
         trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=-75.0, realized_expansion_pct=-75.0, store=store,
+        exit_execution_scenarios=claimed_exit_scenarios(-75.0),
     )
 
     assert retry["learning_update_status"] == "complete"
@@ -251,6 +257,7 @@ def test_a_claim_taken_over_before_learning_writes_nothing(tmp_path, stores, mon
     monkeypatch.setattr(store, "update_exit", exit_then_lose_the_claim)
     result = finalize_trade_and_update_learning(
         trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=5.0, realized_expansion_pct=5.0, store=store,
+        exit_execution_scenarios=claimed_exit_scenarios(5.0),
     )
 
     assert result["status"] == "claim_lost"
@@ -275,6 +282,7 @@ def test_learning_written_after_the_claim_lapsed_is_flagged_for_repair(tmp_path,
     monkeypatch.setattr(cal, "update", slow_calibration_write)
     result = finalize_trade_and_update_learning(
         trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=5.0, realized_expansion_pct=5.0, store=store,
+        exit_execution_scenarios=claimed_exit_scenarios(5.0),
     )
 
     assert result["status"] == "claim_lost"

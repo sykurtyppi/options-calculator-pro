@@ -23,6 +23,7 @@ from services.baseline_evidence_store import (
 )
 from services.claim_contract import CONTRACT_VERSION, claimable_under_current_contract
 from services.outcome_recorder import OutcomeStore, get_outcome_store
+from services.outcome_returns import RETURN_CLAIM, RETURN_MODELED_NET
 from services.event_reconciliation import drop_superseded, one_trade_per_event, superseded_keys
 from services.recommendation_ledger import RecommendationLedger, get_recommendation_ledger
 
@@ -136,6 +137,12 @@ def build_forward_performance_diagnostics(
         # Later paper trades on an event already counted (not in any figure).
         "same_event_extra_trades": same_event_extra_trades,
         "invalidated_outcome_count": invalidated_count,
+        "return_basis": RETURN_MODELED_NET,
+        "return_basis_note": (
+            "Every return here is modeled_net (mid return minus the cost the selector modeled at "
+            "entry) except claimable_performance.claimable and claimable_evidence.claimable_returns, "
+            "which are claimed returns at the conservative fill."
+        ),
         "performance_summary": _group_stats(resolved),
         "by_structure": _group_by(resolved, lambda item: item["structure"] or "unknown"),
         "stale_source_comparison": _group_by(
@@ -149,7 +156,7 @@ def build_forward_performance_diagnostics(
         "execution_scenario_comparison": _execution_scenario_stats(resolved),
         "calibration_report": _calibration_report(resolved),
         "benchmark_comparison": _benchmark_comparison(resolved, resolved_baselines),
-        "claimable_performance": _group_by(resolved, _claimable_group),
+        "claimable_performance": _claimable_performance(resolved),
         "claimable_evidence": {
             "claimable_count": sum(1 for row in resolved if bool(row.get("claim_allowed"))),
             "non_claimable_count": sum(1 for row in resolved if row.get("claim_allowed") is not None and not bool(row.get("claim_allowed"))),
@@ -318,6 +325,35 @@ def _quality_group(item: Dict[str, Any]) -> str:
     if quality >= HIGH_QUALITY_THRESHOLD:
         return "high_quality"
     return "middle_quality"
+
+
+def _claimable_performance(resolved: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Resolved outcomes split by claimability, each group on its stated basis.
+
+    The claimable group is valued at the claim contract's conservative fill:
+    that is what a claim means. A claimable row with no conservative-fill
+    return is withheld (counted), never valued at the modeled-net return.
+    The other groups are observational and stay on the modeled-net basis.
+    """
+    grouped: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
+    for item in resolved:
+        grouped[_claimable_group(item)].append(item)
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, rows in sorted(grouped.items()):
+        if key == "claimable":
+            claimed = [
+                {**row, "realized_return_pct": _num((row.get("execution_scenario_returns") or {}).get(RETURN_CLAIM))}
+                for row in rows
+            ]
+            valued = [row for row in claimed if row["realized_return_pct"] is not None]
+            stats = _group_stats(valued)
+            stats["withheld_count"] = len(rows) - len(valued)
+            stats["return_basis"] = RETURN_CLAIM
+        else:
+            stats = _group_stats(rows)
+            stats["return_basis"] = RETURN_MODELED_NET
+        out[key] = stats
+    return out
 
 
 def _claimable_group(item: Dict[str, Any]) -> str:

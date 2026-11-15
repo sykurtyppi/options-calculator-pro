@@ -317,6 +317,7 @@ class StructurePriorStore:
         source_type: str = "paper",
         observation_date: Optional[date] = None,
         observation_id: Optional[str] = None,
+        return_basis: Optional[str] = None,
     ) -> bool:
         """
         Record one finalized outcome observation for *structure*.
@@ -343,6 +344,12 @@ class StructurePriorStore:
         observation_id : str, optional
             Stable deduplication key.  When provided, duplicate calls with the
             same id are silently ignored.
+        return_basis : str, optional
+            Which return ``realized_return_pct`` is (services.outcome_returns:
+            forward outcomes are "conservative_fill"). Recorded on the
+            observation so returns on different bases are never mistaken for
+            one another; observations written before this was recorded carry
+            none and are counted as "unrecorded" in diagnostics.
         """
         if structure not in SUPPORTED_STRUCTURES:
             logger.warning(
@@ -399,6 +406,8 @@ class StructurePriorStore:
                 "realized_return_pct": float(realized_return_pct),
                 "realized_expansion_pct": float(realized_expansion_pct),
             }
+            if return_basis is not None:
+                observation["return_basis"] = str(return_basis)
             observations = list(entry.get("observations", []))
             observations.append(observation)
 
@@ -666,6 +675,7 @@ class StructurePriorStore:
                     ),
                     "rank_score": self._data.get(s, {}).get("rank_score"),
                     "source_types": self._data.get(s, {}).get("source_types", {}),
+                    "return_bases": _count_return_bases(self._data.get(s, {}).get("observations", [])),
                     "last_updated": self._data.get(s, {}).get("last_updated"),
                     "overrides_report_prior": self._data.get(s, {}).get(
                         "observation_count", 0
@@ -679,6 +689,16 @@ class StructurePriorStore:
             "store_path": str(self._path),
             "store_exists": self._path.exists(),
         }
+
+
+def _count_return_bases(observations: Any) -> Dict[str, int]:
+    """Observations per return basis; ones that never recorded a basis are "unrecorded"."""
+    counts: Dict[str, int] = {}
+    for obs in observations or []:
+        if isinstance(obs, dict):
+            key = str(obs.get("return_basis") or "unrecorded")
+            counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────

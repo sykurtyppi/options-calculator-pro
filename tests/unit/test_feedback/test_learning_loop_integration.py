@@ -22,6 +22,7 @@ import pytest
 from services.calibration_service import IVExpansionCalibration
 from services.outcome_recorder import OutcomeStore, finalize_trade_and_update_learning
 from services.structure_prior_store import MIN_OBS_FOR_OVERRIDE, StructurePriorStore
+from tests.unit.outcome_fixtures import claimed_exit_scenarios
 
 
 # ── singleton-swap helper ─────────────────────────────────────────────────────
@@ -149,6 +150,7 @@ def test_finalize_updates_priors_and_invalidates_cache(paths) -> None:
             exit_date=date(2025, 1, 20),
             realized_return_pct=8.0,
             realized_expansion_pct=10.0,
+            exit_execution_scenarios=claimed_exit_scenarios(8.0),
         )
 
         # Cache-invalidation check: post-finalize call must return a NEW object …
@@ -184,6 +186,7 @@ def test_calibration_observation_dedup_via_observation_id(paths) -> None:
             exit_date=date(2025, 1, 20),
             realized_return_pct=5.0,
             realized_expansion_pct=7.0,
+            exit_execution_scenarios=claimed_exit_scenarios(5.0),
         )
         # Second call with same trade_id — deduplication should fire on prior and calibration
         result2 = finalize_trade_and_update_learning(
@@ -191,6 +194,7 @@ def test_calibration_observation_dedup_via_observation_id(paths) -> None:
             exit_date=date(2025, 1, 20),
             realized_return_pct=5.0,
             realized_expansion_pct=7.0,
+            exit_execution_scenarios=claimed_exit_scenarios(5.0),
         )
 
     assert result2["prior_observation_count"] == 1, (

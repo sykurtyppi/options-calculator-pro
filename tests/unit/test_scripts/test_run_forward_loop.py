@@ -262,8 +262,11 @@ def test_run_daily_cycle_records_entries_finalizes_exits_and_skips_missing_data(
     assert aapl_notes["recommendation_id"] == aapl_trade["recommendation_id"]
 
     prior_diag = priors.diagnostics()["structures"]
-    assert prior_diag["atm_straddle"]["observation_count"] == 1
-    assert prior_diag["call_calendar"]["observation_count"] == 1
+    # The fake exit quotes carry a mid but no per-leg bid/ask, so there is no
+    # conservative fill: the trades finalize, but the priors (which learn only
+    # the claimed conservative-fill return) learn nothing from them.
+    assert prior_diag["atm_straddle"]["observation_count"] == 0
+    assert prior_diag["call_calendar"]["observation_count"] == 0
 
     logs = [json.loads(line) for line in log_path.read_text().splitlines()]
     assert any(item["event_type"] == "entry" and item["symbol"] == "AAPL" for item in logs)

@@ -312,6 +312,7 @@ export default function ForwardPerformancePanel({ apiBase }) {
                       <th>Win Rate</th>
                       <th>Realized</th>
                       <th>Median</th>
+                      <th>Return basis</th>
                       <th>Signal</th>
                     </tr>
                   </thead>
@@ -319,10 +320,11 @@ export default function ForwardPerformancePanel({ apiBase }) {
                     {claimableRows.map((row) => (
                       <tr key={row.key}>
                         <td><strong>{row.label}</strong></td>
-                        <td>{row.n}</td>
+                        <td>{row.n}{row.withheldCount ? ` (+${row.withheldCount} withheld)` : ''}</td>
                         <td>{row.winRateLabel}</td>
                         <td>{row.avgRealizedLabel}</td>
                         <td>{row.medianRealizedLabel}</td>
+                        <td>{row.basisLabel}</td>
                         <td>{row.warningLabel}</td>
                       </tr>
                     ))}

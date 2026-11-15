@@ -38,11 +38,20 @@ from services.forward_performance_diagnostics import build_forward_performance_d
 from services.outcome_recorder import OutcomeStore, finalize_trade_and_update_learning, make_trade_id
 from services.recommendation_ledger import RecommendationLedger
 from services.structure_prior_store import StructurePriorStore
+from services.execution_scenarios import build_execution_scenarios
+from services.outcome_returns import claimed_return_pct
+from tests.unit.outcome_fixtures import claimed_exit_scenarios
 
 T_MINUS_1 = date(2026, 4, 27)
 EARNINGS = T_MINUS_1 + timedelta(days=1)
+# Per-leg quotes, so exits carry a conservative fill (the return priors learn).
+LEGS = {"call": {"bid": 1.45, "ask": 1.55}, "put": {"bid": 1.45, "ask": 1.55}}
 QUOTE = {"mid": 3.0, "context": {}, "quote_source": "marketdata", "quote_quality": "live",
-         "quote_timestamp": "2026-04-27T15:59:00", "bid_ask_mid": {"bid": 2.9, "ask": 3.1}}
+         "quote_timestamp": "2026-04-27T15:59:00", "bid_ask_mid": {"bid": 2.9, "ask": 3.1, "legs": LEGS}}
+ENTRY_SCENARIOS = build_execution_scenarios(
+    structure="otm_strangle", phase="entry",
+    quote_payload={"bid_ask_mid": {"legs": {"call": {"bid": 0.95, "ask": 1.05}, "put": {"bid": 0.95, "ask": 1.05}}}},
+).to_dict()
 
 
 @pytest.fixture()
@@ -62,7 +71,7 @@ def _open(store, trade_id, *, source="paper"):
         trade_id=trade_id, symbol=trade_id, structure="otm_strangle",
         entry_date=EARNINGS - timedelta(days=6), earnings_date=EARNINGS,
         setup_score=0.6, source_type=source, entry_mid=2.0, execution_penalty_at_entry=0.0,
-        notes=json.dumps({"pricing_context": {}}),
+        notes=json.dumps({"pricing_context": {}}), entry_execution_scenarios=ENTRY_SCENARIOS,
     )
 
 
@@ -76,6 +85,13 @@ def _run(tmp_path, store, day, quote=None, **kwargs):
 
 def _cal_expansions(tmp_path):
     return json.loads((tmp_path / "cal.json").read_text())["expansions"]
+
+
+def _claimed(store, trade_id="AAA"):
+    """The conservative-fill return of the recorded exit: what priors learn."""
+    value = claimed_return_pct(store.get_trade(trade_id))
+    assert value is not None and value < 50.0  # costs make it worse than the 50% mid return
+    return value
 
 
 def _prior_returns(tmp_path):
@@ -119,7 +135,7 @@ def test_same_day_retry_after_lost_claim_does_not_requote(tmp_path, stores):
     row = store.get_trade("AAA")
     assert row["status"] == "finalized"
     assert row["realized_expansion_pct"] == 50.0  # (3 - 2) / 2, the first quote
-    assert _cal_expansions(tmp_path) == [50.0] and _prior_returns(tmp_path) == [50.0]
+    assert _cal_expansions(tmp_path) == [50.0] and _prior_returns(tmp_path) == [_claimed(store)]
 
 
 def test_finalize_error_after_learning_then_retry_stays_consistent(tmp_path, stores):
@@ -134,7 +150,7 @@ def test_finalize_error_after_learning_then_retry_stays_consistent(tmp_path, sto
 
     row = store.get_trade("AAA")
     assert row["status"] == "finalized" and row["realized_return_pct"] == 50.0
-    assert _cal_expansions(tmp_path) == [50.0] and _prior_returns(tmp_path) == [50.0]
+    assert _cal_expansions(tmp_path) == [50.0] and _prior_returns(tmp_path) == [_claimed(store)]
 
 
 def test_sweep_keeps_every_stored_exit_detail(tmp_path, stores):
@@ -163,7 +179,8 @@ def test_partial_finalize_call_keeps_recorded_exit_fields(tmp_path, stores):
                       exit_bid_ask_mid={"bid": 2.4, "ask": 2.6})  # record_trade_exit, no realized values yet
 
     finalize_trade_and_update_learning(trade_id="AAA", realized_return_pct=25.0, realized_expansion_pct=25.0,
-                                       store=store)
+                                       store=store,
+                                       exit_execution_scenarios=claimed_exit_scenarios(25.0))
 
     row = store.get_trade("AAA")
     assert (row["exit_mid"], row["exit_quote_source"]) == (2.5, "marketdata")
@@ -184,15 +201,17 @@ def test_finalize_learns_the_recorded_exit_not_the_callers_numbers(tmp_path, sto
     store = OutcomeStore(tmp_path / "o.sqlite")
     _open(store, "AAA")
     store.update_exit(trade_id="AAA", exit_date=T_MINUS_1, exit_mid=3.0, realized_return_pct=50.0,
-                      realized_expansion_pct=50.0, exit_quote_source="marketdata")
+                      realized_expansion_pct=50.0, exit_quote_source="marketdata",
+                      exit_execution_scenarios=claimed_exit_scenarios(50.0, conservative=41.0))
 
     result = finalize_trade_and_update_learning(trade_id="AAA", exit_date=T_MINUS_1, exit_mid=4.0,
                                                 realized_return_pct=100.0, realized_expansion_pct=100.0,
-                                                exit_quote_source="other", store=store)
+                                                exit_quote_source="other", store=store,
+                                                exit_execution_scenarios=claimed_exit_scenarios(100.0))
 
     row = store.get_trade("AAA")
     assert (row["realized_return_pct"], row["exit_mid"], row["exit_quote_source"]) == (50.0, 3.0, "marketdata")
-    assert _cal_expansions(tmp_path) == [50.0] and _prior_returns(tmp_path) == [50.0]
+    assert _cal_expansions(tmp_path) == [50.0] and _prior_returns(tmp_path) == [_claimed(store)]
     assert any("already recorded" in warning for warning in result["warnings"])
 
 
@@ -297,7 +316,8 @@ def _backfill(tmp_path):
 def _finalized(store, trade_id, value=50.0):
     _open(store, trade_id)
     finalize_trade_and_update_learning(trade_id=trade_id, exit_date=T_MINUS_1, realized_return_pct=value,
-                                       realized_expansion_pct=value, store=store)
+                                       realized_expansion_pct=value, store=store,
+                                       exit_execution_scenarios=claimed_exit_scenarios(value))
 
 
 def test_backfill_empties_calibration_holding_only_invalidated_observations(tmp_path, stores):
@@ -348,7 +368,8 @@ def test_health_and_invalidate_see_partial_learning(tmp_path, stores):
     _open(store, "AAA")
     priors.update = _raise  # prior write fails: calibration only
     finalize_trade_and_update_learning(trade_id="AAA", exit_date=T_MINUS_1, realized_return_pct=5.0,
-                                       realized_expansion_pct=5.0, store=store)
+                                       realized_expansion_pct=5.0, store=store,
+                                       exit_execution_scenarios=claimed_exit_scenarios(5.0))
     assert store.get_trade("AAA")["learning_update_status"] == "prior_failed"
 
     assert store.invalidate("AAA", reason="x")["learning_already_applied"] is True
@@ -373,7 +394,7 @@ def test_failed_learning_is_retried_by_the_loop(tmp_path, stores):
 
     assert summary["learning_retried"] == 1
     assert store.get_trade("AAA")["learning_update_status"] == "complete"
-    assert _prior_returns(tmp_path) == [50.0] and _cal_expansions(tmp_path) == [50.0]
+    assert _prior_returns(tmp_path) == [_claimed(store)] and _cal_expansions(tmp_path) == [50.0]
 
 
 def test_health_alerts_on_learning_that_keeps_failing(tmp_path, stores):
