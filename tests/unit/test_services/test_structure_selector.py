@@ -346,10 +346,16 @@ class TestStructureSelector(unittest.TestCase):
             _scorecard("call_calendar", expected_edge_pct=0.8, composite_structure_score=0.48),
             _scorecard("put_calendar", expected_edge_pct=0.5, composite_structure_score=0.40),
         ]
-        self.assertEqual(
-            select_best_structure(snap, cards_veto).recommendation,
-            RECOMMENDATION_NO_TRADE,
-        )
+        # The vetoed straddle is never traded. It is passed over (recorded with
+        # its gate) and the next structure that clears the hard gates is
+        # decided on, instead of the whole event being dropped.
+        vetoed = select_best_structure(snap, cards_veto)
+        self.assertNotEqual(vetoed.best_structure, "atm_straddle")
+        self.assertEqual(vetoed.passed_over_structures, {"atm_straddle": ["execution_cost_dominates_edge"]})
+        # Alone, the vetoed structure means no trade.
+        alone = select_best_structure(snap, cards_veto[:1])
+        self.assertEqual(alone.recommendation, RECOMMENDATION_NO_TRADE)
+        self.assertEqual(alone.binding_gate, "execution_cost_dominates_edge")
         self.assertNotEqual(
             select_best_structure(snap, cards_safe).recommendation,
             RECOMMENDATION_NO_TRADE,
