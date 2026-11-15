@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from services import release_timing as _release_timing_rule
+from services import structure_legs as _structure_legs
 from services.earnings_move_profile import (
     compute_earnings_move_profile as _compute_earnings_move_profile,
     normalize_release_timing as _normalize_release_timing,
@@ -182,6 +183,10 @@ class VolSnapshot:
     surface_sparse_atm_count: int = 0
     surface_iv_anomaly_count: int = 0
     surface_quality: Dict[str, Any] = field(default_factory=dict)
+    # The exact legs each structure would book (services.structure_legs), on the
+    # trade expiry: {"trade_expiry", "back_expiry", "structures": {structure:
+    # {"legs", "reason", "leg_spread_pct"}}}. Empty when no chain or no event.
+    structure_legs: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -484,6 +489,10 @@ def build_vol_snapshot(
             else:
                 event_decomposition_status = "no_event_spanning_expiry"
 
+    structure_legs = _structure_legs_for_chain(
+        chain_frame, underlying_price, earnings_date, earnings.release_timing, as_of_date,
+    )
+
     _decomp = decompose_event_vol(
         near_term_implied_move_pct=decomp_input_move,
         near_term_dte=decomp_input_dte,
@@ -710,7 +719,48 @@ def build_vol_snapshot(
         surface_sparse_atm_count=int(surface_quality.get("sparse_atm_expiration_count") or 0),
         surface_iv_anomaly_count=int(surface_quality.get("missing_iv_count") or 0) + int(surface_quality.get("iv_outlier_count") or 0),
         surface_quality=surface_quality,
+        structure_legs=structure_legs,
     )
+
+
+def _structure_legs_for_chain(
+    chain_frame: pd.DataFrame,
+    underlying_price: Optional[float],
+    earnings_date: Optional[date],
+    release_timing: str,
+    as_of_date: date,
+) -> Dict[str, Any]:
+    """The legs every structure would book on this chain (services.structure_legs)."""
+    if (earnings_date is None or chain_frame is None or chain_frame.empty
+            or underlying_price is None or not np.isfinite(underlying_price)):
+        return {}
+    expiry_dates = pd.to_datetime(chain_frame["expiry"], errors="coerce").dt.date
+    listed = sorted({d for d in expiry_dates.dropna().tolist() if d > as_of_date})
+    front = _structure_legs.trade_expiry(listed, earnings_date, release_timing)
+    if front is None:
+        return {"trade_expiry": None, "back_expiry": None, "structures": {
+            name: {"legs": {}, "reason": "no_front_expiry_after_earnings", "leg_spread_pct": None}
+            for name in _structure_legs.STRUCTURES}}
+    back = _structure_legs.calendar_back_expiry(listed, front)
+
+    def _sides(expiry: Optional[date]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if expiry is None:
+            return pd.DataFrame(), pd.DataFrame()
+        grp = chain_frame[expiry_dates == expiry]
+        return grp[grp["call_put"] == "C"].copy(), grp[grp["call_put"] == "P"].copy()
+
+    calls, puts = _sides(front)
+    back_calls, back_puts = _sides(back)
+    return {
+        "trade_expiry": front.isoformat(),
+        "back_expiry": back.isoformat() if back is not None else None,
+        "structures": {
+            name: _structure_legs.discover_legs(
+                name, calls, puts, float(underlying_price), back_calls=back_calls, back_puts=back_puts,
+            )
+            for name in _structure_legs.STRUCTURES
+        },
+    }
 
 
 def _coerce_date(value: date | datetime | pd.Timestamp) -> date:

@@ -67,6 +67,23 @@ from services.provider_telemetry import (
     telemetry_context,
 )
 from services.quote_provenance import quote_provenance_problem
+from services.structure_legs import (  # the shared discovery rules (see that module)
+    CONDOR_SHORT_OTM_PCT,
+    CONDOR_WING_OFFSET_PCT,
+    OTM_STRANGLE_FALLBACK_DISTANCE_PCT,
+    OTM_STRANGLE_MIN_FALLBACK_DISTANCE,
+    OTM_WING_PCT,
+    max_strangle_fallback_distance as _max_strangle_fallback_distance,
+    mid_from_row as _mid_from_row,
+    nearest_row as _nearest_row,
+    quote_invalid_reason as _quote_invalid_reason,
+    row_at_strike as _row_at_strike,
+    select_condor_wing as _select_condor_wing,
+    select_otm_wing as _select_otm_wing,
+    trade_expiry as _trade_expiry,
+)
+from services.structure_legs import compare_booked_to_scored as _compare_booked_to_scored
+
 from services.recommendation_ledger import (
     RecommendationLedger,
     make_recommendation_id,
@@ -98,8 +115,6 @@ DEFAULT_LOG_PATH = (
 )
 ALLOWED_RECOMMENDATIONS = {"Best Candidate", "Candidate"}
 FORWARD_DISCOVERY_WEEKS = 6
-OTM_STRANGLE_FALLBACK_DISTANCE_PCT = 0.025
-OTM_STRANGLE_MIN_FALLBACK_DISTANCE = 2.5
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -338,6 +353,7 @@ def _fetch_quote_for_forward_loop(
     as_of_date: date,
     context: Optional[Dict[str, Any]],
     mda_client: Any,
+    release_timing: Optional[str] = None,
 ) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "symbol": symbol,
@@ -352,6 +368,8 @@ def _fetch_quote_for_forward_loop(
         params = {}
     if "mda_client" in params:
         kwargs["mda_client"] = mda_client
+    if "release_timing" in params:
+        kwargs["release_timing"] = release_timing
     # Point-in-time: the live fetcher can only price the present. Valuing a
     # past as_of with it (e.g. re-running a missed T-1 the next morning) would
     # book a later, possibly post-earnings, quote as that day's price.
@@ -566,16 +584,6 @@ def _latest_spot_price(symbol: str) -> Optional[float]:
     return float(close.iloc[-1])
 
 
-def _mid_from_row(row: Optional[pd.Series]) -> Optional[float]:
-    if row is None:
-        return None
-    bid = _safe_float(row.get("bid"))
-    ask = _safe_float(row.get("ask"))
-    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:  # H3: zero bid not executable
-        return None
-    mid = (bid + ask) / 2.0
-    return float(mid) if mid > 0 else None
-
 
 def _exit_claim(entry_execution_scenarios: Any, exit_quote: Dict[str, Any], *, symbol: Any) -> Dict[str, Any]:
     """The exit half of the claim contract, checked against the booked entry legs
@@ -698,96 +706,6 @@ def _loads_list(value: Any) -> list:
     return parsed if isinstance(parsed, list) else []
 
 
-def _quote_invalid_reason(row: Optional[pd.Series], *, leg: str) -> str:
-    if row is None:
-        return f"missing_{leg}_mid"
-    bid = _safe_float(row.get("bid"))
-    ask = _safe_float(row.get("ask"))
-    if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:  # H3: zero bid not executable
-        return "bad_bid_ask"
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
-        return f"missing_{leg}_mid"
-    return "partial_or_missing_mid"
-
-
-def _max_strangle_fallback_distance(spot: float) -> float:
-    return max(OTM_STRANGLE_MIN_FALLBACK_DISTANCE, float(spot) * OTM_STRANGLE_FALLBACK_DISTANCE_PCT)
-
-
-def _select_otm_wing(
-    frame: pd.DataFrame,
-    *,
-    target_strike: float,
-    spot: float,
-    leg: str,
-) -> Dict[str, Any]:
-    """Select the requested OTM wing, with a bounded nearest-valid fallback."""
-    empty_reason = "empty_call_chain" if leg == "call" else "empty_put_chain"
-    missing_mid_reason = "missing_call_mid" if leg == "call" else "missing_put_mid"
-
-    if frame is None or frame.empty:
-        return {"row": None, "reason": empty_reason, "quote_quality_label": "partial_or_missing_mid"}
-
-    work = frame.copy()
-    work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
-    work = work.dropna(subset=["strike"])
-    work = work[work["strike"] >= spot] if leg == "call" else work[work["strike"] <= spot]
-    if work.empty:
-        return {"row": None, "reason": empty_reason, "quote_quality_label": "partial_or_missing_mid"}
-
-    work["fallback_distance"] = (work["strike"] - float(target_strike)).abs()
-    work = work.sort_values(["fallback_distance", "strike"], ascending=[True, leg != "put"])
-    max_distance = _max_strangle_fallback_distance(spot)
-    primary = work.iloc[0]
-    if float(primary["fallback_distance"]) > max_distance:
-        return {
-            "row": None,
-            "reason": "wing_strike_unavailable",
-            "quote_quality_label": "partial_or_missing_mid",
-            "max_fallback_distance": round(max_distance, 4),
-        }
-
-    primary_mid = _mid_from_row(primary)
-    if primary_mid is not None:
-        return {
-            "row": primary,
-            "reason": None,
-            "quote_quality_label": "exact_wing_mid",
-            "fallback_distance": float(primary["fallback_distance"]),
-            "requested_strike": float(target_strike),
-            "max_fallback_distance": round(max_distance, 4),
-        }
-
-    bounded = work[work["fallback_distance"] <= max_distance]
-    invalid_reasons = [_quote_invalid_reason(row, leg=leg) for _, row in bounded.iterrows()]
-    for _, candidate in bounded.iterrows():
-        candidate_mid = _mid_from_row(candidate)
-        if candidate_mid is None:
-            continue
-        return {
-            "row": candidate,
-            "reason": None,
-            "quote_quality_label": "nearest_valid_wing_mid",
-            "fallback_distance": float(candidate["fallback_distance"]),
-            "requested_strike": float(target_strike),
-            "max_fallback_distance": round(max_distance, 4),
-        }
-
-    if not len(bounded):
-        reason = "wing_strike_unavailable"
-    elif "bad_bid_ask" in invalid_reasons:
-        reason = "bad_bid_ask"
-    else:
-        reason = missing_mid_reason
-    return {
-        "row": None,
-        "reason": reason,
-        "quote_quality_label": "partial_or_missing_mid",
-        "requested_strike": float(target_strike),
-        "max_fallback_distance": round(max_distance, 4),
-    }
-
 
 def _normalize_forward_chain_frame(frame: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Provider boundary for the forward loop's option chains.
@@ -900,17 +818,6 @@ def _spot_from_marketdata_chain(chain: pd.DataFrame) -> Optional[float]:
     return value if value > 0 else None
 
 
-def _nearest_row(frame: pd.DataFrame, strike: float) -> Optional[pd.Series]:
-    if frame is None or frame.empty:
-        return None
-    work = frame.copy()
-    work["strike"] = pd.to_numeric(work["strike"], errors="coerce")
-    work = work.dropna(subset=["strike"])
-    if work.empty:
-        return None
-    work["dist"] = (work["strike"] - float(strike)).abs()
-    return work.sort_values("dist").iloc[0]
-
 
 def _expiry_after(options: list[str], target: date) -> Optional[str]:
     parsed = sorted(
@@ -937,8 +844,6 @@ def _expiry_after_gap(options: list[str], start: date, gap_days: int) -> Optiona
 # CONDOR_WING_OFFSET_PCT beyond them — that offset is what converts an undefined-
 # risk strangle sale into a defined-risk condor, and it sets the max loss
 # (wing width - net credit).
-CONDOR_SHORT_OTM_PCT = 0.03
-CONDOR_WING_OFFSET_PCT = 0.02
 # How far outside the no-arbitrage bounds a re-priced condor value may sit before
 # it is treated as unusable data rather than quote noise. Two ticks on a
 # penny-increment chain. Repairing more than this fabricates an outcome.
@@ -948,23 +853,6 @@ CONDOR_QUOTE_REPAIR_TOLERANCE = 0.02
 # where a flat two ticks would be a large slice of the return.
 CONDOR_QUOTE_REPAIR_MAX_RETURN_IMPACT = 0.05
 
-
-def _row_at_strike(frame: pd.DataFrame, strike: Optional[float], *, tolerance: float = 1e-6) -> Optional[pd.Series]:
-    """Exact-strike lookup, used to RE-PRICE an already-booked leg.
-
-    Deliberately NOT _select_otm_wing: that helper filters to strikes still OTM
-    relative to the CURRENT spot, which is right when discovering a new structure
-    but wrong when re-pricing an open position. If spot has moved through a short
-    strike — precisely the case where a condor loses money — the OTM filter drops
-    the booked strike and the fallback silently prices a DIFFERENT option, so the
-    realized P&L would describe a trade that was never held.
-    """
-    if strike is None or frame is None or frame.empty:
-        return None
-    row = _nearest_row(frame, float(strike))
-    if row is None:
-        return None
-    return row if abs(float(row["strike"]) - float(strike)) <= tolerance else None
 
 
 def _reprice_selection(frame: pd.DataFrame, strike: Optional[float], *, leg: str) -> Dict[str, Any]:
@@ -1045,28 +933,6 @@ def _closing_leg_mid(row: Optional[pd.Series], *, action: str) -> Optional[float
     return float((bid + ask) / 2.0)
 
 
-def _select_condor_wing(
-    frame: pd.DataFrame,
-    *,
-    short_strike: float,
-    target_strike: float,
-    leg: str,
-) -> Optional[pd.Series]:
-    """Nearest protective long wing STRICTLY beyond the short strike.
-
-    Direction is filtered before snapping: a wing at or inside the short strike
-    would invert the vertical and silently turn the position into something that
-    is not a condor (and not defined-risk), so it must never be selected. Returns
-    None when the chain has no strike beyond the short leg, which the caller
-    turns into an explicit no-wing skip rather than a naked short.
-    """
-    if frame is None or frame.empty or "strike" not in frame.columns:
-        return None
-    candidates = frame[frame["strike"] > short_strike] if leg == "call" else frame[frame["strike"] < short_strike]
-    if candidates.empty:
-        return None
-    return _nearest_row(candidates, target_strike)
-
 
 def fetch_structure_quote(
     *,
@@ -1076,6 +942,7 @@ def fetch_structure_quote(
     as_of_date: date,
     context: Optional[Dict[str, Any]] = None,
     mda_client: Any = None,
+    release_timing: Optional[str] = None,
 ) -> Dict[str, Any]:
     start = time.perf_counter()
     resolved_mda_client = _get_marketdata_client(mda_client) if mda_client is not None else None
@@ -1146,7 +1013,10 @@ def fetch_structure_quote(
 
     pricing_context = dict(context or {})
     if not pricing_context:
-        front_expiry = _expiry_after(options, earnings_date)
+        # The first expiry that spans the earnings reaction (services.structure_legs):
+        # an after-close report's same-day expiry expires before the market reacts.
+        _front = _trade_expiry(options, earnings_date, release_timing)
+        front_expiry = _front.isoformat() if _front is not None else None
         if front_expiry is None:
             _record_quote(False, "no_front_expiry_after_earnings")
             return {"mid": None, "reason": "no_front_expiry_after_earnings", **_payload()}
@@ -1259,8 +1129,8 @@ def fetch_structure_quote(
             put_selection = _reprice_selection(front_puts, _booked_put, leg="put")
         else:
             # DISCOVERY of a new structure: pick the wings against current spot.
-            call_target = float(spot * 1.03)
-            put_target = float(spot * 0.97)
+            call_target = float(spot * (1.0 + OTM_WING_PCT))
+            put_target = float(spot * (1.0 - OTM_WING_PCT))
             call_selection = _select_otm_wing(
                 front_calls,
                 target_strike=call_target,
@@ -1763,6 +1633,7 @@ def _record_baseline_entries(
             as_of_date=as_of,
             context=None,
             mda_client=mda_client,
+            release_timing=_get(vol_snapshot, "release_timing"),
         )
         entry_mid = _safe_float(quote.get("mid"))
         # Persist the booked contracts so the exit reprices THESE strikes and
@@ -2479,6 +2350,7 @@ def _run_forward_screener(
             as_of_date=as_of,
             context=None,
             mda_client=mda_client,
+            release_timing=_get(vol_snapshot, "release_timing"),
         )
         try:
             if not dry_run:
@@ -2570,6 +2442,10 @@ def _run_forward_screener(
                 "release_timing": row.get("release_timing"),
             },
             "pricing_context": quote.get("context", {}),
+            # Whether entry booked the legs the selector scored (services.structure_legs).
+            "scored_legs_check": _compare_booked_to_scored(
+                structure, quote.get("context", {}), _get(vol_snapshot, "structure_legs", {}),
+            ),
             "entry_price_source": f"{quote.get('quote_source', 'unknown')}_option_chain_mid",
             "entry_quote_source": quote.get("quote_source", "yfinance"),
             "entry_quote_quality": quote.get("quote_quality", "paper_research_mid_not_execution_grade"),
