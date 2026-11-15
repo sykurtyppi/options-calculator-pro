@@ -534,3 +534,168 @@ def test_discovery_rejects_a_calendar_without_a_positive_debit() -> None:
     cheap_back[["bid", "ask"]] = cheap_back[["bid", "ask"]] * 0.5
     result = sl.discover_legs("call_calendar", calls, _side(kind="P"), 100.0, back_calls=cheap_back, back_puts=cheap_back)
     assert result["reason"] == "non_positive_calendar_debit"
+
+
+# ── review round 2: source state machine, containment, as-of guard ─────────
+
+
+def _provider_frame(expiry: str, mid_scale: float, sides=("call", "put")) -> pd.DataFrame:
+    frames = []
+    for side in sides:
+        part = _dense_side("C" if side == "call" else "P", 500.0, expiry)
+        mid = np.maximum(0.5, 20.0 - np.abs(DENSE - 500.0) * 0.3) * mid_scale
+        frames.append(pd.DataFrame({"optionSymbol": part["contractSymbol"], "side": side, "strike": DENSE,
+                                    "bid": mid - 0.05, "ask": mid + 0.05, "mid": mid,
+                                    "impliedVolatility": 0.4, "expiration_date": expiry, "underlyingPrice": 500.0}))
+    return pd.concat(frames, ignore_index=True)
+
+
+class _MixedProvider:
+    """Front chain lacks puts (so both paths fall back to Yahoo); back chain is cheap."""
+
+    def __init__(self, front, back):
+        self.front, self.back = front, back
+
+    def get_expirations(self, _s):
+        return WEEKLY
+
+    def get_quote(self, _s):
+        return 500.0
+
+    def get_option_chain(self, _s, expiration=None, **_k):
+        if expiration == self.front:
+            return _provider_frame(expiration, 1.0, sides=("call",))
+        return _provider_frame(expiration, 0.1)  # far cheaper than Yahoo's back
+
+
+@pytest.mark.parametrize("structure", ["call_calendar", "put_calendar"])
+def test_the_back_chain_comes_from_the_same_source_as_the_front_like_entry(monkeypatch, structure) -> None:
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+    ticker = _dense_ticker(WEEKLY)
+    client = _MixedProvider("2026-11-20", "2026-12-04")
+    monkeypatch.setattr(forward_loop.yf, "Ticker", lambda _s: ticker)
+    monkeypatch.setattr(forward_loop, "record_provider_telemetry", lambda **_k: None)
+    monkeypatch.setattr(forward_loop, "_latest_spot_price", lambda _s: 500.0)
+    structure_chain = edge_engine._fetch_structure_chain(
+        "AAA", client=client, use_provider=True, ticker=ticker, earnings_date=earnings,
+        release_timing="AMC", as_of_date=as_of)
+    scored = _structure_legs_from_inputs(structure_chain, pd.DataFrame(), 500.0, earnings, "AMC", as_of)
+    assert scored["coverage"] == "complete"
+    assert scored["structures"][structure]["reason"] is None  # Yahoo front + Yahoo back: a real debit
+    quote = forward_loop.fetch_structure_quote(symbol="AAA", structure=structure, earnings_date=earnings,
+                                               as_of_date=as_of, mda_client=client, release_timing="AMC")
+    assert quote.get("mid") is not None and quote["mid"] > 0
+    assert sl.compare_booked_to_scored(structure, quote["context"], scored)["match"] is True
+
+
+def test_a_provider_front_keeps_the_back_on_the_provider() -> None:
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+
+    class _Provider(_MixedProvider):
+        def get_option_chain(self, _s, expiration=None, **_k):
+            return _provider_frame(expiration, 1.0 if expiration == self.front else 2.0)
+
+    calls = []
+
+    class _NoYahoo:
+        def option_chain(self, expiry):  # must not be used: the front came from the provider
+            calls.append(expiry)
+            raise AssertionError("yahoo used")
+
+    chain = edge_engine._fetch_structure_chain("AAA", client=_Provider("2026-11-20", "2026-12-04"),
+                                               use_provider=True, ticker=_NoYahoo(), earnings_date=earnings,
+                                               release_timing="AMC", as_of_date=as_of)
+    assert chain is not None and calls == []
+
+
+def test_an_unreadable_yahoo_listing_does_not_break_an_explicit_expiry_fetch() -> None:
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+    base = _dense_ticker(WEEKLY)
+
+    class _ListingRaises:
+        @property
+        def options(self):
+            raise RuntimeError("Yahoo listing unavailable")
+
+        def option_chain(self, expiry):
+            return base.option_chain(expiry)
+
+    chain = edge_engine._fetch_structure_chain(
+        "AAA", client=_MixedProvider("2026-11-20", "2026-12-04"), use_provider=True, ticker=_ListingRaises(),
+        earnings_date=earnings, release_timing="AMC", as_of_date=as_of)
+    assert chain is not None
+    legs = _structure_legs_from_inputs(chain, pd.DataFrame(), 500.0, earnings, "AMC", as_of)
+    assert legs["coverage"] == "complete"
+
+
+def test_a_failing_structure_fetch_never_aborts_the_analysis(monkeypatch) -> None:
+    from tests.unit.test_web.test_analyze_single_ticker_golden import _run_watch_scenario
+
+    def boom(*_a, **_k):
+        raise RuntimeError("listing unavailable")
+
+    monkeypatch.setattr(edge_engine, "_fetch_structure_chain", boom)
+    result = _run_watch_scenario()
+    assert result.recommendation  # the analysis completed
+
+
+def test_structure_quotes_obey_the_as_of_boundary() -> None:
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+    ticker = _dense_ticker(WEEKLY)
+    fresh = edge_engine._fetch_structure_chain("AAA", client=None, use_provider=False, ticker=ticker,
+                                               earnings_date=earnings, release_timing="AMC",
+                                               as_of_date=as_of)
+    future = {"listing": fresh["listing"],
+              "chain": [part.assign(trade_date="2026-11-18") for part in fresh["chain"]]}
+    undated = {"listing": fresh["listing"], "chain": [part.assign(trade_date=None) for part in fresh["chain"]]}
+    for chain in (future, undated):
+        legs = _structure_legs_from_inputs(chain, pd.DataFrame(), 500.0, earnings, "AMC", as_of)
+        assert legs == {} or legs.get("coverage") != "complete"
+    on_time = {"listing": fresh["listing"], "chain": [part.assign(trade_date="2026-11-16") for part in fresh["chain"]]}
+    assert _structure_legs_from_inputs(on_time, pd.DataFrame(), 500.0, earnings, "AMC", as_of)["coverage"] == "complete"
+
+
+@pytest.mark.parametrize("with_empty_column", [False, True])
+def test_live_rows_without_a_trade_date_are_stamped_with_the_fetch_date(monkeypatch, with_empty_column) -> None:
+    monkeypatch.setattr(edge_engine, "_market_today_date", lambda: date(2026, 11, 16))
+    earnings = date(2026, 11, 19)
+
+    class _Provider(_MixedProvider):
+        def get_option_chain(self, _s, expiration=None, **_k):
+            frame = _provider_frame(expiration, 1.0 if expiration == self.front else 2.0)
+            return frame.assign(trade_date=None) if with_empty_column else frame
+
+    # Analysed as of an EARLIER day than the fetch (e.g. a re-run): rows carry the
+    # fetch date, never the as-of date, so the as-of guard refuses them.
+    chain = edge_engine._fetch_structure_chain(
+        "AAA", client=_Provider("2026-11-20", "2026-12-04"), use_provider=True, ticker=None,
+        earnings_date=earnings, release_timing="AMC", as_of_date=date(2026, 11, 13))
+    assert all(set(part["trade_date"]) == {"2026-11-16"} for part in chain["chain"])
+    past = _structure_legs_from_inputs(chain, pd.DataFrame(), 500.0, earnings, "AMC", date(2026, 11, 13))
+    assert past == {} or past.get("coverage") != "complete"
+    today = _structure_legs_from_inputs(chain, pd.DataFrame(), 500.0, earnings, "AMC", date(2026, 11, 16))
+    assert today["coverage"] == "complete"
+
+
+def test_discovery_rejects_a_condor_credit_at_or_above_its_wing_width() -> None:
+    calls, puts = _side(kind="C"), _side(kind="P")
+    # Make the shorts worth far more than the wings: credit >= width (broken quotes).
+    for frame, short in ((calls, 102.5), (puts, 97.5)):
+        frame.loc[frame["strike"] == short, ["bid", "ask"]] = [9.9, 10.1]
+    assert sl.discover_legs("iron_condor", calls, puts, 100.0)["reason"] == "condor_credit_exceeds_wing_width"
+
+
+def test_a_failed_back_fetch_leaves_the_legs_sampled() -> None:
+    base = _dense_ticker(WEEKLY)
+
+    class _BackFails:
+        options = WEEKLY
+
+        def option_chain(self, expiry):
+            if expiry == "2026-12-04":
+                raise RuntimeError("timeout")
+            return base.option_chain(expiry)
+
+    assert edge_engine._fetch_structure_chain("AAA", client=None, use_provider=False, ticker=_BackFails(),
+                                              earnings_date=date(2026, 11, 19), release_timing="AMC",
+                                              as_of_date=date(2026, 11, 16)) is None

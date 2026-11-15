@@ -2287,14 +2287,16 @@ def _collect_yf_option_chain_frame(
     max_expiries: int = 6,
     expiries: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    expirations = list(getattr(ticker, "options", []) or [])
     rows: List[Dict[str, Any]] = []
     # Tenor-spanning selection (same fetch count) so the yfinance fallback
     # still brackets the 30D/45D interpolation targets on weekly-heavy names.
-    # ``expiries`` fetches exactly those instead (the structure-leg fetch).
-    selected = list(expiries) if expiries is not None else select_tenor_spanning_expiries(
-        expirations, as_of_date, max_expiries=max_expiries
-    )
+    # ``expiries`` fetches exactly those instead (the structure-leg fetch),
+    # without reading the listing at all.
+    if expiries is not None:
+        selected = list(expiries)
+    else:
+        expirations = list(getattr(ticker, "options", []) or [])
+        selected = select_tenor_spanning_expiries(expirations, as_of_date, max_expiries=max_expiries)
     for expiry in selected:
         start = time.perf_counter()
         try:
@@ -2404,27 +2406,53 @@ def _fetch_structure_chain(
     if front is None:
         return None
     back = _structure_legs_rule.calendar_back_expiry(listing, front)
-    parts: List[pd.DataFrame] = []
-    for expiry in (front, back):
-        if expiry is None:
-            continue
-        frame = None
-        if use_provider and client is not None:
-            try:
-                frame = client.get_option_chain(
-                    symbol, expiration=expiry.isoformat(), strike_limit=_structure_legs_rule.ENTRY_STRIKE_LIMIT,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.info("Structure-leg chain fetch failed for %s %s: %s", symbol, expiry, exc)
-                frame = None
-        if not _chain_has_both_sides(frame) and ticker is not None:
-            frame = _collect_yf_option_chain_frame(ticker, as_of_date=as_of_date, expiries=[expiry.isoformat()])
-        if frame is None or frame.empty:
-            # A chain that did not arrive is not evidence the legs are missing:
-            # leave the snapshot's legs "sampled" rather than half-complete.
+
+    def _provider_chain(expiry: date) -> Optional[pd.DataFrame]:
+        try:
+            return client.get_option_chain(
+                symbol, expiration=expiry.isoformat(), strike_limit=_structure_legs_rule.ENTRY_STRIKE_LIMIT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Structure-leg chain fetch failed for %s %s: %s", symbol, expiry, exc)
             return None
-        parts.append(frame)
-    return {"listing": listing, "chain": parts}
+
+    def _yahoo_chain(expiry: date) -> Optional[pd.DataFrame]:
+        if ticker is None:
+            return None
+        return _collect_yf_option_chain_frame(ticker, as_of_date=as_of_date, expiries=[expiry.isoformat()])
+
+    # Entry's source state machine (fetch_structure_quote): the front chain
+    # comes from the provider when it has calls AND puts, else from yfinance;
+    # the calendar back chain comes from the SAME source as the front, with no
+    # fallback of its own. Choosing each expiry's source independently would
+    # price a front and back entry never combines.
+    front_frame = _provider_chain(front) if use_provider and client is not None else None
+    front_from_provider = _chain_has_both_sides(front_frame)
+    if not front_from_provider:
+        front_frame = _yahoo_chain(front)
+    if front_frame is None or front_frame.empty:
+        # A chain that did not arrive is not evidence the legs are missing:
+        # leave the snapshot's legs "sampled" rather than half-complete.
+        return None
+    parts: List[pd.DataFrame] = [front_frame]
+    if back is not None:
+        back_frame = _provider_chain(back) if front_from_provider else _yahoo_chain(back)
+        if back_frame is None or back_frame.empty:
+            return None
+        parts.append(back_frame)
+    # Live fetch: a row without its own trade date was quoted today. Stamp it
+    # with the fetch date (never the as-of date) so the snapshot's as-of
+    # guard can still refuse it for a past as-of.
+    fetched_on = _market_today_date().isoformat()
+    stamped = []
+    for part in parts:
+        part = part.copy()
+        if "trade_date" not in part.columns:
+            part["trade_date"] = fetched_on
+        else:
+            part["trade_date"] = part["trade_date"].where(part["trade_date"].notna(), fetched_on)
+        stamped.append(part)
+    return {"listing": listing, "chain": stamped}
 
 
 def _attach_live_forward_provenance(edge_snapshot: "EdgeSnapshot") -> None:
@@ -2787,11 +2815,17 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
     )
     # The chains entry will book from (complete listing, entry strike
     # coverage), so structures are priced and judged on what entry will see.
-    structure_chain = _fetch_structure_chain(
-        clean_symbol, client=client, use_provider=use_provider, ticker=ticker,
-        earnings_date=earnings_date, release_timing=earnings_release_time,
-        as_of_date=_market_today_date(),
-    )
+    # Optional: a failure here must never abort the analysis; the legs are
+    # then "sampled" and nothing is ruled out on them.
+    try:
+        structure_chain = _fetch_structure_chain(
+            clean_symbol, client=client, use_provider=use_provider, ticker=ticker,
+            earnings_date=earnings_date, release_timing=earnings_release_time,
+            as_of_date=_market_today_date(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Structure-leg fetch failed for %s; legs stay sampled: %s", clean_symbol, exc)
+        structure_chain = None
     vol_snapshot = build_vol_snapshot(
         clean_symbol,
         _market_today_date(),

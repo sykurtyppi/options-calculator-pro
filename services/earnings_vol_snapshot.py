@@ -753,6 +753,13 @@ def _structure_legs_from_inputs(
         normalized = [_normalize_option_chain(part)[0] for part in parts]
         normalized = [part for part in normalized if not part.empty]
         frame = pd.concat(normalized, ignore_index=True) if normalized else pd.DataFrame()
+        # The same point-in-time guard as the primary chain: rows quoted after
+        # the as-of date, or with no valid trade date, never price the legs.
+        # Dropping them can leave a needed expiry missing; the completeness
+        # check below then marks the legs "sampled".
+        if not frame.empty:
+            trade_dates = pd.to_datetime(frame.get("trade_date"), errors="coerce")
+            frame = frame[trade_dates.notna() & (trade_dates <= pd.Timestamp(as_of_date))].reset_index(drop=True)
         listing = [pd.Timestamp(v).date() for v in (structure_chain.get("listing") or []) if v]
         if not frame.empty and listing and earnings_date is not None:
             legs = _structure_legs_for_chain(
