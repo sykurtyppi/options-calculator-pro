@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 
-from services.claim_contract import claimable_under_current_contract
+from services.claim_contract import CONTRACT_VERSION, claimable_under_current_contract
 from services.baseline_evidence_store import (
     COHORT_PAIRED,
     COHORT_UNIVERSE,
@@ -33,6 +33,7 @@ from services.evidence_statistics import (
     two_sample_difference,
 )
 from services.forward_performance_diagnostics import build_forward_performance_diagnostics
+from services.outcome_returns import RETURN_CLAIM, RETURN_MODELED_NET, claimed_return_pct
 from services.outcome_recorder import OutcomeStore, get_outcome_store, outcome_invalidation_reason
 from services.provider_telemetry import build_provider_telemetry_diagnostics
 
@@ -130,11 +131,22 @@ def build_evidence_report(
     )
 
     uncertainty = _uncertainty(selected, comparable_paired, baselines)
+    claimed = _claimed_evidence(selected, comparable_paired, baselines)
     fragility_warnings = []
     if (uncertainty["selector"].get("outlier_dependence") or {}).get("fragile"):
         fragility_warnings.append(
-            "Selector average return is positive only because of its 5 best results; "
+            "Selector average modeled-net return is positive only because of its 5 best results; "
             "without them it is zero or negative."
+        )
+    if (claimed["selector"].get("outlier_dependence") or {}).get("fragile"):
+        fragility_warnings.append(
+            "Selector claimed (conservative-fill) return is positive only because of its 5 best "
+            "results; without them it is zero or negative. This does not count as edge."
+        )
+    if claimed["selector_withheld_count"]:
+        fragility_warnings.append(
+            f"{claimed['selector_withheld_count']} claimable selector outcome(s) have no "
+            "conservative-fill return and are withheld from the claimed analysis."
         )
 
     report = {
@@ -147,6 +159,19 @@ def build_evidence_report(
             maturity=maturity,
         ),
         "selector_summary": selector_stats,
+        "return_bases": {
+            "claimed_evidence": RETURN_CLAIM,
+            "selector_summary": RETURN_MODELED_NET,
+            "baseline_comparison": RETURN_MODELED_NET,
+            "uncertainty": RETURN_MODELED_NET,
+            "universe_shadow": RETURN_MODELED_NET,
+            "note": (
+                "claimed_evidence is the claim: claimable outcomes at the claim contract's "
+                "conservative fill. Every other return figure is modeled_net (mid return minus "
+                "the cost the selector modeled at entry) and is observational only."
+            ),
+        },
+        "claimed_evidence": claimed,
         "invalidated_outcomes": {
             "n": len(invalidated),
             "resolved_n": sum(1 for row in invalidated if _is_resolved(row)),
@@ -311,6 +336,7 @@ def _outcome_stats(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "win_rate": wins / len(clean_returns) if clean_returns else None,
         "avg_realized_return_pct": _avg(clean_returns),
         "avg_realized_expansion_pct": _avg(expansion),
+        "return_basis": RETURN_MODELED_NET,
         "paper_research_label": "paper/research outcomes, not execution-grade live fills",
     }
 
@@ -328,6 +354,7 @@ def _baseline_stats(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "win_rate": wins / len(clean_returns) if clean_returns else None,
         "avg_realized_return_pct": _avg(clean_returns),
         "avg_realized_expansion_pct": _avg(expansion),
+        "return_basis": RETURN_MODELED_NET,
         "paper_research_label": "shadow paper baseline, not execution-grade live fills",
     }
 
@@ -339,18 +366,25 @@ def _group_by(rows: Iterable[Dict[str, Any]], key_fn: Any) -> Dict[str, Dict[str
     return {key: _baseline_stats(items) for key, items in sorted(grouped.items())}
 
 
-def _unique_by_recommendation(rows: Iterable[Dict[str, Any]]) -> tuple[Dict[str, Any], List[str]]:
+def _modeled_net(row: Dict[str, Any]) -> Any:
+    return row.get("realized_return_pct")
+
+
+def _unique_by_recommendation(
+    rows: Iterable[Dict[str, Any]],
+    value: Any = _modeled_net,
+) -> tuple[Dict[str, Any], List[str]]:
     """Map recommendation_id -> return, EXCLUDING ids that occur more than once.
 
     A pairing key must identify one event on each side. Silently keeping the
     last duplicate made the paired result depend on row order; ambiguous keys
-    are dropped and reported instead.
+    are dropped and reported instead. ``value`` picks the return basis.
     """
     grouped: Dict[str, list] = defaultdict(list)
     for row in rows:
         key = row.get("recommendation_id")
-        if key and row.get("realized_return_pct") is not None:
-            grouped[str(key)].append(row.get("realized_return_pct"))
+        if key and value(row) is not None:
+            grouped[str(key)].append(value(row))
     unique = {key: values[0] for key, values in grouped.items() if len(values) == 1}
     duplicates = sorted(key for key, values in grouped.items() if len(values) > 1)
     return unique, duplicates
@@ -426,15 +460,80 @@ def _uncertainty(
         )
 
     return {
+        "return_basis": RETURN_MODELED_NET,
         "selector": summarize_returns(selector_returns),
         "selector_minus_baseline": paired,
         "universe_picked_minus_skipped": picked_vs_skipped,
         "method": METHOD_NOTE,
         "notes": [
+            "Observational: modeled_net returns over every resolved outcome. The claim is claimed_evidence.",
             "selector: the interval is also the comparison with no-trade (zero return).",
             "selector_minus_baseline pairs each selector trade with the baseline entered on the same event.",
             "universe_picked_minus_skipped compares independent groups, so its interval is wider.",
             "fragile = the mean turns non-positive once the 5 best results are removed.",
+        ],
+    }
+
+
+def _claimed_evidence(
+    selected: list[Dict[str, Any]],
+    comparable_paired: list[Dict[str, Any]],
+    baselines: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The pre-registered analysis: claimable outcomes at the conservative fill.
+
+    Same three questions as ``_uncertainty``, restricted to rows claimable under
+    the current claim contract and valued at the claim contract's conservative
+    fill (services.outcome_returns.RETURN_CLAIM). A claimable row with no
+    conservative-fill return is withheld and counted, never valued on another
+    basis.
+    """
+    claimable = [row for row in selected if claimable_under_current_contract(row)]
+    selector_values = [claimed_return_pct(row) for row in claimable]
+    selector_by_rec, selector_duplicates = _unique_by_recommendation(claimable, claimed_return_pct)
+
+    claimable_paired = [row for row in comparable_paired if claimable_under_current_contract(row)]
+    paired: Dict[str, Any] = {}
+    for name in sorted({str(row.get("baseline_name") or "unknown_baseline") for row in claimable_paired}):
+        baseline_by_rec, baseline_duplicates = _unique_by_recommendation(
+            (row for row in claimable_paired if str(row.get("baseline_name") or "unknown_baseline") == name),
+            claimed_return_pct,
+        )
+        paired[name] = {
+            **paired_difference(selector_by_rec, baseline_by_rec),
+            "excluded_duplicate_keys": sorted(set(selector_duplicates) | set(baseline_duplicates)),
+        }
+
+    universe_rows = [
+        row for row in baselines
+        if baseline_cohort(row) == COHORT_UNIVERSE
+        and str(row.get("status") or "") == "resolved"
+        and is_booked_strike_exit(row)
+        and claimable_under_current_contract(row)
+    ]
+    picked_vs_skipped: Dict[str, Any] = {}
+    for name in sorted({str(row.get("baseline_name") or "unknown_baseline") for row in universe_rows}):
+        members = [row for row in universe_rows if str(row.get("baseline_name") or "unknown_baseline") == name]
+        picked_vs_skipped[name] = two_sample_difference(
+            [claimed_return_pct(row) for row in members
+             if row.get("selector_recommendation") in ACTIONABLE_RECOMMENDATIONS],
+            [claimed_return_pct(row) for row in members
+             if row.get("selector_recommendation") not in ACTIONABLE_RECOMMENDATIONS],
+        )
+
+    return {
+        "return_basis": RETURN_CLAIM,
+        "claim_contract_version": CONTRACT_VERSION,
+        "selector_claimable_n": len(claimable),
+        "selector_withheld_count": sum(1 for value in selector_values if value is None),
+        "selector": summarize_returns(selector_values),
+        "selector_minus_baseline": paired,
+        "universe_picked_minus_skipped": picked_vs_skipped,
+        "method": METHOD_NOTE,
+        "notes": [
+            "H1: selector is the interval of claimed returns; its lower bound above 0 beats no trade.",
+            "H2: selector_minus_baseline pairs claimed returns on the same event; both sides must be claimable.",
+            "Withheld: claimable outcomes with no conservative-fill return; they are not valued on another basis.",
         ],
     }
 

@@ -138,6 +138,8 @@ const payload = {
       avg_realized_return_pct: 4,
       median_realized_return_pct: 4,
       small_sample_warning: true,
+      return_basis: 'conservative_fill',
+      withheld_count: 1,
     },
     non_claimable: {
       n: 1,
@@ -227,6 +229,12 @@ test('claimable rows separate record-only observations from claimable evidence',
   assert.equal(claimable.n, 1)
   assert.equal(claimable.avgRealizedLabel, '+4.0%')
   assert.equal(nonClaimable.avgRealizedLabel, '-1.5%')
+  // The claimable row says it is the claimed (conservative-fill) return; a
+  // group that does not state its basis is never presented as claimed.
+  assert.equal(claimable.basisLabel, 'Conservative fill (claimed)')
+  assert.equal(claimable.withheldCount, 1)
+  assert.equal(nonClaimable.basisLabel, 'Basis not stated')
+  assert.equal(nonClaimable.withheldCount, 0)
 })
 
 test('stale and quality comparisons remain visible with zero-count fallbacks', () => {

@@ -74,5 +74,8 @@ describe('EvidenceReportPanel integrity sections', () => {
     expect(body).toMatch(/Above zero/)
     expect(body).toMatch(/depends on a few trades/)
     expect(body).toMatch(/percentile bootstrap/)
+    // Without a claimed analysis the figures are labelled observational, never as the claim.
+    expect(body).toMatch(/Observational: Selector vs no trade \(modeled net\)/)
+    expect(body).not.toMatch(/Claimed: Selector/)
   })
 })

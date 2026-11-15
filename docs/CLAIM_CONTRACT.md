@@ -81,6 +81,25 @@ diagnostics, under `claimable_evidence.claimable_returns`:
 | `natural` | Pay the ask when buying, receive the bid when selling. |
 | `conservative_fill` | **The claimed price.** The natural side, moved a further slippage of max($0.01, 10% of the spread) per share, plus $0.65 commission and $0.02 regulatory fee per contract on every leg at entry and at exit. |
 
+### Which return means what
+
+An outcome row's `realized_return_pct` column is **not** the claimed return.
+It is the mid return minus the cost the selector modeled at entry
+(`modeled_net`), kept as a diagnostic of that cost guess.
+`services/outcome_returns.py` names the three returns (`mid`, `modeled_net`,
+`conservative_fill`) and reads each one; nothing else should read them
+directly.
+
+- The evidence report's `claimed_evidence` section (the pre-registered H1/H2),
+  the claimable row of `claimable_performance`, and `claimable_returns` use
+  `conservative_fill`. Every other return figure is `modeled_net` and is
+  labelled observational (`return_bases` in the report).
+- Structure priors learn `conservative_fill`, and each observation records its
+  `return_basis`. Replay-seeded observations are `replay_net`; observations
+  written before bases were recorded count as `unrecorded`.
+- A row without a conservative-fill return is withheld and counted. It is never
+  valued on another basis.
+
 ## Versions
 
 - `conservative_fill_v1` (#170): let through future-dated legs, quotes after an early close, impossible contract dates, and entries with no exit verdict.

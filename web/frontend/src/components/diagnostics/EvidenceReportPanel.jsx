@@ -14,6 +14,7 @@ import {
   buildSimpleIvRvFilter,
   buildSurfaceQualitySummary,
   buildUncertaintyRows,
+  buildClaimedWithheld,
   buildUniverseShadowRows,
   buildUniverseShadowSummary,
 } from './evidenceReportViewModel'
@@ -56,6 +57,7 @@ export default function EvidenceReportPanel({ apiBase }) {
   const attritionRows = useMemo(() => buildExitAttritionRows(payload || {}), [payload])
   const excluded = useMemo(() => buildExcludedEvidenceSummary(payload || {}), [payload])
   const uncertaintyRows = useMemo(() => buildUncertaintyRows(payload || {}), [payload])
+  const claimedWithheld = useMemo(() => buildClaimedWithheld(payload || {}), [payload])
   const outliers = useMemo(() => buildOutlierDependence(payload || {}), [payload])
   const uncertaintyMethod = (payload?.uncertainty || {}).method || ''
 
@@ -152,9 +154,14 @@ export default function EvidenceReportPanel({ apiBase }) {
                 </table>
               </div>
             ) : <div className="oos-message">No resolved evidence to measure yet.</div>}
+            <p className="oos-help">
+              Claimed rows are claimable outcomes at the claim contract&apos;s conservative fill; they are the
+              pre-registered test. Observational rows use the mid return minus the selector&apos;s own modeled cost.
+              {claimedWithheld ? ` ${claimedWithheld} claimable outcome(s) had no conservative-fill return and are withheld.` : ''}
+            </p>
             {outliers.available && (
               <p className={`oos-help ${outliers.fragile ? 'error-banner' : ''}`}>
-                Without the {outliers.k} best selector results the mean is {outliers.withoutTopLabel}
+                Without the {outliers.k} best {outliers.basis === 'claimed' ? 'claimed' : 'observational (modeled net)'} selector results the mean is {outliers.withoutTopLabel}
                 {' '}(without the {outliers.k} worst: {outliers.withoutBottomLabel}); the {outliers.k} largest gains
                 {' '}are {outliers.topShareLabel} of all gains.
                 {outliers.fragile ? ' The positive average depends on a few trades.' : ''}

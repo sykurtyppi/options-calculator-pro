@@ -91,6 +91,9 @@ logger = logging.getLogger(__name__)
 # backtest_trades.pricing_source for trades priced from stored option
 # snapshots (services.institutional_ml_db.PRICING_SOURCE_SNAPSHOT_REPLAY).
 SNAPSHOT_REPLAY_PRICING = "snapshot_replay"
+# Basis of a replay-seeded prior observation: the replay net return, priced by
+# the backtest's own cost model (services.outcome_returns names the forward bases).
+REPLAY_RETURN_BASIS = "replay_net"
 
 _DEFAULT_DB = Path.home() / ".options_calculator_pro" / "institutional_ml.db"
 
@@ -388,6 +391,9 @@ def seed_from_trades(
                 source_type="replay",
                 observation_date=obs_date,
                 observation_id=trade_id,
+                # The replay's own net return (its cost model), not the claim
+                # contract's conservative fill: recorded so the two never mix.
+                return_basis=REPLAY_RETURN_BASIS,
             )
             prior_ok = True
         except Exception as exc:  # noqa: BLE001

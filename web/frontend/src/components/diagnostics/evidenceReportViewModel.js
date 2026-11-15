@@ -200,26 +200,55 @@ export function buildExcludedEvidenceSummary(payload = {}) {
 
 // Every headline comparison with its interval. "Too few to tell" is shown
 // instead of an interval below the backend's minimum sample.
+//
+// The claimed rows come first: claimable outcomes at the claim contract's
+// conservative fill (the pre-registered H1/H2). The rest are modeled-net
+// returns (mid minus the selector's own cost guess) and are labelled as
+// observational, so they can never read as the claim.
 export function buildUncertaintyRows(payload = {}) {
-  const block = payload.uncertainty || {}
+  const claimed = payload.claimed_evidence || null
   const rows = []
+  if (claimed) {
+    rows.push(...comparisonRows(claimed, 'claimed', 'Claimed', 'conservative fill'))
+  }
+  rows.push(...comparisonRows(payload.uncertainty || {}, 'observational', 'Observational', 'modeled net'))
+  return rows
+}
+
+function comparisonRows(block, group, prefix, basis) {
+  const rows = []
+  const tag = (label) => `${prefix}: ${label} (${basis})`
   if (block.selector) {
-    rows.push(uncertaintyRow('selector', 'Selector vs no trade', block.selector, block.selector.n))
+    rows.push({ ...uncertaintyRow(`${group}-selector`, tag('Selector vs no trade'), block.selector, block.selector.n), group })
   }
   for (const [name, item] of Object.entries(block.selector_minus_baseline || {})) {
-    rows.push(uncertaintyRow(`paired-${name}`, `Selector − ${labelBaseline(name)} (same events)`, item, item.pairs))
+    rows.push({
+      ...uncertaintyRow(`${group}-paired-${name}`, tag(`Selector − ${labelBaseline(name)}, same events`), item, item.pairs),
+      group,
+    })
   }
   for (const [name, item] of Object.entries(block.universe_picked_minus_skipped || {})) {
     const n = `${Number(item.n_first || 0)} vs ${Number(item.n_second || 0)}`
-    rows.push(uncertaintyRow(`universe-${name}`, `Picked − skipped (${labelBaseline(name)})`, item, n))
+    rows.push({ ...uncertaintyRow(`${group}-universe-${name}`, tag(`Picked − skipped, ${labelBaseline(name)}`), item, n), group })
   }
   return rows
 }
 
+// Claimable outcomes that had no conservative-fill return (withheld, not
+// valued on another basis).
+export function buildClaimedWithheld(payload = {}) {
+  return Number((payload.claimed_evidence || {}).selector_withheld_count || 0)
+}
+
+// The fragility check belongs to the claim when there is one; otherwise it
+// describes the observational figure and says so.
 export function buildOutlierDependence(payload = {}) {
-  const item = ((payload.uncertainty || {}).selector || {}).outlier_dependence || {}
+  const claimedItem = (((payload.claimed_evidence || {}).selector) || {}).outlier_dependence || {}
+  const claimedAvailable = finiteOrNull(claimedItem.mean_without_top_k) !== null
+  const item = claimedAvailable ? claimedItem : ((payload.uncertainty || {}).selector || {}).outlier_dependence || {}
   return {
     available: item.mean_without_top_k !== null && item.mean_without_top_k !== undefined,
+    basis: claimedAvailable ? 'claimed' : 'observational',
     k: Number(item.k || 5),
     withoutTopLabel: formatReturnPct(item.mean_without_top_k),
     withoutBottomLabel: formatReturnPct(item.mean_without_bottom_k),

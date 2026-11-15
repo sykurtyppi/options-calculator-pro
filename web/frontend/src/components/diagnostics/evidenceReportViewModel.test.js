@@ -15,6 +15,7 @@ import {
   buildUniverseShadowSummary,
   buildOutlierDependence,
   buildUncertaintyRows,
+  buildClaimedWithheld,
 } from './evidenceReportViewModel.js'
 
 const payload = {
@@ -268,9 +269,9 @@ const uncertaintyPayload = {
 test('uncertainty rows put every comparison next to its interval', () => {
   const rows = buildUncertaintyRows(uncertaintyPayload)
   assert.deepEqual(rows.map((row) => row.label), [
-    'Selector vs no trade',
-    'Selector − Always ATM straddle (same events)',
-    'Picked − skipped (Always OTM strangle)',
+    'Observational: Selector vs no trade (modeled net)',
+    'Observational: Selector − Always ATM straddle, same events (modeled net)',
+    'Observational: Picked − skipped, Always OTM strangle (modeled net)',
   ])
   assert.equal(rows[0].intervalLabel, '+1.2% to +11.9%')
   assert.equal(rows[0].verdictLabel, 'Above zero')
@@ -279,6 +280,37 @@ test('uncertainty rows put every comparison next to its interval', () => {
   assert.equal(rows[2].n, '4 vs 20')
   assert.equal(rows[2].intervalLabel, '—')
   assert.equal(rows[2].verdictLabel, 'Too few to tell')
+})
+
+test('the claimed analysis comes first and is never confused with the observational one', () => {
+  const rows = buildUncertaintyRows({
+    ...uncertaintyPayload,
+    claimed_evidence: {
+      selector: { n: 11, mean: -1.4, ci_low: -3.2, ci_high: 0.5, verdict: 'includes_zero',
+        outlier_dependence: { k: 5, mean_without_top_k: -4.1, fragile: false } },
+      selector_minus_baseline: { always_atm_straddle: { pairs: 10, mean: -2, ci_low: -5, ci_high: 1, verdict: 'includes_zero' } },
+      universe_picked_minus_skipped: {},
+      selector_withheld_count: 2,
+    },
+  })
+  assert.deepEqual(rows.map((row) => row.group), ['claimed', 'claimed', 'observational', 'observational', 'observational'])
+  assert.equal(rows[0].label, 'Claimed: Selector vs no trade (conservative fill)')
+  assert.equal(rows[0].meanLabel, '-1.4%')
+  assert.equal(rows[2].meanLabel, '+6.4%')
+  assert.equal(new Set(rows.map((row) => row.key)).size, rows.length)
+  assert.equal(buildClaimedWithheld({ claimed_evidence: { selector_withheld_count: 2 } }), 2)
+  assert.equal(buildClaimedWithheld({}), 0)
+})
+
+test('fragility describes the claimed result when there is one', () => {
+  const claimed = buildOutlierDependence({
+    ...uncertaintyPayload,
+    claimed_evidence: { selector: { outlier_dependence: { k: 5, mean_without_top_k: -4.1, fragile: false } } },
+  })
+  assert.equal(claimed.basis, 'claimed')
+  assert.equal(claimed.fragile, false)
+  assert.equal(claimed.withoutTopLabel, '-4.1%')
+  assert.equal(buildOutlierDependence(uncertaintyPayload).basis, 'observational')
 })
 
 test('outlier dependence flags a result carried by a few trades', () => {

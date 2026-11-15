@@ -19,6 +19,7 @@ from services.calibration_service import IVExpansionCalibration
 from services.durable_json import PersistenceError
 from services.outcome_recorder import OutcomeStore, finalize_trade_and_update_learning
 from services.structure_prior_store import StructurePriorStore
+from tests.unit.outcome_fixtures import claimed_exit_scenarios
 
 DAY = date(2026, 5, 1)
 
@@ -227,6 +228,7 @@ def test_finalize_marks_a_persistence_failure_as_retryable(tmp_path, monkeypatch
 
     result = finalize_trade_and_update_learning(
         trade_id="T1", exit_date=DAY, realized_return_pct=5.0, realized_expansion_pct=5.0, store=store,
+        exit_execution_scenarios=claimed_exit_scenarios(5.0),
     )
 
     assert result["learning_update_status"] == "calibration_failed"
@@ -320,6 +322,7 @@ def test_second_finalizer_is_refused_while_the_first_holds_the_claim(tmp_path, m
         finalize_trade_and_update_learning(
             trade_id="T1", exit_date=DAY, realized_return_pct=-50.0, realized_expansion_pct=-50.0,
             store=worker_b,
+            exit_execution_scenarios=claimed_exit_scenarios(-50.0),
         )
 
     assert learned == []
@@ -336,7 +339,8 @@ def test_refinalizing_a_finalized_trade_reruns_learning_idempotently(tmp_path, m
     monkeypatch.setattr(structure_prior_store, "get_structure_prior_store", lambda: priors)
     store = OutcomeStore(tmp_path / "o.sqlite")
     _open_trade(store, "T1")
-    kwargs = dict(trade_id="T1", exit_date=DAY, realized_return_pct=5.0, realized_expansion_pct=5.0, store=store)
+    kwargs = dict(trade_id="T1", exit_date=DAY, realized_return_pct=5.0, realized_expansion_pct=5.0, store=store,
+                  exit_execution_scenarios=claimed_exit_scenarios(5.0))
 
     first = finalize_trade_and_update_learning(**kwargs)
     second = finalize_trade_and_update_learning(**{**kwargs, "realized_return_pct": 77.0})
@@ -351,11 +355,13 @@ def _finalize_worker(db: str, ret: float, barrier, results) -> None:
     # before spawn), since the modules resolve them at import time.
     from services.outcome_recorder import OutcomeStore as Store
     from services.outcome_recorder import finalize_trade_and_update_learning as finalize
+    from tests.unit.outcome_fixtures import claimed_exit_scenarios
 
     store = Store(Path(db))
     barrier.wait()
     try:
-        finalize(trade_id="RACE", exit_date=DAY, realized_return_pct=ret, realized_expansion_pct=ret, store=store)
+        finalize(trade_id="RACE", exit_date=DAY, realized_return_pct=ret, realized_expansion_pct=ret, store=store,
+                 exit_execution_scenarios=claimed_exit_scenarios(ret))
         results.put(("ok", ret))
     except ValueError:
         results.put(("refused", ret))

@@ -285,8 +285,13 @@ def test_forward_performance_aggregates_outcomes_by_structure_quality_and_bucket
     assert payload["spread_cost_buckets"]["30pct_plus_spread_cost"]["n"] == 1
     assert payload["execution_scenario_comparison"]["mid"]["n"] == 3
     assert payload["claimable_evidence"]["claimable_count"] == 1
-    assert payload["claimable_performance"]["claimable"]["n"] == 1
+    # The claimable row's stored scenarios have a mid return but no
+    # conservative fill: it is withheld from the claimed figure, never valued
+    # at its modeled-net return.
+    claimable = payload["claimable_performance"]["claimable"]
+    assert (claimable["n"], claimable["withheld_count"], claimable["return_basis"]) == (0, 1, "conservative_fill")
     assert payload["claimable_performance"]["non_claimable"]["n"] == 2
+    assert payload["claimable_performance"]["non_claimable"]["return_basis"] == "modeled_net"
     assert payload["outcome_count_by_symbol"]["AAPL"] == 1
     assert any(row["bucket"] == "75-90" and row["n"] == 1 for row in payload["calibration_buckets"])
     assert payload["calibration_report"]["selector_score_bucket"]["0.75-0.90"]["n"] == 1

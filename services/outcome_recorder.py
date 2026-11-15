@@ -1481,7 +1481,10 @@ def finalize_trade_and_update_learning(
     ----------
     trade_id : str
     realized_return_pct : float
-        Net return after costs, in % (9.0 = 9%).  Positive = profitable.
+        Modeled-net return (mid return minus the cost the selector modeled at
+        entry), in % (9.0 = 9%). Stored on the row; NOT what priors learn:
+        priors learn the conservative-fill return from exit_execution_scenarios
+        (services.outcome_returns.PRIOR_LEARNING_RETURN_BASIS).
     realized_expansion_pct : float
         Gross option value change from entry to exit, in %.
         Positive = IV expansion occurred.  Negative = crush.
@@ -1730,18 +1733,33 @@ def finalize_trade_and_update_learning(
     prior_obs_count = 0
     prior_win_rate: Optional[float] = None
     prior_ok = False
+    # Priors learn the claimed (conservative-fill) return, read from the
+    # stored exit scenarios: never the modeled-net realized_return_pct, which
+    # is mid minus the selector's own cost guess. No conservative fill, no
+    # prior observation (fails closed; the trade itself is still finalized).
+    from services.outcome_returns import PRIOR_LEARNING_RETURN_BASIS, return_pct
+
+    prior_learning_return = return_pct(s.get_trade(trade_id) or {}, PRIOR_LEARNING_RETURN_BASIS)
+    prior_learning_withheld = prior_learning_return is None
     try:
         from services.structure_prior_store import get_structure_prior_store
 
         ps = get_structure_prior_store()
-        prior_recorded = ps.update(
-            structure=structure,
-            realized_return_pct=realized_return_pct,
-            realized_expansion_pct=realized_expansion_pct,
-            source_type=_source_type,
-            observation_date=resolved_exit_date,
-            observation_id=trade_id,
-        )
+        if prior_learning_withheld:
+            warnings.append(
+                f"structure prior not updated: no {PRIOR_LEARNING_RETURN_BASIS} return for this trade"
+            )
+            prior_recorded = False
+        else:
+            prior_recorded = ps.update(
+                structure=structure,
+                realized_return_pct=prior_learning_return,
+                realized_expansion_pct=realized_expansion_pct,
+                source_type=_source_type,
+                observation_date=resolved_exit_date,
+                observation_id=trade_id,
+                return_basis=PRIOR_LEARNING_RETURN_BASIS,
+            )
         if prior_recorded and not _still_owned():
             s.flag_learning_written_without_claim(trade_id)
             return _claim_lost_result()
@@ -1807,6 +1825,9 @@ def finalize_trade_and_update_learning(
         "calibration_phase": cal_phase,
         "prior_observation_count": prior_obs_count,
         "prior_win_rate": round(prior_win_rate, 4) if prior_win_rate is not None else None,
+        "prior_return_basis": PRIOR_LEARNING_RETURN_BASIS,
+        "prior_learning_return_pct": None if prior_learning_withheld else round(prior_learning_return, 4),
+        "prior_learning_withheld": prior_learning_withheld,
         "status": "finalized",
         "learning_update_status": learning_status,
         "warnings": warnings,

@@ -13,6 +13,7 @@ from services.claim_contract import CONTRACT_VERSION
 from services.evidence_health import DEFAULT_MAX_EXIT_ATTRITION_RATE
 from services.evidence_report import MIN_RESOLVED_SAMPLE
 from services.evidence_statistics import BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED, CONFIDENCE, MIN_CI_SAMPLE, OUTLIER_K
+from services.outcome_returns import RETURN_CLAIM, RETURN_MODELED_NET
 
 DOC = (Path(__file__).resolve().parents[3] / "docs" / "PREREGISTRATION.md").read_text()
 
@@ -31,3 +32,10 @@ def test_every_baseline_it_compares_against_exists() -> None:
     for name in ("always_atm_straddle", "always_otm_strangle", "always_iron_condor"):
         assert name in BASELINE_STRUCTURES
         assert name in DOC
+
+
+def test_the_hypotheses_name_the_claimed_return_not_the_modeled_one() -> None:
+    assert f"return basis\n`{RETURN_CLAIM}`" in DOC
+    assert f"`{RETURN_MODELED_NET}`" in DOC
+    assert "`claimed_evidence.selector`" in DOC
+    assert "`claimed_evidence.selector_minus_baseline`" in DOC
