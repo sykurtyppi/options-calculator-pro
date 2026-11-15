@@ -23,3 +23,6 @@ Tests cover structure differentiation, monotonic penalties, no-trade eligibility
 
 ## Do Not Infer
 Do not infer that the highest score guarantees profit or that score differences are precise expected-return differences.
+
+## Iron Condor Horizon
+Every structure exits the session before earnings, so the iron condor is scored for that window: it never collects the post-earnings crush or faces the earnings move, and the crush classifier and earnings-move ratios do not enter its score. Under the event split's assumption (non-event implied vol = HAR forecast) the premium that decays before the exit is priced at fair value at best, so the snapshot signal tops out at zero; a positive condor edge can only come from real condor outcomes through the walk-forward prior. A hold-through-earnings condor would be a different strategy with its own exit rule.

@@ -2738,6 +2738,8 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
         # model never saw for that case.
         iv_rv=_safe_float(vol_snapshot.iv_rv_yz, NO_RV_IV_RV_RATIO),
     )
+    # Passed for compatibility; no scorer uses it now (the condor exits before
+    # earnings and never holds the crush; see score_iron_condor).
     structure_scorecards = build_structure_scorecards(
         vol_snapshot, crush_probability=_condor_crush_prob
     )
