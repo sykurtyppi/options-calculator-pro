@@ -90,6 +90,12 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from services import release_timing as _release_timing_rule  # noqa: E402
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 # Increment this string whenever the label selection logic changes materially.
@@ -423,29 +429,21 @@ def _ensure_schema(db_path: Path, logger: logging.Logger) -> None:
 
 # ─── Earnings date fetching ────────────────────────────────────────────────────
 
-def _infer_release_timing(event_dt: datetime, row: Optional[pd.Series]) -> str:
+def _infer_release_timing(event_ts: Any, row: Optional[pd.Series]) -> str:
     """
-    Infer release timing from yfinance row metadata and timestamp hour.
-    Returns 'AMC', 'BMO', or 'UNKNOWN'.
-
-    This mirrors the heuristic in InstitutionalMLDatabase._infer_release_timing_from_earnings_row.
+    AMC / BMO / DMH / UNKNOWN from yfinance row metadata, else the row's own
+    timestamp judged on the New York clock (services.release_timing is the rule;
+    the same one InstitutionalMLDatabase uses). Pass the timestamp tz-aware, as
+    the provider gave it.
     """
     if row is not None:
         for key, value in row.items():
             key_text = str(key).lower()
             if "time" in key_text or "hour" in key_text:
-                text = str(value or "").strip().upper()
-                if "AMC" in text or "AFTER" in text or text in {"POST", "PM"}:
-                    return "AMC"
-                if "BMO" in text or "BEFORE" in text or text in {"PRE", "AM"}:
-                    return "BMO"
-
-    hour = int(event_dt.hour)
-    if hour >= 15:
-        return "AMC"
-    if 0 <= hour <= 10:
-        return "BMO"
-    return "UNKNOWN"
+                timing = _release_timing_rule.to_code(value)
+                if timing != "UNKNOWN":
+                    return timing
+    return _release_timing_rule.classify_instant(event_ts)
 
 
 def _load_cached_earnings(
@@ -539,15 +537,16 @@ def _fetch_earnings_from_yfinance(
     events: List[EarningsEvent] = []
     for idx, ts in enumerate(pd.to_datetime(earnings_df.index)):
         ts_obj = pd.Timestamp(ts)
+        provider_ts = ts_obj  # as given (tz-aware): timing is judged on the New York clock
         if ts_obj.tzinfo is not None:
             ts_obj = ts_obj.tz_convert(None)
         dt = ts_obj.to_pydatetime()
-        # Normalise to midnight for date comparison
-        event_date = dt.replace(hour=0, minute=0, second=0, microsecond=0).date()
+        # The New York date of the release (a 20:30 ET stamp is the next day in UTC).
+        event_date = _release_timing_rule.market_date(provider_ts)
         if not (start_date <= event_date <= end_date):
             continue
         row = earnings_df.iloc[idx] if idx < len(earnings_df) else None
-        timing = _infer_release_timing(dt, row)
+        timing = _infer_release_timing(provider_ts, row)
         events.append(EarningsEvent(
             symbol=symbol,
             event_date=event_date,

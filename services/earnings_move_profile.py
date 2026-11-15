@@ -23,37 +23,18 @@ from typing import Any, Dict, List, Mapping, Optional
 import numpy as np
 import pandas as pd
 
+from services import release_timing as _release_timing_rule
 from services.candidate_shadow_outcome import safe_float
 
 
 def normalize_release_timing(value: Any) -> str:
-    """Canonical BMO / AMC / intraday classifier for an earnings release time.
+    """Long timing label for a release time or token (services.release_timing is the rule).
 
-    Accepts a datetime/Timestamp (inferred from time-of-day) or a free string
-    ("before market open", "amc", "post", …). Returns one of
-    "before market open" / "after market close" / "during market hours" /
-    "unknown".
+    Returns "before market open" / "after market close" / "during market hours"
+    / "unknown". A timestamp is judged on the New York clock (naive values are
+    New York wall-clock time); a date-only value is "unknown".
     """
-    if isinstance(value, pd.Timestamp):
-        value = value.to_pydatetime()
-    if isinstance(value, datetime):
-        if any((value.hour, value.minute, value.second, value.microsecond)):
-            total_minutes = (value.hour * 60) + value.minute
-            if total_minutes < (9 * 60 + 30):
-                return "before market open"
-            if total_minutes >= (16 * 60):
-                return "after market close"
-            return "during market hours"
-    text = str(value or "").strip().lower()
-    if not text:
-        return "unknown"
-    if "before" in text or text in {"bmo", "pre", "am"}:
-        return "before market open"
-    if "after" in text or text in {"amc", "post", "pm"}:
-        return "after market close"
-    if "during" in text or "intraday" in text:
-        return "during market hours"
-    return "unknown"
+    return _release_timing_rule.to_label(value)
 
 
 @dataclass(frozen=True)

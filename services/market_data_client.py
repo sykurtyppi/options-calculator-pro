@@ -377,16 +377,12 @@ class MarketDataClient:
 
         # Normalise reportTime to short form for convenience
         def _normalise_rt(v: Any) -> Optional[str]:
+            from services import release_timing as _release_timing_rule
+
             if v is None:
                 return None
-            s = str(v).lower().strip()
-            if "before" in s:
-                return "before market open"
-            if "after" in s:
-                return "after market close"
-            if "during" in s:
-                return "during market hours"
-            return s or None
+            code = _release_timing_rule.to_code(v)
+            return None if code == _release_timing_rule.UNKNOWN else _release_timing_rule.to_label(code)
 
         df["reportTime"] = df["reportTime"].map(_normalise_rt)
 

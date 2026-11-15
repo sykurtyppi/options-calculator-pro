@@ -29,6 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from services import release_timing as _release_timing_rule
 from services.earnings_vol_snapshot import build_vol_snapshot
 from services.structure_scorecard import build_structure_scorecards
 from services.structure_selector import select_best_structure
@@ -140,28 +141,23 @@ def _parse_date(value: Any) -> date | None:
 
 
 def _normalize_timing(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    if not text:
-        return "UNKNOWN"
-    if text in {"amc", "after market close", "after-hours", "after hours"} or "after" in text:
-        return "AMC"
-    if text in {"bmo", "before market open", "pre-market", "pre market"} or "before" in text:
-        return "BMO"
-    if text in {"dmh", "during market hours", "during market"} or "during" in text:
-        return "DMH"
-    return "UNKNOWN"
+    return _release_timing_rule.to_code(value)
 
 
 def _infer_timing_from_timestamp(ts: Any) -> tuple[str, str | None]:
+    """Timing of a provider earnings timestamp, judged on the New York clock."""
     parsed = pd.to_datetime(ts, utc=True, errors="coerce")
     if pd.isna(parsed):
         return "UNKNOWN", None
-    hour = int(parsed.hour)
-    if hour >= 20:
-        return "AMC", parsed.isoformat()
-    if hour < 14:
-        return "BMO", parsed.isoformat()
-    return "UNKNOWN", parsed.isoformat()
+    return _release_timing_rule.classify_instant(parsed), parsed.isoformat()
+
+
+def _infer_timing_from_acceptance(value: Any) -> tuple[str, str | None]:
+    """Timing of an EDGAR acceptanceDateTime (both time-zone readings must agree)."""
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return "UNKNOWN", None
+    return _release_timing_rule.classify_sec_acceptance(value), parsed.isoformat()
 
 
 def _fetch_yfinance_events(symbol: str, start: date, end: date, *, limit: int = 100) -> list[EarningsRecord]:
@@ -185,7 +181,8 @@ def _fetch_yfinance_events(symbol: str, start: date, end: date, *, limit: int = 
     for idx, event_ts in enumerate(pd.to_datetime(frame.index, utc=True, errors="coerce")):
         if pd.isna(event_ts):
             continue
-        event_date = event_ts.date()
+        # The New York date of the release (a 20:30 ET stamp is the next day in UTC).
+        event_date = _release_timing_rule.market_date(event_ts)
         if not (start <= event_date <= end):
             continue
         row = frame.iloc[idx].to_dict() if idx < len(frame) else {}
@@ -319,7 +316,7 @@ def _sec_confirmation_records(
             continue
         candidates.sort(key=lambda row: (abs((row["filing_date"] - event.event_date).days), row["filing_date"]))
         selected = candidates[0]
-        timing, source_time = _infer_timing_from_timestamp(selected.get("acceptanceDateTime"))
+        timing, source_time = _infer_timing_from_acceptance(selected.get("acceptanceDateTime"))
         confirmations.append(
             EarningsRecord(
                 symbol=symbol,

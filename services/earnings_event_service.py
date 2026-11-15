@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 import pandas as pd
+
+from services import release_timing as _release_timing_rule
 import requests
 import yfinance as yf
 
@@ -69,31 +71,8 @@ class ResolvedEarningsEvent:
 
 
 def _normalize_release_timing(value: Any) -> str:
-    if value is None:
-        return "UNKNOWN"
-    text = str(value).strip().lower()
-    if not text:
-        return "UNKNOWN"
-    if text in {"amc", "after market close", "after-hours", "after hours"}:
-        return "AMC"
-    if text in {"bmo", "before market open", "pre-market", "pre market"}:
-        return "BMO"
-    if text in {"dmh", "during market hours", "during market"}:
-        return "DMH"
-    if text in {"unknown", "tbd", "time not supplied"}:
-        return "UNKNOWN"
-    if ":" in text:
-        try:
-            parts = text.replace("am", " am").replace("pm", " pm")
-            parsed = datetime.strptime(parts.strip(), "%I:%M %p")
-            if parsed.hour < 9 or (parsed.hour == 9 and parsed.minute < 30):
-                return "BMO"
-            if parsed.hour >= 16:
-                return "AMC"
-            return "DMH"
-        except ValueError:
-            pass
-    return "UNKNOWN"
+    """AMC / BMO / DMH / UNKNOWN (services.release_timing is the rule)."""
+    return _release_timing_rule.to_code(value)
 
 
 def _parse_date(value: Any) -> Optional[date]:
@@ -131,47 +110,15 @@ def _extract_calendar_dates(raw_calendar: Any) -> list[date]:
 
 def _infer_release_timing_from_info(info: dict[str, Any]) -> str:
     ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
-    if ts is None:
-        return "UNKNOWN"
-    try:
-        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
-    except (TypeError, ValueError, OSError):
-        return "UNKNOWN"
-    if dt.hour >= 20:
-        return "AMC"
-    if dt.hour < 16:
-        return "BMO"
-    return "UNKNOWN"
+    return _release_timing_rule.classify_instant(ts) if ts is not None else "UNKNOWN"
 
 
 def _infer_release_timing_from_acceptance(value: Any) -> str:
-    if value is None:
-        return "UNKNOWN"
-    text = str(value).strip()
-    if not text:
-        return "UNKNOWN"
-    try:
-        accepted = pd.to_datetime(text, utc=True, errors="coerce")
-    except Exception:
-        accepted = pd.NaT
-    if pd.isna(accepted):
-        return "UNKNOWN"
-    accepted_dt = accepted.to_pydatetime()
-    if accepted_dt.hour >= 20:
-        return "AMC"
-    if accepted_dt.hour < 16:
-        return "BMO"
-    return "UNKNOWN"
+    return _release_timing_rule.classify_sec_acceptance(value)
 
 
 def _timing_label_to_full(label: str) -> str:
-    if label == "AMC":
-        return "after market close"
-    if label == "BMO":
-        return "before market open"
-    if label == "DMH":
-        return "during market hours"
-    return "unknown"
+    return _release_timing_rule.to_label(label)
 
 
 class EarningsEventService:
@@ -571,10 +518,8 @@ class EarningsEventService:
                     parsed = _parse_date(idx)
                     if parsed is None or parsed < as_of or parsed > cutoff:
                         continue
-                    idx_ts = pd.Timestamp(idx)
-                    timing = "UNKNOWN"
-                    if idx_ts.hour or idx_ts.minute:
-                        timing = _normalize_release_timing(idx_ts.strftime("%I:%M %p"))
+                    # Judged on the New York clock; a date-only stamp is UNKNOWN.
+                    timing = _release_timing_rule.classify_instant(pd.Timestamp(idx))
                     candidates.append(
                         EarningsEventCandidate(
                             symbol=symbol.upper(),

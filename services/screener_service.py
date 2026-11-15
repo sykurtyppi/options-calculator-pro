@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from services import release_timing as _release_timing_rule
 from services.earnings_event_service import _timing_label_to_full, resolve_upcoming_earnings_event
 from services.earnings_vol_snapshot import VolSnapshot, build_vol_snapshot
 from services.iv_term_structure import select_tenor_spanning_expiries
@@ -332,15 +333,8 @@ def _get_next_earnings(
                     event_date = pd.Timestamp(idx).normalize().date()
                     if today <= event_date <= cutoff:
                         dte = (event_date - today).days
-                        # infer timing from timestamp hour
-                        ts_raw = pd.Timestamp(idx)
-                        total_min = ts_raw.hour * 60 + ts_raw.minute if ts_raw.hour else 0
-                        if total_min < 9 * 60 + 30 and total_min > 0:
-                            timing = "BMO"
-                        elif total_min >= 16 * 60:
-                            timing = "AMC"
-                        else:
-                            timing = "UNKNOWN"
+                        # Timing from the stamp, judged on the New York clock.
+                        timing = _release_timing_rule.classify_instant(pd.Timestamp(idx))
                         return dte, timing, event_date
     except Exception as exc:
         # V7 (F3): the earnings date anchors the entire thesis — a swallowed
@@ -374,21 +368,11 @@ def _get_next_earnings(
 
 
 def _release_timing_label_to_full(label: str) -> str:
-    norm = str(label or "").upper()
-    if norm == "AMC":
-        return "after market close"
-    if norm == "BMO":
-        return "before market open"
-    return "unknown"
+    return _release_timing_rule.to_label(label)
 
 
 def _release_timing_full_to_label(value: str) -> str:
-    norm = str(value or "").strip().lower()
-    if norm == "after market close":
-        return "AMC"
-    if norm == "before market open":
-        return "BMO"
-    return "UNKNOWN"
+    return _release_timing_rule.to_code(value)
 
 
 def _collect_yf_past_earnings_events(ticker: yf.Ticker, today: date) -> List[Dict[str, Any]]:
@@ -399,18 +383,11 @@ def _collect_yf_past_earnings_events(ticker: yf.Ticker, today: date) -> List[Dic
             edf = get_dates(limit=24)
             if edf is not None and not edf.empty:
                 for idx in edf.index:
-                    ts = pd.Timestamp(idx).tz_localize(None)
+                    stamp = pd.Timestamp(idx)
+                    ts = stamp.tz_localize(None)
                     event_date = ts.normalize().date()
                     if event_date < today:
-                        release_timing = _release_timing_label_to_full("UNKNOWN")
-                        if ts.hour or ts.minute:
-                            if ts.hour < 9 or (ts.hour == 9 and ts.minute < 30):
-                                release_timing = "before market open"
-                            elif ts.hour >= 16:
-                                release_timing = "after market close"
-                            else:
-                                release_timing = "during market hours"
-                        events.append({"event_date": ts.normalize(), "release_timing": release_timing})
+                        events.append({"event_date": ts.normalize(), "release_timing": _release_timing_rule.to_label(stamp)})
         except Exception:
             pass
     if events:
