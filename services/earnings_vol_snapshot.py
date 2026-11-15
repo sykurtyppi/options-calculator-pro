@@ -752,6 +752,14 @@ def _structure_legs_from_inputs(
         parts = raw if isinstance(raw, (list, tuple)) else [raw]
         normalized = [_normalize_option_chain(part)[0] for part in parts]
         normalized = [part for part in normalized if not part.empty]
+        # A row with no quote time of its own (after the normaliser has read
+        # any provider timestamp) was quoted when it was fetched: stamp it with
+        # the fetch date, never the as-of date.
+        fetched_on = structure_chain.get("fetched_on")
+        if fetched_on:
+            stamp = pd.Timestamp(fetched_on)
+            normalized = [part.assign(trade_date=pd.to_datetime(part["trade_date"], errors="coerce").fillna(stamp))
+                          for part in normalized]
         frame = pd.concat(normalized, ignore_index=True) if normalized else pd.DataFrame()
         # The same point-in-time guard as the primary chain: rows quoted after
         # the as-of date, or with no valid trade date, never price the legs.

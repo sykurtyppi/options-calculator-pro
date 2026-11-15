@@ -2286,6 +2286,7 @@ def _collect_yf_option_chain_frame(
     as_of_date: date,
     max_expiries: int = 6,
     expiries: Optional[List[str]] = None,
+    stamp_trade_date: bool = True,
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
     # Tenor-spanning selection (same fetch count) so the yfinance fallback
@@ -2343,7 +2344,11 @@ def _collect_yf_option_chain_frame(
                 # mid injected here would survive and silently defeat it.
                 rows.append(
                     {
-                        "trade_date": as_of_date.isoformat(),
+                        # The structure-leg fetch leaves the date off: the
+                        # snapshot stamps genuinely undated rows with the real
+                        # fetch date, so a later live fetch is not passed off
+                        # as the as-of date's quotes.
+                        "trade_date": as_of_date.isoformat() if stamp_trade_date else None,
                         "expiry": str(expiry)[:10],
                         "call_put": side,
                         "strike": row.get("strike"),
@@ -2407,52 +2412,52 @@ def _fetch_structure_chain(
         return None
     back = _structure_legs_rule.calendar_back_expiry(listing, front)
 
+    class _ProviderFailed(Exception):
+        pass
+
     def _provider_chain(expiry: date) -> Optional[pd.DataFrame]:
         try:
             return client.get_option_chain(
                 symbol, expiration=expiry.isoformat(), strike_limit=_structure_legs_rule.ENTRY_STRIKE_LIMIT,
             )
         except Exception as exc:  # noqa: BLE001
+            # Entry does not survive a provider error (it raises before any
+            # fallback), so nothing here may be certified as what entry sees.
             logger.info("Structure-leg chain fetch failed for %s %s: %s", symbol, expiry, exc)
-            return None
+            raise _ProviderFailed() from exc
 
     def _yahoo_chain(expiry: date) -> Optional[pd.DataFrame]:
         if ticker is None:
             return None
-        return _collect_yf_option_chain_frame(ticker, as_of_date=as_of_date, expiries=[expiry.isoformat()])
+        return _collect_yf_option_chain_frame(
+            ticker, as_of_date=as_of_date, expiries=[expiry.isoformat()], stamp_trade_date=False,
+        )
 
     # Entry's source state machine (fetch_structure_quote): the front chain
     # comes from the provider when it has calls AND puts, else from yfinance;
     # the calendar back chain comes from the SAME source as the front, with no
-    # fallback of its own. Choosing each expiry's source independently would
-    # price a front and back entry never combines.
-    front_frame = _provider_chain(front) if use_provider and client is not None else None
-    front_from_provider = _chain_has_both_sides(front_frame)
-    if not front_from_provider:
-        front_frame = _yahoo_chain(front)
-    if front_frame is None or front_frame.empty:
-        # A chain that did not arrive is not evidence the legs are missing:
-        # leave the snapshot's legs "sampled" rather than half-complete.
-        return None
-    parts: List[pd.DataFrame] = [front_frame]
-    if back is not None:
-        back_frame = _provider_chain(back) if front_from_provider else _yahoo_chain(back)
-        if back_frame is None or back_frame.empty:
+    # fallback of its own. A provider that raises (rather than returning an
+    # incomplete chain) makes entry fail, so the legs stay "sampled".
+    try:
+        front_frame = _provider_chain(front) if use_provider and client is not None else None
+        front_from_provider = _chain_has_both_sides(front_frame)
+        if not front_from_provider:
+            front_frame = _yahoo_chain(front)
+        if front_frame is None or front_frame.empty:
+            # A chain that did not arrive is not evidence the legs are missing.
             return None
-        parts.append(back_frame)
-    # Live fetch: a row without its own trade date was quoted today. Stamp it
-    # with the fetch date (never the as-of date) so the snapshot's as-of
-    # guard can still refuse it for a past as-of.
-    fetched_on = _market_today_date().isoformat()
-    stamped = []
-    for part in parts:
-        part = part.copy()
-        if "trade_date" not in part.columns:
-            part["trade_date"] = fetched_on
-        else:
-            part["trade_date"] = part["trade_date"].where(part["trade_date"].notna(), fetched_on)
-        stamped.append(part)
-    return {"listing": listing, "chain": stamped}
+        parts: List[pd.DataFrame] = [front_frame]
+        if back is not None:
+            back_frame = _provider_chain(back) if front_from_provider else _yahoo_chain(back)
+            if back_frame is None or back_frame.empty:
+                return None
+            parts.append(back_frame)
+    except _ProviderFailed:
+        return None
+    # Undated rows are stamped by the snapshot AFTER normalisation, so a
+    # provider's own quote time (report_date / updated) always wins.
+    return {"listing": listing, "chain": parts, "fetched_on": _market_today_date().isoformat()}
+
 
 
 def _attach_live_forward_provenance(edge_snapshot: "EdgeSnapshot") -> None:
