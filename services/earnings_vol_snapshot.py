@@ -274,7 +274,18 @@ def build_vol_snapshot(
     price_data: Any = None,
     config: Optional[VolSnapshotConfig] = None,
     options_provider: Optional[str] = None,
+    structure_chain: Optional[Mapping[str, Any]] = None,
 ) -> VolSnapshot:
+    """Build the point-in-time volatility snapshot for one symbol.
+
+    ``structure_chain`` (optional): ``{"listing": [every listed expiry],
+    "chain": the trade (and calendar back) expiry chains fetched the way entry
+    fetches them}``. With it the structure legs are resolved from the complete
+    listing and entry-equivalent strike coverage (coverage "complete"); without
+    it they come from the analysis chain, which may hold only sampled tenors
+    and a narrow strike window (coverage "sampled"), and must not be read as
+    "this structure cannot be formed".
+    """
     cfg = config or VolSnapshotConfig()
     as_of_date = _coerce_date(as_of)
     null_reasons: Dict[str, str] = {}
@@ -489,8 +500,8 @@ def build_vol_snapshot(
             else:
                 event_decomposition_status = "no_event_spanning_expiry"
 
-    structure_legs = _structure_legs_for_chain(
-        chain_frame, underlying_price, earnings_date, earnings.release_timing, as_of_date,
+    structure_legs = _structure_legs_from_inputs(
+        structure_chain, chain_frame, underlying_price, earnings_date, earnings.release_timing, as_of_date,
     )
 
     _decomp = decompose_event_vol(
@@ -723,19 +734,66 @@ def build_vol_snapshot(
     )
 
 
+COVERAGE_COMPLETE = "complete"
+COVERAGE_SAMPLED = "sampled"
+
+
+def _structure_legs_from_inputs(
+    structure_chain: Optional[Mapping[str, Any]],
+    analysis_chain: pd.DataFrame,
+    underlying_price: Optional[float],
+    earnings_date: Optional[date],
+    release_timing: str,
+    as_of_date: date,
+) -> Dict[str, Any]:
+    """Structure legs from the entry-equivalent fetch when given, else (sampled) the analysis chain."""
+    if structure_chain:
+        raw = structure_chain.get("chain")
+        parts = raw if isinstance(raw, (list, tuple)) else [raw]
+        normalized = [_normalize_option_chain(part)[0] for part in parts]
+        normalized = [part for part in normalized if not part.empty]
+        frame = pd.concat(normalized, ignore_index=True) if normalized else pd.DataFrame()
+        listing = [pd.Timestamp(v).date() for v in (structure_chain.get("listing") or []) if v]
+        if not frame.empty and listing and earnings_date is not None:
+            legs = _structure_legs_for_chain(
+                frame, underlying_price, earnings_date, release_timing, as_of_date, listing=listing,
+            )
+            # Complete only if every expiry the legs need was actually fetched
+            # (both sides): a chain that failed to arrive is not a missing leg.
+            fetched = {
+                (pd.Timestamp(e).date(), side)
+                for e, side in zip(frame["expiry"], frame["call_put"]) if pd.notna(e)
+            }
+            needed = [legs.get("trade_expiry"), legs.get("back_expiry")] if legs else []
+            if legs and needed[0] is not None and all(
+                {(date.fromisoformat(e), "C"), (date.fromisoformat(e), "P")} <= fetched
+                for e in needed if e is not None
+            ):
+                return {**legs, "coverage": COVERAGE_COMPLETE}
+    legs = _structure_legs_for_chain(analysis_chain, underlying_price, earnings_date, release_timing, as_of_date)
+    return {**legs, "coverage": COVERAGE_SAMPLED} if legs else {}
+
+
 def _structure_legs_for_chain(
     chain_frame: pd.DataFrame,
     underlying_price: Optional[float],
     earnings_date: Optional[date],
     release_timing: str,
     as_of_date: date,
+    *,
+    listing: Optional[Sequence[date]] = None,
 ) -> Dict[str, Any]:
-    """The legs every structure would book on this chain (services.structure_legs)."""
+    """The legs every structure would book on this chain (services.structure_legs).
+
+    ``listing`` is the complete expiry listing; without it the expiries present
+    in the chain are used, which may be a sample.
+    """
     if (earnings_date is None or chain_frame is None or chain_frame.empty
             or underlying_price is None or not np.isfinite(underlying_price)):
         return {}
     expiry_dates = pd.to_datetime(chain_frame["expiry"], errors="coerce").dt.date
-    listed = sorted({d for d in expiry_dates.dropna().tolist() if d > as_of_date})
+    source = listing if listing is not None else expiry_dates.dropna().tolist()
+    listed = sorted({d for d in source if d > as_of_date})
     front = _structure_legs.trade_expiry(listed, earnings_date, release_timing)
     if front is None:
         return {"trade_expiry": None, "back_expiry": None, "structures": {

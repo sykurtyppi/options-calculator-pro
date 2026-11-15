@@ -70,6 +70,7 @@ from services.quote_provenance import quote_provenance_problem
 from services.structure_legs import (  # the shared discovery rules (see that module)
     CONDOR_SHORT_OTM_PCT,
     CONDOR_WING_OFFSET_PCT,
+    ENTRY_STRIKE_LIMIT,
     OTM_STRANGLE_FALLBACK_DISTANCE_PCT,
     OTM_STRANGLE_MIN_FALLBACK_DISTANCE,
     OTM_WING_PCT,
@@ -1034,7 +1035,7 @@ def fetch_structure_quote(
         mda_chain = resolved_mda_client.get_option_chain(
             symbol,
             expiration=str(pricing_context["front_expiry"]),
-            strike_limit=80,
+            strike_limit=ENTRY_STRIKE_LIMIT,
         )
         mda_calls, mda_puts = _split_marketdata_chain(mda_chain)
         if not mda_calls.empty and not mda_puts.empty:
@@ -1514,7 +1515,7 @@ def fetch_structure_quote(
             mda_back_chain = resolved_mda_client.get_option_chain(
                 symbol,
                 expiration=str(pricing_context["back_expiry"]),
-                strike_limit=80,
+                strike_limit=ENTRY_STRIKE_LIMIT,
             )
             back_calls, back_puts = _split_marketdata_chain(mda_back_chain)
             back_frame = back_calls if structure == "call_calendar" else back_puts

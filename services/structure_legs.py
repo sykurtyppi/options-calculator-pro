@@ -42,6 +42,9 @@ OTM_STRANGLE_MIN_FALLBACK_DISTANCE = 2.5
 CONDOR_SHORT_OTM_PCT = OTM_WING_PCT
 CONDOR_WING_OFFSET_PCT = 0.02
 CALENDAR_BACK_GAP_DAYS = 14
+# Strikes per expiry requested when a structure's legs are discovered, at entry
+# and (since the analysis must see what entry will see) in the analysis.
+ENTRY_STRIKE_LIMIT = 80
 
 STRUCTURES = ("atm_straddle", "otm_strangle", "call_calendar", "put_calendar", "iron_condor")
 
@@ -290,7 +293,19 @@ def discover_legs(
             return _result({}, "no_condor_call_wing")
         if long_put is None:
             return _result({}, "no_condor_put_wing")
-        return _result({"short_call": sc, "long_call": long_call, "short_put": sp, "long_put": long_put})
+        result = _result({"short_call": sc, "long_call": long_call, "short_put": sp, "long_put": long_put})
+        if result["reason"] is None:
+            # The same opening gates entry applies (fetch_structure_quote): a
+            # condor must pay a credit, and less than its wing width.
+            q = result["legs"]
+            credit = (q["short_call"]["mid"] - q["long_call"]["mid"]) + (q["short_put"]["mid"] - q["long_put"]["mid"])
+            width = max(q["long_call"]["strike"] - q["short_call"]["strike"],
+                        q["short_put"]["strike"] - q["long_put"]["strike"])
+            if credit <= 0:
+                return {**result, "reason": "non_positive_condor_credit", "leg_spread_pct": None}
+            if width - credit <= 0:
+                return {**result, "reason": "condor_credit_exceeds_wing_width", "leg_spread_pct": None}
+        return result
     if structure in ("call_calendar", "put_calendar"):
         front_frame = calls if structure == "call_calendar" else puts
         back_frame = back_calls if structure == "call_calendar" else back_puts
@@ -302,7 +317,11 @@ def discover_legs(
         back = row_at_strike(back_frame, float(front["strike"]))
         if back is None:
             return _result({}, "missing_back_leg")
-        return _result({"front": front, "back": back})
+        result = _result({"front": front, "back": back})
+        if result["reason"] is None and result["legs"]["back"]["mid"] - result["legs"]["front"]["mid"] <= 0:
+            # Entry books a calendar only for a positive debit.
+            return {**result, "reason": "non_positive_calendar_debit", "leg_spread_pct": None}
+        return result
     raise ValueError(f"unknown structure {structure!r}")
 
 
@@ -353,7 +372,7 @@ def compare_booked_to_scored(structure: str, booked_context: Any, structure_legs
 
 
 __all__ = [
-    "CALENDAR_BACK_GAP_DAYS", "CONDOR_SHORT_OTM_PCT", "CONDOR_WING_OFFSET_PCT", "OTM_STRANGLE_FALLBACK_DISTANCE_PCT",
+    "CALENDAR_BACK_GAP_DAYS", "CONDOR_SHORT_OTM_PCT", "ENTRY_STRIKE_LIMIT", "CONDOR_WING_OFFSET_PCT", "OTM_STRANGLE_FALLBACK_DISTANCE_PCT",
     "OTM_STRANGLE_MIN_FALLBACK_DISTANCE", "OTM_WING_PCT", "STRUCTURES",
     "calendar_back_expiry", "compare_booked_to_scored", "discover_legs", "max_strangle_fallback_distance", "mid_from_row", "nearest_row",
     "quote_invalid_reason", "row_at_strike", "select_condor_wing", "select_otm_wing", "trade_expiry",

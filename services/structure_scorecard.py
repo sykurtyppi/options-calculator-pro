@@ -915,11 +915,17 @@ def _booked_leg_spread(
     execution is priced on THOSE legs (OTM wings for strangles and condors,
     the back leg for calendars), not on the near-term ATM pair. When the chain
     shows the structure cannot be formed, the structure is ineligible (the
-    loop could not book it either). Only a snapshot built without a chain
-    (no ``structure_legs``) falls back to the ATM proxy.
+    loop could not book it either). That holds only for coverage "complete"
+    (the complete expiry listing and entry-equivalent strikes); otherwise
+    (sampled coverage, or no legs) the ATM proxy is used and nothing is ruled
+    out, because a missing leg may be missing only from the fetch.
     """
     legs = getattr(snapshot, "structure_legs", None) or {}
-    if not legs:
+    # Only legs resolved from the complete expiry listing with entry-equivalent
+    # strike coverage say what entry would book. Legs from the sampled analysis
+    # chain may be missing a wing or a back expiry that entry would find, so
+    # they neither price the structure nor rule it out.
+    if not legs or legs.get("coverage") != "complete":
         return atm_proxy
     entry = (legs.get("structures") or {}).get(structure) or {}
     value = entry.get("leg_spread_pct")

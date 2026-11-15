@@ -76,7 +76,8 @@ def test_each_structure_discovers_its_legs() -> None:
     assert _strikes(strangle) == {"call": 102.5, "put": 97.5}
     condor = sl.discover_legs("iron_condor", calls, puts, 100.0)
     assert _strikes(condor) == {"short_call": 102.5, "long_call": 105.0, "short_put": 97.5, "long_put": 95.0}
-    calendar = sl.discover_legs("call_calendar", calls, puts, 100.4, back_calls=calls, back_puts=puts)
+    calendar = sl.discover_legs("call_calendar", calls, puts, 100.4, back_calls=_pricier(calls),
+                                back_puts=_pricier(puts))
     assert _strikes(calendar) == {"front": 100.0, "back": 100.0}
     assert straddle["legs"]["call"]["contract"] == "XC100"
 
@@ -118,12 +119,20 @@ def test_no_spot_is_unformable() -> None:
 # ── entry books what was scored ─────────────────────────────────────────────
 
 
+def _pricier(frame):
+    out = frame.copy()
+    out[["bid", "ask"]] = out[["bid", "ask"]] * 1.5
+    return out
+
+
 def _install(monkeypatch, calls, puts, expiries):
     class _Ticker:
         options = expiries
 
-        def option_chain(self, _expiry):
-            return SimpleNamespace(calls=calls, puts=puts)
+        def option_chain(self, expiry):
+            if expiry == expiries[0]:
+                return SimpleNamespace(calls=calls, puts=puts)
+            return SimpleNamespace(calls=_pricier(calls), puts=_pricier(puts))
 
     monkeypatch.setattr(forward_loop.yf, "Ticker", lambda _s: _Ticker())
     monkeypatch.setattr(forward_loop, "_latest_spot_price", lambda _s: 100.0)
@@ -139,7 +148,10 @@ def test_entry_discovery_books_the_legs_the_scorer_priced(monkeypatch, structure
     assert quote.get("mid") is not None, quote.get("reason")
     scored = {
         "trade_expiry": "2026-11-20", "back_expiry": "2026-12-04",
-        "structures": {structure: sl.discover_legs(structure, calls, puts, 100.0, back_calls=calls, back_puts=puts)},
+        "structures": {structure: sl.discover_legs(structure, calls, puts, 100.0, back_calls=calls, back_puts=puts,
+                                                   ) if not structure.endswith("calendar") else
+                       sl.discover_legs(structure, calls, puts, 100.0, back_calls=_pricier(calls),
+                                        back_puts=_pricier(puts))},
     }
     check = sl.compare_booked_to_scored(structure, quote["context"], scored)
     assert check["match"] is True, check
@@ -194,8 +206,9 @@ def test_no_scored_legs_is_unknown_not_a_mismatch() -> None:
 # ── the scorer prices the booked legs ───────────────────────────────────────
 
 
-def _with_legs(structures: dict, **snapshot_kw):
-    return replace(_base_snapshot(**snapshot_kw), structure_legs={"trade_expiry": "2026-04-30", "structures": structures})
+def _with_legs(structures: dict, coverage: str = "complete", **snapshot_kw):
+    return replace(_base_snapshot(**snapshot_kw), structure_legs={
+        "trade_expiry": "2026-04-30", "structures": structures, "coverage": coverage})
 
 
 def _ok(spread):
@@ -236,7 +249,8 @@ def test_the_snapshot_records_the_legs_on_the_trade_expiry() -> None:
     legs = snap.structure_legs
     assert date.fromisoformat(legs["trade_expiry"]) > snap.earnings_date  # after-close: never the same day
     assert set(legs["structures"]) == set(sl.STRUCTURES)
-    assert all(entry["reason"] is None for entry in legs["structures"].values())
+    for name in ("atm_straddle", "otm_strangle", "iron_condor"):
+        assert legs["structures"][name]["reason"] is None, name
     assert snap.to_dict()["structure_legs"] == legs
 
 
@@ -281,3 +295,242 @@ def test_entry_records_whether_it_booked_the_scored_legs(tmp_path) -> None:
     assert run(100.0)["match"] is True
     moved = run(105.0)
     assert moved["match"] is False and moved["booked_strikes"]["call"] == 105.0
+
+
+
+@pytest.mark.parametrize("scorer,structure", [
+    (score_otm_strangle, "otm_strangle"),
+    (score_iron_condor, "iron_condor"),
+    (score_atm_straddle, "atm_straddle"),
+    (score_call_calendar, "call_calendar"),
+])
+def test_sampled_legs_neither_price_nor_rule_out_a_structure(scorer, structure) -> None:
+    # Legs from the analysis chain (narrow strike window, sampled tenors) may
+    # miss what entry would find: keep the ATM proxy and rule nothing out.
+    proxy = scorer(_base_snapshot())
+    unformable = scorer(_with_legs({structure: {"legs": {}, "reason": "wing_strike_unavailable",
+                                                "leg_spread_pct": None}}, coverage="sampled"))
+    wide = scorer(_with_legs({structure: _ok(9.0)}, coverage="sampled"))
+    assert unformable.eligible and LEGS_UNAVAILABLE_FLAG not in unformable.eligibility_flags
+    assert unformable.execution_penalty == wide.execution_penalty == proxy.execution_penalty
+
+
+# ── coverage through the actual adapter and collectors (Hermes's cases) ─────
+
+
+from services.earnings_vol_snapshot import _structure_legs_from_inputs, _normalize_option_chain  # noqa: E402
+from services.yfinance_market_data_client import YFinanceMarketDataClient  # noqa: E402
+from web.api import edge_engine  # noqa: E402
+
+DENSE = np.arange(440.0, 560.5, 0.5)  # a 0.50 grid around spot 500
+
+
+def _dense_side(kind: str, spot: float = 500.0, expiry: str = "2026-11-20") -> pd.DataFrame:
+    # Later expiries cost more (time value), as on a real chain.
+    tenor = 1.0 + (date.fromisoformat(expiry) - date(2026, 11, 1)).days / 30.0
+    mid = np.maximum(0.5, 20.0 - np.abs(DENSE - spot) * 0.3) * tenor
+    return pd.DataFrame({"contractSymbol": [f"X{kind}{k}" for k in DENSE], "strike": DENSE,
+                         "bid": mid - 0.05, "ask": mid + 0.05, "lastPrice": mid, "volume": 10,
+                         "openInterest": 100, "impliedVolatility": 0.40})
+
+
+def _dense_ticker(expiries, spot=500.0):
+    class _T:
+        options = list(expiries)
+        fast_info = {"last_price": spot}
+
+        def option_chain(self, expiry):
+            return SimpleNamespace(calls=_dense_side("C", spot, expiry), puts=_dense_side("P", spot, expiry))
+
+    return _T()
+
+
+WEEKLY = ["2026-11-20", "2026-11-27", "2026-12-04", "2026-12-11", "2026-12-18", "2026-12-24", "2026-12-31",
+          "2027-01-08", "2027-01-15", "2027-01-22", "2027-02-19", "2027-03-19", "2027-06-17"]
+
+
+def test_a_narrow_analysis_window_is_not_read_as_an_unformable_strangle() -> None:
+    ticker = _dense_ticker(WEEKLY)
+    client = YFinanceMarketDataClient(ticker_factory=lambda _s: ticker)
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+
+    narrow = client.get_option_chain("AAA", expiration="all", strike_limit=10)  # what the analysis fetches
+    sampled, _ = _normalize_option_chain(narrow)
+    only_sampled = _structure_legs_from_inputs(None, sampled, 500.0, earnings, "AMC", as_of)
+    assert only_sampled["coverage"] == "sampled"
+    assert only_sampled["structures"]["otm_strangle"]["reason"] == "wing_strike_unavailable"
+    assert only_sampled["structures"]["iron_condor"]["reason"] == "wing_strike_unavailable"
+
+    structure_chain = edge_engine._fetch_structure_chain(
+        "AAA", client=client, use_provider=True, ticker=ticker, earnings_date=earnings,
+        release_timing="AMC", as_of_date=as_of)
+    complete = _structure_legs_from_inputs(structure_chain, sampled, 500.0, earnings, "AMC", as_of)
+    assert complete["coverage"] == "complete"
+    for structure in ("otm_strangle", "iron_condor", "atm_straddle", "call_calendar"):
+        assert complete["structures"][structure]["reason"] is None, structure
+
+
+@pytest.mark.parametrize("structure", ["atm_straddle", "otm_strangle", "iron_condor", "call_calendar", "put_calendar"])
+def test_the_analysis_scores_what_entry_books_through_the_same_adapter(monkeypatch, structure) -> None:
+    ticker = _dense_ticker(WEEKLY)
+    client = YFinanceMarketDataClient(ticker_factory=lambda _s: ticker)
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+    monkeypatch.setattr(forward_loop, "record_provider_telemetry", lambda **_k: None)
+    structure_chain = edge_engine._fetch_structure_chain(
+        "AAA", client=client, use_provider=True, ticker=ticker, earnings_date=earnings,
+        release_timing="AMC", as_of_date=as_of)
+    scored = _structure_legs_from_inputs(structure_chain, pd.DataFrame(), 500.0, earnings, "AMC", as_of)
+    quote = forward_loop.fetch_structure_quote(symbol="AAA", structure=structure, earnings_date=earnings,
+                                               as_of_date=as_of, mda_client=client, release_timing="AMC")
+    assert quote.get("mid") is not None, quote.get("reason")
+    assert sl.compare_booked_to_scored(structure, quote["context"], scored)["match"] is True
+
+
+def _dense_listing():
+    # Mon/Wed/Fri expiries for three weeks, then weeklies and monthlies.
+    days = [date(2026, 12, 11) + pd.Timedelta(days=i).to_pytimedelta() for i in range(22)]
+    dailies = [d for d in days if d.weekday() in (0, 2, 4) and d != date(2026, 12, 25)]
+    later = [date(2026, 12, 24), date(2027, 1, 8), date(2027, 1, 15), date(2027, 1, 22), date(2027, 1, 29),
+             date(2027, 2, 19), date(2027, 3, 19), date(2027, 6, 17)]
+    return [d.isoformat() for d in sorted(set(dailies + later))]
+
+
+@pytest.mark.parametrize("earnings,front,back,sample_front,sample_back", [
+    # The 6-tenor sample (chosen for IV interpolation) keeps the front but not the back expiry.
+    (date(2026, 12, 16), "2026-12-18", "2027-01-01", "2026-12-18", "2027-01-15"),
+    # The sample has nothing between 12-21 and 01-15: it would score a mid-January front.
+    (date(2026, 12, 22), "2026-12-23", "2027-01-08", "2027-01-15", "2027-01-29"),
+])
+def test_trade_and_back_expiries_come_from_the_complete_listing(earnings, front, back, sample_front,
+                                                                sample_back) -> None:
+    ticker = _dense_ticker(_dense_listing())
+    as_of = date(2026, 12, 11)
+    sampled_frame = edge_engine._collect_yf_option_chain_frame(ticker, as_of_date=as_of)
+    sampled, _ = _normalize_option_chain(sampled_frame)
+    from_sample = _structure_legs_from_inputs(None, sampled, 500.0, earnings, "AMC", as_of)
+    assert (from_sample["trade_expiry"], from_sample["back_expiry"], from_sample["coverage"]) == (
+        sample_front, sample_back, "sampled")
+
+    structure_chain = edge_engine._fetch_structure_chain(
+        "AAA", client=None, use_provider=False, ticker=ticker, earnings_date=earnings,
+        release_timing="AMC", as_of_date=as_of)
+    complete = _structure_legs_from_inputs(structure_chain, sampled, 500.0, earnings, "AMC", as_of)
+    assert (complete["trade_expiry"], complete["back_expiry"], complete["coverage"]) == (front, back, "complete")
+    assert complete["structures"]["call_calendar"]["reason"] is None
+
+
+def test_without_a_listing_the_legs_stay_sampled() -> None:
+    class _Empty:
+        options: list = []
+
+    assert edge_engine._fetch_structure_chain("AAA", client=None, use_provider=False, ticker=_Empty(),
+                                              earnings_date=date(2026, 11, 19), release_timing="AMC",
+                                              as_of_date=date(2026, 11, 16)) is None
+    assert edge_engine._fetch_structure_chain("AAA", client=None, use_provider=False, ticker=_dense_ticker(WEEKLY),
+                                              earnings_date=None, release_timing="AMC",
+                                              as_of_date=date(2026, 11, 16)) is None
+
+
+def test_a_provider_chain_missing_a_side_falls_back_to_yfinance_like_entry() -> None:
+    ticker = _dense_ticker(WEEKLY)
+
+    class _CallsOnly:
+        def get_expirations(self, _s):
+            return WEEKLY
+
+        def get_option_chain(self, _s, **_k):
+            frame = YFinanceMarketDataClient(ticker_factory=lambda _x: ticker).get_option_chain(
+                "AAA", expiration="2026-11-20", strike_limit=80)
+            return frame[frame["side"] == "call"]
+
+    structure_chain = edge_engine._fetch_structure_chain(
+        "AAA", client=_CallsOnly(), use_provider=True, ticker=ticker, earnings_date=date(2026, 11, 19),
+        release_timing="AMC", as_of_date=date(2026, 11, 16))
+    frame, _ = _normalize_option_chain(structure_chain["chain"][0])
+    assert set(frame["call_put"]) == {"C", "P"}
+    assert len(frame) == 2 * len(DENSE)  # the full yfinance chain, as entry's fallback uses
+
+
+def test_the_analysis_passes_the_entry_equivalent_chain_to_the_snapshot(monkeypatch) -> None:
+    from unittest import mock
+
+    import tests.unit.test_web.test_analyze_single_ticker_golden as golden
+
+    sentinel = {"listing": ["2026-01-01"], "chain": []}
+    mocks = {}
+    real_patch = golden.patch
+
+    class _Recorder:
+        def __getattr__(self, name):
+            return getattr(real_patch, name)
+
+        def __call__(self, *a, **k):
+            return real_patch(*a, **k)
+
+        def object(self, target, attribute, *a, **k):
+            context = real_patch.object(target, attribute, *a, **k)
+            if attribute != "build_vol_snapshot":
+                return context
+
+            class _Recording:
+                def __enter__(self_inner):
+                    mocks["build"] = context.__enter__()
+                    return mocks["build"]
+
+                def __exit__(self_inner, *exc):
+                    return context.__exit__(*exc)
+
+            return _Recording()
+
+    monkeypatch.setattr(golden, "patch", _Recorder())
+    monkeypatch.setattr(edge_engine, "_fetch_structure_chain", lambda *a, **k: sentinel)
+    golden._run_watch_scenario()
+    assert isinstance(mocks["build"], mock.MagicMock)
+    assert mocks["build"].call_args.kwargs["structure_chain"] is sentinel
+
+
+def test_a_failed_front_fetch_never_makes_the_legs_complete() -> None:
+    ticker = _dense_ticker(WEEKLY)
+
+    class _FrontFails:
+        options = WEEKLY
+
+        def option_chain(self, expiry):
+            if expiry == "2026-11-20":
+                raise RuntimeError("timeout")
+            return ticker.option_chain(expiry)
+
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+    assert edge_engine._fetch_structure_chain("AAA", client=None, use_provider=False, ticker=_FrontFails(),
+                                              earnings_date=earnings, release_timing="AMC", as_of_date=as_of) is None
+    # And a partial chain handed in directly is not complete either: only the back expiry arrived.
+    back_only = edge_engine._collect_yf_option_chain_frame(ticker, as_of_date=as_of, expiries=["2026-12-04"])
+    legs = _structure_legs_from_inputs({"listing": WEEKLY, "chain": [back_only]}, pd.DataFrame(), 500.0,
+                                       earnings, "AMC", as_of)
+    assert legs == {} or legs.get("coverage") != "complete"
+
+
+def test_a_missing_back_chain_is_not_complete_coverage() -> None:
+    ticker = _dense_ticker(WEEKLY)
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+    front_only = edge_engine._collect_yf_option_chain_frame(ticker, as_of_date=as_of, expiries=["2026-11-20"])
+    legs = _structure_legs_from_inputs({"listing": WEEKLY, "chain": [front_only]}, pd.DataFrame(), 500.0,
+                                       earnings, "AMC", as_of)
+    assert legs == {} or legs.get("coverage") != "complete"
+
+
+def test_discovery_applies_entrys_condor_opening_gates() -> None:
+    calls, puts = _side(kind="C"), _side(kind="P")
+    # Make the protective wings as expensive as the shorts: no credit.
+    for frame, wing in ((calls, 105.0), (puts, 95.0)):
+        short = 102.5 if frame is calls else 97.5
+        frame.loc[frame["strike"] == wing, ["bid", "ask"]] = frame.loc[frame["strike"] == short, ["bid", "ask"]].values
+    assert sl.discover_legs("iron_condor", calls, puts, 100.0)["reason"] == "non_positive_condor_credit"
+
+
+def test_discovery_rejects_a_calendar_without_a_positive_debit() -> None:
+    calls = _side(kind="C")
+    cheap_back = calls.copy()
+    cheap_back[["bid", "ask"]] = cheap_back[["bid", "ask"]] * 0.5
+    result = sl.discover_legs("call_calendar", calls, _side(kind="P"), 100.0, back_calls=cheap_back, back_puts=cheap_back)
+    assert result["reason"] == "non_positive_calendar_debit"
