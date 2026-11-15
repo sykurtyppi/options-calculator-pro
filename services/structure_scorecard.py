@@ -196,12 +196,11 @@ def build_structure_scorecards(
     ----------
     snapshot : VolSnapshot
     crush_probability : float, optional
-        Trained crush-classifier probability for this event (services.crush_features
-        / edge_engine._ml_crush_probability). Consumed ONLY by the sell-side
-        iron_condor scorecard, where a high crush probability is the entry signal.
-        None (the default, and the value under any caller that has not computed it)
-        makes the condor fall back to a neutral crush component and lean on the raw
-        vol-richness ratios instead. The four long-vol scorers ignore it.
+        Trained post-earnings crush-classifier probability (services.crush_features
+        / edge_engine._ml_crush_probability). Accepted for compatibility and
+        currently used by NO scorer: every structure, the iron condor included,
+        exits the session before earnings and never holds the crush. It becomes
+        relevant only to a structure that holds through the announcement.
     as_of_date : date, optional
         If provided, the walk-forward priors are filtered to observations
         recorded on or before this date, and the raising leakage sentinel runs.
@@ -635,38 +634,38 @@ def score_iron_condor(
     prior: Optional[WalkForwardPrior] = None,
     crush_probability: Optional[float] = None,
 ) -> StructureScorecard:
-    """Defined-risk SHORT-volatility structure: sell an OTM call spread + an OTM
-    put spread. This is the sell-side counterpart to the four long-vol structures,
-    and its edge sign is INVERTED.
+    """Defined-risk SHORT-volatility structure (short OTM call spread + short OTM
+    put spread), scored for the window it actually holds: entry to the session
+    BEFORE earnings (the forward loop's T-1 exit; see baseline_evidence_store).
 
-    The long structures win when realized move > implied; the condor wins when
-    realized move < implied — the variance-risk-premium / vol-crush edge (implied
-    exceeds realized ~70-75% of the time at earnings; De Silva, Smith & So 2025,
-    Review of Finance, show delta-neutral long straddle/strangle/calendar returns
-    are negative in the concave pre-earnings smile). Three inversions follow, and
-    each is called out at its term below:
+    It never holds the announcement, so it never collects the post-earnings
+    crush and never faces the earnings move. Over the window it does hold, the
+    condor's value is driven by:
 
-      1. The historical/implied and tail/implied ratios are scored LOW-good here
-         (via _score_low_good) instead of HIGH-good: a low ratio means realized
-         ran below implied, which is what the seller wants.
-      2. IV richness (iv/rv) is a POSITIVE driver ("richness_score"), not the
-         crowding PENALTY it is for the long structures — rich IV is the premium
-         the condor collects.
-      3. Theta is the seller's friend, so theta carries only a tiny timing
-         sensitivity, not the decay drag the long structures pay; and crowding is
-         not penalised at all.
+      * decay of the NON-event part of the premium: diffusion variance runs off
+        day by day and the seller keeps it. Only the share of the near-term
+        straddle that is not event variance (1 - event_move_share_of_total)
+        decays before the event; the event variance stays in the price.
+      * the event run-up, which works AGAINST the seller: the event variance
+        is untouched until the print and tends to be repriced upward into it
+        (earnings uncertainty is under-priced on average; Gao, Xing & Zhang,
+        JFQA 2018). The larger the event share, the more of the premium is
+        exposed to that run-up.
+      * a short strike breached by an ordinary pre-event move, more likely in
+        an elevated realized-vol regime.
 
-    The trained crush classifier (OOF AUC ~0.84) is the PRIMARY move-fit driver
-    via ``crush_probability`` — a high crush probability is precisely the entry
-    signal. When it is None (model unavailable, or a caller that did not compute
-    it) the crush component falls back to neutral 0.5 and the raw vol-richness
-    ratios carry the score, so the condor degrades gracefully rather than
-    fabricating confidence.
-
-    Two risks are penalised MORE heavily than for buyers, because a defined-risk
-    condor's worst case is a move that breaches a short strike:
-      - a concave / bimodal smile (the market pricing a large expected jump), and
-      - upper-quartile historical tails (tail_vs_implied in its p75-p95 band).
+    The event split assumes the non-event implied vol equals the HAR forecast,
+    so the decaying premium is priced at fair value at best (below it when the
+    split clips the event to zero). Nothing in the snapshot therefore shows a
+    positive premium for this window: the snapshot signal tops out at zero and
+    a positive expected edge can only come from real condor outcomes through
+    the walk-forward prior. Within that, the scorer prefers a fairly priced
+    decaying premium, a small event share and a calm regime. ``crush_probability`` is accepted for API
+    compatibility and NOT used: a post-earnings crush classifier says nothing
+    about a position closed before the earnings. Nor are the earnings-move
+    ratios (historical/implied, tail/implied) or the event-jump smile
+    concavity: they describe an event the position never holds. Like every
+    scorecard, the result is a score-derived diagnostic, not a P&L forecast.
     """
     prior = prior or _load_walk_forward_priors()["iron_condor"]
     flags = _base_eligibility_flags(snapshot)
@@ -680,92 +679,70 @@ def score_iron_condor(
     if snapshot.near_term_spread_pct is not None and snapshot.near_term_spread_pct > ABSOLUTE_SPREAD_THRESHOLD_PCT:
         flags.append("structure_spread_exceeds_absolute_threshold")
 
-    # (0) The SHARED composite term must be inverted too. _finalize_scorecard adds
-    # `+ 0.10 * context.cheapness_score` for every structure, and
-    # snapshot.cheapness_score is HIGH when options are CHEAP (it is
-    # 1 - clip((iv_rv - 0.80)/0.90)). That is right for the four buyers and
-    # exactly backwards for a premium seller: left raw, the condor collects a
-    # composite bonus on the cheap-vol names where selling premium makes least
-    # sense, and that 0.10 weight swamps the richness term inside move_fit
-    # (0.15 x 0.15 = 0.0225). Feed the seller's own premium-richness into that
-    # slot instead, on the same underlying metric so the term stays comparable
-    # across structures.
-    cheapness = _coalesce_unit(snapshot.cheapness_score)
-    premium_richness = _clamp01(1.0 - cheapness)
     timing = _coalesce_unit(snapshot.timing_score)
     execution = _coalesce_unit(snapshot.execution_score)
     quality = _coalesce_unit(snapshot.data_quality_score)
 
-    # (1) Inverted ratio scores: LOW historical/implied and LOW tail/implied are
-    # favourable for the seller. Same corpus-calibrated bounds as the long
-    # structures (module header), just scored on the low side.
-    low_move_score = _score_low_good(snapshot.historical_vs_implied_move_ratio, MOVE_RATIO_P10, MOVE_RATIO_P90)
-    low_tail_score = _score_low_good(snapshot.tail_vs_implied_move_ratio, TAIL_RATIO_P10, TAIL_RATIO_P90)
-    # (2) IV richness as a POSITIVE driver (same iv/rv the long structures treat
-    # as crowding and penalise).
-    richness_score = _score_high_good(_first_finite(snapshot.iv_rv_har, snapshot.iv_rv_yz), 1.00, 1.60)
-    # Crush classifier is the primary signal; neutral 0.5 when unavailable.
-    crush_score = _coalesce_unit(crush_probability)
+    # The event split (P-5a) assumes the non-event part of the near-term implied
+    # vol equals the HAR forecast of realized vol, and puts the rest in the event.
+    # Under that assumption the decaying (non-event) premium is priced at fair
+    # value at best, so it carries no positive premium for the seller; when the
+    # split clips the event to zero, implied is BELOW the realized forecast and
+    # the decaying premium is cheap (the seller is short vol under expected
+    # realized). Fairness = min(1, implied sigma / HAR non-event sigma).
+    implied_sigma = snapshot.near_term_implied_sigma_pct
+    har_sigma = snapshot.non_event_move_pct_har
+    if (implied_sigma is not None and har_sigma is not None
+            and np.isfinite(implied_sigma) and np.isfinite(har_sigma) and har_sigma > 0):
+        diffusion_fairness = min(1.0, float(implied_sigma) / float(har_sigma))
+    else:
+        diffusion_fairness = None
+    fair_score = _score_high_good(diffusion_fairness, 0.70, 1.00)
+    # Share of the premium that is event variance: untouched until the print and
+    # repriced upward into it on average, i.e. exposure to the run-up. Corpus
+    # band p25/p90 = 0.78/0.94 (as for the long structures' crowding term).
+    event_share = snapshot.event_move_share_of_total
+    ramp_exposure = _score_high_good(event_share, 0.78, 0.94)
+    decay_score = 1.0 - ramp_exposure
+    # Breach risk before the event: an elevated realized-vol regime.
+    calm_score = _score_low_good(snapshot.rv_percentile_rank, 30.0, 80.0)
+    breach_risk = _score_high_good(snapshot.rv_percentile_rank, 70.0, 95.0)
 
-    _using_daily_fallback = (
-        getattr(snapshot, "historical_move_source", "earnings_history") == "daily_fallback"
-    )
     _event_split_unavailable = (
         getattr(snapshot, "event_decomposition_status", "no_earnings_date")
         in ("no_event_spanning_expiry", "event_expiry_not_quotable")
     )
-    _move_fit_degraded = _using_daily_fallback or _event_split_unavailable
+    _move_fit_degraded = (
+        _event_split_unavailable or diffusion_fairness is None
+        or event_share is None or not np.isfinite(event_share)
+    )
     if _move_fit_degraded:
-        # Without a real earnings-move distribution the seller cannot judge breach
-        # risk either — degrade to the same low sentinel the long structures use
-        # rather than sell blind.
         move_fit = 0.15
     else:
-        move_fit = _clamp01(
-            0.40 * crush_score
-            + 0.25 * low_tail_score
-            + 0.20 * low_move_score
-            + 0.15 * richness_score
-        )
-
-    concavity_intensity = _clamp01(
-        max(
-            1.0 if snapshot.smile_concavity_flag else 0.0,
-            _score_high_good(abs(snapshot.smile_curvature) if snapshot.smile_curvature is not None else None, 0.22, 0.70),
-        )
-    )
+        move_fit = _clamp01(0.45 * fair_score + 0.30 * calm_score + 0.25 * decay_score)
 
     leg_spread_pct = _average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct])
     execution_penalty = _execution_penalty(snapshot, leg_spread_pct=leg_spread_pct, structure="iron_condor")
-    # (3) Theta works FOR the seller: only a small penalty for entering so far out
-    # that little decay is captured — NOT the decay drag a buyer pays.
+    # Theta works FOR the seller: only a small penalty for a window too short to collect decay.
     theta_penalty = 0.02 * (1.0 - timing)
-    # Crowding (rich IV, everyone long vol) is the seller's premium, not a cost.
     crowding_penalty = 0.0
-    # A concave / bimodal smile signals a large expected jump — real breach risk
-    # for short strikes — so it is penalised more than for buyers (0.10 vs 0.08).
-    concavity_penalty = 0.10 * concavity_intensity
-    # Upper-quartile historical tails elevate short-strike breach risk. Fold into
-    # the sample-uncertainty penalty like the calendar's tail-risk term.
-    tail_risk_penalty = 0.09 * _score_high_good(snapshot.tail_vs_implied_move_ratio, TAIL_RATIO_P75, TAIL_RATIO_P95)
+    # The event jump is not held, so the event-pricing smile is not a breach risk here.
+    concavity_penalty = 0.0
     sample_confidence, sample_penalty = _sample_confidence_and_penalty(snapshot, prior, max_penalty=0.12)
-    sample_penalty = _clamp01(sample_penalty + tail_risk_penalty)
+    sample_penalty = _clamp01(sample_penalty + 0.09 * breach_risk)
 
-    # IV contribution = crush actually captured (no crowding subtraction — see (2)).
-    expected_iv_contribution_pct = 10.0 * _clamp01(
-        0.50 * crush_score + 0.30 * richness_score + 0.20 * low_tail_score
-    )
-    # Provisional pre-OOS return scale (between the calendar's 14 and the
-    # strangle's 22). The neutral prior means _blend_expected_return leans fully
-    # on this signal until real condor outcomes accrue and the walk-forward blend
-    # takes over; it is a score-derived diagnostic, not a calibrated forecast.
+    # Only the run-up moves IV in this window, and it moves against the seller.
+    expected_iv_contribution_pct = -6.0 * ramp_exposure
+    # No snapshot input shows a positive premium for this window (see above), so
+    # the signal tops out at zero in the best case (fair decay, calm regime,
+    # good timing and execution) and is negative otherwise. A positive expected
+    # edge can come only from the walk-forward prior, i.e. from real condor
+    # outcomes (the always_iron_condor baseline measures them).
     expected_return_signal_pct = 16.0 * (
-        0.40 * move_fit
-        + 0.20 * richness_score
-        + 0.15 * timing
-        + 0.10 * execution
-        + 0.15 * low_tail_score
-        - 0.50
+        0.60 * move_fit
+        + 0.20 * timing
+        + 0.20 * execution
+        - 1.00
     )
     expected_return_pct = _blend_expected_return(prior, expected_return_signal_pct + expected_iv_contribution_pct * 0.30)
     expected_edge_pct = expected_return_pct - _penalty_pct(
@@ -776,45 +753,38 @@ def score_iron_condor(
         sample_penalty=sample_penalty,
     )
 
-    _crush_txt = (
-        f"Crush classifier probability {crush_probability:.2f} "
-        f"{'supports' if crush_probability >= 0.50 else 'does not support'} a vol-sale."
-        if crush_probability is not None and np.isfinite(crush_probability)
-        else "Crush classifier unavailable; the crush component stays neutral and the vol-richness ratios carry the score."
+    share_txt = (
+        f"Event variance is {event_share:.0%} of the near-term premium (exposed to the run-up); "
+        f"the non-event premium is priced at {diffusion_fairness:.2f}x the realized-vol forecast "
+        f"({'fair at best' if diffusion_fairness >= 1.0 else 'cheap: short vol under expected realized'})."
+        if not _move_fit_degraded
+        else "Event split unavailable; what the seller would collect cannot be judged."
     )
     rationale = [
-        _crush_txt,
-        _ratio_rationale(
-            "historical/implied move", snapshot.historical_vs_implied_move_ratio,
-            favorable="above 1 warns realized has outrun implied — hostile to a vol sale",
-            cautious="below 1 means realized ran under implied — favorable for the seller",
-        ),
-        _ratio_rationale(
-            "tail/implied move", snapshot.tail_vs_implied_move_ratio,
-            favorable="fat tails raise short-strike breach risk",
-            cautious="contained tails keep the short strikes safer",
-        ),
-        f"IV/RV richness {'supports' if richness_score >= 0.6 else 'does not strongly support'} premium collection (score {richness_score:.2f}).",
+        "Exits the session before earnings: it never collects the post-earnings crush or faces the "
+        "earnings move, so the crush classifier and earnings-move ratios are not used. Nothing in "
+        "the snapshot shows a positive premium for this window, so a positive edge needs real "
+        "condor outcomes in the walk-forward prior.",
+        share_txt,
+        f"Event run-up exposure {ramp_exposure:.2f}: event variance is repriced into the print, against the seller.",
+        f"Realized-vol regime percentile "
+        f"{snapshot.rv_percentile_rank if snapshot.rv_percentile_rank is not None else float('nan'):.0f}: "
+        f"{'calm, fewer pre-event breaches' if calm_score >= 0.5 else 'elevated, more pre-event breach risk'}.",
         _execution_rationale(snapshot, execution_penalty),
-        "Defined-risk: max loss is capped at the wing width minus the net credit; the crush-gate keeps entries to events where implied looks rich versus realized.",
+        "Defined-risk: max loss is capped at the wing width minus the net credit.",
         f"Walk-forward prior: {prior.history_count} {'SIMULATED (not yet OOS-validated)' if prior.is_simulated else ''} observations, {prior.win_rate:.0%} win rate, source={prior.source}.",
     ]
     if _move_fit_degraded:
-        if _event_split_unavailable:
-            rationale.append(
-                "Warning: no quotable option expiry spans the earnings reaction, so the "
-                "event-implied move could not be computed. Move-fit estimate set to "
-                "sentinel 0.15 — no event-pricing evidence exists to justify selling vol."
-            )
-        else:
-            rationale.append(
-                "Warning: historical move profile uses daily returns (no earnings history available). "
-                "Move-fit estimate set to sentinel 0.15 — unreliable for judging short-strike breach risk."
-            )
+        rationale.append(
+            "Warning: no event split (no quotable expiry spans the earnings reaction, or the "
+            "implied/realized inputs are missing). Move-fit set to sentinel 0.15."
+        )
     context = _StructureContext(
         move_fit_score=move_fit,
-        # Seller's slot: richness, not cheapness — see (0) above.
-        cheapness_score=premium_richness,
+        # The shared composite's cheapness slot ("is the premium this structure
+        # trades priced in its favour"): for this seller, how fairly the
+        # decaying premium is priced.
+        cheapness_score=fair_score,
         timing_score=timing,
         execution_score=execution,
         data_quality_score=quality,

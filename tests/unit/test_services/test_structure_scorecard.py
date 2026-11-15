@@ -1036,107 +1036,108 @@ class TestBuildScorecardsTemporalIntegrity(unittest.TestCase):
 
 
 class TestIronCondorScorecard(unittest.TestCase):
-    """Sell-side defined-risk structure. Its edge sign is inverted vs the long
-    structures: it wins when realized < implied and the crush classifier fires."""
+    """The condor is scored for the window it holds: entry to the session BEFORE
+    earnings. It never collects the post-earnings crush or faces the earnings
+    move, so those inputs do not move it; the event split leaves it no positive
+    premium to collect, so a positive edge needs real condor outcomes."""
 
-    def _condor_prior(self):
-        # Neutral no-data prior (history_count=0) so the blend leans on the live
-        # signal and the crush gate is what moves the score in these tests.
-        return WalkForwardPrior(
-            structure="iron_condor", history_count=0, win_rate=0.50,
-            avg_return_pct=0.0, rank_score=0.31, source="test_neutral_condor",
-        )
+    def _condor_prior(self, **kw):
+        base = dict(structure="iron_condor", history_count=0, win_rate=0.50,
+                    avg_return_pct=0.0, rank_score=0.31, source="test_neutral_condor")
+        base.update(kw)
+        return WalkForwardPrior(**base)
 
-    def _seller_favorable(self, **extra):
-        # Realized ran well below implied, tails contained, IV rich, smile not
-        # concave — the setup a vol-seller wants.
+    def _seller_best_case(self, **extra):
+        # Implied at (not below) the realized forecast, a small event share and
+        # a calm regime: the best this window offers a seller.
         base = dict(
-            historical_vs_implied_move_ratio=0.55,
-            tail_vs_implied_move_ratio=0.45,
-            iv_rv_har=1.45,
-            iv_rv_yz=1.40,
-            smile_curvature=0.10,
-            smile_concavity_flag=False,
+            near_term_implied_sigma_pct=1.6,
+            non_event_move_pct_har=1.2,
+            event_move_share_of_total=0.70,
+            rv_percentile_rank=20.0,
         )
         base.update(extra)
         return _base_snapshot(**base)
+
+    def _score(self, snap=None, prior=None, crush_probability=None):
+        return score_iron_condor(snap or self._seller_best_case(), prior=prior or self._condor_prior(),
+                                 crush_probability=crush_probability)
 
     def test_build_includes_iron_condor(self):
         with patch(
             "services.structure_scorecard._load_walk_forward_priors",
             side_effect=lambda as_of_date=None: _neutral_priors(),
         ):
-            cards = build_structure_scorecards(self._seller_favorable(), crush_probability=0.8)
-        structures = {c.structure for c in cards}
-        assert "iron_condor" in structures
-        assert len(cards) == 5
+            cards = build_structure_scorecards(self._seller_best_case(), crush_probability=0.8)
+        assert "iron_condor" in {c.structure for c in cards} and len(cards) == 5
 
     def test_eligible_on_a_well_formed_snapshot(self):
-        card = score_iron_condor(
-            self._seller_favorable(), prior=self._condor_prior(), crush_probability=0.8
-        )
+        card = self._score()
         assert card.eligible, card.eligibility_flags
         assert card.structure == "iron_condor"
 
-    def test_crush_gate_is_monotonic(self):
-        # Holding the snapshot fixed, a higher crush probability must not lower
-        # the composite score — the classifier is the primary entry signal.
-        snap = self._seller_favorable()
-        prior = self._condor_prior()
-        low = score_iron_condor(snap, prior=prior, crush_probability=0.15)
-        mid = score_iron_condor(snap, prior=prior, crush_probability=0.50)
-        high = score_iron_condor(snap, prior=prior, crush_probability=0.85)
-        assert low.composite_structure_score <= mid.composite_structure_score <= high.composite_structure_score
-        assert low.expected_edge_pct <= high.expected_edge_pct
+    def _mid_case(self, **extra):
+        # Unsaturated inputs, so any term that leaks in would show.
+        return self._seller_best_case(event_move_share_of_total=0.86, rv_percentile_rank=55.0,
+                                      near_term_implied_sigma_pct=1.05, **extra)
 
-    def test_high_crush_low_realized_produces_positive_edge(self):
-        card = score_iron_condor(
-            self._seller_favorable(), prior=self._condor_prior(), crush_probability=0.9
-        )
-        assert card.expected_edge_pct > 0.0
-        assert card.expected_move_fit_score > 0.5
+    def test_the_crush_classifier_does_not_move_a_condor_closed_before_earnings(self):
+        low, none, high = (self._score(self._mid_case(), crush_probability=p) for p in (0.05, None, 0.95))
+        assert low.expected_edge_pct == none.expected_edge_pct == high.expected_edge_pct
+        assert low.composite_structure_score == high.composite_structure_score
 
-    def test_high_realized_move_is_hostile_to_the_seller(self):
-        # When realized has been outrunning implied (ratio well above 1), the
-        # low-good score collapses and the condor's edge should fall vs the
-        # favorable case, even with the same high crush probability.
-        prior = self._condor_prior()
-        favorable = score_iron_condor(self._seller_favorable(), prior=prior, crush_probability=0.85)
-        hostile = score_iron_condor(
-            self._seller_favorable(historical_vs_implied_move_ratio=1.80, tail_vs_implied_move_ratio=1.70),
-            prior=prior, crush_probability=0.85,
-        )
-        assert hostile.expected_edge_pct < favorable.expected_edge_pct
+    def test_earnings_move_and_tail_ratios_do_not_move_it(self):
+        calm = self._score(self._mid_case(historical_vs_implied_move_ratio=0.5, tail_vs_implied_move_ratio=0.4,
+                                          smile_concavity_flag=False, smile_curvature=0.05))
+        wild = self._score(self._mid_case(historical_vs_implied_move_ratio=1.9, tail_vs_implied_move_ratio=1.8,
+                                          smile_concavity_flag=True, smile_curvature=0.65))
+        assert calm.expected_edge_pct == wild.expected_edge_pct
+        assert calm.composite_structure_score == wild.composite_structure_score
+        assert calm.concavity_penalty == wild.concavity_penalty == 0.0
 
-    def test_fat_tails_and_concavity_penalize_the_condor(self):
-        prior = self._condor_prior()
-        contained = score_iron_condor(self._seller_favorable(), prior=prior, crush_probability=0.8)
-        breachy = score_iron_condor(
-            self._seller_favorable(
-                tail_vs_implied_move_ratio=1.80,   # upper-quartile tails
-                smile_concavity_flag=True,          # bimodal / large expected jump
-                smile_curvature=0.65,
-            ),
-            prior=prior, crush_probability=0.8,
-        )
-        assert breachy.concavity_penalty > contained.concavity_penalty
-        assert breachy.composite_structure_score < contained.composite_structure_score
+    def test_the_snapshot_alone_never_gives_a_positive_edge(self):
+        best = self._score()
+        assert best.expected_edge_pct <= 0.0
+        assert best.expected_return_pct <= 0.0
 
-    def test_missing_crush_is_neutral_not_a_crash(self):
-        # crush_probability=None (model unavailable / caller did not compute it)
-        # must not raise; the crush component falls back to neutral and the
-        # ratios carry the score.
-        card = score_iron_condor(
-            self._seller_favorable(), prior=self._condor_prior(), crush_probability=None
-        )
-        assert card.structure == "iron_condor"
-        assert 0.0 <= card.composite_structure_score <= 1.0
+    def test_real_condor_outcomes_can_make_the_edge_positive(self):
+        proven = self._score(prior=self._condor_prior(history_count=60, win_rate=0.70, avg_return_pct=12.0,
+                                                      rank_score=0.80, source="test_live_condor"))
+        assert proven.expected_edge_pct > 0.0
+
+    def test_a_larger_event_share_is_more_run_up_exposure(self):
+        small = self._score(self._seller_best_case(event_move_share_of_total=0.75))
+        large = self._score(self._seller_best_case(event_move_share_of_total=0.95))
+        assert large.expected_edge_pct < small.expected_edge_pct
+        assert large.composite_structure_score < small.composite_structure_score
+        # The run-up only ever works against the seller.
+        assert small.expected_iv_contribution_pct == 0.0
+        assert large.expected_iv_contribution_pct < 0.0
+
+    def test_implied_below_the_realized_forecast_is_hostile(self):
+        # The split clips the event to zero when implied < HAR: the decaying
+        # premium is then cheap, not "all collectible".
+        fair = self._score(self._seller_best_case(event_move_share_of_total=0.0))
+        cheap = self._score(self._seller_best_case(event_move_share_of_total=0.0, near_term_implied_sigma_pct=0.8))
+        assert cheap.expected_edge_pct < fair.expected_edge_pct
+        assert cheap.composite_structure_score < fair.composite_structure_score
+
+    def test_an_elevated_realized_vol_regime_raises_breach_risk(self):
+        calm = self._score(self._seller_best_case(rv_percentile_rank=20.0))
+        hot = self._score(self._seller_best_case(rv_percentile_rank=92.0))
+        assert hot.sample_uncertainty_penalty > calm.sample_uncertainty_penalty
+        assert hot.expected_edge_pct < calm.expected_edge_pct
+
+    def test_no_event_split_is_the_low_sentinel(self):
+        card = self._score(self._seller_best_case(event_move_share_of_total=None))
+        assert card.expected_move_fit_score == 0.15
+        assert any("no event split" in line for line in card.rationale_bullets)
+
+    def test_the_rationale_says_what_it_does_not_hold(self):
+        assert any("never collects the post-earnings crush" in line for line in self._score().rationale_bullets)
 
     def test_ineligible_when_wings_cannot_form(self):
-        card = score_iron_condor(
-            self._seller_favorable(near_term_atm_iv=None, smile_points=1),
-            prior=self._condor_prior(), crush_probability=0.8,
-        )
+        card = self._score(self._seller_best_case(near_term_atm_iv=None, smile_points=1), crush_probability=0.8)
         assert not card.eligible
         assert card.composite_structure_score == 0.0
 
@@ -1220,28 +1221,17 @@ class TestAuditFixes(unittest.TestCase):
             avg_return_pct=0.0, rank_score=0.31, source="test_neutral_condor",
         )
 
-    def test_condor_prefers_rich_vol_over_cheap_vol(self):
-        """AUDIT HIGH: _finalize_scorecard adds +0.10 * cheapness_score for every
-        structure, and cheapness is HIGH when options are CHEAP. Passed through
-        raw, it made the premium-SELLING condor score higher on cheap vol — the
-        opposite of its thesis, and it out-weighed the richness term in move_fit."""
-        common = dict(
-            historical_vs_implied_move_ratio=0.55, tail_vs_implied_move_ratio=0.45,
-            smile_curvature=0.10, smile_concavity_flag=False,
-        )
-        rich = score_iron_condor(
-            _base_snapshot(cheapness_score=0.19, iv_rv_har=1.50, iv_rv_yz=1.45, **common),
-            prior=self._condor_prior(), crush_probability=0.80,
-        )
-        cheap = score_iron_condor(
-            _base_snapshot(cheapness_score=0.94, iv_rv_har=0.85, iv_rv_yz=0.85, **common),
-            prior=self._condor_prior(), crush_probability=0.80,
-        )
-        assert rich.expected_edge_pct > cheap.expected_edge_pct
-        assert rich.composite_structure_score > cheap.composite_structure_score, (
-            f"selling premium must score better on RICH vol: "
-            f"rich={rich.composite_structure_score:.3f} cheap={cheap.composite_structure_score:.3f}"
-        )
+    def test_condor_composite_uses_the_sellers_pricing_not_the_buyers_cheapness(self):
+        """AUDIT HIGH (kept): _finalize_scorecard adds +0.10 * cheapness_score for
+        every structure, and the snapshot's cheapness is the BUYERS' measure.
+        The condor feeds its own slot instead (how fairly the decaying premium is
+        priced), so the buyers' cheapness never moves it."""
+        common = dict(near_term_implied_sigma_pct=1.6, non_event_move_pct_har=1.2,
+                      event_move_share_of_total=0.80, rv_percentile_rank=40.0)
+        a = score_iron_condor(_base_snapshot(cheapness_score=0.19, **common), prior=self._condor_prior())
+        b = score_iron_condor(_base_snapshot(cheapness_score=0.94, **common), prior=self._condor_prior())
+        assert a.composite_structure_score == b.composite_structure_score
+        assert a.expected_edge_pct == b.expected_edge_pct
 
     def test_simulated_report_prior_gains_no_weight_from_the_blend(self):
         """AUDIT HIGH: blending a SIMULATED report prior's win/return at w_report
