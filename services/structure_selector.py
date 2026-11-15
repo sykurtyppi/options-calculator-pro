@@ -66,6 +66,19 @@ GATE_PROMOTION_SAMPLE_CONFIDENCE_LOW = "promotion_sample_confidence_low"
 GATE_PROMOTION_SCORE_GAP_NON_FINITE = "promotion_score_gap_non_finite"
 GATE_PROMOTION_SAMPLE_CONFIDENCE_NON_FINITE = "promotion_sample_confidence_non_finite"
 
+# A structure that fails ONLY these card-level gates is economically
+# unattractive, not broken: the selector passes over it and considers the next
+# structure in composite order instead of abstaining for the whole event.
+# Anything else stops the walk where it is: non-finite inputs (a broken card
+# fails closed, it is never skipped to trade a neighbour), snapshot-level gates
+# (data quality applies to every structure), and the decision-level gates
+# (weak history, watch, promotion) evaluated on the structure finally chosen.
+PASS_OVER_GATES = frozenset({
+    GATE_NON_POSITIVE_EDGE,
+    GATE_EXECUTION_PENALTY_HIGH,
+    GATE_EXECUTION_COST_DOMINATES_EDGE,
+})
+
 
 @dataclass(frozen=True)
 class SelectorOutput:
@@ -96,6 +109,9 @@ class SelectorOutput:
     data_quality_score: float
     binding_gate: Optional[str] = None
     binding_gates: List[str] = field(default_factory=list)
+    # Structures that out-ranked the chosen one on composite score but failed
+    # an economic hard gate (see PASS_OVER_GATES), with the gates they failed.
+    passed_over_structures: Dict[str, List[str]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -128,10 +144,9 @@ def select_best_structure(
         if card.eligible and np.isfinite(card.composite_structure_score)
     ]
     ranked = sorted(eligible, key=_ranking_key)
-    runner_ups = [card.structure for card in ranked[1:3]]
-    why_not = {card.structure: _explain_not_selected(card) for card in scorecards if not ranked or card.structure != ranked[0].structure}
 
     if not ranked:
+        why_not = {card.structure: _explain_not_selected(card) for card in scorecards}
         binding_gates = [GATE_NO_ELIGIBLE_STRUCTURE]
         return SelectorOutput(
             symbol=snapshot.symbol,
@@ -157,39 +172,22 @@ def select_best_structure(
             binding_gates=binding_gates,
         )
 
-    top = ranked[0]
-    runner_up = ranked[1] if len(ranked) > 1 else None
+    top, passed_over = _choose_structure(snapshot, ranked)
+    # The chosen structure competes with the structures ranked below it; the
+    # ones passed over above it are not alternatives (they failed a hard gate),
+    # so they neither shrink its score gap nor appear as runners-up.
+    competitors = [card for card in ranked if card is not top and card.structure not in passed_over]
+    runner_ups = [card.structure for card in competitors[:2]]
+    why_not = {card.structure: _explain_not_selected(card) for card in scorecards if card.structure != top.structure}
+    runner_up = competitors[0] if competitors else None
     gap = max(top.composite_structure_score - runner_up.composite_structure_score, 0.0) if runner_up is not None else top.composite_structure_score
     conflicting = _has_conflicting_signals(snapshot, top)
     weak_history = top.effective_walk_forward_history_count < MIN_WALK_FORWARD_HISTORY and gap < DOMINANT_SCORE_GAP
     top_penalty = max(top.execution_penalty, top.crowding_penalty, top.concavity_penalty, top.theta_drag_penalty)
 
-    # Execution-cost-dominates-edge veto (De Silva et al. 2025).
-    # Compute gross return BEFORE the execution cost was deducted, then check the ratio.
-    # The multiplier 26.0 matches structure_scorecard._penalty_pct(execution_penalty * 26.0),
-    # keeping both sides in the same internal scorecard units.
-    _exec_cost_pct = 26.0 * float(top.execution_penalty)
-    _gross_return_pct = float(top.expected_edge_pct) + _exec_cost_pct
-    _cost_dominates_edge = (
-        _gross_return_pct > 0.0
-        and _exec_cost_pct >= EXECUTION_COST_DOMINATES_EDGE_RATIO * _gross_return_pct
+    no_trade_gates = _ordered_no_trade_gates(
+        _card_hard_gates(top), _snapshot_hard_gates(snapshot), weak_history=weak_history,
     )
-
-    no_trade_gates = [
-        gate
-        for condition, gate in (
-            (not np.isfinite(top.expected_edge_pct), GATE_NON_FINITE_EXPECTED_EDGE),
-            (not np.isfinite(top.expected_return_pct), GATE_NON_FINITE_EXPECTED_RETURN),
-            (not np.isfinite(top.execution_penalty), GATE_NON_FINITE_EXECUTION_PENALTY),
-            (not np.isfinite(snapshot.data_quality_score), GATE_NON_FINITE_DATA_QUALITY_SCORE),
-            (top.expected_edge_pct <= 0.0, GATE_NON_POSITIVE_EDGE),
-            (top.execution_penalty >= HIGH_EXECUTION_PENALTY_THRESHOLD, GATE_EXECUTION_PENALTY_HIGH),
-            (snapshot.data_quality_score < MIN_DATA_QUALITY_FOR_ANY_TRADE, GATE_DATA_QUALITY_BELOW_FLOOR),
-            (weak_history, GATE_WEAK_WALK_FORWARD_HISTORY),
-            (_cost_dominates_edge, GATE_EXECUTION_COST_DOMINATES_EDGE),
-        )
-        if condition
-    ]
     watch_gates = [
         gate
         for condition, gate in (
@@ -283,14 +281,107 @@ def select_best_structure(
         model_output_note=_model_output_note(),
         primary_thesis=_primary_thesis(snapshot, top, recommendation),
         primary_risks=_common_risks(snapshot, top),
-        why_this_structure=_explain_selected(snapshot, top, gap, recommendation),
+        why_this_structure=_explain_selected(snapshot, top, gap, recommendation) + _passed_over_bullets(passed_over),
         why_not_others=why_not,
         runner_up_structures=runner_ups,
         data_quality=snapshot.data_quality,
         data_quality_score=_finite_or_zero(snapshot.data_quality_score),
         binding_gate=binding_gates[0] if binding_gates else None,
         binding_gates=binding_gates,
+        passed_over_structures=passed_over,
     )
+
+
+def _cost_dominates_edge(card: StructureScorecard) -> bool:
+    """Execution-cost-dominates-edge veto (De Silva et al. 2025).
+
+    Gross return BEFORE the execution cost was deducted, then the ratio. The
+    multiplier 26.0 matches structure_scorecard._penalty_pct(execution_penalty
+    * 26.0), keeping both sides in the same internal scorecard units.
+    """
+    exec_cost_pct = 26.0 * float(card.execution_penalty)
+    gross_return_pct = float(card.expected_edge_pct) + exec_cost_pct
+    return gross_return_pct > 0.0 and exec_cost_pct >= EXECUTION_COST_DOMINATES_EDGE_RATIO * gross_return_pct
+
+
+def _card_hard_gates(card: StructureScorecard) -> set:
+    """No-trade gates that depend on this structure's card alone."""
+    return {
+        gate
+        for condition, gate in (
+            (not np.isfinite(card.expected_edge_pct), GATE_NON_FINITE_EXPECTED_EDGE),
+            (not np.isfinite(card.expected_return_pct), GATE_NON_FINITE_EXPECTED_RETURN),
+            (not np.isfinite(card.execution_penalty), GATE_NON_FINITE_EXECUTION_PENALTY),
+            (card.expected_edge_pct <= 0.0, GATE_NON_POSITIVE_EDGE),
+            (card.execution_penalty >= HIGH_EXECUTION_PENALTY_THRESHOLD, GATE_EXECUTION_PENALTY_HIGH),
+            (_cost_dominates_edge(card), GATE_EXECUTION_COST_DOMINATES_EDGE),
+        )
+        if condition
+    }
+
+
+def _snapshot_hard_gates(snapshot: VolSnapshot) -> set:
+    """No-trade gates that apply to every structure on this snapshot."""
+    return {
+        gate
+        for condition, gate in (
+            (not np.isfinite(snapshot.data_quality_score), GATE_NON_FINITE_DATA_QUALITY_SCORE),
+            (snapshot.data_quality_score < MIN_DATA_QUALITY_FOR_ANY_TRADE, GATE_DATA_QUALITY_BELOW_FLOOR),
+        )
+        if condition
+    }
+
+
+# Stable recorded order of the no-trade gates (binding_gate is the first).
+_NO_TRADE_GATE_ORDER = (
+    GATE_NON_FINITE_EXPECTED_EDGE,
+    GATE_NON_FINITE_EXPECTED_RETURN,
+    GATE_NON_FINITE_EXECUTION_PENALTY,
+    GATE_NON_FINITE_DATA_QUALITY_SCORE,
+    GATE_NON_POSITIVE_EDGE,
+    GATE_EXECUTION_PENALTY_HIGH,
+    GATE_DATA_QUALITY_BELOW_FLOOR,
+    GATE_WEAK_WALK_FORWARD_HISTORY,
+    GATE_EXECUTION_COST_DOMINATES_EDGE,
+)
+
+
+def _ordered_no_trade_gates(card_gates: set, snapshot_gates: set, *, weak_history: bool) -> List[str]:
+    fired = set(card_gates) | set(snapshot_gates) | ({GATE_WEAK_WALK_FORWARD_HISTORY} if weak_history else set())
+    return [gate for gate in _NO_TRADE_GATE_ORDER if gate in fired]
+
+
+def _choose_structure(
+    snapshot: VolSnapshot,
+    ranked: Sequence[StructureScorecard],
+) -> tuple[StructureScorecard, Dict[str, List[str]]]:
+    """The structure to decide on, and the higher-ranked ones passed over.
+
+    Walks the composite ranking and passes over a structure only when every
+    hard gate it fails is economic (PASS_OVER_GATES). It stops at the first
+    structure that passes them, or that fails any other card gate (fail
+    closed). If every structure is passed over, or a snapshot-level gate fires,
+    the decision falls back to the top-ranked structure with nothing passed
+    over: exactly the abstention (and binding gates) recorded before.
+    """
+    if _snapshot_hard_gates(snapshot):
+        return ranked[0], {}
+    passed_over: Dict[str, List[str]] = {}
+    for card in ranked:
+        gates = _card_hard_gates(card)
+        if gates and gates <= PASS_OVER_GATES:
+            passed_over[card.structure] = _ordered_no_trade_gates(gates, set(), weak_history=False)
+            continue
+        return card, passed_over
+    return ranked[0], {}
+
+
+def _passed_over_bullets(passed_over: Dict[str, List[str]]) -> List[str]:
+    return [
+        f"{structure} ranked higher on composite score but failed {', '.join(gates)}, so it was passed over; "
+        "the score gap is measured against the structures ranked below this one."
+        for structure, gates in passed_over.items()
+    ]
 
 
 def _surface_degraded(snapshot: VolSnapshot) -> bool:
