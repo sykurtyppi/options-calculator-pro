@@ -31,6 +31,7 @@ import asyncio
 from utils.logger import setup_logger as get_logger
 from utils.quotes import safe_mid
 from services import crush_features as _CF
+from services import release_timing as _release_timing_rule
 from services.execution_cost_model import ExecutionCostModel
 from services.market_calendar import add_sessions, is_trading_day, next_session_on_or_after, quote_session
 
@@ -1807,14 +1808,16 @@ class InstitutionalMLDatabase:
 
             for idx, ts in enumerate(pd.to_datetime(earnings_df.index)):
                 ts_obj = pd.Timestamp(ts)
+                provider_ts = ts_obj  # as given (tz-aware): timing is judged on the New York clock
                 if ts_obj.tzinfo is not None:
                     # tz_localize(None) raises TypeError on already-aware timestamps;
                     # use tz_convert(None) to correctly strip the timezone.
                     ts_obj = ts_obj.tz_convert(None)
-                dt = ts_obj.to_pydatetime()
+                # The New York date of the release (a 20:30 ET stamp is the next day in UTC).
+                dt = datetime.combine(_release_timing_rule.market_date(provider_ts), datetime.min.time())
                 if window_start <= dt <= window_end:
                     release_timing = self._infer_release_timing_from_earnings_row(
-                        dt,
+                        provider_ts,
                         earnings_df.iloc[idx] if idx < len(earnings_df) else None
                     )
                     event_rows.append({
@@ -1836,10 +1839,15 @@ class InstitutionalMLDatabase:
 
         return event_rows
 
-    def _infer_release_timing_from_earnings_row(self, event_dt: datetime,
+    def _infer_release_timing_from_earnings_row(self, event_ts: Any,
                                               row: Optional[pd.Series]) -> str:
-        """Infer release timing bucket (AMC/BMO/UNKNOWN) from row/time metadata."""
-        # Heuristic 1: explicit columns from provider
+        """AMC / BMO / DMH / UNKNOWN for a provider earnings row (services.release_timing).
+
+        An explicit time column wins; otherwise the row's own timestamp is
+        judged on the New York clock. Pass the timestamp as the provider gave
+        it (tz-aware): a value already converted to naive UTC would be read as
+        New York wall-clock time.
+        """
         if row is not None:
             for key, value in row.items():
                 key_text = str(key).lower()
@@ -1847,29 +1855,11 @@ class InstitutionalMLDatabase:
                     timing = self._normalize_release_timing_token(value)
                     if timing != 'UNKNOWN':
                         return timing
-
-        # Heuristic 2: timestamp hour if provided
-        hour = int(event_dt.hour)
-        if hour >= 15:
-            return 'AMC'
-        if 0 <= hour <= 10:
-            return 'BMO'
-        return 'UNKNOWN'
+        return _release_timing_rule.classify_instant(event_ts)
 
     def _normalize_release_timing_token(self, value: Any) -> str:
-        """Normalize free-form timing token into AMC/BMO/UNKNOWN."""
-        text = str(value or '').strip().upper()
-        if not text:
-            return 'UNKNOWN'
-        if 'AMC' in text or 'AFTER' in text:
-            return 'AMC'
-        if 'BMO' in text or 'BEFORE' in text:
-            return 'BMO'
-        if text in {'POST', 'PM'}:
-            return 'AMC'
-        if text in {'PRE', 'AM'}:
-            return 'BMO'
-        return 'UNKNOWN'
+        """Normalize a free-form timing token (services.release_timing is the rule)."""
+        return _release_timing_rule.to_code(value)
 
     def _build_proxy_earnings_schedule(self, trading_dates: pd.Series, window_start: datetime,
                                      window_end: datetime,

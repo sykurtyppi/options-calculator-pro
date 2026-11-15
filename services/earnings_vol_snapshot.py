@@ -9,6 +9,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from services import release_timing as _release_timing_rule
 from services.earnings_move_profile import (
     compute_earnings_move_profile as _compute_earnings_move_profile,
     normalize_release_timing as _normalize_release_timing,
@@ -1165,16 +1166,13 @@ def _build_term_structure_snapshot(
 def _reaction_session_for_event(earnings_date: date, release_timing: str) -> date:
     """First session on which the earnings reaction can print.
 
-    BMO / intraday: the report lands before/during the event day's session, so
-    an option expiring ON the event date still captures the reaction.
-    AMC: the reaction prints the NEXT session — a same-day expiry expires
-    before it. Unknown timing is treated as AMC (conservative: never claim
-    event coverage that may not exist).
+    BMO / intraday: the event day's session (or the next session when the event
+    date is a weekend or holiday), so an option expiring ON the event date still
+    captures the reaction. AMC: the next session after the event day. Unknown
+    timing is treated as AMC (conservative: never claim event coverage that may
+    not exist). services.release_timing.reaction_session is the rule.
     """
-    timing = _normalize_release_timing(release_timing)
-    if timing in ("before market open", "during market hours"):
-        return earnings_date
-    return earnings_date + timedelta(days=1)
+    return _release_timing_rule.reaction_session(earnings_date, release_timing)
 
 
 def _find_event_expiry_stats(

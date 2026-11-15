@@ -369,14 +369,10 @@ class YFinanceMarketDataClient:
             ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
             if not ts:
                 return None
-            import pytz
-            ny = pytz.timezone("America/New_York")
-            dt_ny = _dt.datetime.fromtimestamp(int(ts), tz=_dt.timezone.utc).astimezone(ny)
-            if dt_ny.hour >= 16:
-                return "after market close"
-            if dt_ny.hour < 12:
-                return "before market open"
-            return "during market hours"
+            from services import release_timing as _release_timing_rule
+
+            code = _release_timing_rule.classify_instant(int(ts))
+            return None if code == _release_timing_rule.UNKNOWN else _release_timing_rule.to_label(code)
         except Exception:
             return None
 

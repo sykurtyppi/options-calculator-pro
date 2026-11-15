@@ -29,6 +29,12 @@ import pandas as pd
 import pytz
 import yfinance as yf
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from services import release_timing as _release_timing_rule  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -89,15 +95,15 @@ def t3_entry_date(event_date: date) -> date:
 
 
 def get_release_timing(info: dict) -> str:
+    """AMC / BMO, or "INTRADAY (HH:MM ET)" for a release during the session."""
     ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
     if not ts:
         return "UNKNOWN"
-    dt_ny = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(NY_TZ)
-    if dt_ny.hour >= 16:
-        return "AMC"
-    if dt_ny.hour < 12:
-        return "BMO"
-    return f"INTRADAY ({dt_ny.strftime('%H:%M')} ET)"
+    code = _release_timing_rule.classify_instant(ts)
+    if code == _release_timing_rule.DMH:
+        dt_ny = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(NY_TZ)
+        return f"INTRADAY ({dt_ny.strftime('%H:%M')} ET)"
+    return code
 
 
 def pick_front_expiry_after(expirations: tuple, event_date: date) -> Optional[str]:

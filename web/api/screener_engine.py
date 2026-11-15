@@ -10,6 +10,7 @@ import pandas as pd
 import yfinance as yf
 
 from utils.quotes import safe_mid
+from services import release_timing as _release_timing_rule
 from services.earnings_event_service import resolve_upcoming_earnings_event
 from services.market_data_client import MarketDataClient
 from services.market_calendar import is_trading_day, monthly_option_expiry
@@ -110,17 +111,7 @@ def _extract_calendar_dates(raw_calendar: Any) -> list[date]:
 
 def _infer_release_timing(info: dict[str, Any]) -> str:
     ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
-    if ts is None:
-        return "UNKNOWN"
-    try:
-        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
-    except (TypeError, ValueError, OSError):
-        return "UNKNOWN"
-    if dt.hour >= 20:
-        return "AMC"
-    if dt.hour < 16:
-        return "BMO"
-    return "UNKNOWN"
+    return _release_timing_rule.classify_instant(ts) if ts is not None else "UNKNOWN"
 
 
 def _load_upcoming_event(
