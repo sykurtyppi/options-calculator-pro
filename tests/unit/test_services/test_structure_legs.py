@@ -789,3 +789,49 @@ def test_a_later_live_yahoo_fetch_is_refused_for_an_earlier_as_of(monkeypatch) -
     assert past == {} or past.get("coverage") != "complete"
     assert _structure_legs_from_inputs(chain, pd.DataFrame(), 500.0, earnings, "AMC",
                                        date(2026, 11, 16))["coverage"] == "complete"
+
+
+# ── review round 4: per-row quote-date resolution ──────────────────────────
+
+NOV18_UNIX = pd.Timestamp("2026-11-18 15:00", tz="UTC").timestamp()
+NOV16_UNIX = pd.Timestamp("2026-11-16 15:00", tz="UTC").timestamp()
+
+
+@pytest.mark.parametrize("columns,complete_on_nov16", [
+    ({"trade_date": None, "updated": NOV18_UNIX}, False),        # null canonical must not hide a valid alias
+    ({"trade_date": None, "report_date": "2026-11-18"}, False),
+    ({"trade_date": "invalid-date"}, False),                     # supplied but unusable: untrusted, not "today"
+    ({"report_date": "garbage"}, False),
+    ({"updated": "not-a-time"}, False),
+    ({"trade_date": None, "updated": "nan-ish"}, False),
+    ({"updated": NOV16_UNIX}, True),
+    ({"trade_date": "2026-11-16", "updated": NOV18_UNIX}, True),  # a valid canonical date decides
+    ({"trade_date": None}, True),                                # genuinely undated: the fetch date
+    ({}, True),
+])
+def test_each_rows_quote_date_is_resolved_before_it_is_trusted(monkeypatch, columns, complete_on_nov16) -> None:
+    monkeypatch.setattr(edge_engine, "_market_today_date", lambda: date(2026, 11, 16))
+    earnings = date(2026, 11, 19)
+
+    class _Dated(_MixedProvider):
+        def get_option_chain(self, _s, expiration=None, **_k):
+            return _provider_frame(expiration, 1.0 if expiration == self.front else 2.0).assign(**columns)
+
+    chain = edge_engine._fetch_structure_chain(
+        "AAA", client=_Dated("2026-11-20", "2026-12-04"), use_provider=True, ticker=None,
+        earnings_date=earnings, release_timing="AMC", as_of_date=date(2026, 11, 16))
+    legs = _structure_legs_from_inputs(chain, pd.DataFrame(), 500.0, earnings, "AMC", date(2026, 11, 16))
+    assert (legs.get("coverage") == "complete") is complete_on_nov16
+
+
+def test_untrusted_rows_never_price_a_structure() -> None:
+    # Half the front rows carry a malformed date: those rows are dropped, never stamped "today".
+    ticker = _dense_ticker(WEEKLY)
+    earnings, as_of = date(2026, 11, 19), date(2026, 11, 16)
+    chain = edge_engine._fetch_structure_chain("AAA", client=None, use_provider=False, ticker=ticker,
+                                               earnings_date=earnings, release_timing="AMC", as_of_date=as_of)
+    front = chain["chain"][0].copy()
+    front.loc[front["call_put"] == "P", "trade_date"] = "invalid-date"
+    tampered = {**chain, "chain": [front] + chain["chain"][1:], "fetched_on": "2026-11-16"}
+    legs = _structure_legs_from_inputs(tampered, pd.DataFrame(), 500.0, earnings, "AMC", as_of)
+    assert legs == {} or legs.get("coverage") != "complete"  # the front expiry has no trusted puts left

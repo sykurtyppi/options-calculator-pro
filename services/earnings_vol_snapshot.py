@@ -750,16 +750,14 @@ def _structure_legs_from_inputs(
     if structure_chain:
         raw = structure_chain.get("chain")
         parts = raw if isinstance(raw, (list, tuple)) else [raw]
+        fetched_on = structure_chain.get("fetched_on")
+        # Resolve every row's quote date BEFORE normalisation (see
+        # _resolve_structure_trade_dates): a supplied date always wins, a
+        # supplied but unusable one leaves the row untrusted, and only a row
+        # with no date at all takes the fetch date.
+        parts = [_resolve_structure_trade_dates(part, fetched_on) for part in parts]
         normalized = [_normalize_option_chain(part)[0] for part in parts]
         normalized = [part for part in normalized if not part.empty]
-        # A row with no quote time of its own (after the normaliser has read
-        # any provider timestamp) was quoted when it was fetched: stamp it with
-        # the fetch date, never the as-of date.
-        fetched_on = structure_chain.get("fetched_on")
-        if fetched_on:
-            stamp = pd.Timestamp(fetched_on)
-            normalized = [part.assign(trade_date=pd.to_datetime(part["trade_date"], errors="coerce").fillna(stamp))
-                          for part in normalized]
         frame = pd.concat(normalized, ignore_index=True) if normalized else pd.DataFrame()
         # The same point-in-time guard as the primary chain: rows quoted after
         # the as-of date, or with no valid trade date, never price the legs.
@@ -787,6 +785,61 @@ def _structure_legs_from_inputs(
                 return {**legs, "coverage": COVERAGE_COMPLETE}
     legs = _structure_legs_for_chain(analysis_chain, underlying_price, earnings_date, release_timing, as_of_date)
     return {**legs, "coverage": COVERAGE_SAMPLED} if legs else {}
+
+
+_DATE_COLUMNS = ("trade_date", "report_date", "updated")
+
+
+def _is_absent(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and np.isnan(value):
+        return True
+    return isinstance(value, str) and not value.strip()
+
+
+def _parse_quote_date(column: str, value: Any) -> Optional[pd.Timestamp]:
+    """The naive (UTC calendar) timestamp of one supplied value, or None if unusable."""
+    if column == "updated":
+        try:
+            parsed = pd.to_datetime(float(value), unit="s", utc=True)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    if parsed is None or pd.isna(parsed):
+        return None
+    return parsed.tz_localize(None)
+
+
+def _resolve_structure_trade_dates(part: Any, fetched_on: Optional[str]) -> Any:
+    """One trusted quote date per row of a structure-chain part.
+
+    For each row, the first SUPPLIED value among trade_date, report_date and
+    updated (the timestamps the snapshot normaliser understands) decides: a
+    parseable one is the row's date; an unparseable one makes the row
+    untrusted (NaT, which the as-of guard then drops). Only a row with none
+    of them supplied takes the fetch date. The alias columns are dropped so
+    the normaliser cannot second-guess the result.
+    """
+    if not isinstance(part, pd.DataFrame) or part.empty:
+        return part
+    present = [column for column in _DATE_COLUMNS if column in part.columns]
+    stamp = pd.Timestamp(fetched_on) if fetched_on else pd.NaT
+    resolved = []
+    for _, row in part.iterrows():
+        value = stamp
+        for column in present:
+            raw = row[column]
+            if _is_absent(raw):
+                continue
+            parsed = _parse_quote_date(column, raw)
+            value = parsed if parsed is not None else pd.NaT
+            break
+        resolved.append(value)
+    out = part.drop(columns=[c for c in ("report_date", "updated") if c in part.columns])
+    out["trade_date"] = pd.to_datetime(pd.Series(resolved, index=part.index), errors="coerce")
+    return out
 
 
 def _structure_legs_for_chain(
