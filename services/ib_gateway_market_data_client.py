@@ -29,7 +29,11 @@ Connection settings (all optional):
   IB_GATEWAY_HOST                 default 127.0.0.1
   IB_GATEWAY_PORT                 default 4002 (paper gateway; live gateway 4001,
                                   TWS paper 7497, TWS live 7496)
-  IB_GATEWAY_CLIENT_ID            default 17
+  IB_GATEWAY_CLIENT_ID            default 17. The gateway allows one connection per
+                                  client id, and the API server and each scheduled
+                                  job are separate processes, so a process that
+                                  finds its id taken connects with the next free
+                                  one (17, 18, ... up to eight tries).
   IB_GATEWAY_MARKET_DATA_TYPE     1 live | 2 frozen | 3 delayed | 4 delayed-frozen
   IB_GATEWAY_TIMEOUT_SECONDS      socket connect timeout, default 10
   IB_GATEWAY_QUOTE_SETTLE_SECONDS max wait for streamed quotes to arrive, default 15
@@ -45,6 +49,11 @@ so a screener that asks for many symbols at once forms a queue. The two budgets
 above are separate on purpose: time spent waiting in that queue is not time the
 gateway took, and must not fail a request the gateway would have served.
 
+The market-data lines belong to the account, not to one connection, so the turn
+is also taken across processes: a lock file under
+``~/.options_calculator_pro/state`` keeps the API server and a scheduled job
+from each streaming a full batch at the same moment.
+
 The gateway must be running and logged in; the client never enters credentials.
 It connects read-only and never places, modifies or cancels orders.
 """
@@ -57,7 +66,13 @@ import math
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
+
+try:  # POSIX only; without it the cross-process turn is skipped, not faked.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 import numpy as np
 import pandas as pd
@@ -108,6 +123,17 @@ _OPTION_GENERIC_TICKS = "100,101,106"
 # How long a failed connection attempt keeps is_available() False before retrying.
 UNAVAILABLE_COOLDOWN_SECONDS = 60.0
 MAX_EXPIRATIONS_FOR_ALL = 12
+# "Unable to connect as the client id is already in use."
+CLIENT_ID_IN_USE_CODE = 326
+# The configured client id, then the next seven. The API server plus every
+# scheduled job running at once is far fewer processes than that.
+MAX_CLIENT_ID_ATTEMPTS = 8
+# Where the cross-process chain turn is taken; one lock file per gateway address.
+_DEFAULT_LINE_LOCK_DIR = Path.home() / ".options_calculator_pro" / "state"
+_LINE_LOCK_POLL_SECONDS = 0.25
+# After finishing a chain, how long this process leaves the turn free before
+# taking it again: two poll intervals, so a waiting process is sure to see it.
+_LINE_LOCK_STAND_BACK_SECONDS = 2 * _LINE_LOCK_POLL_SECONDS
 
 # Normalized chain columns expected by edge_engine / screener / institutional_ml_db
 # (mirrors MarketDataClient._chain_response_to_df). ``updated`` (unix seconds) is
@@ -155,6 +181,24 @@ class IBGatewayQueueTimeout(TimeoutError):
     """A chain request waited for its turn longer than the queue budget."""
 
 
+# Returned by the line-lock wait when the queue budget ran out first.
+_QUEUE_EXPIRED = object()
+
+
+def _lock_name(host: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in str(host)) or "host"
+
+
+def _release_line_lock(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:  # pragma: no cover - closing releases it anyway
+        pass
+    handle.close()
+
+
 def _add_settle(timing: Dict[str, Any], stats: Dict[str, Any]) -> None:
     """Fold one batch's settle wait into the chain's timing record."""
     timing["settle_seconds"] = timing.get("settle_seconds", 0.0) + stats["seconds"]
@@ -200,6 +244,9 @@ class _IBSession:
         self._ib: Any = None
         self._start_lock = threading.Lock()
         self._chain_lock: Optional[asyncio.Lock] = None
+        self._client_id_refused: Optional[asyncio.Event] = None
+        #: The client id the live connection actually uses (None until connected).
+        self.connected_client_id: Optional[int] = None
         self.recent_errors: List[Dict[str, Any]] = []
 
     # ── loop plumbing ─────────────────────────────────────────────────────────
@@ -235,18 +282,78 @@ class _IBSession:
             if error_event is not None:
                 error_event += self._on_error
         if not self._ib.isConnected():
-            try:
-                await self._ib.connectAsync(
-                    self._host, self._port, clientId=self._client_id,
-                    timeout=self._timeout, readonly=True,
-                )
-            except Exception as exc:
-                raise IBGatewayConnectionError(
-                    f"IB Gateway not reachable at {self._host}:{self._port} "
-                    f"(clientId={self._client_id}): {type(exc).__name__}: {exc}"
-                ) from exc
+            await self._connect_with_free_client_id()
             self._ib.reqMarketDataType(self._market_data_type)
         return self._ib
+
+    async def _connect_with_free_client_id(self) -> None:
+        """Connect with the configured client id, or the next one nobody holds.
+
+        The gateway accepts one connection per client id. The API server and
+        each scheduled job are separate processes reading the same setting, so
+        whichever connected second used to be refused and fell back to another
+        data provider without a word. A refusal for that reason (IB error 326)
+        moves on to the next id; any other failure is the gateway being down
+        and is reported as before.
+        """
+        self.connected_client_id = None
+        tried: List[int] = []
+        failure: Optional[BaseException] = None
+        id_in_use = False
+        for offset in range(MAX_CLIENT_ID_ATTEMPTS):
+            client_id = self._client_id + offset
+            tried.append(client_id)
+            failure, id_in_use = await self._connect_once(client_id)
+            if failure is None:
+                self.connected_client_id = client_id
+                if offset:
+                    logger.info(
+                        "IB Gateway client id %s is held by another process; connected as client id %s.",
+                        self._client_id, client_id,
+                    )
+                return
+            if not id_in_use:
+                break
+        if id_in_use:
+            raise IBGatewayConnectionError(
+                f"IB Gateway at {self._host}:{self._port} refused client ids {tried[0]}-{tried[-1]}: "
+                f"every one is already in use. Close other API clients or set {CLIENT_ID_ENV}."
+            ) from failure
+        raise IBGatewayConnectionError(
+            f"IB Gateway not reachable at {self._host}:{self._port} "
+            f"(clientId={tried[-1]}): {type(failure).__name__}: {failure}"
+        ) from failure
+
+    async def _connect_once(self, client_id: int):
+        """One connection attempt. Returns ``(failure or None, client_id_in_use)``.
+
+        A refused client id is announced at once (error 326) but ib_async keeps
+        waiting for its connect timeout, so the attempt is raced against that
+        announcement instead of costing the full timeout per taken id.
+        """
+        refused = self._client_id_refused = asyncio.Event()
+        connect = asyncio.ensure_future(self._ib.connectAsync(
+            self._host, self._port, clientId=client_id, timeout=self._timeout, readonly=True,
+        ))
+        announced = asyncio.ensure_future(refused.wait())
+        try:
+            await asyncio.wait({connect, announced}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            announced.cancel()
+            if not connect.done():
+                connect.cancel()
+            await asyncio.gather(connect, announced, return_exceptions=True)
+            self._client_id_refused = None
+        if not connect.cancelled() and connect.exception() is None and not refused.is_set():
+            return None, False
+        failure = (None if connect.cancelled() else connect.exception()) or ConnectionRefusedError(
+            f"client id {client_id} is already in use")
+        try:
+            # Leave the IB object clean for the next attempt.
+            self._ib.disconnect()
+        except Exception:  # pragma: no cover - best-effort reset
+            pass
+        return failure, refused.is_set()
 
     def _on_error(self, reqId: Any, errorCode: Any, errorString: Any, contract: Any = None, *rest: Any) -> None:
         # Keep a short ring of the gateway's error messages so an all-NaN chain
@@ -257,6 +364,8 @@ class _IBSession:
             "at": time.time(),
         })
         del self.recent_errors[:-50]
+        if str(errorCode) == str(CLIENT_ID_IN_USE_CODE) and self._client_id_refused is not None:
+            self._client_id_refused.set()
 
     def chain_lock(self) -> asyncio.Lock:
         if self._chain_lock is None:
@@ -295,6 +404,7 @@ class IBGatewayMarketDataClient:
         settle_seconds: Optional[float] = None,
         chain_timeout: Optional[float] = None,
         chain_queue_timeout: Optional[float] = None,
+        line_lock_path: Optional[Path] = None,
     ) -> None:
         self.host = host or os.environ.get(HOST_ENV, "").strip() or DEFAULT_HOST
         self.port = port if port is not None else _env_int(PORT_ENV, DEFAULT_PORT)
@@ -317,6 +427,9 @@ class IBGatewayMarketDataClient:
         )
         self._earnings_client = earnings_client
         self._unavailable_until = 0.0
+        self._line_lock_released_at = float("-inf")
+        self._line_lock_path = Path(line_lock_path) if line_lock_path is not None else (
+            _DEFAULT_LINE_LOCK_DIR / f"ib_gateway_chain_{_lock_name(self.host)}_{self.port}.lock")
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -332,6 +445,11 @@ class IBGatewayMarketDataClient:
 
     def _run(self, coro_fn: Callable[[Any], Any], *, timeout: Optional[float] = None) -> Any:
         return self._session.run(coro_fn, timeout=timeout if timeout is not None else self.timeout + 5.0)
+
+    @property
+    def connected_client_id(self) -> Optional[int]:
+        """The client id in use: the configured one, or the next free one if it was taken."""
+        return self._session.connected_client_id
 
     @property
     def recent_gateway_errors(self) -> List[Dict[str, Any]]:
@@ -509,27 +627,78 @@ class IBGatewayMarketDataClient:
         """
         timing = timing if timing is not None else {}
         queued_at = time.monotonic()
+
+        def _too_long() -> IBGatewayQueueTimeout:
+            return IBGatewayQueueTimeout(
+                f"{symbol} chain waited {time.monotonic() - queued_at:.0f} s for its turn "
+                f"(limit {self.chain_queue_timeout:.0f} s)"
+            )
+
+        # Two turns to take: among this process's own requests, then among the
+        # processes sharing the account's market-data lines.
         async with self._session.chain_lock():
-            started_at = time.monotonic()
-            timing["queued_seconds"] = started_at - queued_at
-            if timing["queued_seconds"] > self.chain_queue_timeout:
-                raise IBGatewayQueueTimeout(
-                    f"{symbol} chain waited {timing['queued_seconds']:.0f} s for its turn "
-                    f"(limit {self.chain_queue_timeout:.0f} s)"
-                )
-            timing["fetch_started"] = True
+            if time.monotonic() - queued_at > self.chain_queue_timeout:
+                raise _too_long()
+            line_lock = await self._acquire_line_lock(queued_at + self.chain_queue_timeout)
+            if line_lock is _QUEUE_EXPIRED:
+                raise _too_long()
             try:
-                async with asyncio.timeout(self.chain_timeout) as budget:
-                    return await self._fetch_chain_now(ib, symbol, expiration, strike_limit, side,
-                                                       range_filter, timing)
-            except TimeoutError as exc:
-                if budget.expired():
-                    raise IBGatewayChainTimeout(
-                        f"{symbol} chain did not finish within {self.chain_timeout:.0f} s of starting"
-                    ) from exc
-                raise
+                started_at = time.monotonic()
+                timing["queued_seconds"] = started_at - queued_at
+                timing["fetch_started"] = True
+                try:
+                    async with asyncio.timeout(self.chain_timeout) as budget:
+                        return await self._fetch_chain_now(ib, symbol, expiration, strike_limit, side,
+                                                           range_filter, timing)
+                except TimeoutError as exc:
+                    if budget.expired():
+                        raise IBGatewayChainTimeout(
+                            f"{symbol} chain did not finish within {self.chain_timeout:.0f} s of starting"
+                        ) from exc
+                    raise
+                finally:
+                    timing["fetch_seconds"] = time.monotonic() - started_at
             finally:
-                timing["fetch_seconds"] = time.monotonic() - started_at
+                _release_line_lock(line_lock)
+                self._line_lock_released_at = time.monotonic()
+
+    async def _acquire_line_lock(self, deadline: float) -> Any:
+        """Take the cross-process chain turn; ``_QUEUE_EXPIRED`` if ``deadline`` passes first.
+
+        An advisory lock on a file: the kernel drops it when the holder exits,
+        so a crashed process can never leave the turn taken. Returns None when
+        the platform has no flock or the lock file cannot be opened; the fetch
+        then proceeds with only the in-process turn, as it did before.
+        """
+        if fcntl is None:
+            return None
+        # A burst of queued chains would otherwise retake the lock the instant
+        # it is released, and a process polling for it could wait out the whole
+        # burst. Standing back briefly after each chain gives a waiting process
+        # a certain opening, at half a second per back-to-back chain.
+        stand_back = self._line_lock_released_at + _LINE_LOCK_STAND_BACK_SECONDS - time.monotonic()
+        if stand_back > 0:
+            await asyncio.sleep(stand_back)
+        try:
+            self._line_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self._line_lock_path, "a+")
+        except OSError as exc:
+            logger.warning("IB Gateway chain lock %s unavailable (%s); continuing without the "
+                           "cross-process turn.", self._line_lock_path, exc)
+            return None
+        try:
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return handle
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        handle.close()
+                        return _QUEUE_EXPIRED
+                    await asyncio.sleep(_LINE_LOCK_POLL_SECONDS)
+        except BaseException:
+            handle.close()
+            raise
 
     async def _fetch_chain_now(self, ib: Any, symbol: str, expiration: Optional[str], strike_limit: int,
                                side: Optional[str], range_filter: Optional[str], timing: Dict[str, Any]):

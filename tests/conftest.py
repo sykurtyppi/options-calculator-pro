@@ -98,6 +98,7 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
     """
     import services.baseline_evidence_store as bes
     import services.evidence_funnel as ef
+    import services.ib_gateway_market_data_client as ibg
     import services.outcome_recorder as orec
     import services.provider_reliability as pr
     import services.recommendation_ledger as rl
@@ -121,6 +122,9 @@ def _isolate_default_singleton_stores(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(pr, "_DEFAULT_BUDGET_STORE", root / "telemetry" / "provider_budget.sqlite")
     monkeypatch.setattr(pr, "_DEFAULT_CACHE_STORE", root / "cache" / "provider_response_cache.sqlite")
     monkeypatch.setattr(pr, "_DEFAULT_UNMETERED_LOG", root / "telemetry" / "unmetered_provider_calls.jsonl")
+    # The IB chain turn is a lock file shared by every process on the machine;
+    # a test must never wait on (or hold up) a real job's turn.
+    monkeypatch.setattr(ibg, "_DEFAULT_LINE_LOCK_DIR", root / "state")
 
     def _reset_singletons():
         pr.reset_breakers()
