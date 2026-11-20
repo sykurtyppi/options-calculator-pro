@@ -107,6 +107,42 @@ The sector map is incomplete:
 
 Fix it before relying on group offsets.
 
+## Ordinary daily variance during the hold
+
+Step 3 of the pricing plan (`services/daily_vol.py`). Between entry and exit a
+straddle also gains when the stock moves more on ordinary days than the base
+variance the options price, and loses when it moves less.
+
+**Target:** the realized close-to-close variance of the hold, which is the
+mean squared log return of the sessions after the entry through the exit.
+Every session must have a close; a gap is reported as `hold_closes_missing`
+and never averaged over. The hold ends before the event, so the event is
+never in it.
+
+**Forecasts, all in variance per session and point in time:**
+
+| Forecast | What it is |
+|---|---|
+| `implied` | The market's base variance b from the two-expiry fit. |
+| `har_rs` | What production uses today: the snapshot's HAR on Rogers-Satchell variance, which is open-to-close only. It leaves out the overnight gap, but an option is paid on close-to-close moves. |
+| `har_cc` | The same HAR regression on close-to-close returns, with the sessions earlier earnings moved excluded (the snapshot's rule). |
+| `calibrated` | `har_cc` times a walk-forward scale. The pooled scale is the ratio of summed realized to summed forecast variance over every earlier hold. Group and symbol factors are each a per-event mean ratio, shrunk toward 1 by n / (n + 8). |
+
+**Losses.** A few sessions' squared returns are a noisy, skewed estimate of
+the true variance. By Jensen's inequality, a log loss (and a log-ratio
+calibration) rewards forecasts that are too low, and on synthetic data it ranks
+a forecast 30% too low ahead of the truth. So the report uses only the
+losses that rank correctly against a noisy target (Patton 2011):
+
+- **QLIKE:** realized/forecast − log(realized/forecast) − 1.
+- **Squared error in levels.**
+
+For each loss it reports skill against `implied` (1 − loss / loss(implied),
+above 0 beats the market). Bias is reported as a level ratio, mean realized ÷
+mean forecast (above 1 means the forecast is too low). Spread Spearman asks
+whether a forecast knows when the market's base variance is rich or cheap.
+All forecasts are compared on the same rows.
+
 ## Limits, stated in every report
 
 - **No claims.** The archive is end of day: there is no live source and no per-leg quote time, so no fill here is a claim under the claim contract. The conservative fill is used as a price, not as evidence.

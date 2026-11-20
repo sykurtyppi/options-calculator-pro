@@ -101,7 +101,9 @@ def test_every_read_is_the_entry_session_or_the_exit_session(replay) -> None:
     chain_reads = {(s, d) for kind, s, d in archive.reads if kind == "chain"}
     price_reads = {(s, d) for kind, s, d in archive.reads if kind == "prices"}
     assert chain_reads == entries | exits
-    assert price_reads == entries
+    # Prices through the exit are the outcome (the hold's realized variance);
+    # the snapshot only ever gets the entry read (checked below).
+    assert price_reads == entries | exits
 
 
 def test_the_snapshot_sees_nothing_after_its_session(replay) -> None:
