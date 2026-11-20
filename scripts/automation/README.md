@@ -69,6 +69,29 @@ The screener alert runs weekdays at 15:00 local — on this Atlantic/Reykjavik (
 
 Operators in other timezones: change `Hour=15` in `com.optionscalculator.premarket-screener-alert.plist` to your local equivalent of "at least 30 minutes AFTER the 09:30 ET open in both DST regimes" (never pre-open — yfinance has no usable quotes before the bell), then reinstall.
 
+### IB Gateway login check
+
+IB Gateway is a GUI app a person signs into, and it signs itself out: on IB's weekly reset, when a nightly restart's session token is refused, or when the session is closed mid-day. Nothing fails when that happens. Every analysis falls back to another data provider and the only trace is a different `option_source` in that day's rows.
+
+`scripts/ib_gateway_login_alert.py` makes it loud. It is not a job of its own; two existing jobs run it first:
+
+| Job | When | Message when the gateway is not ready |
+|---|---|---|
+| `premarket-screener-alert` | Weekdays 15:00 | Sign in before today's evidence cycle. |
+| `evidence-cycle` | Daily 16:45 | Today's cycle is starting now on the fallback provider. |
+
+- **What it checks.** It sends the first frame of an API handshake to `IB_GATEWAY_HOST:IB_GATEWAY_PORT` and waits for the server version. A gateway at its login screen has no API socket (connection refused); one with a dialog waiting accepts and says nothing. The probe never sends `startApi`, so it takes no client id and cannot disturb a connected client.
+- **When it stays quiet.** Another options provider is configured, the market is closed that day (the gateway signs out every weekend), or the gateway answered.
+- **One text per job per day**, recorded in `~/.options_calculator_pro/state/ib_gateway_login_alerts.json`. Recipient is `WATCHDOG_IMESSAGE_TO`, shared with the watchdog.
+- **It cannot stop a job.** The script exits 0 whatever it finds, and both wrappers guard the call. Its one line of JSON lands in the calling job's log.
+- **It cannot sign in.** Credentials are never stored or entered; signing in is always done by a person at the Mac.
+
+Preview what it would send without sending or recording anything:
+
+```bash
+.venv311/bin/python scripts/ib_gateway_login_alert.py --context premarket --dry-run
+```
+
 The log-rotation job runs at 03:00 local — chosen to be safely away from every other launchd job so no other job has an active handle on the `.log` files we rotate. Rotation is size-based (default 5 MB threshold) with gzip + 7-archive retention per file; see `scripts/rotate_launchd_logs.py --help` for the exact contract and tunables. Only `*_launchd*.log` shapes are touched — the Python-logger files (`__main__.log`, `services.*.log`) manage their own rotation via `RotatingFileHandler`.
 
 The candidate exit resolver is scheduled at 12:30 local time so prior-day post-event chains have time to settle before the resolver scans pending forward observations. It is operational infrastructure only: it records whether candidate shadow outcomes could be resolved, and it never alerts on positive/negative PnL or candidate-vs-legacy performance.

@@ -76,6 +76,12 @@ fi
 {
   echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') premarket alert start ====="
   echo "min_score=${MIN_SCORE} top=${TOP_N}"
+  # This job runs 1h45 before the evidence cycle on trading days, which makes it
+  # the moment to say IB Gateway is not signed in while there is still time to
+  # sign in. The check only reports (one iMessage per day) and can never stop
+  # or fail the screener alert.
+  "${PYTHON_BIN}" scripts/ib_gateway_login_alert.py --context premarket \
+    || echo "ib gateway login check could not run (exit_code=$?)"
   set +e
   "${PYTHON_BIN}" - "${PYTHON_BIN}" "${TIMEOUT_SECONDS}" "${ALERT_ARGS[@]}" <<'PY'
 import subprocess
