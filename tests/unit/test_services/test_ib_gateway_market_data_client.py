@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import fcntl
 import math
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -132,6 +134,13 @@ class _FakeIB:
 
     def cancelMktData(self, contract):
         self.cancelled.append(contract)
+
+
+@pytest.fixture(autouse=True)
+def _no_stand_back(monkeypatch):
+    """Back-to-back chains pause half a second for other processes; the one test
+    about that pause turns it back on, the rest should not pay for it."""
+    monkeypatch.setattr(ib_module, "_LINE_LOCK_STAND_BACK_SECONDS", 0.0)
 
 
 def _client(fake: _FakeIB, **kwargs) -> IBGatewayMarketDataClient:
@@ -444,3 +453,168 @@ def test_chain_budgets_are_read_from_env(monkeypatch):
     monkeypatch.setenv("IB_GATEWAY_CHAIN_QUEUE_SECONDS", "soon")
     client = IBGatewayMarketDataClient(ib_factory=_FakeIB)
     assert (client.chain_timeout, client.chain_queue_timeout) == (120.0, 900.0)
+
+
+# ── one gateway, several processes ────────────────────────────────────────────
+
+class _BusyIdsIB(_FakeIB):
+    """A gateway where some client ids are already held by other processes.
+
+    Mirrors the real one: it announces error 326 at once, then leaves the caller
+    waiting until its connect timeout.
+    """
+
+    def __init__(self, *, taken) -> None:
+        super().__init__()
+        self.taken = set(taken)
+
+    async def connectAsync(self, host, port, clientId, timeout, readonly):
+        if clientId in self.taken:
+            self.connect_calls.append({"host": host, "port": port, "clientId": clientId, "readonly": readonly})
+            self.errorEvent.emit(-1, 326, "Unable to connect as the client id is already in use.", None)
+            await asyncio.sleep(timeout)
+            raise TimeoutError()
+        await super().connectAsync(host, port, clientId, timeout, readonly)
+
+    def disconnect(self) -> None:
+        self.connected = False
+
+
+def _tried_ids(fake):
+    return [call["clientId"] for call in fake.connect_calls]
+
+
+def test_taken_client_id_moves_to_the_next_free_one_without_waiting_out_the_timeout():
+    """The API server holds client id 17; a scheduled job reading the same
+    setting used to be refused and fall back to another provider."""
+    fake = _BusyIdsIB(taken={17, 18})
+    client = _client(fake)
+    started = time.monotonic()
+    assert client.is_available() is True
+    # Two refusals at a 2 s connect timeout each would be 4 s if waited out.
+    assert time.monotonic() - started < 1.5
+    assert _tried_ids(fake) == [17, 18, 19]
+    assert client.connected_client_id == 19
+    assert not client.get_option_chain("ACME", expiration="2026-07-17").empty
+
+
+def test_free_client_id_is_used_as_configured():
+    fake = _FakeIB()
+    client = _client(fake)
+    assert client.connected_client_id is None            # nothing dialled yet
+    assert client.is_available() is True
+    assert _tried_ids(fake) == [17] and client.connected_client_id == 17
+
+
+def test_every_client_id_taken_is_reported_as_such(caplog):
+    fake = _BusyIdsIB(taken=set(range(17, 17 + ib_module.MAX_CLIENT_ID_ATTEMPTS)))
+    client = _client(fake)
+    with caplog.at_level("WARNING"):
+        assert client.is_available() is False
+    assert _tried_ids(fake) == list(range(17, 25))
+    assert "refused client ids 17-24" in caplog.text and "already in use" in caplog.text
+    assert client.connected_client_id is None
+
+
+def test_stopped_gateway_is_not_mistaken_for_a_taken_client_id():
+    fake = _FakeIB(refuse=True)
+    client = _client(fake)
+    assert client.is_available() is False
+    assert _tried_ids(fake) == [17]                       # no walk through 18, 19, ...
+
+
+def test_reconnect_starts_again_from_the_configured_client_id():
+    fake = _BusyIdsIB(taken={17})
+    client = _client(fake)
+    assert client.is_available() and client.connected_client_id == 18
+    # The other process went away and the gateway restarted overnight.
+    fake.taken.clear()
+    fake.connected = False
+    assert client.is_available() and client.connected_client_id == 17
+
+
+def _hold_line_lock(client):
+    """Take the chain turn the way another process would: its own open file."""
+    client._line_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(client._line_lock_path, "a+")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return handle
+
+
+def test_chain_waits_for_another_process_to_finish_its_chain(telemetry):
+    fake = _FakeIB()
+    client = _client(fake)
+    other = _hold_line_lock(client)
+    threading.Timer(0.7, other.close).start()             # the other process finishes
+
+    assert not client.get_option_chain("ACME", expiration="2026-07-17").empty
+    event = _chain_events(telemetry)[-1]
+    assert event["success"] is True and event["latency_ms"] >= 600.0
+    queued = float(event["response_quality_note"].split("queued=")[1].split("s")[0])
+    assert queued >= 0.6                                  # counted as waiting, not as gateway time
+    # And the turn is handed back: a second chain does not wait.
+    assert not client.get_option_chain("ACME", expiration="2026-07-17").empty
+    assert _chain_events(telemetry)[-1]["latency_ms"] < 500.0
+
+
+def test_a_burst_of_chains_lets_a_waiting_process_in_between(telemetry, monkeypatch):
+    """A screener burst is a dozen chains queued back to back. Another process
+    polling for the turn must get it after the chain in progress, not after the
+    whole burst."""
+    monkeypatch.setattr(ib_module, "_LINE_LOCK_STAND_BACK_SECONDS", 2 * ib_module._LINE_LOCK_POLL_SECONDS)
+    fake = _SlowIB(work_seconds=0.3)
+    client = _client(fake)
+    seen = {}
+
+    def _other_process():
+        handle = open(client._line_lock_path, "a+")
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(ib_module._LINE_LOCK_POLL_SECONDS)
+        seen["chains_started_before_its_turn"] = fake.chains_started
+        time.sleep(0.2)
+        handle.close()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        chains = [pool.submit(client.get_option_chain, "ACME", expiration="2026-07-17") for _ in range(4)]
+        while fake.chains_started == 0:
+            time.sleep(0.01)
+        other = threading.Thread(target=_other_process)
+        other.start()
+        assert all(not chain.result().empty for chain in chains)
+        other.join(5.0)
+
+    assert seen["chains_started_before_its_turn"] < 4
+
+
+def test_other_process_holding_the_turn_too_long_is_a_queue_timeout(telemetry):
+    fake = _FakeIB()
+    client = _client(fake, chain_queue_timeout=1.0)
+    other = _hold_line_lock(client)
+    try:
+        assert client.get_option_chain("ACME", expiration="2026-07-17").empty
+    finally:
+        other.close()
+    event = _chain_events(telemetry)[-1]
+    assert (event["response_quality_note"], event["error_category"]) == ("queue_timeout", "timeout")
+    assert fake.requested == []                           # no market-data line was opened
+    assert provider_reliability.get_breaker("ib_gateway").consecutive_failures == 0
+
+
+def test_two_clients_on_one_gateway_share_one_turn():
+    a = _client(_FakeIB())
+    b = _client(_FakeIB())
+    assert a._line_lock_path == b._line_lock_path
+    assert a._line_lock_path.name == "ib_gateway_chain_127_0_0_1_4002.lock"
+    live = IBGatewayMarketDataClient(ib_factory=_FakeIB, port=4001)
+    assert live._line_lock_path != a._line_lock_path
+
+
+def test_unusable_lock_file_does_not_stop_the_fetch(tmp_path):
+    blocker = tmp_path / "not_a_directory"
+    blocker.write_text("")
+    client = _client(_FakeIB(), line_lock_path=blocker / "chain.lock")
+    assert not client.get_option_chain("ACME", expiration="2026-07-17").empty
