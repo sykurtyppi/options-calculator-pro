@@ -208,6 +208,38 @@ def _market_today_date():
     return datetime.now(_MARKET_TZ).date()
 
 
+def _dated_live_chain(chain: Optional[pd.DataFrame], as_of_date) -> Optional[pd.DataFrame]:
+    """Give a live provider chain the date it was fetched for, when it has none.
+
+    ``build_vol_snapshot`` drops every chain row without a valid ``trade_date``
+    (its guard against pricing off undated or future data in replay). Providers
+    differ in what they stamp: MarketData.app sends a per-row ``updated`` quote
+    time, which the snapshot turns into a date; the raw-yfinance collector
+    stamps ``trade_date`` itself; IB Gateway stamps ``updated`` only on a live
+    feed, because a delayed or frozen feed has no honest per-quote time. A
+    delayed IB chain therefore reached the snapshot undated and was discarded
+    whole: every IB-sourced analysis recorded ``missing_option_chain`` and no
+    structure could be eligible.
+
+    A chain fetched just now for ``as_of_date`` is that day's chain, exactly as
+    the yfinance collector treats it. So when a frame carries neither a usable
+    ``trade_date`` nor a usable ``updated``, stamp ``trade_date`` here. A frame
+    that already dates itself is returned untouched, and no ``updated`` is ever
+    invented: quote-time provenance (and the claim contract that needs it)
+    still sees a delayed feed as having none.
+    """
+    if chain is None or not isinstance(chain, pd.DataFrame) or chain.empty:
+        return chain
+    for column, kwargs in (("trade_date", {}), ("report_date", {}), ("updated", {"unit": "s", "utc": True})):
+        if column in chain.columns:
+            parsed = pd.to_datetime(chain[column], errors="coerce", **kwargs)
+            if bool(parsed.notna().any()):
+                return chain
+    dated = chain.copy()
+    dated["trade_date"] = as_of_date.isoformat()
+    return dated
+
+
 # PR-AE C2: extracted to services/candidate_shadow_outcome.py so the
 # upcoming resolver (services/candidate_exit_resolver.py, PR-AE C4)
 # does not need to import upward from web/. The private name
@@ -2803,7 +2835,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
         }
     )
     if chain_df is not None:
-        option_snapshot_frame = chain_df
+        option_snapshot_frame = _dated_live_chain(chain_df, _market_today_date())
     else:
         option_snapshot_frame = _collect_yf_option_chain_frame(ticker, as_of_date=_market_today_date())
         chain_fetched_at = datetime.now(timezone.utc)
