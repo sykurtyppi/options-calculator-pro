@@ -48,6 +48,11 @@ cd "${PROJECT_ROOT}"
 
 {
   echo "===== $(date -u '+%Y-%m-%dT%H:%M:%SZ') daily evidence cycle start ====="
+  # Say so now if IB Gateway is not signed in: the cycle would otherwise fall
+  # back to another data provider without a word. The check only reports (one
+  # iMessage per day) and can never stop or fail the cycle.
+  "${PYTHON_BIN}" scripts/ib_gateway_login_alert.py --context cycle \
+    || echo "ib gateway login check could not run (exit_code=$?)"
   # Hardening P1-4: capture and propagate the Python heredoc's exit code
   # the same way scripts/automation/run_candidate_exit_resolver.sh does
   # (set +e around the call, then EXIT_CODE=$?, then a branch on the
