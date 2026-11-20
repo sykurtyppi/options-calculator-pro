@@ -47,6 +47,7 @@ import pandas as pd
 
 from services import release_timing as _release_timing_rule
 from services.earnings_vol_snapshot import COVERAGE_COMPLETE, build_vol_snapshot
+from services import daily_vol as _daily_vol
 from services.event_variance import (
     EventVarianceForecaster,
     VarianceObservation,
@@ -60,7 +61,7 @@ from services.structure_legs import STRUCTURES
 from services.structure_scorecard import build_structure_scorecards, prior_from_returns
 from services.structure_selector import select_best_structure
 
-HARNESS_VERSION = "pricing_harness_v1"
+HARNESS_VERSION = "pricing_harness_v2"
 
 # The forward loop's entry window (services/screener_service.DTE_MIN_DEFAULT /
 # DTE_MAX_DEFAULT) and the recommendations it books (scripts/run_forward_loop.
@@ -419,10 +420,37 @@ class HarnessResult:
                 "variance_rows": self.variance_rows}
 
 
+def _daily_fields(event: EarningsEvent, day: date, exit_day: date, held: int, implied_base: Optional[float],
+                  har_rs_annual: Any, prices_entry: pd.DataFrame, prices_exit: pd.DataFrame,
+                  past_events: Sequence[Mapping[str, Any]], forecaster: "_daily_vol.DailyVarianceCalibrator",
+                  counts: Dict[str, int]) -> Dict[str, Any]:
+    """Each forecast of the hold's per-session variance, and what it realized."""
+    har_cc = _daily_vol.har_close_to_close(prices_entry, past_events)
+    calibrated, correction = None, None
+    if har_cc is not None:
+        correction = forecaster.calibration(event.symbol, day)
+        calibrated = har_cc * correction.factor
+    realized, reason = _daily_vol.realized_hold_variance(prices_exit, day, exit_day, held)
+    if realized is not None and har_cc is not None:
+        forecaster.add(event.symbol, event.event_date, exit_day, realized, har_cc)
+    _count(counts, f"daily:{'measured' if reason is None else reason}")
+    return {
+        "daily_realized_variance": realized,
+        "daily_forecast_implied": implied_base if implied_base is not None and implied_base > 0 else None,
+        "daily_forecast_har_rs": _daily_vol.per_session(har_rs_annual),
+        "daily_forecast_har_cc": har_cc,
+        "daily_forecast_calibrated": calibrated,
+        "daily_calibration_factor": correction.factor if correction else None,
+        "daily_calibration_n_pooled": correction.n_pooled if correction else 0,
+        "daily_unmeasured_reason": reason,
+    }
+
+
 def _variance_row(event: EarningsEvent, day: date, exit_day: date, chain: pd.DataFrame,
                   exit_chain: pd.DataFrame, forecaster: EventVarianceForecaster, is_first: bool,
-                  counts: Dict[str, int]) -> Dict[str, Any]:
-    """E at entry and at exit (same expiry pair), and the forecast of the change."""
+                  counts: Dict[str, int], *, daily: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """E at entry and at exit (same expiry pair), the forecast of its change, and
+    (``daily``: the inputs of _daily_fields) the ordinary daily variance of the hold."""
     entry = implied_event_variance(chain, day, event.event_date, event.release_timing)
     exit_ = None
     if entry.usable:
@@ -458,6 +486,8 @@ def _variance_row(event: EarningsEvent, day: date, exit_day: date, chain: pd.Dat
         "forecast_n_pooled": forecast.n_pooled,
         "forecast_n_symbol_events": forecast.n_symbol_events,
         "unmeasured_reason": reason,
+        **(_daily_fields(event, day, exit_day, held, entry.base_variance_per_session, counts=counts, **daily)
+           if daily is not None else {}),
     }
 
 
@@ -475,6 +505,7 @@ def run_harness(
     require_lookahead_safe: bool = False,
     snapshot_builder: Callable[..., Any] = build_vol_snapshot,
     variance_forecaster: Optional[EventVarianceForecaster] = None,
+    daily_calibrator: Optional["_daily_vol.DailyVarianceCalibrator"] = None,
 ) -> HarnessResult:
     """Replay every event of ``symbols`` dated in [start, end]; one row per
     (event, entry session, structure)."""
@@ -509,6 +540,8 @@ def run_harness(
 
     history = OutcomeHistory()
     forecaster = variance_forecaster if variance_forecaster is not None else EventVarianceForecaster()
+    daily_calibrator = daily_calibrator if daily_calibrator is not None else _daily_vol.DailyVarianceCalibrator(
+        group_of=forecaster.group_of)
     variance_rows: List[Dict[str, Any]] = []
     rows: List[Dict[str, Any]] = []
     exit_cache: Dict[tuple, pd.DataFrame] = {}
@@ -546,7 +579,15 @@ def run_harness(
             exit_cache[key] = archive.chain(event.symbol, exit_day)
         exit_chain = exit_cache[key]
         _count(counts, "entries_scored")
-        variance_rows.append(_variance_row(event, day, exit_day, chain, exit_chain, forecaster, is_first, counts))
+        daily = {
+            "har_rs_annual": getattr(snapshot, "rv_har_forecast", None),
+            "prices_entry": prices,
+            "prices_exit": archive.prices(event.symbol, exit_day),
+            "past_events": _earnings_metadata(event, events, day)["prior_events"],
+            "forecaster": daily_calibrator,
+        }
+        variance_rows.append(_variance_row(event, day, exit_day, chain, exit_chain, forecaster, is_first, counts,
+                                           daily=daily))
         by_name = {card.structure: card for card in cards}
         for structure in STRUCTURES:
             card = by_name.get(structure)
@@ -787,6 +828,10 @@ def summarize(result: HarnessResult) -> Dict[str, Any]:
             "entries": len(result.variance_rows),
             "first_look": forecast_quality([r for r in result.variance_rows if r["first_look"]]),
             "all_entries": forecast_quality(result.variance_rows),
+        },
+        "daily_variance": {
+            "first_look": _daily_vol.forecast_quality([r for r in result.variance_rows if r["first_look"]]),
+            "all_entries": _daily_vol.forecast_quality(result.variance_rows),
         },
         "caveats": [
             "End-of-day archive quotes: no fill here is a claim under the claim contract "

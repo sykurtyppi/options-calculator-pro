@@ -11,7 +11,8 @@ report directory.
 
 Outputs, under --out-dir/<UTC timestamp>/: summary.json (the report),
 rows.csv (one row per event, entry session and structure), variance_rows.csv
-(the event variance at entry and exit and its forecast, one row per entry)
+(per entry: the event variance at entry and exit and its forecast, and the
+ordinary daily variance of the hold against each of its forecasts)
 and report.md.
 """
 from __future__ import annotations
@@ -37,6 +38,7 @@ from services.pricing_harness import (  # noqa: E402
     run_harness,
     summarize,
 )
+from services.daily_vol import DailyVarianceCalibrator  # noqa: E402
 from services.event_variance import EventVarianceForecaster  # noqa: E402
 from services.structure_legs import STRUCTURES  # noqa: E402
 
@@ -147,6 +149,18 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         lines.append(f"| {name} | {q.get('n', 0)} | {_fmt(q.get('events'))} | {_fmt(q.get('mean_realized_log_ratio'))} | "
                      f"{_fmt(q.get('rmse'))} | {_fmt(q.get('rmse_no_change'))} | {_fmt(q.get('rmse_pooled'))} | "
                      f"{_fmt(q.get('r2_vs_no_change'))} | {_fmt(q.get('r2_vs_pooled'))} | {_fmt(q.get('spearman'))} |")
+    dv = (summary.get("daily_variance") or {}).get("all_entries") or {}
+    lines += ["", "## Ordinary daily variance during the hold (all entries)", "",
+              f"Rows with every forecast and a realized hold variance: {dv.get('n', 0)} "
+              f"(realized measured on {dv.get('rows_with_realized', 0)}); realized vol "
+              f"{_fmt(dv.get('mean_realized_vol_annual'))} annualised. Skill is 1 - loss / loss(implied): "
+              "above 0 beats the market's base variance.", "",
+              "| Forecast | mean vol | level ratio | QLIKE | QLIKE skill | MSE skill | spread Spearman |",
+              "|---|---|---|---|---|---|---|"]
+    for name, block in (dv.get("forecasts") or {}).items():
+        lines.append(f"| {name} | {_fmt(block.get('mean_forecast_vol_annual'))} | {_fmt(block.get('level_ratio'))} | "
+                     f"{_fmt(block.get('qlike'))} | {_fmt(block.get('qlike_skill_vs_implied'))} | "
+                     f"{_fmt(block.get('mse_skill_vs_implied'))} | {_fmt(block.get('spread_spearman'))} |")
     lines += ["", "## Counts", ""]
     lines += [f"- `{key}`: {value}" for key, value in summary["counts"].items()]
     lines += ["", "## Caveats", ""] + [f"- {c}" for c in summary["caveats"]]
@@ -198,7 +212,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         group_of = SECTOR_MAP.get
     result = run_harness(archive, symbols, start=args.start, end=end, prior_mode=args.prior_mode,
                          require_lookahead_safe=args.require_lookahead_safe,
-                         variance_forecaster=EventVarianceForecaster(group_of=group_of))
+                         variance_forecaster=EventVarianceForecaster(group_of=group_of),
+                         daily_calibrator=DailyVarianceCalibrator(group_of=group_of))
     summary = summarize(result)
     summary["config"]["git_sha"] = _git_sha()
     run_dir = write_outputs(result, summary, args.out_dir)
