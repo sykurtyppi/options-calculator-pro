@@ -28,6 +28,27 @@ from tests.unit.test_services.test_structure_scorecard import _base_snapshot
 
 STRIKES = [80, 85, 90, 92.5, 95, 97.5, 100, 102.5, 105, 107.5, 110, 115, 120]
 
+# The fixtures are written for the week of 2026-11-10. Every clock the fetch
+# path reads is pinned there, so the tests do not start failing once the real
+# date passes the fixture expiries (a 0-DTE expiry is dropped as expired).
+FROZEN_TODAY = date(2026, 11, 10)
+
+
+class _FrozenDate(date):
+    @classmethod
+    def today(cls):
+        return FROZEN_TODAY
+
+
+@pytest.fixture(autouse=True)
+def _frozen_clock(monkeypatch):
+    import services.yfinance_market_data_client as yf_client
+    from web.api import edge_engine
+
+    monkeypatch.setattr(yf_client, "_dt", SimpleNamespace(**{**vars(yf_client._dt), "date": _FrozenDate}))
+    monkeypatch.setattr(edge_engine, "_market_today_date", lambda: FROZEN_TODAY)
+    monkeypatch.setattr(forward_loop, "_today", lambda: FROZEN_TODAY)
+
 
 def _side(spread: float = 0.10, wide_otm: float | None = None, kind: str = "C") -> pd.DataFrame:
     rows = []
