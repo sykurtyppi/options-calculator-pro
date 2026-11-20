@@ -21,6 +21,8 @@ VolSnapshot, structure prior store, historical walk-forward outputs, and current
 ## Validation Approach
 Tests cover structure differentiation, monotonic penalties, no-trade eligibility, determinism, and low-sample behavior.
 
+Accuracy is measured by the walk-forward pricing harness (`docs/PRICING_HARNESS.md`): the archive is replayed point in time, the scorecards are given priors learned only from outcomes that exited before each entry (`build_structure_scorecards(..., priors=...)`, which then reads neither the report files nor the prior store), and each prediction is compared with the conservative-fill return of the same contracts at the T-1 exit.
+
 ## Do Not Infer
 Do not infer that the highest score guarantees profit or that score differences are precise expected-return differences.
 
