@@ -47,6 +47,13 @@ import pandas as pd
 
 from services import release_timing as _release_timing_rule
 from services.earnings_vol_snapshot import COVERAGE_COMPLETE, build_vol_snapshot
+from services.event_variance import (
+    EventVarianceForecaster,
+    VarianceObservation,
+    forecast_quality,
+    implied_event_variance,
+    sessions_between,
+)
 from services.execution_scenarios import build_execution_scenarios, compare_execution_scenarios
 from services.market_calendar import is_trading_day
 from services.structure_legs import STRUCTURES
@@ -403,9 +410,55 @@ class HarnessResult:
     rows: List[Dict[str, Any]]
     counts: Dict[str, int]
     config: Dict[str, Any]
+    # One row per scored entry: the event variance at entry and at exit, and
+    # the walk-forward forecast of its change (services/event_variance.py).
+    variance_rows: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"rows": self.rows, "counts": self.counts, "config": self.config}
+        return {"rows": self.rows, "counts": self.counts, "config": self.config,
+                "variance_rows": self.variance_rows}
+
+
+def _variance_row(event: EarningsEvent, day: date, exit_day: date, chain: pd.DataFrame,
+                  exit_chain: pd.DataFrame, forecaster: EventVarianceForecaster, is_first: bool,
+                  counts: Dict[str, int]) -> Dict[str, Any]:
+    """E at entry and at exit (same expiry pair), and the forecast of the change."""
+    entry = implied_event_variance(chain, day, event.event_date, event.release_timing)
+    exit_ = None
+    if entry.usable:
+        exit_ = implied_event_variance(exit_chain, exit_day, event.event_date, event.release_timing,
+                                       expiries=entry.expiries)
+    held = sessions_between(day, exit_day)
+    forecast = forecaster.predict(event.symbol, held, day)
+    realized = None
+    reason = entry.reason if not entry.usable else (exit_.reason if not exit_.usable else None)
+    if reason is None:
+        realized = math.log(exit_.event_variance / entry.event_variance)
+        forecaster.add(VarianceObservation(event.symbol, event.event_date, day, exit_day, held, realized))
+    _count(counts, f"variance:{'measured' if reason is None else reason.split(':')[0]}")
+    return {
+        "symbol": event.symbol,
+        "event_date": event.event_date.isoformat(),
+        "entry_date": day.isoformat(),
+        "exit_date": exit_day.isoformat(),
+        "first_look": is_first,
+        "sessions_held": held,
+        "expiries": [e.isoformat() for e in entry.expiries],
+        "entry_event_variance": _finite(entry.event_variance),
+        "entry_event_move_pct": _finite(entry.event_move_pct),
+        "entry_base_variance_per_session": _finite(entry.base_variance_per_session),
+        "exit_expiries": [e.isoformat() for e in exit_.expiries] if exit_ else [],
+        "exit_event_variance": _finite(exit_.event_variance) if exit_ else None,
+        "exit_event_move_pct": _finite(exit_.event_move_pct) if exit_ else None,
+        "realized_log_ratio": realized,
+        "forecast_log_ratio": forecast.log_ratio,
+        "pooled_log_ratio": forecast.pooled,
+        "group_offset": forecast.group_offset,
+        "symbol_offset": forecast.symbol_offset,
+        "forecast_n_pooled": forecast.n_pooled,
+        "forecast_n_symbol_events": forecast.n_symbol_events,
+        "unmeasured_reason": reason,
+    }
 
 
 def _count(counts: Dict[str, int], key: str, n: int = 1) -> None:
@@ -421,6 +474,7 @@ def run_harness(
     prior_mode: str = PRIOR_WALK_FORWARD,
     require_lookahead_safe: bool = False,
     snapshot_builder: Callable[..., Any] = build_vol_snapshot,
+    variance_forecaster: Optional[EventVarianceForecaster] = None,
 ) -> HarnessResult:
     """Replay every event of ``symbols`` dated in [start, end]; one row per
     (event, entry session, structure)."""
@@ -454,6 +508,8 @@ def run_harness(
     plan.sort(key=lambda item: (item[0], item[1].symbol, item[1].event_date))
 
     history = OutcomeHistory()
+    forecaster = variance_forecaster if variance_forecaster is not None else EventVarianceForecaster()
+    variance_rows: List[Dict[str, Any]] = []
     rows: List[Dict[str, Any]] = []
     exit_cache: Dict[tuple, pd.DataFrame] = {}
     for day, event, events, is_first in plan:
@@ -490,6 +546,7 @@ def run_harness(
             exit_cache[key] = archive.chain(event.symbol, exit_day)
         exit_chain = exit_cache[key]
         _count(counts, "entries_scored")
+        variance_rows.append(_variance_row(event, day, exit_day, chain, exit_chain, forecaster, is_first, counts))
         by_name = {card.structure: card for card in cards}
         for structure in STRUCTURES:
             card = by_name.get(structure)
@@ -540,8 +597,11 @@ def run_harness(
         "entry_window_days": [DTE_MIN, DTE_MAX],
         "exit_rule": "last NYSE session before the event date",
         "judged_return": JUDGED_LEVEL,
+        "variance_shrinkage_events": forecaster.shrinkage_events,
+        "variance_grouping": "by group" if forecaster.group_of else "none",
     }
-    return HarnessResult(rows=rows, counts=dict(sorted(counts.items())), config=config)
+    return HarnessResult(rows=rows, counts=dict(sorted(counts.items())), config=config,
+                         variance_rows=variance_rows)
 
 
 # ── metrics ──────────────────────────────────────────────────────────────────
@@ -722,6 +782,12 @@ def summarize(result: HarnessResult) -> Dict[str, Any]:
         },
         "per_structure": per_structure,
         "policies": policy_comparison(rows),
+        "event_variance": {
+            "measured_entries": sum(1 for r in result.variance_rows if r["realized_log_ratio"] is not None),
+            "entries": len(result.variance_rows),
+            "first_look": forecast_quality([r for r in result.variance_rows if r["first_look"]]),
+            "all_entries": forecast_quality(result.variance_rows),
+        },
         "caveats": [
             "End-of-day archive quotes: no fill here is a claim under the claim contract "
             "(no live source and no per-leg quote time).",

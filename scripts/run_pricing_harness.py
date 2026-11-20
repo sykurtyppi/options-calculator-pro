@@ -10,7 +10,9 @@ report directory.
   .venv_arm64/bin/python3 scripts/run_pricing_harness.py --prior-mode neutral
 
 Outputs, under --out-dir/<UTC timestamp>/: summary.json (the report),
-rows.csv (one row per event, entry session and structure) and report.md.
+rows.csv (one row per event, entry session and structure), variance_rows.csv
+(the event variance at entry and exit and its forecast, one row per entry)
+and report.md.
 """
 from __future__ import annotations
 
@@ -35,6 +37,7 @@ from services.pricing_harness import (  # noqa: E402
     run_harness,
     summarize,
 )
+from services.event_variance import EventVarianceForecaster  # noqa: E402
 from services.structure_legs import STRUCTURES  # noqa: E402
 
 DEFAULT_DATA_ROOT = Path(os.environ.get("MARKET_DATA_ROOT") or "/Volumes/T9/market_data")
@@ -58,6 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-mode", choices=PRIOR_MODES, default=PRIOR_WALK_FORWARD)
     parser.add_argument("--require-lookahead-safe", action="store_true",
                         help="only entries on which the event date was verifiably known")
+    parser.add_argument("--group-by", choices=("sector", "none"), default="sector",
+                        help="pool the event-variance forecast by sector before the symbol "
+                             "(scripts/stress_test_expansion.SECTOR_MAP; unmapped symbols get no group)")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     return parser
 
@@ -128,8 +134,20 @@ def render_markdown(summary: Dict[str, Any]) -> str:
         lines.append(f"| {name} | {block.get('n_events', 0)} | {_fmt(block.get('mean_return'))} | "
                      f"{_fmt(block.get('median_return'))} | {_fmt(block.get('win_rate'))} | "
                      f"{_fmt(block.get('mean_ci95'))} |")
-    lines += ["", f"Selector trades without an exit price: {pol['selector'].get('traded_but_unpriced', 0)}",
-              "", "## Counts", ""]
+    lines += ["", f"Selector trades without an exit price: {pol['selector'].get('traded_but_unpriced', 0)}"]
+    ev = summary.get("event_variance") or {}
+    lines += ["", "## Event variance: forecast of log(E at exit / E at entry)", "",
+              f"Measured on {ev.get('measured_entries', 0)} of {ev.get('entries', 0)} entries "
+              "(two expiries spanning the event, same pair at entry and exit).", "",
+              "| Sample | n | events | mean realized | RMSE | RMSE no change | RMSE pooled | "
+              "R2 vs no change | R2 vs pooled | Spearman |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+    for name in ("first_look", "all_entries"):
+        q = ev.get(name) or {}
+        lines.append(f"| {name} | {q.get('n', 0)} | {_fmt(q.get('events'))} | {_fmt(q.get('mean_realized_log_ratio'))} | "
+                     f"{_fmt(q.get('rmse'))} | {_fmt(q.get('rmse_no_change'))} | {_fmt(q.get('rmse_pooled'))} | "
+                     f"{_fmt(q.get('r2_vs_no_change'))} | {_fmt(q.get('r2_vs_pooled'))} | {_fmt(q.get('spearman'))} |")
+    lines += ["", "## Counts", ""]
     lines += [f"- `{key}`: {value}" for key, value in summary["counts"].items()]
     lines += ["", "## Caveats", ""] + [f"- {c}" for c in summary["caveats"]]
     return "\n".join(lines) + "\n"
@@ -145,6 +163,12 @@ def write_outputs(result: Any, summary: Dict[str, Any], out_dir: Path) -> Path:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for row in result.rows:
+            writer.writerow({k: (json.dumps(v) if isinstance(v, (list, dict)) else v) for k, v in row.items()})
+    variance_fields = list(result.variance_rows[0].keys()) if result.variance_rows else ["symbol"]
+    with (run_dir / "variance_rows.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=variance_fields)
+        writer.writeheader()
+        for row in result.variance_rows:
             writer.writerow({k: (json.dumps(v) if isinstance(v, (list, dict)) else v) for k, v in row.items()})
     (run_dir / "report.md").write_text(render_markdown(summary))
     return run_dir
@@ -167,8 +191,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     end = args.end or date.today()
     archive = ParquetArchive(options_root, ohlc_root, earnings_db)
+    group_of = None
+    if args.group_by == "sector":
+        from scripts.stress_test_expansion import SECTOR_MAP
+
+        group_of = SECTOR_MAP.get
     result = run_harness(archive, symbols, start=args.start, end=end, prior_mode=args.prior_mode,
-                         require_lookahead_safe=args.require_lookahead_safe)
+                         require_lookahead_safe=args.require_lookahead_safe,
+                         variance_forecaster=EventVarianceForecaster(group_of=group_of))
     summary = summarize(result)
     summary["config"]["git_sha"] = _git_sha()
     run_dir = write_outputs(result, summary, args.out_dir)

@@ -49,6 +49,64 @@ For every earnings event of every symbol, dated in `[start, end]`:
   Each policy has a 95% bootstrap interval of its mean.
 - **Counts:** every event and entry skipped or failed, and every unpriced row, by reason.
 
+## Event variance: measured, and its change forecast
+
+Step 2 of the pricing plan (`services/event_variance.py`). What a T-1 straddle
+earns is mostly the change in the event variance the market prices (E)
+between entry and exit, plus ordinary daily moves, less costs. So E is
+measured at both ends, and its change is forecast.
+
+**Measurement.** Two expiries that both span the event (on or after the
+reaction session; unknown timing counts as after the close) each give a total
+implied variance W = IV² × calendar days / 365, the archive's IV convention.
+With T the NYSE sessions from the as-of date through the expiry, W = b·T + E,
+so
+
+    E = (W1·T2 − W2·T1) / (T2 − T1),    b = (W2 − W1) / (T2 − T1).
+
+ATM IV is interpolated linearly in strike at the spot price, never
+extrapolated, with calls and puts averaged. The exit is measured on the
+entry's expiry pair, so the change is not partly a change of expiries. Unlike
+the snapshot's split, this uses no realized-vol forecast. It also counts trading
+sessions, so a long weekend is not read as base variance: this is the
+calendar-vs-trading-day bias documented in `event_vol_decomposition.py`. An
+entry that cannot be measured is counted by reason:
+
+- `fewer_than_two_spanning_expiries`
+- `atm_iv_unavailable`
+- `expiries_not_separable`
+- `non_positive_event_variance`
+
+**Forecast.** The target is log(E_exit / E_entry), which is scale-free and
+so can be pooled across names. It is predicted from observations whose exit
+came before the entry, built in three layers:
+
+1. the pooled mean for the holding-period bucket (1–2, 3–4, 5–6, 7–8 or 9+ sessions);
+2. a group offset (by sector, `--group-by sector`, from `scripts/stress_test_expansion.SECTOR_MAP`);
+3. a symbol offset.
+
+Each offset is an average of per-event mean residuals, shrunk by n / (n + 8)
+with n the number of events behind it. Every entry of an event is an
+observation, but an event counts once in an offset.
+
+**Judged against two baselines:**
+
+- no change (log ratio 0);
+- the pooled bucket mean alone.
+
+The report gives RMSE, out-of-sample R² against each baseline (above 0 beats
+it), Spearman correlation, and the realized and forecast means by holding
+period. These are reported for first looks and for all entries, with one row
+per entry in `variance_rows.csv`.
+
+The sector map is incomplete:
+
+- ADBE, SNPS, ZS, DDOG, NET, TEAM, WDAY, SNOW, OKTA, TTD, PYPL and EBAY are missing; unmapped names get no group offset.
+- GIS appears twice, so the second entry ("Indust") is the one kept.
+- DGX is labelled REIT.
+
+Fix it before relying on group offsets.
+
 ## Limits, stated in every report
 
 - **No claims.** The archive is end of day: there is no live source and no per-leg quote time, so no fill here is a claim under the claim contract. The conservative fill is used as a price, not as evidence.

@@ -1,8 +1,10 @@
 """A small synthetic archive for the pricing-harness tests.
 
-Chains are priced with Black-Scholes on a flat base volatility plus an event
-variance for expiries after the event, so a straddle carries the event premium
-the snapshot expects. Everything is deterministic.
+Chains are priced with Black-Scholes on a total variance of BASE_VOL^2 per
+252 trading sessions to expiry plus the event variance for expiries after the
+event, so a straddle carries the event premium the snapshot expects and the
+two-expiry estimate recovers the event variance exactly. The event variance
+can grow into the event (``event_growth`` per symbol). Deterministic.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from services.event_variance import sessions_between
 from services.market_calendar import is_trading_day
 from services.pricing_harness import EarningsEvent
 
@@ -49,13 +52,14 @@ class SyntheticArchive:
     def __init__(self, events: Dict[str, List[EarningsEvent]], *, start: date = date(2023, 9, 1),
                  end: date = date(2024, 6, 28), seed: int = 3, spread_frac: float = 0.03,
                  vol_bump_after: Optional[date] = None, missing_days: Optional[Dict[str, set]] = None,
-                 expiry_horizon_days: int = 70):
+                 expiry_horizon_days: int = 70, event_growth: Optional[Dict[str, float]] = None):
         self._events = events
         self._days = trading_days(start, end)
         self.spread_frac = spread_frac
         self.vol_bump_after = vol_bump_after
         self.missing_days = missing_days or {}
         self.expiry_horizon_days = expiry_horizon_days
+        self.event_growth = event_growth or {}
         self.reads: List[tuple] = []
         self._spot: Dict[str, Dict[date, float]] = {}
         for i, symbol in enumerate(sorted(events)):
@@ -76,6 +80,11 @@ class SyntheticArchive:
                  "volume": 1_000_000} for d, s in self._spot[symbol].items() if d <= through]
         return pd.DataFrame(rows)
 
+    def event_variance(self, symbol: str, event_date: date, day: date) -> float:
+        """The event variance priced on ``day``: grows linearly over the last 14 days."""
+        growth = self.event_growth.get(symbol, 0.0)
+        return EVENT_MOVE ** 2 * (1.0 + growth * max(0, 14 - (event_date - day).days) / 14.0)
+
     def _vol(self, day: date) -> float:
         if self.vol_bump_after is not None and day > self.vol_bump_after:
             return BASE_VOL * 1.6
@@ -93,9 +102,10 @@ class SyntheticArchive:
         rows = []
         for expiry in fridays:
             t = (expiry - day).days / 365.0
-            event_var = sum(EVENT_MOVE ** 2 for e in self._events.get(symbol, [])
+            event_var = sum(self.event_variance(symbol, e.event_date, day) for e in self._events.get(symbol, [])
                             if day < e.event_date <= expiry)
-            total_vol = math.sqrt((vol * vol * t + event_var) / t)
+            total_var = vol * vol * sessions_between(day, expiry) / 252.0 + event_var
+            total_vol = math.sqrt(total_var / t)
             for strike in strikes:
                 for kind in ("C", "P"):
                     mid = bs_price(spot, strike, t, total_vol, kind)
