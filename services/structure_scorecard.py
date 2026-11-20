@@ -258,7 +258,9 @@ def score_atm_straddle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
     flags = _base_eligibility_flags(snapshot)
     if snapshot.atm_call_spread_pct is None or snapshot.atm_put_spread_pct is None:
         flags.append("cannot_form_atm_straddle")
-    leg_spread_pct = _average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct])
+    leg_spread_pct = _booked_leg_spread(
+        snapshot, "atm_straddle", _average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct]), flags,
+    )
     if leg_spread_pct is not None and leg_spread_pct > ABSOLUTE_SPREAD_THRESHOLD_PCT:
         flags.append("structure_spread_exceeds_absolute_threshold")
 
@@ -432,7 +434,10 @@ def score_otm_strangle(snapshot: VolSnapshot, *, prior: Optional[WalkForwardPrio
         + 0.35 * (1.0 - _score_high_good(_first_finite(snapshot.atm_total_open_interest, snapshot.atm_total_volume), 600.0, 3500.0))
     )
     theta_penalty = 0.11 * (1.0 - timing)
-    execution_penalty = _execution_penalty(snapshot, leg_spread_pct=_average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct]), structure="otm_strangle")
+    leg_spread_pct = _booked_leg_spread(
+        snapshot, "otm_strangle", _average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct]), flags,
+    )
+    execution_penalty = _execution_penalty(snapshot, leg_spread_pct=leg_spread_pct, structure="otm_strangle")
     # P-5b: event_move_share band anchored on post-P-5a real corpus (747
     # events). Using p25/p90 of event_move_share_of_total = (0.78, 0.94).
     # calibration_basis="post_p5a_real_corpus_747_events_2024_2025"
@@ -518,6 +523,7 @@ def _score_calendar(
     flags = _base_eligibility_flags(snapshot)
     if snapshot.back_term_dte is None or snapshot.back_term_atm_iv is None or snapshot.near_term_atm_iv is None:
         flags.append("cannot_form_calendar")
+    leg_spread_pct = _booked_leg_spread(snapshot, structure, leg_spread_pct, flags)
     if leg_spread_pct is None:
         flags.append("missing_structure_leg_spread")
     if snapshot.near_term_spread_pct is not None and snapshot.near_term_spread_pct > ABSOLUTE_SPREAD_THRESHOLD_PCT:
@@ -721,7 +727,9 @@ def score_iron_condor(
     else:
         move_fit = _clamp01(0.45 * fair_score + 0.30 * calm_score + 0.25 * decay_score)
 
-    leg_spread_pct = _average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct])
+    leg_spread_pct = _booked_leg_spread(
+        snapshot, "iron_condor", _average([snapshot.atm_call_spread_pct, snapshot.atm_put_spread_pct]), flags,
+    )
     execution_penalty = _execution_penalty(snapshot, leg_spread_pct=leg_spread_pct, structure="iron_condor")
     # Theta works FOR the seller: only a small penalty for a window too short to collect decay.
     theta_penalty = 0.02 * (1.0 - timing)
@@ -889,6 +897,42 @@ def _sample_confidence_and_penalty(
         sample_conf = _clamp01(sample_conf * 0.15)
 
     return sample_conf, max_penalty * (1.0 - sample_conf)
+
+
+LEGS_UNAVAILABLE_FLAG = "structure_legs_unavailable"
+
+
+def _booked_leg_spread(
+    snapshot: VolSnapshot,
+    structure: str,
+    atm_proxy: Optional[float],
+    flags: List[str],
+) -> Optional[float]:
+    """Mean spread (% of mid) of the legs this structure would actually book.
+
+    The snapshot carries the legs services.structure_legs would book on the
+    trade expiry; the forward loop books by the same rules. When it has them,
+    execution is priced on THOSE legs (OTM wings for strangles and condors,
+    the back leg for calendars), not on the near-term ATM pair. When the chain
+    shows the structure cannot be formed, the structure is ineligible (the
+    loop could not book it either). That holds only for coverage "complete"
+    (the complete expiry listing and entry-equivalent strikes); otherwise
+    (sampled coverage, or no legs) the ATM proxy is used and nothing is ruled
+    out, because a missing leg may be missing only from the fetch.
+    """
+    legs = getattr(snapshot, "structure_legs", None) or {}
+    # Only legs resolved from the complete expiry listing with entry-equivalent
+    # strike coverage say what entry would book. Legs from the sampled analysis
+    # chain may be missing a wing or a back expiry that entry would find, so
+    # they neither price the structure nor rule it out.
+    if not legs or legs.get("coverage") != "complete":
+        return atm_proxy
+    entry = (legs.get("structures") or {}).get(structure) or {}
+    value = entry.get("leg_spread_pct")
+    if entry.get("reason") or value is None or not np.isfinite(float(value)):
+        flags.append(LEGS_UNAVAILABLE_FLAG)
+        return atm_proxy
+    return float(value)
 
 
 def _execution_penalty(snapshot: VolSnapshot, *, leg_spread_pct: Optional[float], structure: str) -> float:

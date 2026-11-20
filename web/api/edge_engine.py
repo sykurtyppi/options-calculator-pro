@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from utils.quotes import safe_mid
+from services import structure_legs as _structure_legs_rule
 from services.crush_features import NO_RV_IV_RV_RATIO, crush_feature_vector
 from services.dividend_yields import get_dividend_yield
 from services.iv_term_structure import bounded_interp, select_tenor_spanning_expiries
@@ -2316,14 +2317,20 @@ def _collect_yf_option_chain_frame(
     *,
     as_of_date: date,
     max_expiries: int = 6,
+    expiries: Optional[List[str]] = None,
+    stamp_trade_date: bool = True,
 ) -> pd.DataFrame:
-    expirations = list(getattr(ticker, "options", []) or [])
     rows: List[Dict[str, Any]] = []
     # Tenor-spanning selection (same fetch count) so the yfinance fallback
     # still brackets the 30D/45D interpolation targets on weekly-heavy names.
-    for expiry in select_tenor_spanning_expiries(
-        expirations, as_of_date, max_expiries=max_expiries
-    ):
+    # ``expiries`` fetches exactly those instead (the structure-leg fetch),
+    # without reading the listing at all.
+    if expiries is not None:
+        selected = list(expiries)
+    else:
+        expirations = list(getattr(ticker, "options", []) or [])
+        selected = select_tenor_spanning_expiries(expirations, as_of_date, max_expiries=max_expiries)
+    for expiry in selected:
         start = time.perf_counter()
         try:
             chain = ticker.option_chain(expiry)
@@ -2369,7 +2376,11 @@ def _collect_yf_option_chain_frame(
                 # mid injected here would survive and silently defeat it.
                 rows.append(
                     {
-                        "trade_date": as_of_date.isoformat(),
+                        # The structure-leg fetch leaves the date off: the
+                        # snapshot stamps genuinely undated rows with the real
+                        # fetch date, so a later live fetch is not passed off
+                        # as the as-of date's quotes.
+                        "trade_date": as_of_date.isoformat() if stamp_trade_date else None,
                         "expiry": str(expiry)[:10],
                         "call_put": side,
                         "strike": row.get("strike"),
@@ -2382,6 +2393,103 @@ def _collect_yf_option_chain_frame(
                     }
                 )
     return pd.DataFrame(rows)
+
+
+def _chain_has_both_sides(frame: Optional[pd.DataFrame]) -> bool:
+    """A provider chain usable for leg discovery: calls AND puts present."""
+    if frame is None or getattr(frame, "empty", True):
+        return False
+    for column in ("side", "call_put", "type", "optionType"):
+        if column in frame.columns:
+            sides = {str(v).strip().lower()[:1] for v in frame[column].dropna().tolist()}
+            return {"c", "p"} <= sides
+    return False
+
+
+def _fetch_structure_chain(
+    symbol: str,
+    *,
+    client: Any,
+    use_provider: bool,
+    ticker: Any,
+    earnings_date: Optional[date],
+    release_timing: Optional[str],
+    as_of_date: date,
+) -> Optional[Dict[str, Any]]:
+    """The chains entry will book from, fetched the way entry fetches them.
+
+    The analysis chain is fetched for the term structure: a narrow strike
+    window (provider) or a sample of tenors (yfinance). Leg discovery needs
+    what entry sees: the trade expiry and calendar back expiry resolved from
+    the COMPLETE listing, and each fetched with ENTRY_STRIKE_LIMIT strikes
+    (provider) or the full chain (yfinance), falling back from the provider
+    to yfinance exactly as fetch_structure_quote does. Returns None when the
+    listing or the trade expiry is unavailable; the snapshot then marks its
+    legs "sampled" and nothing is ruled out on them.
+    """
+    if earnings_date is None:
+        return None
+    listing: List[str] = []
+    if use_provider and client is not None:
+        try:
+            listing = list(client.get_expirations(symbol) or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Structure-leg expiry listing failed for %s: %s", symbol, exc)
+    if not listing and ticker is not None:
+        listing = list(getattr(ticker, "options", []) or [])
+    if not listing:
+        return None
+    front = _structure_legs_rule.trade_expiry(listing, earnings_date, release_timing)
+    if front is None:
+        return None
+    back = _structure_legs_rule.calendar_back_expiry(listing, front)
+
+    class _ProviderFailed(Exception):
+        pass
+
+    def _provider_chain(expiry: date) -> Optional[pd.DataFrame]:
+        try:
+            return client.get_option_chain(
+                symbol, expiration=expiry.isoformat(), strike_limit=_structure_legs_rule.ENTRY_STRIKE_LIMIT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Entry does not survive a provider error (it raises before any
+            # fallback), so nothing here may be certified as what entry sees.
+            logger.info("Structure-leg chain fetch failed for %s %s: %s", symbol, expiry, exc)
+            raise _ProviderFailed() from exc
+
+    def _yahoo_chain(expiry: date) -> Optional[pd.DataFrame]:
+        if ticker is None:
+            return None
+        return _collect_yf_option_chain_frame(
+            ticker, as_of_date=as_of_date, expiries=[expiry.isoformat()], stamp_trade_date=False,
+        )
+
+    # Entry's source state machine (fetch_structure_quote): the front chain
+    # comes from the provider when it has calls AND puts, else from yfinance;
+    # the calendar back chain comes from the SAME source as the front, with no
+    # fallback of its own. A provider that raises (rather than returning an
+    # incomplete chain) makes entry fail, so the legs stay "sampled".
+    try:
+        front_frame = _provider_chain(front) if use_provider and client is not None else None
+        front_from_provider = _chain_has_both_sides(front_frame)
+        if not front_from_provider:
+            front_frame = _yahoo_chain(front)
+        if front_frame is None or front_frame.empty:
+            # A chain that did not arrive is not evidence the legs are missing.
+            return None
+        parts: List[pd.DataFrame] = [front_frame]
+        if back is not None:
+            back_frame = _provider_chain(back) if front_from_provider else _yahoo_chain(back)
+            if back_frame is None or back_frame.empty:
+                return None
+            parts.append(back_frame)
+    except _ProviderFailed:
+        return None
+    # Undated rows are stamped by the snapshot AFTER normalisation, so a
+    # provider's own quote time (report_date / updated) always wins.
+    return {"listing": listing, "chain": parts, "fetched_on": _market_today_date().isoformat()}
+
 
 
 def _attach_live_forward_provenance(edge_snapshot: "EdgeSnapshot") -> None:
@@ -2742,6 +2850,19 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
         option_snapshot_frame, provider=snapshot_options_provider,
         fetched_at=chain_fetched_at or datetime.now(timezone.utc),
     )
+    # The chains entry will book from (complete listing, entry strike
+    # coverage), so structures are priced and judged on what entry will see.
+    # Optional: a failure here must never abort the analysis; the legs are
+    # then "sampled" and nothing is ruled out on them.
+    try:
+        structure_chain = _fetch_structure_chain(
+            clean_symbol, client=client, use_provider=use_provider, ticker=ticker,
+            earnings_date=earnings_date, release_timing=earnings_release_time,
+            as_of_date=_market_today_date(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Structure-leg fetch failed for %s; legs stay sampled: %s", clean_symbol, exc)
+        structure_chain = None
     vol_snapshot = build_vol_snapshot(
         clean_symbol,
         _market_today_date(),
@@ -2749,6 +2870,7 @@ def build_analysis_inputs(symbol: str, mda_client: Any = None) -> AnalysisInputs
         earnings_metadata=earnings_metadata_for_snapshot,
         price_data=price_snapshot_frame,
         options_provider=snapshot_options_provider,
+        structure_chain=structure_chain,
     )
     # Crush-classifier probability for the sell-side iron_condor scorecard. Uses
     # the SAME patchable inference path as the surfaced ml_crush_prob (below), so

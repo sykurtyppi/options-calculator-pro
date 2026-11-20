@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from services import release_timing as _release_timing_rule
+from services import structure_legs as _structure_legs
 from services.earnings_move_profile import (
     compute_earnings_move_profile as _compute_earnings_move_profile,
     normalize_release_timing as _normalize_release_timing,
@@ -182,6 +183,10 @@ class VolSnapshot:
     surface_sparse_atm_count: int = 0
     surface_iv_anomaly_count: int = 0
     surface_quality: Dict[str, Any] = field(default_factory=dict)
+    # The exact legs each structure would book (services.structure_legs), on the
+    # trade expiry: {"trade_expiry", "back_expiry", "structures": {structure:
+    # {"legs", "reason", "leg_spread_pct"}}}. Empty when no chain or no event.
+    structure_legs: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -269,7 +274,18 @@ def build_vol_snapshot(
     price_data: Any = None,
     config: Optional[VolSnapshotConfig] = None,
     options_provider: Optional[str] = None,
+    structure_chain: Optional[Mapping[str, Any]] = None,
 ) -> VolSnapshot:
+    """Build the point-in-time volatility snapshot for one symbol.
+
+    ``structure_chain`` (optional): ``{"listing": [every listed expiry],
+    "chain": the trade (and calendar back) expiry chains fetched the way entry
+    fetches them}``. With it the structure legs are resolved from the complete
+    listing and entry-equivalent strike coverage (coverage "complete"); without
+    it they come from the analysis chain, which may hold only sampled tenors
+    and a narrow strike window (coverage "sampled"), and must not be read as
+    "this structure cannot be formed".
+    """
     cfg = config or VolSnapshotConfig()
     as_of_date = _coerce_date(as_of)
     null_reasons: Dict[str, str] = {}
@@ -483,6 +499,10 @@ def build_vol_snapshot(
                 event_decomposition_status = "event_expiry_not_quotable"
             else:
                 event_decomposition_status = "no_event_spanning_expiry"
+
+    structure_legs = _structure_legs_from_inputs(
+        structure_chain, chain_frame, underlying_price, earnings_date, earnings.release_timing, as_of_date,
+    )
 
     _decomp = decompose_event_vol(
         near_term_implied_move_pct=decomp_input_move,
@@ -710,7 +730,163 @@ def build_vol_snapshot(
         surface_sparse_atm_count=int(surface_quality.get("sparse_atm_expiration_count") or 0),
         surface_iv_anomaly_count=int(surface_quality.get("missing_iv_count") or 0) + int(surface_quality.get("iv_outlier_count") or 0),
         surface_quality=surface_quality,
+        structure_legs=structure_legs,
     )
+
+
+COVERAGE_COMPLETE = "complete"
+COVERAGE_SAMPLED = "sampled"
+
+
+def _structure_legs_from_inputs(
+    structure_chain: Optional[Mapping[str, Any]],
+    analysis_chain: pd.DataFrame,
+    underlying_price: Optional[float],
+    earnings_date: Optional[date],
+    release_timing: str,
+    as_of_date: date,
+) -> Dict[str, Any]:
+    """Structure legs from the entry-equivalent fetch when given, else (sampled) the analysis chain."""
+    if structure_chain:
+        raw = structure_chain.get("chain")
+        parts = raw if isinstance(raw, (list, tuple)) else [raw]
+        fetched_on = structure_chain.get("fetched_on")
+        # Resolve every row's quote date BEFORE normalisation (see
+        # _resolve_structure_trade_dates): a supplied date always wins, a
+        # supplied but unusable one leaves the row untrusted, and only a row
+        # with no date at all takes the fetch date.
+        parts = [_resolve_structure_trade_dates(part, fetched_on) for part in parts]
+        normalized = [_normalize_option_chain(part)[0] for part in parts]
+        normalized = [part for part in normalized if not part.empty]
+        frame = pd.concat(normalized, ignore_index=True) if normalized else pd.DataFrame()
+        # The same point-in-time guard as the primary chain: rows quoted after
+        # the as-of date, or with no valid trade date, never price the legs.
+        # Dropping them can leave a needed expiry missing; the completeness
+        # check below then marks the legs "sampled".
+        if not frame.empty:
+            trade_dates = pd.to_datetime(frame.get("trade_date"), errors="coerce")
+            frame = frame[trade_dates.notna() & (trade_dates <= pd.Timestamp(as_of_date))].reset_index(drop=True)
+        listing = [pd.Timestamp(v).date() for v in (structure_chain.get("listing") or []) if v]
+        if not frame.empty and listing and earnings_date is not None:
+            legs = _structure_legs_for_chain(
+                frame, underlying_price, earnings_date, release_timing, as_of_date, listing=listing,
+            )
+            # Complete only if every expiry the legs need was actually fetched
+            # (both sides): a chain that failed to arrive is not a missing leg.
+            fetched = {
+                (pd.Timestamp(e).date(), side)
+                for e, side in zip(frame["expiry"], frame["call_put"]) if pd.notna(e)
+            }
+            needed = [legs.get("trade_expiry"), legs.get("back_expiry")] if legs else []
+            if legs and needed[0] is not None and all(
+                {(date.fromisoformat(e), "C"), (date.fromisoformat(e), "P")} <= fetched
+                for e in needed if e is not None
+            ):
+                return {**legs, "coverage": COVERAGE_COMPLETE}
+    legs = _structure_legs_for_chain(analysis_chain, underlying_price, earnings_date, release_timing, as_of_date)
+    return {**legs, "coverage": COVERAGE_SAMPLED} if legs else {}
+
+
+_DATE_COLUMNS = ("trade_date", "report_date", "updated")
+
+
+def _is_absent(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and np.isnan(value):
+        return True
+    return isinstance(value, str) and not value.strip()
+
+
+def _parse_quote_date(column: str, value: Any) -> Optional[pd.Timestamp]:
+    """The naive (UTC calendar) timestamp of one supplied value, or None if unusable."""
+    if column == "updated":
+        try:
+            parsed = pd.to_datetime(float(value), unit="s", utc=True)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    if parsed is None or pd.isna(parsed):
+        return None
+    return parsed.tz_localize(None)
+
+
+def _resolve_structure_trade_dates(part: Any, fetched_on: Optional[str]) -> Any:
+    """One trusted quote date per row of a structure-chain part.
+
+    For each row, the first SUPPLIED value among trade_date, report_date and
+    updated (the timestamps the snapshot normaliser understands) decides: a
+    parseable one is the row's date; an unparseable one makes the row
+    untrusted (NaT, which the as-of guard then drops). Only a row with none
+    of them supplied takes the fetch date. The alias columns are dropped so
+    the normaliser cannot second-guess the result.
+    """
+    if not isinstance(part, pd.DataFrame) or part.empty:
+        return part
+    present = [column for column in _DATE_COLUMNS if column in part.columns]
+    stamp = pd.Timestamp(fetched_on) if fetched_on else pd.NaT
+    resolved = []
+    for _, row in part.iterrows():
+        value = stamp
+        for column in present:
+            raw = row[column]
+            if _is_absent(raw):
+                continue
+            parsed = _parse_quote_date(column, raw)
+            value = parsed if parsed is not None else pd.NaT
+            break
+        resolved.append(value)
+    out = part.drop(columns=[c for c in ("report_date", "updated") if c in part.columns])
+    out["trade_date"] = pd.to_datetime(pd.Series(resolved, index=part.index), errors="coerce")
+    return out
+
+
+def _structure_legs_for_chain(
+    chain_frame: pd.DataFrame,
+    underlying_price: Optional[float],
+    earnings_date: Optional[date],
+    release_timing: str,
+    as_of_date: date,
+    *,
+    listing: Optional[Sequence[date]] = None,
+) -> Dict[str, Any]:
+    """The legs every structure would book on this chain (services.structure_legs).
+
+    ``listing`` is the complete expiry listing; without it the expiries present
+    in the chain are used, which may be a sample.
+    """
+    if (earnings_date is None or chain_frame is None or chain_frame.empty
+            or underlying_price is None or not np.isfinite(underlying_price)):
+        return {}
+    expiry_dates = pd.to_datetime(chain_frame["expiry"], errors="coerce").dt.date
+    source = listing if listing is not None else expiry_dates.dropna().tolist()
+    listed = sorted({d for d in source if d > as_of_date})
+    front = _structure_legs.trade_expiry(listed, earnings_date, release_timing)
+    if front is None:
+        return {"trade_expiry": None, "back_expiry": None, "structures": {
+            name: {"legs": {}, "reason": "no_front_expiry_after_earnings", "leg_spread_pct": None}
+            for name in _structure_legs.STRUCTURES}}
+    back = _structure_legs.calendar_back_expiry(listed, front)
+
+    def _sides(expiry: Optional[date]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if expiry is None:
+            return pd.DataFrame(), pd.DataFrame()
+        grp = chain_frame[expiry_dates == expiry]
+        return grp[grp["call_put"] == "C"].copy(), grp[grp["call_put"] == "P"].copy()
+
+    calls, puts = _sides(front)
+    back_calls, back_puts = _sides(back)
+    return {
+        "trade_expiry": front.isoformat(),
+        "back_expiry": back.isoformat() if back is not None else None,
+        "structures": {
+            name: _structure_legs.discover_legs(
+                name, calls, puts, float(underlying_price), back_calls=back_calls, back_puts=back_puts,
+            )
+            for name in _structure_legs.STRUCTURES
+        },
+    }
 
 
 def _coerce_date(value: date | datetime | pd.Timestamp) -> date:
