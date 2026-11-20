@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 import logging
 from pathlib import Path
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from services.move_statistics import ANCHOR_RATIO_UNIT_SCALE, TAIL_RATIO_UNIT_SCALE
 import numpy as np
@@ -183,11 +183,15 @@ _PRIORS_CACHE: Dict[tuple, Dict[str, WalkForwardPrior]] = {}
 _PRIORS_CACHE_MAX: int = 32
 
 
+_SCORED_STRUCTURES = ("atm_straddle", "otm_strangle", "call_calendar", "put_calendar", "iron_condor")
+
+
 def build_structure_scorecards(
     snapshot: VolSnapshot,
     as_of_date: Optional[date] = None,
     *,
     crush_probability: Optional[float] = None,
+    priors: Optional[Mapping[str, WalkForwardPrior]] = None,
 ) -> List[StructureScorecard]:
     """
     Build scorecards for all supported structures.
@@ -195,6 +199,12 @@ def build_structure_scorecards(
     Parameters
     ----------
     snapshot : VolSnapshot
+    priors : mapping, optional
+        The walk-forward prior for every structure, supplied by the caller
+        (the pricing harness learns them from its own earlier outcomes). When
+        given, neither the report files nor the persistent store is read, so
+        the leakage sentinel has nothing to check and does not run. Every
+        structure in services.structure_legs.STRUCTURES must be present.
     crush_probability : float, optional
         Trained post-earnings crush-classifier probability (services.crush_features
         / edge_engine._ml_crush_probability). Accepted for compatibility and
@@ -218,7 +228,12 @@ def build_structure_scorecards(
         paper or live observations dated after as_of_date.  Replay
         observations are exempt (they are the sanctioned backtest signal).
     """
-    if as_of_date is not None:
+    if priors is not None:
+        missing = [name for name in _SCORED_STRUCTURES if name not in priors]
+        if missing:
+            raise ValueError(f"priors missing for {missing}")
+        priors = dict(priors)
+    elif as_of_date is not None:
         from services.structure_prior_store import (
             BacktestLeakageError,
             get_structure_prior_store,
@@ -241,7 +256,8 @@ def build_structure_scorecards(
                 f"prior store unavailable ({type(exc).__name__}: {exc})"
             ) from exc
 
-    priors = _load_walk_forward_priors(as_of_date=as_of_date)
+    if priors is None:
+        priors = _load_walk_forward_priors(as_of_date=as_of_date)
     return [
         score_atm_straddle(snapshot, prior=priors["atm_straddle"]),
         score_otm_strangle(snapshot, prior=priors["otm_strangle"]),
@@ -1694,6 +1710,30 @@ def _shrink_live_into_report_prior(
         # simulated even when the report half was.
         is_simulated=False,
     )
+
+
+def prior_from_returns(structure: str, returns: Sequence[float], *, source: str) -> WalkForwardPrior:
+    """The prior production would hold after observing ``returns`` (no report).
+
+    The observations are aggregated exactly as the persistent store aggregates
+    them (Laplace-smoothed win rate below its threshold) and shrunk into the
+    neutral no-data baseline with the live shrinkage weight, as
+    _load_walk_forward_priors does for a structure without a report. With no
+    observations this is the neutral prior.
+    """
+    neutral = _neutral_prior(structure, source=source)
+    clean = [float(r) for r in returns if r is not None and np.isfinite(float(r))]
+    if not clean:
+        return neutral
+    from services.structure_prior_store import _recompute_aggregates
+
+    agg = _recompute_aggregates([{"realized_return_pct": r} for r in clean])
+    blended = _shrink_live_into_report_prior(neutral, {
+        "history_count": agg["observation_count"],
+        "win_rate": agg["win_rate"],
+        "avg_return_pct": agg["avg_return_pct"],
+    })
+    return replace(blended, source=f"{source}:{blended.source}")
 
 
 def _load_walk_forward_priors(
